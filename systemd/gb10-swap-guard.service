@@ -1,0 +1,18 @@
+[Unit]
+Description=GB10 vLLM swap guard
+After=default.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=GB10_SWAP_WARN_GIB=7.5
+Environment=GB10_SWAP_STOP_GIB=12
+Environment=GB10_SWAP_GUARD_INTERVAL=20
+Environment=GB10_SWAP_ATTRIBUTION_INTERVAL=300
+ExecStart=%h/.local/bin/gb10-swap-guard.sh
+Restart=always
+RestartSec=5
+OOMScoreAdjust=-850
+
+[Install]
+WantedBy=default.target

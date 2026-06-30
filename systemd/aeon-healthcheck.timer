@@ -1,0 +1,10 @@
+[Unit]
+Description=AEON DFlash health check timer (every 2 min)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

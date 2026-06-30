@@ -1,0 +1,62 @@
+[Unit]
+Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.23.0 dflashfix, BF16/default KV, port 18010, 262144 ctx, util=0.49, seq=64, guard active=8)
+Requires=vllm-embedding.service
+After=network.target vllm-embedding.service
+# Direct AEON text endpoint moved behind llm-guard-proxy; wrapper owns stable 18009.
+Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
+Environment=HF_HUB_OFFLINE=1
+OOMScoreAdjust=500
+# Recover from real vLLM/container crashes such as EngineDeadError exits.
+# Manual `systemctl --user stop` remains a clean stop and is not restarted.
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=1200
+TimeoutStopSec=60
+
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 120); do curl -sf http://100.105.4.92:18002/v1/models >/dev/null 2>&1 && exit 0; sleep 5; done; echo "embedding not ready after 10min"; exit 1'
+ExecStartPre=-/usr/bin/docker rm -f vllm-aeon-27b-dflash-n12 vllm-aeon-27b-dflash vllm-aeon-27b
+ExecStart=/usr/bin/docker run --rm --name vllm-aeon-27b-dflash-n12 \
+  --gpus all --ipc host --dns 8.8.8.8 --dns 1.1.1.1 \
+  -p 100.105.4.92:18010:8000 \
+  -v /home/obj/.cache/huggingface/hub/models--AEON-7--Qwen3.6-27B-AEON-Ultimate-Uncensored-Multimodal-NVFP4-MTP-XS:/models/aeon-cache:ro \
+  -v /home/obj/.cache/huggingface/hub/models--z-lab--Qwen3.6-27B-DFlash:/models/dflash-cache:ro \
+  -v /home/obj/scripts/aeon_hang_guard.py:/opt/hang_guard/aeon_hang_guard.py:ro \
+  -v /home/obj/scripts/aeon_vllm_wrapper.py:/opt/hang_guard/aeon_vllm_wrapper.py:ro \
+  -e HF_HUB_OFFLINE=1 \
+  -e PYTHONPATH=/opt/hang_guard \
+  --memory 69g \
+  --oom-score-adj 500 \
+  --entrypoint python3 \
+  ghcr.io/aeon-7/aeon-vllm-ultimate:2026-06-18-v0.23.0-dflashfix \
+  /opt/hang_guard/aeon_vllm_wrapper.py serve \
+    /models/aeon-cache/snapshots/6394b93fa092dcbfbf09e952f56f30337509d17c \
+    --host 0.0.0.0 --port 8000 \
+    --served-model-name "aeon-ultimate" "qwen3.6-27b-decensor-by-aeon" \
+    --quantization modelopt \
+    --mamba-cache-dtype float32 \
+    --max-model-len 262144 \
+    --max-num-seqs 64 \
+    --max-num-batched-tokens 16384 \
+    --enable-prefix-caching \
+    --gpu-memory-utilization 0.49 \
+    --speculative-config '{"method":"dflash","model":"/models/dflash-cache/snapshots/0919688658996800f86b895034249700e9481106","num_speculative_tokens":10}' \
+    --enable-chunked-prefill \
+    --no-scheduler-reserve-full-isl \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --default-chat-template-kwargs '{"enable_thinking": false}' \
+    --override-generation-config '{"temperature": 0.6, "top_p": 0.95, "top_k": 20}' \
+    --trust-remote-code
+ExecStop=/usr/bin/docker stop vllm-aeon-27b-dflash-n12
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,47 @@
+[Unit]
+Description=vLLM Qwen3-Embedding-8B (reliability-first, 40k native max, co-resident with 122B, 8 seq, 6.5GiB KV)
+After=network.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
+Environment=HF_HUB_OFFLINE=1
+# Embedding is the reliability-critical service. Ideal would be oom_score_adj=0
+# but rootless docker (rootlesskit pid 3907540 adj=200) caps the child floor
+# at 200 — obj user cannot lower a process's oom_score_adj without sudo. The
+# --oom-score-adj 0 flag below is kept as documentation of intent; docker
+# silently accepts it but the value remains 200 in HostConfig. Protection
+# relies on temporary workloads being launched with --oom-score-adj 1000
+# (giving an 800-point gap), so the kernel kills them first under pressure.
+# To fully reach adj=0, run `sudo choom -p <rootlesskit_pid> -n 0` then
+# `systemctl --user restart vllm-embedding`.
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=600
+TimeoutStopSec=60
+
+ExecStartPre=-/usr/bin/docker rm -f vllm-embedding
+ExecStart=/usr/bin/docker run --rm --name vllm-embedding \
+  --gpus all --ipc host --dns 8.8.8.8 --dns 1.1.1.1 \
+  -p 100.105.4.92:18002:8000 \
+  -v /home/obj/.cache/huggingface:/root/.cache/huggingface \
+  -e HF_HUB_OFFLINE=1 \
+  --memory 25g \
+  --oom-score-adj 0 \
+  ghcr.io/bjk110/vllm-spark:v019-ngc2603-patched \
+  vllm serve Qwen/Qwen3-Embedding-8B \
+    --host 0.0.0.0 --port 8000 \
+    --convert embed \
+    --max-model-len 40960 \
+    --max-num-batched-tokens 2048 \
+    --max-num-seqs 8 \
+    --kv-cache-memory-bytes 6656M \
+    --enforce-eager
+ExecStop=/usr/bin/docker stop vllm-embedding
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

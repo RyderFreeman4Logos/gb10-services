@@ -1,0 +1,51 @@
+[Unit]
+Description=vLLM Qwen3-Reranker-8B (BF16, 20k ctx, pooling reranker, util=0.22, 3.25GiB KV, port 18003, 32 seq)
+Requires=vllm-aeon-27b-dflash-n12.service
+BindsTo=vllm-aeon-27b-dflash-n12.service
+After=network.target vllm-aeon-27b-dflash-n12.service
+PartOf=vllm-aeon-27b-dflash-n12.service
+Conflicts=vllm-qwen35-hauhau.service
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
+Environment=HF_HUB_OFFLINE=1
+OOMScoreAdjust=800
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=1320
+TimeoutStopSec=60
+
+ExecStartPre=%h/.local/bin/aeon_chat_ready.py --deadline-seconds 1260 --timeout-seconds 6 --long-timeout-seconds 1200 --interval-seconds 5
+ExecStartPre=-/usr/bin/docker rm -f vllm-qwen3-reranker-8b
+ExecStart=/usr/bin/docker run --rm --name vllm-qwen3-reranker-8b \
+  --gpus all --ipc host --dns 8.8.8.8 --dns 1.1.1.1 \
+  -p 100.105.4.92:18003:8000 \
+  -v /home/obj/.cache/huggingface:/root/.cache/huggingface \
+  -e HF_HUB_OFFLINE=1 \
+  --memory 24g \
+  --oom-score-adj 800 \
+  --entrypoint python3 \
+  ghcr.io/aeon-7/aeon-vllm-ultimate:v0.22.1-pr44389-spark \
+  /usr/local/bin/vllm serve Qwen/Qwen3-Reranker-8B \
+    --host 0.0.0.0 --port 8000 \
+    --served-model-name qwen3-reranker-8b Qwen/Qwen3-Reranker-8B \
+    --runner pooling \
+    --dtype bfloat16 \
+    --max-model-len 20480 \
+    --max-num-batched-tokens 20480 \
+    --max-num-seqs 32 \
+    --gpu-memory-utilization 0.22 \
+    --kv-cache-memory-bytes 3328M \
+    --enforce-eager \
+    --chat-template /vllm-workspace/examples/pooling/score/template/qwen3_reranker.jinja \
+    --hf-overrides '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}' \
+    --trust-remote-code
+ExecStop=/usr/bin/docker stop vllm-qwen3-reranker-8b
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

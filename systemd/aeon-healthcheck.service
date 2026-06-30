@@ -1,0 +1,9 @@
+[Unit]
+Description=AEON DFlash CUDA hang health check
+After=vllm-aeon-27b-dflash.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/obj/scripts/aeon_healthcheck.sh
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,2 @@
+# Allow AGENTS.md in this repository despite global ignores
+!AGENTS.md

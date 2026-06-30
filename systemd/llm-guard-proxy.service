@@ -1,0 +1,30 @@
+[Unit]
+Description=llm-guard-proxy guard wrapper for AEON vLLM on gb10
+After=network.target vllm-aeon-27b-dflash-n12.service
+Wants=vllm-aeon-27b-dflash-n12.service
+
+[Service]
+Type=simple
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/home/obj/.config/llm-guard-proxy /home/obj/.local/bin/llm-guard-proxy
+ReadWritePaths=/home/obj/.local/state /home/obj/.local/state/llm-guard-proxy
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+ExecStartPre=/usr/bin/test -r /home/obj/.config/llm-guard-proxy/config.toml
+ExecStartPre=/usr/bin/mkdir -p /home/obj/.local/state/llm-guard-proxy
+ExecStart=/home/obj/.local/bin/llm-guard-proxy --config /home/obj/.config/llm-guard-proxy/config.toml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
