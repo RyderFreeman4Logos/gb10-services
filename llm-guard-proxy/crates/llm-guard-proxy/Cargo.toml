@@ -1,0 +1,24 @@
+[package]
+name = "llm-guard-proxy"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenAI-compatible LLM guard proxy service."
+
+[dependencies]
+axum = "0.8"
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+llm-guard-proxy-core = { path = "../llm-guard-proxy-core" }
+reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls", "stream"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[lints]
+workspace = true

@@ -40,7 +40,16 @@ chmod +x /home/obj/scripts/*.sh /home/obj/.local/bin/*
 cp config/llm-guard-proxy/config.toml /home/obj/.config/llm-guard-proxy/config.toml
 ```
 
-### 3. Systemd User Services Installation
+### 3. Build llm-guard-proxy
+```bash
+# Compile and place the binary
+cd llm-guard-proxy
+cargo build --release
+cp target/release/llm-guard-proxy /home/obj/.local/bin/
+cd ..
+```
+
+### 4. Systemd User Services Installation
 ```bash
 # Create user-level systemd directory if missing
 mkdir -p /home/obj/.config/systemd/user/
@@ -52,7 +61,7 @@ cp systemd/* /home/obj/.config/systemd/user/
 systemctl --user daemon-reload
 ```
 
-### 4. Enable and Start Services
+### 5. Enable and Start Services
 ```bash
 # Start auxiliary services first
 systemctl --user enable --now sysmon.service

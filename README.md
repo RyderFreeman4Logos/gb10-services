@@ -30,7 +30,7 @@ graph TD
 3. **vllm-qwen3-reranker-8b.service**  
    Serves `Qwen/Qwen3-Reranker-8B` for sequence classification and search rerank tasks.
 4. **llm-guard-proxy.service**  
-   A Go-based shielding gateway proxy ([llm-guard-proxy](https://github.com/RyderFreeman4Logos/llm-guard-proxy)) sitting in front of the main chat endpoint. It manages request queues, retries, stalls, and loop guards to protect the backend from runaway generations.
+   A Rust-based shielding gateway proxy ([llm-guard-proxy](https://github.com/RyderFreeman4Logos/llm-guard-proxy)) sitting in front of the main chat endpoint. It manages request queues, retries, stalls, and loop guards to protect the backend from runaway generations.
 5. **sysmon.service**  
    A lightweight system monitor script executing at 1Hz, recording system load, temperatures, GPU metrics, disk I/O rates, swap-in/out, and top process RSS/swap memory consumption.
 
@@ -85,11 +85,11 @@ Pre-download the required model weights into `~/.cache/huggingface/` or prepare 
 * **Reranker Model**: `Qwen/Qwen3-Reranker-8B`
 
 ### 3. Build llm-guard-proxy
-Clone and compile the proxy binary on the host machine:
+Compile the proxy binary included in this repository:
 ```bash
-git clone https://github.com/RyderFreeman4Logos/llm-guard-proxy.git
 cd llm-guard-proxy
-go build -o ~/.local/bin/llm-guard-proxy
+cargo build --release
+cp target/release/llm-guard-proxy ~/.local/bin/
 ```
 
 ---
