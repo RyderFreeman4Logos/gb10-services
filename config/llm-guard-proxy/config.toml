@@ -1,0 +1,69 @@
+[server]
+bind_host = "100.105.4.92"
+port = 18009
+max_in_flight_requests = 8
+max_queued_generation_requests = 8
+generation_queue_timeout_ms = 1800000
+max_request_body_bytes = 67108864
+
+[upstream]
+base_url = "http://100.105.4.92:18010/v1"
+request_timeout_ms = 1800000
+
+[upstream.stall]
+enabled = true
+idle_timeout_ms = 120000
+
+[upstream.metadata]
+discovery_enabled = true
+enrich_responses = true
+refresh_interval_secs = 60
+
+[shielding]
+enabled = true
+
+[observability]
+enabled = true
+sqlite_path = "/home/obj/.local/state/llm-guard-proxy/observability.sqlite3"
+capture_raw_payloads = false
+metrics_enabled = true
+health_upstream_probe_enabled = true
+health_upstream_probe_timeout_ms = 2000
+debug_summary_enabled = false
+debug_summary_max_records = 20
+
+[observability.retention]
+max_bytes = 1073741824
+prune_to_bytes = 805306368
+max_records = 100000
+prune_to_records = 80000
+
+[thinking]
+enabled = true
+preserve_answer_budget = true
+tool_request_policy = "passthrough"
+
+force_disable = true
+[loop_guard]
+enabled = true
+normalized_input_window_secs = 120
+max_repeated_inputs = 1
+output_repeated_line_threshold = 24
+output_token_window_size = 12
+output_repeated_token_window_threshold = 32
+output_suffix_cycle_threshold = 32
+output_low_progress_min_bytes = 4096
+output_low_progress_unique_ratio_percent = 15
+input_overlap_threshold_multiplier = 4
+
+[retry]
+enabled = true
+max_attempts = 5
+anti_loop_hint_enabled = true
+
+[heartbeat]
+mode = "sse"
+interval_secs = 15
+
+[cloudflare]
+enabled = true

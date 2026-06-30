@@ -1,0 +1,16 @@
+[Unit]
+Description=System monitor (load, temps, GPU, IO, swap) every 1s
+After=default.target
+# Prevent systemd from ever giving up on restarts.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sysmon.sh
+Restart=always
+RestartSec=5
+# Make OOM killer strongly prefer other processes over sysmon
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=default.target
