@@ -1,9 +1,9 @@
 [Unit]
 Description=vLLM Qwen3-Reranker-8B (BF16, 20k ctx, pooling reranker, util=0.22, 3.25GiB KV, port 18003, 32 seq)
-Requires=vllm-aeon-27b-dflash-n12.service
-BindsTo=vllm-aeon-27b-dflash-n12.service
-After=network.target vllm-aeon-27b-dflash-n12.service
-PartOf=vllm-aeon-27b-dflash-n12.service
+Requires=vllm-aeon-27b-dflash.service
+BindsTo=vllm-aeon-27b-dflash.service
+After=network.target vllm-aeon-27b-dflash.service
+PartOf=vllm-aeon-27b-dflash.service
 Conflicts=vllm-qwen35-hauhau.service
 StartLimitIntervalSec=600
 StartLimitBurst=3

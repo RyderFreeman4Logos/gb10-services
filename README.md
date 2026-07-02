@@ -23,7 +23,7 @@ graph TD
 ```
 
 ### The 5 Core Services
-1. **vllm-aeon-27b-dflash-n12.service**  
+1. **vllm-aeon-27b-dflash.service**  
    Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside a specialized Docker container for high-throughput reasoning and long-context processing (up to 256k tokens).
 2. **vllm-embedding.service**  
    Serves `Qwen/Qwen3-Embedding-8B` to handle vector embeddings. This is considered the reliability-critical baseline service.
@@ -63,7 +63,7 @@ gb10-services/
     ├── gb10-swap-guard.service
     ├── llm-guard-proxy.service
     ├── sysmon.service
-    ├── vllm-aeon-27b-dflash-n12.service
+    ├── vllm-aeon-27b-dflash.service
     ├── vllm-embedding.service
     └── vllm-qwen3-reranker-8b.service
 ```
@@ -139,7 +139,7 @@ systemctl --user enable --now aeon-healthcheck.timer
 
 # Enable model services
 systemctl --user enable --now vllm-embedding.service
-systemctl --user enable --now vllm-aeon-27b-dflash-n12.service
+systemctl --user enable --now vllm-aeon-27b-dflash.service
 systemctl --user enable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now llm-guard-proxy.service
 ```

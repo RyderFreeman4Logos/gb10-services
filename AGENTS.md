@@ -8,7 +8,7 @@
 * **Port Allocations**:
   * `18002`: `vllm-embedding.service` (Qwen3-Embedding-8B)
   * `18003`: `vllm-qwen3-reranker-8b.service` (Qwen3-Reranker-8B)
-  * `18010`: `vllm-aeon-27b-dflash-n12.service` (Direct AEON chat endpoint)
+  * `18010`: `vllm-aeon-27b-dflash.service` (Direct AEON chat endpoint)
   * `18009`: `llm-guard-proxy.service` (Shielding wrapper protecting port 18010)
 
 ---
@@ -72,7 +72,7 @@ systemctl --user enable --now aeon-healthcheck.timer
 
 # Start vLLM stack and shielding proxy
 systemctl --user enable --now vllm-embedding.service
-systemctl --user enable --now vllm-aeon-27b-dflash-n12.service
+systemctl --user enable --now vllm-aeon-27b-dflash.service
 systemctl --user enable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now llm-guard-proxy.service
 ```
@@ -99,7 +99,7 @@ tail -n 20 ~/log/sysmon_$(date +%Y-%m-%d).csv
 ### View Live Service logs
 ```bash
 # View last 50 log lines for chat service
-journalctl --user -u vllm-aeon-27b-dflash-n12.service -n 50 --no-pager
+journalctl --user -u vllm-aeon-27b-dflash.service -n 50 --no-pager
 
 # View last 50 log lines for proxy wrapper
 journalctl --user -u llm-guard-proxy.service -n 50 --no-pager
@@ -121,10 +121,10 @@ curl -s -X POST http://100.105.4.92:18009/v1/chat/completions \
 ## Troubleshooting & Recovery
 
 ### 1. CUDA Hang or Service Crash
-If `vllm-aeon-27b-dflash-n12.service` hangs or refuses to respond:
+If `vllm-aeon-27b-dflash.service` hangs or refuses to respond:
 ```bash
 # Restart the chat service (ExecStartPre will automatically purge hung docker containers)
-systemctl --user restart vllm-aeon-27b-dflash-n12.service
+systemctl --user restart vllm-aeon-27b-dflash.service
 ```
 
 ### 2. Manual Docker Cleanups
@@ -134,7 +134,7 @@ If a Docker container gets stuck in a dead state and systemd fails to restart:
 docker rm -f vllm-aeon-27b-dflash-n12 vllm-qwen3-reranker-8b vllm-embedding
 
 # Restart target systemd service
-systemctl --user restart vllm-aeon-27b-dflash-n12.service
+systemctl --user restart vllm-aeon-27b-dflash.service
 ```
 
 ### 3. OOM / Swap Critical
