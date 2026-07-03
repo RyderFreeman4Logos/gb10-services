@@ -41,7 +41,7 @@ prune_to_records = 80000
 [thinking]
 enabled = true
 preserve_answer_budget = true
-tool_request_policy = "passthrough"
+tool_request_policy = "apply"
 
 force_disable = true
 [loop_guard]

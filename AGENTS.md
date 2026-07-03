@@ -2,6 +2,8 @@
 
 > This file contains actionable deployment instructions, runtime facts, and troubleshooting commands for AI agents operating on `gb10` machines.
 
+Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --user`) should be able to deploy the same service stack and runtime behavior as the reference host from the files in this repository.
+
 ## Host & Port Mapping
 * **Host Internal IP / Tailscale IP**: `100.105.4.92` (Verify using `ip route` or `ip addr show`)
 * **Docker Environment**: Rootless Docker active at `unix:///run/user/1001/docker.sock`.
@@ -10,6 +12,15 @@
   * `18003`: `vllm-qwen3-reranker-8b.service` (Qwen3-Reranker-8B)
   * `18010`: `vllm-aeon-27b-dflash.service` (Direct AEON chat endpoint)
   * `18009`: `llm-guard-proxy.service` (Shielding wrapper protecting port 18010)
+
+## Current Reference Runtime
+
+* vLLM image for embedding, AEON chat, and reranker: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0` (`sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c`).
+* `vllm-embedding.service`: `max-model-len=40960`, `max-num-batched-tokens=8192`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
+* `vllm-aeon-27b-dflash.service`: DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-batched-tokens=32768`, `kv-cache-memory-bytes=15360M`, verified 269,589 KV tokens.
+* `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
+* `llm-guard-proxy` force-disables Qwen3.6-27B thinking by rewriting request parameters because the AEON thinking-loop issue is not fixed yet: [AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-DFlash#14](https://github.com/AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-DFlash/issues/14).
+* `llm-guard-proxy` also hot-reloads `config.toml`. Use it to change chat request parallelism (`max_in_flight_requests`, `max_queued_generation_requests`) without restarting vLLM, trading total throughput against single-stream latency.
 
 ---
 
@@ -77,6 +88,21 @@ systemctl --user enable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now llm-guard-proxy.service
 ```
 
+For updates on an already-running GB10, do not restart just one vLLM service when
+changing memory/context profiles. Stop the full vLLM stack first to clear stale
+pages, then start in dependency order:
+
+```bash
+systemctl --user stop vllm-qwen3-reranker-8b.service
+systemctl --user stop vllm-aeon-27b-dflash.service
+systemctl --user stop vllm-embedding.service
+
+systemctl --user start vllm-embedding.service
+systemctl --user start vllm-aeon-27b-dflash.service
+systemctl --user start vllm-qwen3-reranker-8b.service
+systemctl --user start llm-guard-proxy.service
+```
+
 ---
 
 ## Operational Monitoring & Verification
@@ -87,7 +113,7 @@ systemctl --user enable --now llm-guard-proxy.service
 systemctl --user list-units --type=service --state=running
 
 # Check detailed status of core services
-systemctl --user status vllm-embedding vllm-aeon-27b-dflash-n12 vllm-qwen3-reranker-8b llm-guard-proxy sysmon gb10-swap-guard
+systemctl --user status vllm-embedding vllm-aeon-27b-dflash vllm-qwen3-reranker-8b llm-guard-proxy sysmon gb10-swap-guard
 ```
 
 ### Retrieve System Resource Log (sysmon output)
@@ -114,7 +140,25 @@ curl -s http://100.105.4.92:18002/v1/models
 curl -s -X POST http://100.105.4.92:18009/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "aeon-ultimate", "messages": [{"role": "user", "content": "你好"}]}'
+
+# Test Reranker Endpoint
+curl -s -X POST http://100.105.4.92:18003/v1/rerank \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3-reranker-8b","query":"hello","documents":["hello world","goodbye"]}'
 ```
+
+### Hot-reload Chat Parallelism
+
+To tune throughput versus single-stream latency without restarting the slow AEON
+vLLM backend, edit `/home/obj/.config/llm-guard-proxy/config.toml` and adjust:
+
+```toml
+max_in_flight_requests = 8
+max_queued_generation_requests = 8
+```
+
+The running Rust proxy hot-reloads the config file. Restarting vLLM is not
+required for these proxy-only queue/concurrency changes.
 
 ---
 
@@ -131,7 +175,7 @@ systemctl --user restart vllm-aeon-27b-dflash.service
 If a Docker container gets stuck in a dead state and systemd fails to restart:
 ```bash
 # Explicitly force remove the containers
-docker rm -f vllm-aeon-27b-dflash-n12 vllm-qwen3-reranker-8b vllm-embedding
+docker rm -f vllm-aeon-27b-dflash vllm-aeon-27b-dflash-n12 vllm-qwen3-reranker-8b vllm-embedding
 
 # Restart target systemd service
 systemctl --user restart vllm-aeon-27b-dflash.service
