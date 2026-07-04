@@ -24,6 +24,8 @@ name = "qwen3-embedding-8b"
 base_url = "http://100.105.4.92:18012/v1"
 match_models = ["qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B"]
 request_timeout_ms = 1800000
+max_in_flight_requests = 8
+max_queued_generation_requests = 8
 
 [upstreams.metadata]
 discovery_enabled = true
@@ -35,6 +37,8 @@ name = "qwen3-reranker-8b"
 base_url = "http://100.105.4.92:18013/v1"
 match_models = ["qwen3-reranker-8b", "Qwen/Qwen3-Reranker-8B"]
 request_timeout_ms = 1800000
+max_in_flight_requests = 8
+max_queued_generation_requests = 8
 
 [upstreams.metadata]
 discovery_enabled = true

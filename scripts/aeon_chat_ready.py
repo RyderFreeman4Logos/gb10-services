@@ -86,7 +86,7 @@ def probe_models(url: str, timeout: float) -> tuple[bool, str, float]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Wait for AEON 18009 chat completion readiness.")
+    parser = argparse.ArgumentParser(description="Wait for AEON chat completion readiness.")
     parser.add_argument("--url", default="http://100.105.4.92:18009/v1/chat/completions")
     parser.add_argument("--models-url", default="http://100.105.4.92:18009/v1/models")
     parser.add_argument("--model", default="aeon-ultimate")

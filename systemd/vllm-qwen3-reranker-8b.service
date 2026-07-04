@@ -18,7 +18,7 @@ RestartSec=30
 TimeoutStartSec=1320
 TimeoutStopSec=60
 
-ExecStartPre=%h/.local/bin/aeon_chat_ready.py --deadline-seconds 1260 --timeout-seconds 6 --long-timeout-seconds 1200 --interval-seconds 5
+ExecStartPre=%h/.local/bin/aeon_chat_ready.py --url http://100.105.4.92:18010/v1/chat/completions --models-url http://100.105.4.92:18010/v1/models --deadline-seconds 1260 --timeout-seconds 6 --long-timeout-seconds 1200 --interval-seconds 5
 ExecStartPre=-/usr/bin/docker rm -f vllm-qwen3-reranker-8b
 ExecStart=/usr/bin/docker run --rm --name vllm-qwen3-reranker-8b \
   --gpus all --ipc host --dns 8.8.8.8 --dns 1.1.1.1 \
