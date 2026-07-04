@@ -1,7 +1,7 @@
 [Unit]
-Description=llm-guard-proxy guard wrapper for AEON vLLM on gb10
-After=network.target vllm-aeon-27b-dflash.service
-Wants=vllm-aeon-27b-dflash.service
+Description=llm-guard-proxy guard wrapper for GB10 vLLM upstreams
+After=network.target vllm-embedding.service vllm-aeon-27b-dflash.service vllm-qwen3-reranker-8b.service
+Wants=vllm-embedding.service vllm-aeon-27b-dflash.service vllm-qwen3-reranker-8b.service
 
 [Service]
 Type=simple

@@ -8,10 +8,10 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 * **Host Internal IP / Tailscale IP**: `100.105.4.92` (Verify using `ip route` or `ip addr show`)
 * **Docker Environment**: Rootless Docker active at `unix:///run/user/1001/docker.sock`.
 * **Port Allocations**:
-  * `18002`: `vllm-embedding.service` (Qwen3-Embedding-8B)
-  * `18003`: `vllm-qwen3-reranker-8b.service` (Qwen3-Reranker-8B)
-  * `18010`: `vllm-aeon-27b-dflash.service` (Direct AEON chat endpoint)
-  * `18009`: `llm-guard-proxy.service` (Shielding wrapper protecting port 18010)
+  * `18009`: `llm-guard-proxy.service` (stable OpenAI-compatible entrypoint for chat, embeddings, and rerank)
+  * `18010`: `vllm-aeon-27b-dflash.service` (raw AEON chat backend)
+  * `18012`: `vllm-embedding.service` (raw Qwen3-Embedding-8B backend routed by guard)
+  * `18013`: `vllm-qwen3-reranker-8b.service` (raw Qwen3-Reranker-8B backend routed by guard)
 
 ## Current Reference Runtime
 
@@ -19,8 +19,9 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 * `vllm-embedding.service`: `max-model-len=40960`, `max-num-batched-tokens=8192`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
 * `vllm-aeon-27b-dflash.service`: DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-batched-tokens=32768`, `kv-cache-memory-bytes=15360M`, verified 269,589 KV tokens.
 * `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
+* `llm-guard-proxy` routes by request `model` to AEON chat (`aeon-ultimate`, `qwen3.6-27b-decensor-by-aeon`), embedding (`qwen3-embedding-8b`, `Qwen/Qwen3-Embedding-8B`), or reranker (`qwen3-reranker-8b`, `Qwen/Qwen3-Reranker-8B`).
 * `llm-guard-proxy` force-disables Qwen3.6-27B thinking by rewriting request parameters because the AEON thinking-loop issue is not fixed yet: [AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-DFlash#14](https://github.com/AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-DFlash/issues/14).
-* `llm-guard-proxy` also hot-reloads `config.toml`. Use it to change chat request parallelism (`max_in_flight_requests`, `max_queued_generation_requests`) without restarting vLLM, trading total throughput against single-stream latency.
+* `llm-guard-proxy` also hot-reloads `config.toml`. Use it to change request parallelism (`max_in_flight_requests`, `max_queued_generation_requests`) without restarting vLLM, trading total throughput against single-stream latency.
 
 ---
 
@@ -133,16 +134,18 @@ journalctl --user -u llm-guard-proxy.service -n 50 --no-pager
 
 ### Test API Endpoints
 ```bash
-# Test Embedding Endpoint
-curl -s http://100.105.4.92:18002/v1/models
+# Test Embedding Endpoint via llm-guard-proxy
+curl -s -X POST http://100.105.4.92:18009/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3-embedding-8b","input":"hello"}'
 
 # Test Chat via llm-guard-proxy
 curl -s -X POST http://100.105.4.92:18009/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "aeon-ultimate", "messages": [{"role": "user", "content": "你好"}]}'
 
-# Test Reranker Endpoint
-curl -s -X POST http://100.105.4.92:18003/v1/rerank \
+# Test Reranker Endpoint via llm-guard-proxy
+curl -s -X POST http://100.105.4.92:18009/v1/rerank \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3-reranker-8b","query":"hello","documents":["hello world","goodbye"]}'
 ```

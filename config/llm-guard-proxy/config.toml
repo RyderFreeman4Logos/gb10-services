@@ -19,6 +19,28 @@ discovery_enabled = true
 enrich_responses = true
 refresh_interval_secs = 60
 
+[[upstreams]]
+name = "qwen3-embedding-8b"
+base_url = "http://100.105.4.92:18012/v1"
+match_models = ["qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B"]
+request_timeout_ms = 1800000
+
+[upstreams.metadata]
+discovery_enabled = true
+enrich_responses = true
+refresh_interval_secs = 60
+
+[[upstreams]]
+name = "qwen3-reranker-8b"
+base_url = "http://100.105.4.92:18013/v1"
+match_models = ["qwen3-reranker-8b", "Qwen/Qwen3-Reranker-8B"]
+request_timeout_ms = 1800000
+
+[upstreams.metadata]
+discovery_enabled = true
+enrich_responses = true
+refresh_interval_secs = 60
+
 [shielding]
 enabled = true
 

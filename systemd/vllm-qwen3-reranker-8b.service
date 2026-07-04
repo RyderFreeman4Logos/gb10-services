@@ -1,5 +1,5 @@
 [Unit]
-Description=vLLM Qwen3-Reranker-8B (AEON v0.24 GB10 image, BF16, 40k ctx, pooling reranker, util=0.22, 5.68GiB KV=1.01× max-len, port 18003, 64 seq, container swap disabled)
+Description=vLLM Qwen3-Reranker-8B (AEON v0.24 GB10 image, BF16, 40k ctx, pooling reranker, util=0.22, raw backend port 18013 behind llm-guard-proxy 18009, 64 seq, container swap disabled)
 Requires=vllm-aeon-27b-dflash.service
 BindsTo=vllm-aeon-27b-dflash.service
 After=network.target vllm-aeon-27b-dflash.service
@@ -22,7 +22,7 @@ ExecStartPre=%h/.local/bin/aeon_chat_ready.py --deadline-seconds 1260 --timeout-
 ExecStartPre=-/usr/bin/docker rm -f vllm-qwen3-reranker-8b
 ExecStart=/usr/bin/docker run --rm --name vllm-qwen3-reranker-8b \
   --gpus all --ipc host --dns 8.8.8.8 --dns 1.1.1.1 \
-  -p 100.105.4.92:18003:8000 \
+  -p 100.105.4.92:18013:8000 \
   -v /home/obj/.cache/huggingface:/root/.cache/huggingface \
   -e HF_HUB_OFFLINE=1 \
   --memory 24g \

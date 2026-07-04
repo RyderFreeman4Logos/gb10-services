@@ -12,8 +12,8 @@ The stack consists of **5 main services** (3 vLLM model endpoints, 1 loop/shield
 graph TD
     Client[Client Requests] -->|Port 18009| Proxy[llm-guard-proxy]
     Proxy -->|Port 18010| AEON[vLLM AEON-7 27B Chat]
-    Client -->|Port 18002| Embed[vLLM Qwen3-Embedding-8B]
-    Client -->|Port 18003| Rerank[vLLM Qwen3-Reranker-8B]
+    Proxy -->|Port 18012| Embed[vLLM Qwen3-Embedding-8B]
+    Proxy -->|Port 18013| Rerank[vLLM Qwen3-Reranker-8B]
 
     subgraph Monitoring & Health
         Sysmon[sysmon.sh] -->|Logs 1Hz Stats| CSV[(~/log/sysmon_*.csv)]
@@ -26,11 +26,11 @@ graph TD
 1. **vllm-aeon-27b-dflash.service**
    Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside the pinned AEON v0.24 GB10 Docker image for long-context processing up to 256k tokens, with FP8 KV cache and DFlash `TRITON_ATTN` enabled.
 2. **vllm-embedding.service**
-   Serves `Qwen/Qwen3-Embedding-8B` to handle vector embeddings. This is considered the reliability-critical baseline service.
+   Serves `Qwen/Qwen3-Embedding-8B` to handle vector embeddings. This is considered the reliability-critical baseline service. Its raw backend listens on port `18012`; clients should use `llm-guard-proxy` on port `18009` with model `qwen3-embedding-8b`.
 3. **vllm-qwen3-reranker-8b.service**
-   Serves `Qwen/Qwen3-Reranker-8B` for sequence classification and search rerank tasks, with the full 40k context profile restored.
+   Serves `Qwen/Qwen3-Reranker-8B` for sequence classification and search rerank tasks, with the full 40k context profile restored. Its raw backend listens on port `18013`; clients should use `llm-guard-proxy` on port `18009` with model `qwen3-reranker-8b`.
 4. **llm-guard-proxy.service**
-   A Rust-based shielding gateway proxy ([llm-guard-proxy](https://github.com/RyderFreeman4Logos/llm-guard-proxy)) sitting in front of the main chat endpoint. It manages request queues, retries, stalls, and loop guards to protect the backend from runaway generations. It is also the runtime control plane for chat concurrency: edit `config/llm-guard-proxy/config.toml` to tune `max_in_flight_requests` / `max_queued_generation_requests`, and the running proxy hot-reloads the config so operators can choose throughput versus single-stream latency without restarting vLLM.
+   A Rust-based shielding gateway proxy ([llm-guard-proxy](https://github.com/RyderFreeman4Logos/llm-guard-proxy)) sitting in front of the chat, embedding, and reranker endpoints. It routes requests by `model` to named upstream profiles, manages request queues, retries, stalls, and loop guards to protect backends from runaway generations. It is also the runtime control plane for request concurrency: edit `config/llm-guard-proxy/config.toml` to tune `max_in_flight_requests` / `max_queued_generation_requests`, and the running proxy hot-reloads the config so operators can choose throughput versus single-stream latency without restarting vLLM.
 
    The proxy currently force-disables Qwen3.6-27B thinking by rewriting request parameters because the AEON thinking-loop issue is not fixed yet: [AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-DFlash#14](https://github.com/AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-DFlash/issues/14).
 5. **sysmon.service**
