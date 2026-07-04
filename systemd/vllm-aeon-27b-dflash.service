@@ -1,9 +1,9 @@
 [Unit]
-Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.24.0, FP8 KV, port 18010, 262144 ctx, util=0.49 cap, kv-mem=15360M≈1.03x, seq=16, guard active=8)
+Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.24.0, FP8 KV, port 18010, 262144 ctx, util=0.49 cap, kv-mem=15360M≈1.03x, seq=64, guard active=8, container swap disabled)
 Requires=vllm-embedding.service
 After=network.target vllm-embedding.service
 # Direct AEON text endpoint moved behind llm-guard-proxy; wrapper owns stable 18009.
-Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
+Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
 StartLimitIntervalSec=600
 StartLimitBurst=3
 
@@ -33,6 +33,8 @@ ExecStart=/usr/bin/docker run --rm --name vllm-aeon-27b-dflash-n12 \
   -e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768 \
   -e AEON_THINKING_BUDGET_GUARD=0 \
   --memory 69g \
+  --memory-swap 69g \
+  --memory-swappiness 0 \
   --oom-score-adj 500 \
   --entrypoint python3 \
   ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0 \
@@ -45,7 +47,7 @@ ExecStart=/usr/bin/docker run --rm --name vllm-aeon-27b-dflash-n12 \
     --attention-backend TRITON_ATTN \
     --mamba-cache-dtype float32 \
     --max-model-len 262144 \
-    --max-num-seqs 16 \
+    --max-num-seqs 64 \
     --max-num-batched-tokens 32768 \
     --enable-prefix-caching \
     --gpu-memory-utilization 0.49 \
