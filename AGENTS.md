@@ -42,6 +42,7 @@ cp scripts/aeon_vllm_wrapper.py /home/obj/scripts/
 cp scripts/aeon_hang_guard.py /home/obj/scripts/
 cp scripts/aeon_healthcheck.sh /home/obj/scripts/
 cp scripts/aeon_chat_ready.py /home/obj/.local/bin/
+cp scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/
 cp scripts/sysmon.sh /home/obj/.local/bin/
 cp scripts/gb10-swap-guard.sh /home/obj/.local/bin/
 
@@ -57,14 +58,15 @@ cp config/llm-guard-proxy/config.toml /home/obj/.config/llm-guard-proxy/config.t
 
 ### 3. Build llm-guard-proxy
 ```bash
-# Clone the remote repository and compile the binary
-git clone https://github.com/RyderFreeman4Logos/llm-guard-proxy.git
-cd llm-guard-proxy
-cargo build --release
-cp target/release/llm-guard-proxy /home/obj/.local/bin/
-cd ..
-rm -rf llm-guard-proxy
+# Build/update the reviewed main branch through mise with a persistent Cargo
+# target cache. The script uses CARGO_BUILD_JOBS=1 and ionice/nice so rebuilds
+# are safer while the GB10 vLLM stack is resident.
+/home/obj/.local/bin/llm_guard_proxy_cached_rebuild.sh
 ```
+
+The cached rebuild script keeps Cargo build artifacts under
+`/home/obj/.cache/cargo-target/llm-guard-proxy-main`, then atomically relinks
+`/home/obj/.local/bin/llm-guard-proxy` to the mise-managed `ref-main` binary.
 
 ### 4. Systemd User Services Installation
 ```bash
@@ -146,6 +148,11 @@ curl -s -X POST http://100.105.4.92:18009/v1/embeddings \
 curl -s -X POST http://100.105.4.92:18009/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "aeon-ultimate", "messages": [{"role": "user", "content": "你好"}]}'
+
+# The shielded chat retry ladder intentionally starts with max-thinking. A
+# trivial probe such as "Say OK" may return content like "\n\nOK" plus
+# `reasoning_content`; this is the model/parser's final-answer separator, not a
+# failed health check.
 
 # Test Reranker Endpoint via llm-guard-proxy
 curl -s -X POST http://100.105.4.92:18009/v1/rerank \

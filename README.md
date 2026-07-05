@@ -106,13 +106,16 @@ Pre-download the required model weights into `~/.cache/huggingface/` or prepare 
 * **Reranker Model**: `Qwen/Qwen3-Reranker-8B`
 
 ### 3. Build llm-guard-proxy
-Clone and compile the proxy binary on the host machine:
+Build/update the proxy binary on the host machine through mise. This uses a
+persistent Cargo target cache and low-concurrency rebuild settings so future
+GB10 updates do not recompile dependencies from scratch:
 ```bash
-git clone https://github.com/RyderFreeman4Logos/llm-guard-proxy.git
-cd llm-guard-proxy
-cargo build --release
-cp target/release/llm-guard-proxy ~/.local/bin/
+~/.local/bin/llm_guard_proxy_cached_rebuild.sh
 ```
+
+The script keeps build artifacts in
+`~/.cache/cargo-target/llm-guard-proxy-main` and relinks
+`~/.local/bin/llm-guard-proxy` to the mise-managed `ref-main` binary.
 
 ---
 
@@ -128,6 +131,7 @@ cp scripts/aeon_vllm_wrapper.py ~/scripts/
 cp scripts/aeon_hang_guard.py ~/scripts/
 cp scripts/aeon_healthcheck.sh ~/scripts/
 cp scripts/aeon_chat_ready.py ~/.local/bin/
+cp scripts/llm_guard_proxy_cached_rebuild.sh ~/.local/bin/
 cp scripts/sysmon.sh ~/.local/bin/
 cp scripts/gb10-swap-guard.sh ~/.local/bin/
 
