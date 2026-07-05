@@ -41,6 +41,24 @@ chmod 700 "$CACHE_ROOT"
   file "$MISE_BIN"
   sha256sum "$MISE_BIN" "$SERVICE_BIN"
   du -sh "$CACHE_ROOT" 2>/dev/null || true
+
+  if systemctl --user is-active --quiet llm-guard-proxy.service; then
+    MAIN_PID="$(systemctl --user show -p MainPID --value llm-guard-proxy.service)"
+    RUNNING_EXE="$(readlink "/proc/$MAIN_PID/exe" 2>/dev/null || true)"
+    log "running_guard_pid=$MAIN_PID"
+    log "running_guard_exe=$RUNNING_EXE"
+    if printf '%s\n' "$RUNNING_EXE" | grep -q ' (deleted)$'; then
+      log "running guard is still on an unlinked inode; restarting llm-guard-proxy.service only"
+      run systemctl --user restart llm-guard-proxy.service
+      sleep 2
+      run systemctl --user is-active llm-guard-proxy.service
+      curl -fsS -m 10 http://100.105.4.92:18009/health >/dev/null
+      NEW_PID="$(systemctl --user show -p MainPID --value llm-guard-proxy.service)"
+      log "restarted_guard_pid=$NEW_PID"
+      log "restarted_guard_exe=$(readlink "/proc/$NEW_PID/exe")"
+    fi
+  fi
+
   log "cached llm-guard-proxy mise rebuild complete"
 } 2>&1 | tee "$LOG_FILE"
 

@@ -115,7 +115,10 @@ GB10 updates do not recompile dependencies from scratch:
 
 The script keeps build artifacts in
 `~/.cache/cargo-target/llm-guard-proxy-main` and relinks
-`~/.local/bin/llm-guard-proxy` to the mise-managed `ref-main` binary.
+`~/.local/bin/llm-guard-proxy` to the mise-managed `ref-main` binary. If a
+standalone rebuild leaves the running guard process on a deleted old inode, the
+script restarts only `llm-guard-proxy.service` and smokes `/health`; it does not
+restart any vLLM backend.
 
 ---
 

@@ -67,6 +67,9 @@ cp config/llm-guard-proxy/config.toml /home/obj/.config/llm-guard-proxy/config.t
 The cached rebuild script keeps Cargo build artifacts under
 `/home/obj/.cache/cargo-target/llm-guard-proxy-main`, then atomically relinks
 `/home/obj/.local/bin/llm-guard-proxy` to the mise-managed `ref-main` binary.
+If the running guard process still points at a deleted old inode after a
+standalone rebuild, the script restarts only `llm-guard-proxy.service` and
+smokes `/health`; it does not restart any vLLM backend.
 
 ### 4. Systemd User Services Installation
 ```bash
