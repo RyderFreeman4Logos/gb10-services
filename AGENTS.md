@@ -12,6 +12,8 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
   * `18010`: `vllm-aeon-27b-dflash.service` (raw AEON chat backend)
   * `18012`: `vllm-embedding.service` (raw Qwen3-Embedding-8B backend routed by guard)
   * `18013`: `vllm-qwen3-reranker-8b.service` (raw Qwen3-Reranker-8B backend routed by guard)
+  * `18002`: legacy compatibility alias for the raw embedding backend while clients migrate to `18009`/`18012`
+  * `18003`: legacy compatibility alias for the raw reranker backend while clients migrate to `18009`/`18013`
 
 ## Current Reference Runtime
 

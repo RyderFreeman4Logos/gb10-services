@@ -1,5 +1,5 @@
 [Unit]
-Description=vLLM Qwen3-Embedding-8B (AEON v0.24 GB10 image, raw backend port 18012 behind llm-guard-proxy 18009, reliability-first, 40k native max, 64 seq, container swap disabled)
+Description=vLLM Qwen3-Embedding-8B (AEON v0.24 GB10 image, raw backend port 18012 plus legacy 18002, behind llm-guard-proxy 18009, reliability-first, 40k native max, 64 seq, container swap disabled)
 After=network.target
 StartLimitIntervalSec=600
 StartLimitBurst=3
@@ -26,6 +26,7 @@ ExecStartPre=-/usr/bin/docker rm -f vllm-embedding
 ExecStart=/usr/bin/docker run --rm --name vllm-embedding \
   --gpus all --ipc host --dns 8.8.8.8 --dns 1.1.1.1 \
   -p 100.105.4.92:18012:8000 \
+  -p 100.105.4.92:18002:8000 \
   -v /home/obj/.cache/huggingface:/root/.cache/huggingface \
   -e HF_HUB_OFFLINE=1 \
   --memory 25g \
