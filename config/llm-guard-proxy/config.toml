@@ -6,6 +6,23 @@ max_queued_generation_requests = 8
 generation_queue_timeout_ms = 1800000
 max_request_body_bytes = 67108864
 
+[[listeners]]
+name = "embedding-legacy"
+bind_host = "100.105.4.92"
+port = 18002
+allowed_upstreams = ["qwen3-embedding-8b"]
+
+[[listeners]]
+name = "reranker-legacy"
+bind_host = "100.105.4.92"
+port = 18003
+allowed_upstreams = ["qwen3-reranker-8b"]
+
+[[listeners]]
+name = "aggregate"
+bind_host = "100.105.4.92"
+port = 18005
+
 [upstream]
 base_url = "http://100.105.4.92:18010/v1"
 request_timeout_ms = 1800000
@@ -66,12 +83,14 @@ prune_to_records = 80000
 
 [thinking]
 enabled = true
+force_disable = false
+budget_tokens = 32768
 preserve_answer_budget = true
 tool_request_policy = "apply"
 
-force_disable = true
 [loop_guard]
 enabled = true
+mode = "enforce"
 normalized_input_window_secs = 120
 max_repeated_inputs = 1
 output_repeated_line_threshold = 24
@@ -84,8 +103,28 @@ input_overlap_threshold_multiplier = 4
 
 [retry]
 enabled = true
-max_attempts = 5
+max_attempts = 3
 anti_loop_hint_enabled = true
+shielded_streaming_enabled = true
+downstream_drop_policy = "cancel"
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "bounded-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 8192
+anti_loop_hint = "Previous attempt became repetitive. Do not repeat prior analysis; answer directly."
+
+[[retry.ladder]]
+name = "no-thinking"
+thinking_mode = "force_disable"
+max_tokens = 50000
 
 [heartbeat]
 mode = "sse"

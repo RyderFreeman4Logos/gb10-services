@@ -12,8 +12,9 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
   * `18010`: `vllm-aeon-27b-dflash.service` (raw AEON chat backend)
   * `18012`: `vllm-embedding.service` (raw Qwen3-Embedding-8B backend routed by guard)
   * `18013`: `vllm-qwen3-reranker-8b.service` (raw Qwen3-Reranker-8B backend routed by guard)
-  * `18002`: legacy compatibility alias for the raw embedding backend while clients migrate to `18009`/`18012`
-  * `18003`: legacy compatibility alias for the raw reranker backend while clients migrate to `18009`/`18013`
+  * `18002`: `llm-guard-proxy.service` legacy embedding-compatible listener; only embedding upstream profiles are allowed
+  * `18003`: `llm-guard-proxy.service` legacy reranker-compatible listener; only reranker upstream profiles are allowed
+  * `18005`: `llm-guard-proxy.service` aggregate listener for chat, embedding, and rerank profiles
 
 ## Current Reference Runtime
 
@@ -22,7 +23,7 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 * `vllm-aeon-27b-dflash.service`: DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-batched-tokens=32768`, `kv-cache-memory-bytes=15360M`, verified 269,589 KV tokens.
 * `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
 * `llm-guard-proxy` routes by request `model` to AEON chat (`aeon-ultimate`, `qwen3.6-27b-decensor-by-aeon`), embedding (`qwen3-embedding-8b`, `Qwen/Qwen3-Embedding-8B`), or reranker (`qwen3-reranker-8b`, `Qwen/Qwen3-Reranker-8B`).
-* `llm-guard-proxy` force-disables Qwen3.6-27B thinking by rewriting request parameters because the AEON thinking-loop issue is not fixed yet: [AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-DFlash#14](https://github.com/AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-DFlash/issues/14).
+* `llm-guard-proxy` uses a shielded AEON retry ladder for chat: max thinking, bounded thinking, then no-thinking direct streaming relay if prior streaming attempts trip the loop guard. The legacy 18002/18003 ports are guard-owned downstream listeners, not raw vLLM publishes.
 * `llm-guard-proxy` also hot-reloads `config.toml`. Use `[server]` to change default/chat request parallelism and per-`[[upstreams]]` `max_in_flight_requests` / `max_queued_generation_requests` to tune embedding/reranker independently without restarting vLLM, trading total throughput against single-stream latency.
 
 ---
