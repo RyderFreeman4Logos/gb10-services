@@ -1,5 +1,5 @@
 [Unit]
-Description=vLLM Qwen3-Reranker-8B (BF16, 20k ctx, pooling reranker, util=0.22, 2.84GiB KV=1.01× max-len, port 18003, 32 seq)
+Description=vLLM Qwen3-Reranker-8B (AEON v0.24 GB10 image, BF16, 40k ctx, pooling reranker, util=0.22, raw backend port 18013, behind llm-guard-proxy listeners 18009/18003/18005, 64 seq, container swap disabled)
 Requires=vllm-aeon-27b-dflash.service
 BindsTo=vllm-aeon-27b-dflash.service
 After=network.target vllm-aeon-27b-dflash.service
@@ -18,27 +18,29 @@ RestartSec=30
 TimeoutStartSec=1320
 TimeoutStopSec=60
 
-ExecStartPre=%h/.local/bin/aeon_chat_ready.py --deadline-seconds 1260 --timeout-seconds 6 --long-timeout-seconds 1200 --interval-seconds 5
+ExecStartPre=%h/.local/bin/aeon_chat_ready.py --url http://100.105.4.92:18010/v1/chat/completions --models-url http://100.105.4.92:18010/v1/models --deadline-seconds 1260 --timeout-seconds 6 --long-timeout-seconds 1200 --interval-seconds 5
 ExecStartPre=-/usr/bin/docker rm -f vllm-qwen3-reranker-8b
 ExecStart=/usr/bin/docker run --rm --name vllm-qwen3-reranker-8b \
   --gpus all --ipc host --dns 8.8.8.8 --dns 1.1.1.1 \
-  -p 100.105.4.92:18003:8000 \
+  -p 100.105.4.92:18013:8000 \
   -v /home/obj/.cache/huggingface:/root/.cache/huggingface \
   -e HF_HUB_OFFLINE=1 \
   --memory 24g \
+  --memory-swap 24g \
+  --memory-swappiness 0 \
   --oom-score-adj 800 \
   --entrypoint python3 \
-  ghcr.io/aeon-7/aeon-vllm-ultimate:v0.22.1-pr44389-spark \
+  ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0 \
   /usr/local/bin/vllm serve Qwen/Qwen3-Reranker-8B \
     --host 0.0.0.0 --port 8000 \
     --served-model-name qwen3-reranker-8b Qwen/Qwen3-Reranker-8B \
     --runner pooling \
     --dtype bfloat16 \
-    --max-model-len 20480 \
-    --max-num-batched-tokens 20480 \
-    --max-num-seqs 32 \
+    --max-model-len 40960 \
+    --max-num-batched-tokens 40960 \
+    --max-num-seqs 64 \
     --gpu-memory-utilization 0.22 \
-    --kv-cache-memory-bytes 2910M \
+    --kv-cache-memory-bytes 5820M \
     --enforce-eager \
     --chat-template /vllm-workspace/examples/pooling/score/template/qwen3_reranker.jinja \
     --hf-overrides '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}'\

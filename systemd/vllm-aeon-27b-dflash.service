@@ -1,9 +1,9 @@
 [Unit]
-Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.23.0 dflashfix, BF16/default KV, port 18010, 262144 ctx, util=0.49 cap, kv-mem=28070M=1.01x, seq=16, guard active=8)
+Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.24.0, FP8 KV, port 18010, 262144 ctx, util=0.49 cap, kv-mem=15360M≈1.03x, seq=64, guard active=8, container swap disabled)
 Requires=vllm-embedding.service
 After=network.target vllm-embedding.service
 # Direct AEON text endpoint moved behind llm-guard-proxy; wrapper owns stable 18009.
-Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
+Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
 StartLimitIntervalSec=600
 StartLimitBurst=3
 
@@ -19,7 +19,7 @@ RestartSec=30
 TimeoutStartSec=1200
 TimeoutStopSec=60
 
-ExecStartPre=/bin/bash -c 'for i in $(seq 1 120); do curl -sf http://100.105.4.92:18002/v1/models >/dev/null 2>&1 && exit 0; sleep 5; done; echo "embedding not ready after 10min"; exit 1'
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 120); do curl -sf http://100.105.4.92:18012/v1/models >/dev/null 2>&1 && exit 0; sleep 5; done; echo "embedding not ready after 10min"; exit 1'
 ExecStartPre=-/usr/bin/docker rm -f vllm-aeon-27b-dflash-n12 vllm-aeon-27b-dflash vllm-aeon-27b
 ExecStart=/usr/bin/docker run --rm --name vllm-aeon-27b-dflash-n12 \
   --gpus all --ipc host --dns 8.8.8.8 --dns 1.1.1.1 \
@@ -33,22 +33,26 @@ ExecStart=/usr/bin/docker run --rm --name vllm-aeon-27b-dflash-n12 \
   -e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768 \
   -e AEON_THINKING_BUDGET_GUARD=0 \
   --memory 69g \
+  --memory-swap 69g \
+  --memory-swappiness 0 \
   --oom-score-adj 500 \
   --entrypoint python3 \
-  ghcr.io/aeon-7/aeon-vllm-ultimate:2026-06-18-v0.23.0-dflashfix \
+  ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0 \
   /opt/hang_guard/aeon_vllm_wrapper.py serve \
     /models/aeon-cache/snapshots/6394b93fa092dcbfbf09e952f56f30337509d17c \
     --host 0.0.0.0 --port 8000 \
     --served-model-name "aeon-ultimate" "qwen3.6-27b-decensor-by-aeon" \
     --quantization modelopt \
+    --kv-cache-dtype fp8_e4m3 \
+    --attention-backend TRITON_ATTN \
     --mamba-cache-dtype float32 \
     --max-model-len 262144 \
-    --max-num-seqs 16 \
-    --max-num-batched-tokens 16384 \
+    --max-num-seqs 64 \
+    --max-num-batched-tokens 32768 \
     --enable-prefix-caching \
     --gpu-memory-utilization 0.49 \
-    --kv-cache-memory-bytes 28070M \
-    --speculative-config '{"method":"dflash","model":"/models/dflash-cache/snapshots/0919688658996800f86b895034249700e9481106","num_speculative_tokens":10}' \
+    --kv-cache-memory-bytes 15360M \
+    --speculative-config '{"method":"dflash","model":"/models/dflash-cache/snapshots/0919688658996800f86b895034249700e9481106","num_speculative_tokens":10,"attention_backend":"TRITON_ATTN"}' \
     --enable-chunked-prefill \
     --no-scheduler-reserve-full-isl \
     --reasoning-parser qwen3 \

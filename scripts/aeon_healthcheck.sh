@@ -6,7 +6,9 @@
 set -euo pipefail
 
 SERVICE="vllm-aeon-27b-dflash.service"
-METRICS_URL="http://100.105.4.92:18009/metrics"
+# Scrape the raw AEON vLLM backend. The guard proxy exposes its own metrics at
+# 18009 and does not forward vLLM's vllm:* counters.
+METRICS_URL="http://100.105.4.92:18010/metrics"
 LOCKFILE="/tmp/aeon-healthcheck.lock"
 COOLDOWN_FILE="/tmp/aeon-healthcheck-last-restart"
 COOLDOWN_SECONDS=600  # don't restart more than once per 10 minutes
@@ -37,8 +39,8 @@ metrics1=$(curl -sf --max-time 5 "$METRICS_URL" 2>/dev/null) || {
     exit 0
 }
 
-running=$(echo "$metrics1" | grep '^vllm:num_requests_running{' | awk '{print $2}' | cut -d. -f1)
-tokens1=$(echo "$metrics1" | grep '^vllm:generation_tokens_total{' | awk '{print $2}' | cut -d. -f1)
+running=$(awk '/^vllm:num_requests_running\{/ {print int($2); exit}' <<<"$metrics1")
+tokens1=$(awk '/^vllm:generation_tokens_total\{/ {print int($2); exit}' <<<"$metrics1")
 
 if [[ -z "$running" || -z "$tokens1" ]]; then
     log "WARN: could not parse metrics"
@@ -53,7 +55,7 @@ fi
 sleep "$SAMPLE_INTERVAL"
 
 tokens2=$(curl -sf --max-time 5 "$METRICS_URL" 2>/dev/null \
-    | grep '^vllm:generation_tokens_total{' | awk '{print $2}' | cut -d. -f1) || {
+    | awk '/^vllm:generation_tokens_total\{/ {print int($2); exit}') || {
     log "WARN: second metrics fetch failed"
     exit 0
 }

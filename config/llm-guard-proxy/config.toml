@@ -1,23 +1,142 @@
 [server]
 bind_host = "100.105.4.92"
 port = 18009
-max_in_flight_requests = 8
-max_queued_generation_requests = 8
+max_in_flight_requests = 4
+max_queued_generation_requests = 4
 generation_queue_timeout_ms = 1800000
+generation_queue_full_status = 429
+generation_queue_retry_after_secs = 10
+max_control_plane_in_flight_requests = 128
 max_request_body_bytes = 67108864
+
+[[listeners]]
+name = "embedding-legacy"
+bind_host = "100.105.4.92"
+port = 18002
+allowed_upstreams = ["qwen3-embedding-8b"]
+
+[[listeners]]
+name = "reranker-legacy"
+bind_host = "100.105.4.92"
+port = 18003
+allowed_upstreams = ["qwen3-reranker-8b"]
+
+[[listeners]]
+name = "aggregate"
+bind_host = "100.105.4.92"
+port = 18005
 
 [upstream]
 base_url = "http://100.105.4.92:18010/v1"
 request_timeout_ms = 1800000
 
+[upstream.hot_restart]
+enabled = true
+probe_max_tokens = 1
+probe_interval_secs = 5
+probe_timeout_secs = 600
+
 [upstream.stall]
 enabled = true
 idle_timeout_ms = 120000
+recovery_timeout_ms = 300000
+recovery_cooldown_ms = 300000
+recovery_budget_window_ms = 900000
+recovery_max_per_window = 2
 
 [upstream.metadata]
 discovery_enabled = true
 enrich_responses = true
 refresh_interval_secs = 60
+input_token_safety_margin = 512
+
+[[upstreams]]
+name = "aeon-chat"
+base_url = "http://100.105.4.92:18010/v1"
+match_models = ["aeon-ultimate", "qwen3.6-27b-decensor-by-aeon"]
+request_timeout_ms = 1800000
+max_in_flight_requests = 4
+max_queued_generation_requests = 4
+
+[upstreams.metadata]
+discovery_enabled = true
+enrich_responses = true
+refresh_interval_secs = 60
+input_token_safety_margin = 512
+
+[upstreams.hot_restart]
+enabled = true
+probe_max_tokens = 1
+probe_interval_secs = 5
+probe_timeout_secs = 600
+
+[upstreams.thinking]
+mode = "bounded_thinking"
+enabled = true
+force_disable = false
+max_tokens = 50000
+budget_tokens = 32768
+preserve_answer_budget = true
+tool_request_policy = "apply"
+no_thinking_marker_policy = "respect_no_thinking_markers"
+default_injection_schema = "chat_template_kwargs"
+
+[upstreams.param_override]
+enabled = true
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+max_tokens = 50000
+frequency_penalty = 0.0
+presence_penalty = 0.0
+
+[[upstreams]]
+name = "qwen3-embedding-8b"
+base_url = "http://100.105.4.92:18012/v1"
+match_models = ["qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B"]
+request_timeout_ms = 1800000
+max_in_flight_requests = 8
+max_queued_generation_requests = 8
+
+[upstreams.metadata]
+discovery_enabled = true
+enrich_responses = true
+refresh_interval_secs = 60
+input_token_safety_margin = 512
+
+[upstreams.hot_restart]
+enabled = false
+
+[upstreams.thinking]
+mode = "passthrough"
+enabled = false
+
+[upstreams.param_override]
+enabled = false
+
+[[upstreams]]
+name = "qwen3-reranker-8b"
+base_url = "http://100.105.4.92:18013/v1"
+match_models = ["qwen3-reranker-8b", "Qwen/Qwen3-Reranker-8B"]
+request_timeout_ms = 1800000
+max_in_flight_requests = 8
+max_queued_generation_requests = 8
+
+[upstreams.metadata]
+discovery_enabled = true
+enrich_responses = true
+refresh_interval_secs = 60
+input_token_safety_margin = 512
+
+[upstreams.hot_restart]
+enabled = false
+
+[upstreams.thinking]
+mode = "passthrough"
+enabled = false
+
+[upstreams.param_override]
+enabled = false
 
 [shielding]
 enabled = true
@@ -25,11 +144,11 @@ enabled = true
 [observability]
 enabled = true
 sqlite_path = "/home/obj/.local/state/llm-guard-proxy/observability.sqlite3"
-capture_raw_payloads = false
+capture_raw_payloads = true
 metrics_enabled = true
 health_upstream_probe_enabled = true
 health_upstream_probe_timeout_ms = 2000
-debug_summary_enabled = false
+debug_summary_enabled = true
 debug_summary_max_records = 20
 
 [observability.retention]
@@ -38,14 +157,39 @@ prune_to_bytes = 805306368
 max_records = 100000
 prune_to_records = 80000
 
-[thinking]
+[evidence]
 enabled = true
-preserve_answer_budget = true
-tool_request_policy = "passthrough"
+include_raw_payloads = false
+include_request_headers = false
+sqlite_path = "/home/obj/.local/state/llm-guard-proxy-evidence/evidence.sqlite3"
+blob_cache_dir = "/home/obj/.cache/llm-guard-proxy-evidence/blobs"
+max_bytes = 536870912
+prune_to_bytes = 402653184
+max_records = 50000
+prune_to_records = 40000
 
-force_disable = true
+[evidence.shadow]
+enabled = false
+keep_looping_attempt_running = false
+parallel_downgrade_attempts = true
+max_shadow_attempts_per_request = 2
+max_global_shadow_in_flight = 2
+shadow_attempt_timeout_ms = 7200000
+
+[thinking]
+mode = "bounded_thinking"
+enabled = true
+force_disable = false
+max_tokens = 50000
+budget_tokens = 32768
+preserve_answer_budget = true
+tool_request_policy = "apply"
+no_thinking_marker_policy = "respect_no_thinking_markers"
+default_injection_schema = "chat_template_kwargs"
+
 [loop_guard]
 enabled = true
+mode = "enforce"
 normalized_input_window_secs = 120
 max_repeated_inputs = 1
 output_repeated_line_threshold = 24
@@ -54,12 +198,49 @@ output_repeated_token_window_threshold = 32
 output_suffix_cycle_threshold = 32
 output_low_progress_min_bytes = 4096
 output_low_progress_unique_ratio_percent = 15
+reasoning_semantic_detection_enabled = true
+reasoning_semantic_similarity_threshold_percent = 55
+reasoning_semantic_window_token_count = 24
+reasoning_semantic_minimum_token_count = 8
+reasoning_semantic_history_window_count = 16
 input_overlap_threshold_multiplier = 4
 
 [retry]
 enabled = true
-max_attempts = 5
+max_attempts = 3
 anti_loop_hint_enabled = true
+shielded_streaming_enabled = true
+downstream_drop_policy = "cancel"
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 32768
+preserve_answer_budget = true
+tool_request_policy = "apply"
+no_thinking_marker_policy = "respect_no_thinking_markers"
+default_injection_schema = "chat_template_kwargs"
+
+[[retry.ladder]]
+name = "bounded-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 8192
+preserve_answer_budget = true
+tool_request_policy = "apply"
+no_thinking_marker_policy = "respect_no_thinking_markers"
+default_injection_schema = "chat_template_kwargs"
+anti_loop_hint = "Previous attempt became repetitive. Do not repeat prior analysis; answer directly."
+
+[[retry.ladder]]
+name = "no-thinking"
+thinking_mode = "force_disable"
+max_tokens = 50000
+preserve_answer_budget = true
+tool_request_policy = "apply"
+no_thinking_marker_policy = "force"
+default_injection_schema = "chat_template_kwargs"
 
 [heartbeat]
 mode = "sse"

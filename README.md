@@ -1,6 +1,6 @@
 # GB10 AI Service Stack (DGX Spark OEM)
 
-This repository contains the complete configuration, scripts, and systemd user services for deploying and maintaining the core AI inference service stack on a **DGX Spark** (or similar GB10-based OEM server).
+This repository contains the complete configuration, scripts, and systemd user services for deploying and maintaining the core AI inference service stack on a **DGX Spark** (or similar GB10-based OEM server). Its goal is to let an agent with GB10 operator access (`rootless-docker` plus `systemctl --user`) reproduce the same service layout used on the reference GB10 host.
 
 The stack consists of **5 main services** (3 vLLM model endpoints, 1 loop/shielding proxy wrapper, and 1 system monitor) plus auxiliary helper services to ensure high availability, automatic failover, hang recovery, and memory protection.
 
@@ -10,10 +10,10 @@ The stack consists of **5 main services** (3 vLLM model endpoints, 1 loop/shield
 
 ```mermaid
 graph TD
-    Client[Client Requests] -->|Port 18009| Proxy[llm-guard-proxy]
+    Client[Client Requests] -->|Ports 18009/18005/18002/18003| Proxy[llm-guard-proxy]
     Proxy -->|Port 18010| AEON[vLLM AEON-7 27B Chat]
-    Client -->|Port 18002| Embed[vLLM Qwen3-Embedding-8B]
-    Client -->|Port 18003| Rerank[vLLM Qwen3-Reranker-8B]
+    Proxy -->|Port 18012| Embed[vLLM Qwen3-Embedding-8B]
+    Proxy -->|Port 18013| Rerank[vLLM Qwen3-Reranker-8B]
 
     subgraph Monitoring & Health
         Sysmon[sysmon.sh] -->|Logs 1Hz Stats| CSV[(~/log/sysmon_*.csv)]
@@ -23,20 +23,57 @@ graph TD
 ```
 
 ### The 5 Core Services
-1. **vllm-aeon-27b-dflash.service**  
-   Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside a specialized Docker container for high-throughput reasoning and long-context processing (up to 256k tokens).
-2. **vllm-embedding.service**  
-   Serves `Qwen/Qwen3-Embedding-8B` to handle vector embeddings. This is considered the reliability-critical baseline service.
-3. **vllm-qwen3-reranker-8b.service**  
-   Serves `Qwen/Qwen3-Reranker-8B` for sequence classification and search rerank tasks.
-4. **llm-guard-proxy.service**  
-   A Rust-based shielding gateway proxy ([llm-guard-proxy](https://github.com/RyderFreeman4Logos/llm-guard-proxy)) sitting in front of the main chat endpoint. It manages request queues, retries, stalls, and loop guards to protect the backend from runaway generations.
-5. **sysmon.service**  
+1. **vllm-aeon-27b-dflash.service**
+   Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside the pinned AEON v0.24 GB10 Docker image for long-context processing up to 256k tokens, with FP8 KV cache and DFlash `TRITON_ATTN` enabled.
+2. **vllm-embedding.service**
+   Serves `Qwen/Qwen3-Embedding-8B` to handle vector embeddings. This is considered the reliability-critical baseline service. Its raw backend listens only on port `18012`; clients should use `llm-guard-proxy` on port `18009` or the guard-owned legacy listener `18002` with model `qwen3-embedding-8b`.
+3. **vllm-qwen3-reranker-8b.service**
+   Serves `Qwen/Qwen3-Reranker-8B` for sequence classification and search rerank tasks, with the full 40k context profile restored. Its raw backend listens only on port `18013`; clients should use `llm-guard-proxy` on port `18009` or the guard-owned legacy listener `18003` with model `qwen3-reranker-8b`.
+4. **llm-guard-proxy.service**
+   A Rust-based shielding gateway proxy ([llm-guard-proxy](https://github.com/RyderFreeman4Logos/llm-guard-proxy)) sitting in front of the chat, embedding, and reranker endpoints. It routes requests by `model` to named upstream profiles, manages request queues, retries, stalls, and loop guards to protect backends from runaway generations. It owns the stable entrypoint `18009`, aggregate listener `18005`, and legacy restricted listeners `18002`/`18003`; raw vLLM backends stay on `18010`/`18012`/`18013`. It is also the runtime control plane for request concurrency: edit `config/llm-guard-proxy/config.toml` to tune the default/chat `server.max_in_flight_requests` / `server.max_queued_generation_requests` and the named `[[upstreams]]` limits for embedding and reranker. The running proxy hot-reloads these limits so operators can choose throughput versus single-stream latency without restarting vLLM.
+
+   The reference config enables the production guard features that are useful on
+   GB10: explicit named upstream profiles, bounded generation queues with HTTP
+   `429`/`Retry-After`, model metadata enrichment, AEON chat hot-restart probes,
+   stall detection, request parameter overrides for the AEON service-unit
+   sampling defaults (`temperature=0.6`, `top_p=0.95`, `top_k=20`,
+   `max_tokens=50000`), semantic loop detection, metrics, debug summaries,
+   SQLite observability, metadata-only evidence logging, SSE heartbeats, and
+   Cloudflare-friendly streaming. The proxy uses a shielded AEON retry ladder:
+   max thinking, bounded thinking, and a final no-thinking direct streaming
+   relay when prior streaming attempts trigger the loop guard.
+
+   Normal chat uses `mode = "bounded_thinking"` with a 32,768-token thinking
+   budget and `chat_template_kwargs` injection. Client no-thinking markers are respected:
+   a request with `"chat_template_kwargs": {"enable_thinking": false}` should
+   pass through without `reasoning_content`. Embedding and reranker profiles
+   explicitly disable chat-only hot-restart probes, thinking rewrites, and
+   parameter overrides.
+5. **sysmon.service**
    A lightweight system monitor script executing at 1Hz, recording system load, temperatures, GPU metrics, disk I/O rates, swap-in/out, and top process RSS/swap memory consumption.
 
 ### Auxiliary Services
 *   **gb10-swap-guard.service**: Monitors swap space utilization at regular intervals. Prevents OOM crashes by terminating secondary container tasks if swap runs critical, protecting core services.
 *   **aeon-healthcheck.timer & service**: A systemd timer that triggers every 2 minutes to check vLLM metrics. It automatically restarts the chat service if it detects a CUDA kernel hang (running requests with zero tokens/s and low GPU power).
+
+### Reference Production Profile (2026-07-03)
+
+The reference host currently runs all three vLLM services on:
+
+```text
+ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0
+digest: sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c
+```
+
+Verified startup capacities:
+
+```text
+embedding:  max-model-len 40,960, KV 5,820M -> 41,376 tokens = 1.01015625x
+AEON chat:  max-model-len 262,144, FP8 KV 15,360M -> 269,589 tokens = 1.028400421x
+reranker:   max-model-len 40,960, KV 5,820M -> 41,376 tokens = 1.01015625x
+```
+
+For updates to any vLLM memory/context profile, use a full vLLM stack stop-before-start sequence. Stopping or restarting only one model can leave stale vLLM pages in swap.
 
 ---
 
@@ -85,13 +122,19 @@ Pre-download the required model weights into `~/.cache/huggingface/` or prepare 
 * **Reranker Model**: `Qwen/Qwen3-Reranker-8B`
 
 ### 3. Build llm-guard-proxy
-Clone and compile the proxy binary on the host machine:
+Build/update the proxy binary on the host machine through mise. This uses a
+persistent Cargo target cache and low-concurrency rebuild settings so future
+GB10 updates do not recompile dependencies from scratch:
 ```bash
-git clone https://github.com/RyderFreeman4Logos/llm-guard-proxy.git
-cd llm-guard-proxy
-cargo build --release
-cp target/release/llm-guard-proxy ~/.local/bin/
+~/.local/bin/llm_guard_proxy_cached_rebuild.sh
 ```
+
+The script keeps build artifacts in
+`~/.cache/cargo-target/llm-guard-proxy-main` and relinks
+`~/.local/bin/llm-guard-proxy` to the mise-managed `ref-main` binary. If a
+standalone rebuild leaves the running guard process on a deleted old inode, the
+script restarts only `llm-guard-proxy.service` and smokes `/health`; it does not
+restart any vLLM backend.
 
 ---
 
@@ -107,6 +150,7 @@ cp scripts/aeon_vllm_wrapper.py ~/scripts/
 cp scripts/aeon_hang_guard.py ~/scripts/
 cp scripts/aeon_healthcheck.sh ~/scripts/
 cp scripts/aeon_chat_ready.py ~/.local/bin/
+cp scripts/llm_guard_proxy_cached_rebuild.sh ~/.local/bin/
 cp scripts/sysmon.sh ~/.local/bin/
 cp scripts/gb10-swap-guard.sh ~/.local/bin/
 
@@ -117,7 +161,7 @@ chmod +x ~/scripts/*.sh ~/.local/bin/*
 cp config/llm-guard-proxy/config.toml ~/.config/llm-guard-proxy/config.toml
 ```
 
-> [!NOTE]  
+> [!NOTE]
 > Update the IP address `100.105.4.92` in `systemd/*.service` and `config/llm-guard-proxy/config.toml` to match your local or Tailscale network interface IP address.
 
 ### Step 2: Install Systemd Services
@@ -144,13 +188,27 @@ systemctl --user enable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now llm-guard-proxy.service
 ```
 
+For an update on an already-running host, stop all vLLM services first, then
+start them in dependency order:
+
+```bash
+systemctl --user stop vllm-qwen3-reranker-8b.service
+systemctl --user stop vllm-aeon-27b-dflash.service
+systemctl --user stop vllm-embedding.service
+
+systemctl --user start vllm-embedding.service
+systemctl --user start vllm-aeon-27b-dflash.service
+systemctl --user start vllm-qwen3-reranker-8b.service
+systemctl --user start llm-guard-proxy.service
+```
+
 ---
 
 ## Verifying Status
 
 * **Process Status**:
   ```bash
-  systemctl --user status vllm-embedding vllm-aeon-27b-dflash-n12 vllm-qwen3-reranker-8b llm-guard-proxy sysmon
+  systemctl --user status vllm-embedding vllm-aeon-27b-dflash vllm-qwen3-reranker-8b llm-guard-proxy sysmon
   ```
 * **Checking logs**:
   ```bash
