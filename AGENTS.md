@@ -26,6 +26,54 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 * `llm-guard-proxy` uses a shielded AEON retry ladder for chat: max thinking, bounded thinking, then no-thinking direct streaming relay if prior streaming attempts trip the loop guard. The legacy 18002/18003 ports are guard-owned downstream listeners, not raw vLLM publishes.
 * `llm-guard-proxy` also hot-reloads `config.toml`. Use `[server]` to change default/chat request parallelism and per-`[[upstreams]]` `max_in_flight_requests` / `max_queued_generation_requests` to tune embedding/reranker independently without restarting vLLM, trading total throughput against single-stream latency.
 
+### llm-guard-proxy Enabled Features
+
+The reference guard config intentionally enables the practical production
+features from `llm-guard-proxy/deploy/gb10/config.toml` while keeping
+chat-only mutation disabled for embedding/reranker profiles:
+
+* **Named upstream routing**: `aeon-chat`, `qwen3-embedding-8b`, and
+  `qwen3-reranker-8b` are explicit `[[upstreams]]` profiles selected by the
+  request `model` field. The default and aggregate listeners still use port
+  `18009`/`18005`; legacy `18002` only allows the embedding profile and legacy
+  `18003` only allows the reranker profile.
+* **Admission control**: default/chat concurrency is `4` in-flight and `4`
+  queued requests. Embedding and reranker each have independent `8` in-flight
+  and `8` queued limits. Full queues return HTTP `429` with `Retry-After: 10`.
+* **Control-plane headroom**: `max_control_plane_in_flight_requests = 128`, so
+  health/metrics/debug traffic is not starved by generation work.
+* **Metadata discovery/enrichment**: upstream model metadata discovery and
+  response enrichment are enabled with `input_token_safety_margin = 512`.
+* **Chat hot-restart/stall protection**: AEON chat has hot-restart readiness
+  probes plus upstream stall detection. Pooling profiles explicitly set
+  `hot_restart.enabled = false` because the chat probe is not valid for
+  embedding/reranker endpoints.
+* **Chat parameter override**: AEON chat overrides requests to the service-unit
+  sampling defaults (`temperature = 0.6`, `top_p = 0.95`, `top_k = 20`) and
+  `max_tokens = 50000`. Embedding/reranker disable parameter override.
+* **Thinking policy**: normal chat uses `mode = "bounded_thinking"`,
+  `budget_tokens = 32768`, `max_tokens = 50000`,
+  `default_injection_schema = "chat_template_kwargs"`, and
+  `no_thinking_marker_policy = "respect_no_thinking_markers"`. Requests that
+  explicitly send `chat_template_kwargs: {"enable_thinking": false}` are
+  preserved as no-thinking requests; do **not** change normal chat back to
+  `force_thinking` unless callers should lose that opt-out.
+* **Shielded retry ladder**: retry remains enabled with max-thinking,
+  bounded-thinking, and no-thinking ladder steps. The thinking ladder steps
+  also respect no-thinking markers, so a client opt-out is preserved during
+  retries.
+* **Loop guard**: enforce mode is enabled, including semantic reasoning-loop
+  detection (`reasoning_semantic_detection_enabled = true`).
+* **Observability**: SQLite observability, Prometheus metrics, upstream health
+  probing, debug summaries, and raw observability payload capture are enabled.
+  `/debug/recent-requests` currently has no admin token configured; treat it as
+  Tailscale-private metadata/debug output.
+* **Evidence ledger**: evidence recording is enabled with metadata only.
+  `include_raw_payloads = false`, `include_request_headers = false`, and
+  shadow attempts remain disabled.
+* **Streaming heartbeat and Cloudflare mode**: SSE heartbeats are emitted every
+  15 seconds and `[cloudflare].enabled = true`.
+
 ---
 
 ## Deployment & Setup
@@ -156,6 +204,13 @@ curl -s -X POST http://100.105.4.92:18009/v1/chat/completions \
 # trivial probe such as "Say OK" may return content like "\n\nOK" plus
 # `reasoning_content`; this is the model/parser's final-answer separator, not a
 # failed health check.
+
+# Test explicit no-thinking passthrough. This should return a final answer
+# without `reasoning_content`; guard debug metadata should show
+# thinking_rewrite_reason=caller_no_thinking_marker_passthrough.
+curl -s -X POST http://100.105.4.92:18009/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"aeon-ultimate","messages":[{"role":"user","content":"只输出 OK 两个字。"}],"chat_template_kwargs":{"enable_thinking":false},"max_tokens":16}'
 
 # Test Reranker Endpoint via llm-guard-proxy
 curl -s -X POST http://100.105.4.92:18009/v1/rerank \

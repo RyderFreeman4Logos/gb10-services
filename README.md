@@ -32,7 +32,23 @@ graph TD
 4. **llm-guard-proxy.service**
    A Rust-based shielding gateway proxy ([llm-guard-proxy](https://github.com/RyderFreeman4Logos/llm-guard-proxy)) sitting in front of the chat, embedding, and reranker endpoints. It routes requests by `model` to named upstream profiles, manages request queues, retries, stalls, and loop guards to protect backends from runaway generations. It owns the stable entrypoint `18009`, aggregate listener `18005`, and legacy restricted listeners `18002`/`18003`; raw vLLM backends stay on `18010`/`18012`/`18013`. It is also the runtime control plane for request concurrency: edit `config/llm-guard-proxy/config.toml` to tune the default/chat `server.max_in_flight_requests` / `server.max_queued_generation_requests` and the named `[[upstreams]]` limits for embedding and reranker. The running proxy hot-reloads these limits so operators can choose throughput versus single-stream latency without restarting vLLM.
 
-   The proxy uses a shielded AEON retry ladder: max thinking, bounded thinking, and a final no-thinking direct streaming relay when prior streaming attempts trigger the loop guard.
+   The reference config enables the production guard features that are useful on
+   GB10: explicit named upstream profiles, bounded generation queues with HTTP
+   `429`/`Retry-After`, model metadata enrichment, AEON chat hot-restart probes,
+   stall detection, request parameter overrides for the AEON service-unit
+   sampling defaults (`temperature=0.6`, `top_p=0.95`, `top_k=20`,
+   `max_tokens=50000`), semantic loop detection, metrics, debug summaries,
+   SQLite observability, metadata-only evidence logging, SSE heartbeats, and
+   Cloudflare-friendly streaming. The proxy uses a shielded AEON retry ladder:
+   max thinking, bounded thinking, and a final no-thinking direct streaming
+   relay when prior streaming attempts trigger the loop guard.
+
+   Normal chat uses `mode = "bounded_thinking"` with a 32,768-token thinking
+   budget and `chat_template_kwargs` injection. Client no-thinking markers are respected:
+   a request with `"chat_template_kwargs": {"enable_thinking": false}` should
+   pass through without `reasoning_content`. Embedding and reranker profiles
+   explicitly disable chat-only hot-restart probes, thinking rewrites, and
+   parameter overrides.
 5. **sysmon.service**
    A lightweight system monitor script executing at 1Hz, recording system load, temperatures, GPU metrics, disk I/O rates, swap-in/out, and top process RSS/swap memory consumption.
 
