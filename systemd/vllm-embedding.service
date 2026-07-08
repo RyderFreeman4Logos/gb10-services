@@ -1,5 +1,5 @@
 [Unit]
-Description=vLLM Qwen3-Embedding-8B (AEON v0.24 GB10 image, raw backend port 18012, behind llm-guard-proxy listeners 18009/18002/18005, reliability-first, 40k native max, 64 seq, container swap disabled)
+Description=vLLM Qwen3-Embedding-8B (AEON v0.24 GB10 image, raw backend port 18012, behind llm-guard-proxy listeners 18009/18002/18005, reliability-first, 40k native max, 64 seq, post-start swap enforcement)
 After=network.target
 StartLimitIntervalSec=600
 StartLimitBurst=3
@@ -28,8 +28,8 @@ ExecStart=/usr/bin/docker run --rm --name vllm-embedding \
   -p 100.105.4.92:18012:8000 \
   -v /home/obj/.cache/huggingface:/root/.cache/huggingface \
   -e HF_HUB_OFFLINE=1 \
-  --memory 25g \
-  --memory-swap 25g \
+  --memory 24g \
+  --memory-swap 24g \
   --memory-swappiness 0 \
   --oom-score-adj 0 \
   --entrypoint python3 \
@@ -43,6 +43,10 @@ ExecStart=/usr/bin/docker run --rm --name vllm-embedding \
     --max-num-seqs 64 \
     --kv-cache-memory-bytes 5820M \
     --enforce-eager
+# Rootless Docker can accept --memory-swap while leaving memory.swap.max=max.
+# Enforce the generated docker scope directly and verify the 64+24+24=112GiB
+# vLLM budget leaves ~9.6GiB headroom on the 121.6GiB GB10 host.
+ExecStartPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh vllm-embedding 24
 ExecStop=/usr/bin/docker stop vllm-embedding
 StandardOutput=journal
 StandardError=journal

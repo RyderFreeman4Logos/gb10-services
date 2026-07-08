@@ -159,22 +159,37 @@ prune_to_records = 80000
 
 [evidence]
 enabled = true
-include_raw_payloads = false
-include_request_headers = false
+include_raw_payloads = true
+include_request_headers = true
 sqlite_path = "/home/obj/.local/state/llm-guard-proxy-evidence/evidence.sqlite3"
 blob_cache_dir = "/home/obj/.cache/llm-guard-proxy-evidence/blobs"
-max_bytes = 536870912
-prune_to_bytes = 402653184
-max_records = 50000
-prune_to_records = 40000
+max_bytes = 10737418240
+prune_to_bytes = 8589934592
+max_records = 200000
+prune_to_records = 160000
 
 [evidence.shadow]
-enabled = false
-keep_looping_attempt_running = false
+enabled = true
+keep_looping_attempt_running = true
 parallel_downgrade_attempts = true
-max_shadow_attempts_per_request = 2
+max_shadow_attempts_per_request = 4
 max_global_shadow_in_flight = 2
 shadow_attempt_timeout_ms = 7200000
+compare_attempts = ["bounded-thinking", "no-thinking", "cot-salvage"]
+
+[evidence.shadow.paired_comparison]
+enabled = true
+variants = ["max-thinking", "bounded-thinking", "no-thinking"]
+include_raw_input = true
+include_raw_output = true
+include_raw_reasoning = true
+sample_rate = 1.0
+max_raw_input_bytes = 131072
+max_raw_output_bytes = 131072
+max_raw_reasoning_bytes = 131072
+max_retention_records = 100000
+max_retention_bytes = 8589934592
+retention_days = 14
 
 [thinking]
 mode = "bounded_thinking"
@@ -190,6 +205,7 @@ default_injection_schema = "chat_template_kwargs"
 [loop_guard]
 enabled = true
 mode = "enforce"
+on_reasoning_loop = "bounded_answer_from_cot"
 normalized_input_window_secs = 120
 max_repeated_inputs = 1
 output_repeated_line_threshold = 24
@@ -205,9 +221,23 @@ reasoning_semantic_minimum_token_count = 8
 reasoning_semantic_history_window_count = 16
 input_overlap_threshold_multiplier = 4
 
+[loop_guard.embedding]
+provider = "openai_compatible"
+endpoint = "http://100.105.4.92:18012/v1/embeddings"
+model = "Qwen/Qwen3-Embedding-8B"
+window_token_count = 96
+window_stride_tokens = 48
+minimum_token_count = 16
+history_window_count = 64
+batch_max_windows = 64
+batch_max_wait_ms = 75
+queue_max_windows = 4096
+on_queue_full = "block"
+vector_dim = 256
+
 [retry]
 enabled = true
-max_attempts = 3
+max_attempts = 4
 anti_loop_hint_enabled = true
 shielded_streaming_enabled = true
 downstream_drop_policy = "cancel"
@@ -223,6 +253,17 @@ no_thinking_marker_policy = "respect_no_thinking_markers"
 default_injection_schema = "chat_template_kwargs"
 
 [[retry.ladder]]
+name = "bounded-thinking-deep"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 16384
+preserve_answer_budget = true
+tool_request_policy = "apply"
+no_thinking_marker_policy = "respect_no_thinking_markers"
+default_injection_schema = "chat_template_kwargs"
+anti_loop_hint = "Previous attempt became repetitive. Do not repeat prior analysis; answer directly."
+
+[[retry.ladder]]
 name = "bounded-thinking"
 thinking_mode = "force_thinking"
 max_tokens = 50000
@@ -231,7 +272,7 @@ preserve_answer_budget = true
 tool_request_policy = "apply"
 no_thinking_marker_policy = "respect_no_thinking_markers"
 default_injection_schema = "chat_template_kwargs"
-anti_loop_hint = "Previous attempt became repetitive. Do not repeat prior analysis; answer directly."
+anti_loop_hint = "Previous attempt became repetitive after a deeper retry. Use only the useful prior work and answer directly."
 
 [[retry.ladder]]
 name = "no-thinking"

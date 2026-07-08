@@ -63,14 +63,27 @@ chat-only mutation disabled for embedding/reranker profiles:
   also respect no-thinking markers, so a client opt-out is preserved during
   retries.
 * **Loop guard**: enforce mode is enabled, including semantic reasoning-loop
-  detection (`reasoning_semantic_detection_enabled = true`).
+  detection (`reasoning_semantic_detection_enabled = true`) and embedding-backed
+  self-loop scoring through the local Qwen3-Embedding-8B service. Reasoning-loop
+  failures use `on_reasoning_loop = "bounded_answer_from_cot"`, which retries
+  from a bounded private pre-loop CoT prefix before falling back to the normal
+  retry ladder.
 * **Observability**: SQLite observability, Prometheus metrics, upstream health
   probing, debug summaries, and raw observability payload capture are enabled.
   `/debug/recent-requests` currently has no admin token configured; treat it as
   Tailscale-private metadata/debug output.
-* **Evidence ledger**: evidence recording is enabled with metadata only.
-  `include_raw_payloads = false`, `include_request_headers = false`, and
-  shadow attempts remain disabled.
+* **Evidence ledger**: evidence recording runs in quality-debug mode for loop
+  detector improvement. Ordinary attempts store redacted raw payloads and
+  selected request headers (`include_raw_payloads = true`,
+  `include_request_headers = true`). Shadow evidence is enabled for looped
+  attempts with bounded-thinking, no-thinking, and CoT-salvage comparison
+  attempts; the original looping attempt is also kept running for evidence so
+  imperfect loop detection can be audited. Paired comparison sampling is enabled
+  for 100% of successful primary requests across max-thinking,
+  bounded-thinking, and no-thinking variants, storing redacted raw input,
+  output, and reasoning/CoT for offline quality comparison. Evidence retention
+  is increased to a 10 GiB/200k-record envelope and paired raw artifacts retain
+  up to 8 GiB or 14 days.
 * **Streaming heartbeat and Cloudflare mode**: SSE heartbeats are emitted every
   15 seconds and `[cloudflare].enabled = true`.
 
@@ -106,15 +119,15 @@ cp config/llm-guard-proxy/config.toml /home/obj/.config/llm-guard-proxy/config.t
 
 ### 3. Build llm-guard-proxy
 ```bash
-# Build/update the reviewed main branch through mise with a persistent Cargo
-# target cache. The script uses CARGO_BUILD_JOBS=1 and ionice/nice so rebuilds
-# are safer while the GB10 vLLM stack is resident.
+# Build/update the reviewed main branch from a local workspace checkout with a
+# persistent Cargo target cache. The script uses CARGO_BUILD_JOBS=1 and
+# ionice/nice so rebuilds are safer while the GB10 vLLM stack is resident.
 /home/obj/.local/bin/llm_guard_proxy_cached_rebuild.sh
 ```
 
 The cached rebuild script keeps Cargo build artifacts under
 `/home/obj/.cache/cargo-target/llm-guard-proxy-main`, then atomically relinks
-`/home/obj/.local/bin/llm-guard-proxy` to the mise-managed `ref-main` binary.
+`/home/obj/.local/bin/llm-guard-proxy` to the workspace-built release binary.
 If the running guard process still points at a deleted old inode after a
 standalone rebuild, the script restarts only `llm-guard-proxy.service` and
 smokes `/health`; it does not restart any vLLM backend.

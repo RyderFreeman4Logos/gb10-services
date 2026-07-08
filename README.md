@@ -38,10 +38,18 @@ graph TD
    stall detection, request parameter overrides for the AEON service-unit
    sampling defaults (`temperature=0.6`, `top_p=0.95`, `top_k=20`,
    `max_tokens=50000`), semantic loop detection, metrics, debug summaries,
-   SQLite observability, metadata-only evidence logging, SSE heartbeats, and
-   Cloudflare-friendly streaming. The proxy uses a shielded AEON retry ladder:
-   max thinking, bounded thinking, and a final no-thinking direct streaming
-   relay when prior streaming attempts trigger the loop guard.
+   SQLite observability, full quality-debug evidence logging, SSE heartbeats, and
+   Cloudflare-friendly streaming. Reasoning-loop failures use private CoT
+   salvage (`loop_guard.on_reasoning_loop = "bounded_answer_from_cot"`) so the
+   retry can answer from a bounded pre-loop reasoning prefix instead of falling
+   straight to a no-thinking attempt. The proxy still keeps a shielded AEON
+   retry ladder: max thinking, deep bounded thinking, bounded thinking, and
+   final no-thinking fallback.
+
+   Evidence is intentionally configured for loop-detector improvement rather
+   than privacy-minimal production: redacted raw payloads, selected request
+   headers, raw reasoning, loop shadow continuations, and 100% paired
+   max/bounded/no-thinking comparisons are recorded within bounded retention.
 
    Normal chat uses `mode = "bounded_thinking"` with a 32,768-token thinking
    budget and `chat_template_kwargs` injection. Client no-thinking markers are respected:
@@ -122,16 +130,18 @@ Pre-download the required model weights into `~/.cache/huggingface/` or prepare 
 * **Reranker Model**: `Qwen/Qwen3-Reranker-8B`
 
 ### 3. Build llm-guard-proxy
-Build/update the proxy binary on the host machine through mise. This uses a
-persistent Cargo target cache and low-concurrency rebuild settings so future
-GB10 updates do not recompile dependencies from scratch:
+Build/update the proxy binary on the host machine from the reviewed main branch.
+The cached rebuild script uses a local workspace checkout plus a persistent Cargo
+target cache, so path dependencies such as `llm-guard-proxy-core` are built from
+the same commit and future GB10 updates do not recompile dependencies from
+scratch:
 ```bash
 ~/.local/bin/llm_guard_proxy_cached_rebuild.sh
 ```
 
 The script keeps build artifacts in
 `~/.cache/cargo-target/llm-guard-proxy-main` and relinks
-`~/.local/bin/llm-guard-proxy` to the mise-managed `ref-main` binary. If a
+`~/.local/bin/llm-guard-proxy` to the workspace-built release binary. If a
 standalone rebuild leaves the running guard process on a deleted old inode, the
 script restarts only `llm-guard-proxy.service` and smokes `/health`; it does not
 restart any vLLM backend.
