@@ -81,6 +81,10 @@ AEON chat:  max-model-len 262,144, FP8 KV 15,360M -> 269,589 tokens = 1.02840042
 reranker:   max-model-len 40,960, KV 5,820M -> 41,376 tokens = 1.01015625x
 ```
 
+For a detailed live memory attribution across Docker, cgroup, vLLM model
+weights, KV cache, and NVIDIA unified-memory accounting, see
+[`docs/gb10-vllm-memory-footprint.md`](docs/gb10-vllm-memory-footprint.md).
+
 For updates to any vLLM memory/context profile, use a full vLLM stack stop-before-start sequence. Stopping or restarting only one model can leave stale vLLM pages in swap.
 
 ---
@@ -95,6 +99,9 @@ gb10-services/
 ├── config/
 │   └── llm-guard-proxy/
 │       └── config.toml     # llm-guard-proxy shielding rules & limits
+├── docs/
+│   └── gb10-vllm-memory-footprint.md
+│                         # Live Docker/cgroup/weights/KV/unified-memory attribution
 ├── scripts/
 │   ├── aeon_chat_ready.py  # Waits for Chat vLLM metrics endpoint before starting reranker
 │   ├── aeon_hang_guard.py  # Python hook script for Docker container hang protection
