@@ -265,12 +265,30 @@ docker rm -f vllm-aeon-27b-dflash vllm-aeon-27b-dflash-n12 vllm-qwen3-reranker-8
 systemctl --user restart vllm-aeon-27b-dflash.service
 ```
 
-### 3. OOM / Swap Critical
-If the swap guard alerts or kills workloads:
+### 3. OOM / Swap / Low Free Memory
+Hard memory contract (ordinary container memory + fail-fast):
+- Docker scopes: AEON `MemoryMax=64G`, embedding `24G`, reranker `24G` (**112GiB** total), each with `MemorySwapMax=0` via `gb10_enforce_docker_cgroup_limits.sh`.
+- Wrapper units also set a small `MemoryMax`/`MemorySwapMax=0` for the docker CLI only.
+- `llm-guard-proxy`: `MemoryMax=2G`, `MemoryHigh=1536M`, `MemorySwapMax=0`.
+- `gb10-swap-guard`: stops **reranker** when `MemAvailable < 1GiB` (`GB10_MEM_AVAIL_STOP_GIB`) **or** swap used ≥ `GB10_SWAP_STOP_GIB` (default 12GiB). This sheds non-critical load; it does not lower chat concurrency.
+
+If the swap/memory guard alerts or kills workloads:
 ```bash
 # Check memory allocation
 free -h
 
 # Check which processes are consuming top swap/RSS
 tail -n 10 ~/log/sysmon_$(date +%Y-%m-%d).csv | awk -F, '{print "Time: "$1" | Top Swap PID: "$38" ("$40"MB)"}'
+
+# Guard log
+tail -n 50 ~/log/gb10_swap_guard.log
+
+# Verify live docker scope hard-caps
+systemctl --user list-units 'docker-*.scope' --all --no-pager
+for s in $(systemctl --user list-units 'docker-*.scope' --no-legend --all | awk '{print $1}'); do
+  echo "--- $s"
+  systemctl --user show "$s" -p MemoryMax -p MemorySwapMax -p MemoryCurrent -p MemorySwapCurrent
+done
 ```
+
+Note: on GB10 unified memory, Docker/cgroup caps ordinary container memory; NVIDIA EngineCore residency is a separate ledger. The operational goal is **bounded + fail-fast**, not literally zero post-startup allocation.

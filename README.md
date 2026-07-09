@@ -61,7 +61,7 @@ graph TD
    A lightweight system monitor script executing at 1Hz, recording system load, temperatures, GPU metrics, disk I/O rates, swap-in/out, and top process RSS/swap memory consumption.
 
 ### Auxiliary Services
-*   **gb10-swap-guard.service**: Monitors swap space utilization at regular intervals. Prevents OOM crashes by terminating secondary container tasks if swap runs critical, protecting core services.
+*   **gb10-swap-guard.service**: Monitors free memory and swap. Stops the secondary **reranker** when `MemAvailable < 1GiB` or swap use crosses the stop threshold, so chat/embedding keep headroom. Complements per-container `MemoryMax` / `MemorySwapMax=0` enforcement on the three vLLM docker scopes (64+24+24≈112GiB budget).
 *   **aeon-healthcheck.timer & service**: A systemd timer that triggers every 2 minutes to check vLLM metrics. It automatically restarts the chat service if it detects a CUDA kernel hang (running requests with zero tokens/s and low GPU power).
 
 ### Reference Production Profile (2026-07-03)

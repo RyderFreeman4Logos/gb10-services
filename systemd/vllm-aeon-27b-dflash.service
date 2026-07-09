@@ -12,6 +12,10 @@ Type=simple
 Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
 Environment=HF_HUB_OFFLINE=1
 OOMScoreAdjust=500
+# Wrapper/docker-CLI only. Real AEON memory hard-cap is docker --memory 64g plus
+# ExecStartPost MemoryMax=64G / MemorySwapMax=0 on docker-*.scope (112GiB stack).
+MemoryMax=256M
+MemorySwapMax=0
 # Recover from real vLLM/container crashes such as EngineDeadError exits.
 # Manual `systemctl --user stop` remains a clean stop and is not restarted.
 Restart=on-failure
@@ -62,8 +66,8 @@ ExecStart=/usr/bin/docker run --rm --name vllm-aeon-27b-dflash-n12 \
     --override-generation-config '{"temperature": 0.6, "top_p": 0.95, "top_k": 20}' \
     --trust-remote-code
 # Rootless Docker can accept --memory-swap while leaving memory.swap.max=max.
-# Enforce the generated docker scope directly and verify the 64+24+24=112GiB
-# vLLM budget leaves ~9.6GiB headroom on the 121.6GiB GB10 host.
+# Enforce sets docker-*.scope MemoryMax=64G + MemorySwapMax=0 and verifies both.
+# Stack budget: 64+24+24=112GiB (~9.6GiB headroom on 121.6GiB GB10).
 ExecStartPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh vllm-aeon-27b-dflash-n12 64
 ExecStop=/usr/bin/docker stop vllm-aeon-27b-dflash-n12
 StandardOutput=journal

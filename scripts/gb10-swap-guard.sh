@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# GB10 vLLM swap guard. Runs locally on gb10 as a user service.
+# GB10 vLLM swap / free-memory guard. Runs locally on gb10 as a user service.
+#
+# Goals:
+# - Prefer fail-fast over thrash: free headroom and swap ceilings, not silent growth.
+# - When host free memory is critically low, shed the non-critical reranker first
+#   so AEON chat + embedding keep the last ~1GiB of breathing room.
 set -euo pipefail
 
 LOG_DIR="${GB10_SWAP_GUARD_LOG_DIR:-$HOME/log}"
@@ -7,6 +12,8 @@ LOG="${GB10_SWAP_GUARD_LOG:-$LOG_DIR/gb10_swap_guard.log}"
 INTERVAL="${GB10_SWAP_GUARD_INTERVAL:-20}"
 WARN_GIB="${GB10_SWAP_WARN_GIB:-7.5}"
 STOP_GIB="${GB10_SWAP_STOP_GIB:-12}"
+# Stop secondary reranker when MemAvailable falls below this threshold.
+MEM_AVAIL_STOP_GIB="${GB10_MEM_AVAIL_STOP_GIB:-1}"
 ATTRIBUTION_INTERVAL="${GB10_SWAP_ATTRIBUTION_INTERVAL:-300}"
 DOCKER_HOST="${DOCKER_HOST:-unix:///run/user/$(id -u)/docker.sock}"
 export DOCKER_HOST
@@ -23,6 +30,7 @@ PY
 
 WARN_BYTES=$(bytes_from_gib "$WARN_GIB")
 STOP_BYTES=$(bytes_from_gib "$STOP_GIB")
+MEM_AVAIL_STOP_BYTES=$(bytes_from_gib "$MEM_AVAIL_STOP_GIB")
 
 log() {
     printf '[%s] %s\n' "$(date -Is)" "$*" | tee -a "$LOG"
@@ -62,7 +70,6 @@ log_swap_attribution() {
 from __future__ import annotations
 from collections import defaultdict
 from pathlib import Path
-import os
 import subprocess
 
 print('--- top swap attribution ---')
@@ -153,16 +160,18 @@ PY
 }
 
 stop_reranker() {
-    log "STOP_SWAP: swap >= ${STOP_GIB}GiB; stopping vllm-qwen3-reranker-8b.service"
+    reason="${1:-unspecified}"
+    log "STOP_RERANKER: reason=${reason}; stopping vllm-qwen3-reranker-8b.service"
     systemctl --user stop vllm-qwen3-reranker-8b.service 2>&1 | tee -a "$LOG" || true
     docker stop vllm-qwen3-reranker-8b 2>&1 | tee -a "$LOG" || true
     log_vmstat
     log_swap_attribution
 }
 
-log "GB10 swap guard started warn=${WARN_GIB}GiB stop=${STOP_GIB}GiB interval=${INTERVAL}s attribution_interval=${ATTRIBUTION_INTERVAL}s"
+log "GB10 swap/memory guard started warn_swap=${WARN_GIB}GiB stop_swap=${STOP_GIB}GiB mem_avail_stop=${MEM_AVAIL_STOP_GIB}GiB interval=${INTERVAL}s attribution_interval=${ATTRIBUTION_INTERVAL}s"
 warned=0
-stopped=0
+stopped_swap=0
+stopped_mem=0
 last_attribution=0
 
 while true; do
@@ -187,13 +196,26 @@ while true; do
         last_attribution="$now"
     fi
 
-    if (( swap_used >= STOP_BYTES )) && (( stopped == 0 )); then
-        stopped=1
-        stop_reranker
+    # Free-memory first: shed reranker before the host has no room left.
+    if (( mem_avail < MEM_AVAIL_STOP_BYTES )) && (( stopped_mem == 0 )); then
+        stopped_mem=1
+        stop_reranker "mem_avail<${MEM_AVAIL_STOP_GIB}GiB (avail=${mem_avail_gib}GiB)"
+    fi
+
+    if (( swap_used >= STOP_BYTES )) && (( stopped_swap == 0 )); then
+        stopped_swap=1
+        stop_reranker "swap>=${STOP_GIB}GiB (used=${swap_used_gib}GiB)"
     fi
 
     if (( swap_used < WARN_BYTES )); then
         warned=0
+    fi
+    # Allow another free-mem stop after recovery so pressure events can re-trigger.
+    if (( mem_avail >= MEM_AVAIL_STOP_BYTES * 2 )); then
+        stopped_mem=0
+    fi
+    if (( swap_used < STOP_BYTES )); then
+        stopped_swap=0
     fi
 
     sleep "$INTERVAL"

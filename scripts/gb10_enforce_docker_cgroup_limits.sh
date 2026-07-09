@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Enforce and verify rootless Docker container cgroup memory/swap limits.
 # Usage: gb10_enforce_docker_cgroup_limits.sh <container-name> <expected-memory-gib>
+#
+# Rootless Docker + systemd cgroup driver places the workload in
+# docker-<id>.scope. Service-level MemoryMax on the wrapper unit does not
+# constrain the container. This helper:
+#   1) waits for the generated docker scope
+#   2) sets MemoryMax=<N>G and MemorySwapMax=0 on that scope
+#   3) verifies live cgroup files match the intended hard cap
 set -Eeuo pipefail
 
 name="${1:?container name required}"
@@ -29,11 +36,17 @@ if [ -z "$cid" ] || [ -z "$scope" ] || [ -z "$cg" ] || [ "$cg" = "/" ] || [ ! -e
   exit 1
 fi
 
-/usr/bin/systemctl --user set-property --runtime "$scope" MemorySwapMax=0
+expected_bytes=$((expected_gib * 1024 * 1024 * 1024))
+
+# Hard-cap ordinary container memory and ban additional swap. Re-apply both
+# properties so Docker's incomplete --memory-swap mapping cannot leave
+# memory.swap.max=max after start.
+/usr/bin/systemctl --user set-property --runtime "$scope" \
+  "MemoryMax=${expected_gib}G" \
+  MemorySwapMax=0
 
 swap_max="$(cat "/sys/fs/cgroup${cg}/memory.swap.max")"
 mem_max="$(cat "/sys/fs/cgroup${cg}/memory.max")"
-expected_bytes=$((expected_gib * 1024 * 1024 * 1024))
 
 if [ "$swap_max" != "0" ]; then
   echo "unexpected $name memory.swap.max=$swap_max expected=0 scope=$scope cg=$cg" >&2
