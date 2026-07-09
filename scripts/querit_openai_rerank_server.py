@@ -26,7 +26,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from transformers import AutoConfig, AutoModel, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 LOG = logging.getLogger("querit_rerank")
 
@@ -119,9 +119,12 @@ def score_pairs(query: str, documents: list[str]) -> list[float]:
             input_ids=enc["input_ids"],
             attention_mask=enc["attention_mask"],
         )
+        # QueritModel returns dict / ModelOutput with "score"
         if isinstance(out, dict) and "score" in out:
             batch_scores = out["score"].detach().float().reshape(-1).tolist()
-        elif hasattr(out, "logits"):
+        elif hasattr(out, "score") and getattr(out, "score") is not None:
+            batch_scores = out.score.detach().float().reshape(-1).tolist()
+        elif hasattr(out, "logits") and out.logits is not None:
             logits = out.logits
             if logits.ndim == 2 and logits.shape[-1] == 2:
                 probs = torch.softmax(logits, dim=-1)
@@ -193,27 +196,34 @@ def load_model(model_path: str, dtype: str) -> None:
         "float32": torch.float32,
     }[dtype]
 
-    # Querit often ships architectures=["MLQwen3Model"] with class QueritModel
-    # and no auto_map. Prefer remote-code AutoModel; fall back to explicit class.
-    try:
-        STATE.model = AutoModel.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            torch_dtype=torch_dtype,
-        )
-    except Exception as auto_exc:  # noqa: BLE001
-        LOG.warning("AutoModel failed (%s); trying explicit QueritModel import", auto_exc)
-        local = _resolve_local_dir(model_path)
-        mod_path = Path(local) / "modeling_querit_4b.py"
-        if not mod_path.exists():
-            raise RuntimeError(f"missing modeling_querit_4b.py under {local}") from auto_exc
-        spec = importlib.util.spec_from_file_location("modeling_querit_4b", mod_path)
-        assert spec and spec.loader
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        cfg = AutoConfig.from_pretrained(local, trust_remote_code=True)
-        STATE.model = mod.QueritModel.from_pretrained(
-            local, config=cfg, torch_dtype=torch_dtype, trust_remote_code=True
+    # Querit ships architectures=["MLQwen3Model"] with class QueritModel and
+    # no auto_map. AutoModel.from_pretrained loads a plain Qwen3 backbone and
+    # drops head.bias/head.weight as UNEXPECTED — always load QueritModel.
+    local = _resolve_local_dir(model_path)
+    mod_path = Path(local) / "modeling_querit_4b.py"
+    if not mod_path.exists():
+        raise RuntimeError(f"missing modeling_querit_4b.py under {local}")
+    spec = importlib.util.spec_from_file_location("modeling_querit_4b", mod_path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    cfg = AutoConfig.from_pretrained(local, trust_remote_code=True)
+    # QueritModel.__init__(use_lm_head=False) sets lm_head=None which breaks
+    # transformers tied-weight loading. Keep lm_head for load, drop after.
+    STATE.model = mod.QueritModel.from_pretrained(
+        local,
+        config=cfg,
+        torch_dtype=torch_dtype,
+        trust_remote_code=True,
+        use_lm_head=True,
+    )
+    # Free unused generation head once weights are loaded.
+    if hasattr(STATE.model, "lm_head") and STATE.model.lm_head is not None:
+        STATE.model.lm_head = None
+
+    if not hasattr(STATE.model, "head"):
+        raise RuntimeError(
+            f"loaded {type(STATE.model).__name__} without .head — wrong class path"
         )
 
     STATE.model.eval()

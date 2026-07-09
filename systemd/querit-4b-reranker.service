@@ -1,6 +1,6 @@
 [Unit]
-Description=Querit-4B transformers rerank server (raw :18013, aliases qwen3-reranker-8b + Qwen/Qwen3-Reranker-8B; canary/replacement for vllm-qwen3-reranker-8b)
-# Prefer chat healthy before starting (same as current reranker unit).
+Description=Querit-4B transformers rerank server (raw :18013, aliases qwen3-reranker-8b + Qwen/Qwen3-Reranker-8B; replacement for vllm-qwen3-reranker-8b)
+# After AEON unit is up; do not hard-require chat completions (queue can stall readiness).
 Requires=vllm-aeon-27b-dflash.service
 After=network.target vllm-aeon-27b-dflash.service
 Conflicts=vllm-qwen3-reranker-8b.service
@@ -22,8 +22,9 @@ RestartSec=30
 TimeoutStartSec=1200
 TimeoutStopSec=60
 
-# Wait for AEON chat readiness (reranker is non-critical but stack order matches prior unit).
-ExecStartPre=/home/obj/.local/bin/aeon_chat_ready.py
+# Wait for AEON /v1/models only (not chat completion — multi-req queue can delay chat for minutes).
+# MemAvailable<1GiB still auto-stops this unit via gb10-swap-guard.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 120); do curl -sf http://100.105.4.92:18010/v1/models >/dev/null 2>&1 && exit 0; sleep 5; done; echo "aeon models not ready after 10min"; exit 1'
 ExecStartPre=-/usr/bin/docker rm -f querit-4b-reranker vllm-qwen3-reranker-8b
 ExecStart=/usr/bin/docker run --rm --name querit-4b-reranker \
   --gpus all --ipc host --dns 8.8.8.8 --dns 1.1.1.1 \
