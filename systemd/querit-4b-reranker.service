@@ -1,0 +1,50 @@
+[Unit]
+Description=Querit-4B transformers rerank server (raw :18013, aliases qwen3-reranker-8b + Qwen/Qwen3-Reranker-8B; canary/replacement for vllm-qwen3-reranker-8b)
+# Prefer chat healthy before starting (same as current reranker unit).
+Requires=vllm-aeon-27b-dflash.service
+After=network.target vllm-aeon-27b-dflash.service
+Conflicts=vllm-qwen3-reranker-8b.service
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
+Environment=HF_HUB_OFFLINE=1
+Environment=HF_HOME=/home/obj/.cache/huggingface
+Environment=TRANSFORMERS_OFFLINE=1
+# Wrapper/docker-CLI only. Workload hard-cap: 18g (4B weights + room; below prior 24g 8B).
+MemoryMax=256M
+MemorySwapMax=0
+OOMScoreAdjust=800
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=1200
+TimeoutStopSec=60
+
+# Wait for AEON chat readiness (reranker is non-critical but stack order matches prior unit).
+ExecStartPre=/home/obj/.local/bin/aeon_chat_ready.py
+ExecStartPre=-/usr/bin/docker rm -f querit-4b-reranker vllm-qwen3-reranker-8b
+ExecStart=/usr/bin/docker run --rm --name querit-4b-reranker \
+  --gpus all --ipc host --dns 8.8.8.8 --dns 1.1.1.1 \
+  -p 100.105.4.92:18013:8000 \
+  -v /home/obj/.cache/huggingface:/root/.cache/huggingface \
+  -v /home/obj/.local/bin/querit_openai_rerank_server.py:/opt/querit/querit_openai_rerank_server.py:ro \
+  -e HF_HUB_OFFLINE=1 \
+  -e TRANSFORMERS_OFFLINE=1 \
+  -e HF_HOME=/root/.cache/huggingface \
+  --memory 18g \
+  --memory-swap 18g \
+  --memory-swappiness 0 \
+  --oom-score-adj 800 \
+  --entrypoint bash \
+  ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0 \
+  -lc 'pip install -q --disable-pip-version-check fastapi uvicorn pydantic && exec python3 /opt/querit/querit_openai_rerank_server.py --model Querit/Querit-4B --host 0.0.0.0 --port 8000 --max-model-len 40960 --max-batch 8 --dtype bfloat16 --served-model-name qwen3-reranker-8b Qwen/Qwen3-Reranker-8B Querit/Querit-4B'
+# Ordinary hard-cap 18G + no swap (MemAvailable<1G guard also stops this unit).
+ExecStartPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh querit-4b-reranker 18
+ExecStop=/usr/bin/docker stop querit-4b-reranker
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

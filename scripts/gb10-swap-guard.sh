@@ -161,9 +161,11 @@ PY
 
 stop_reranker() {
     reason="${1:-unspecified}"
-    log "STOP_RERANKER: reason=${reason}; stopping vllm-qwen3-reranker-8b.service"
+    log "STOP_RERANKER: reason=${reason}; stopping reranker services"
     systemctl --user stop vllm-qwen3-reranker-8b.service 2>&1 | tee -a "$LOG" || true
+    systemctl --user stop querit-4b-reranker.service 2>&1 | tee -a "$LOG" || true
     docker stop vllm-qwen3-reranker-8b 2>&1 | tee -a "$LOG" || true
+    docker stop querit-4b-reranker 2>&1 | tee -a "$LOG" || true
     log_vmstat
     log_swap_attribution
 }
