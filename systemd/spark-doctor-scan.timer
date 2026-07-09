@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Spark Doctor GB10 diagnostic scan periodically
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -63,6 +63,7 @@ graph TD
 ### Auxiliary Services
 *   **gb10-swap-guard.service**: Monitors swap space utilization at regular intervals. Prevents OOM crashes by terminating secondary container tasks if swap runs critical, protecting core services.
 *   **aeon-healthcheck.timer & service**: A systemd timer that triggers every 2 minutes to check vLLM metrics. It automatically restarts the chat service if it detects a CUDA kernel hang (running requests with zero tokens/s and low GPU power).
+*   **spark-doctor-scan.timer & service**: Runs a low-interference Spark Doctor diagnostic scan on boot and every 30 minutes. Scans use the rootless Docker socket, sample GPU counters for 3 seconds, skip logs by default, and write `~/log/spark-doctor/latest.{json,md,log}`.
 
 ### Reference Production Profile (2026-07-03)
 
@@ -108,12 +109,18 @@ gb10-services/
 │   ├── aeon_healthcheck.sh # Main loop/CUDA hang detection bash script
 │   ├── aeon_vllm_wrapper.py# Wrapper startup script for vLLM container
 │   ├── gb10-swap-guard.sh  # Script to monitor swap usage and protect memory
+│   ├── spark_doctor_gb10_scan.sh
+│   │                         # Low-interference Spark Doctor scan wrapper
+│   ├── spark_doctor_install.sh
+│   │                         # User-local Spark Doctor venv installer
 │   └── sysmon.sh           # System performance and process metric logger (1Hz)
 └── systemd/
     ├── aeon-healthcheck.service
     ├── aeon-healthcheck.timer
     ├── gb10-swap-guard.service
     ├── llm-guard-proxy.service
+    ├── spark-doctor-scan.service
+    ├── spark-doctor-scan.timer
     ├── sysmon.service
     ├── vllm-aeon-27b-dflash.service
     ├── vllm-embedding.service
@@ -170,9 +177,14 @@ cp scripts/aeon_chat_ready.py ~/.local/bin/
 cp scripts/llm_guard_proxy_cached_rebuild.sh ~/.local/bin/
 cp scripts/sysmon.sh ~/.local/bin/
 cp scripts/gb10-swap-guard.sh ~/.local/bin/
+cp scripts/spark_doctor_install.sh ~/.local/bin/
+cp scripts/spark_doctor_gb10_scan.sh ~/.local/bin/
 
 # Make scripts executable
 chmod +x ~/scripts/*.sh ~/.local/bin/*
+
+# Install/upgrade Spark Doctor into ~/.local/share/spark-doctor/venv
+~/.local/bin/spark_doctor_install.sh
 
 # Copy llm-guard-proxy config
 cp config/llm-guard-proxy/config.toml ~/.config/llm-guard-proxy/config.toml
@@ -197,6 +209,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now sysmon.service
 systemctl --user enable --now gb10-swap-guard.service
 systemctl --user enable --now aeon-healthcheck.timer
+systemctl --user enable --now spark-doctor-scan.timer
 
 # Enable model services
 systemctl --user enable --now vllm-embedding.service
@@ -235,6 +248,19 @@ systemctl --user start llm-guard-proxy.service
   The system monitor `sysmon` appends logs to `~/log/sysmon_$(date +%F).csv`. You can monitor real-time resource usage by tailing this file:
   ```bash
   tail -f ~/log/sysmon_$(date +%Y-%m-%d).csv
+  ```
+* **Spark Doctor Diagnostics**:
+  ```bash
+  # Run an immediate low-interference scan without waiting for the timer
+  systemctl --user start spark-doctor-scan.service
+
+  # Inspect the latest rendered and raw reports
+  sed -n '1,120p' ~/log/spark-doctor/latest.md
+  python3 -m json.tool ~/log/spark-doctor/latest.json | sed -n '1,120p'
+
+  # Check the timer and last service result
+  systemctl --user list-timers spark-doctor-scan.timer
+  journalctl --user -u spark-doctor-scan.service -n 80 --no-pager
   ```
 
 ---

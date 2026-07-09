@@ -106,9 +106,15 @@ cp scripts/aeon_chat_ready.py /home/obj/.local/bin/
 cp scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/
 cp scripts/sysmon.sh /home/obj/.local/bin/
 cp scripts/gb10-swap-guard.sh /home/obj/.local/bin/
+cp scripts/spark_doctor_install.sh /home/obj/.local/bin/
+cp scripts/spark_doctor_gb10_scan.sh /home/obj/.local/bin/
 
 # Make executable
 chmod +x /home/obj/scripts/*.sh /home/obj/.local/bin/*
+
+# Install/upgrade Spark Doctor into a user-local virtualenv. It is intentionally
+# separate from the vLLM stack and does not start a persistent daemon.
+/home/obj/.local/bin/spark_doctor_install.sh
 ```
 
 ### 2. Configuration Setup
@@ -150,6 +156,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now sysmon.service
 systemctl --user enable --now gb10-swap-guard.service
 systemctl --user enable --now aeon-healthcheck.timer
+systemctl --user enable --now spark-doctor-scan.timer
 
 # Start vLLM stack and shielding proxy
 systemctl --user enable --now vllm-embedding.service
@@ -190,6 +197,21 @@ systemctl --user status vllm-embedding vllm-aeon-27b-dflash vllm-qwen3-reranker-
 ```bash
 # View last 20 samples from 1Hz monitor
 tail -n 20 ~/log/sysmon_$(date +%Y-%m-%d).csv
+```
+
+### Retrieve Spark Doctor Diagnostics
+```bash
+# One-shot scan. Default timer scans use 3 seconds of GPU sampling, skip logs,
+# and write ~/log/spark-doctor/latest.{json,md,log}.
+systemctl --user start spark-doctor-scan.service
+
+# Inspect latest report
+sed -n '1,120p' ~/log/spark-doctor/latest.md
+python3 -m json.tool ~/log/spark-doctor/latest.json | sed -n '1,120p'
+
+# Timer/service status
+systemctl --user list-timers spark-doctor-scan.timer
+journalctl --user -u spark-doctor-scan.service -n 80 --no-pager
 ```
 
 ### View Live Service logs

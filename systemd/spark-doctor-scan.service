@@ -1,0 +1,16 @@
+[Unit]
+Description=Spark Doctor low-interference GB10 diagnostic scan
+Documentation=https://github.com/joeynyc/spark-doctor
+After=default.target
+
+[Service]
+Type=oneshot
+Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
+Environment=SPARK_DOCTOR_SAMPLE_SECONDS=3
+Environment=SPARK_DOCTOR_INCLUDE_LOGS=0
+Environment=SPARK_DOCTOR_OUT_DIR=%h/log/spark-doctor
+ExecStart=%h/.local/bin/spark_doctor_gb10_scan.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+OOMScoreAdjust=500
