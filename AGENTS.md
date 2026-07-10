@@ -11,18 +11,18 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
   * `18009`: `llm-guard-proxy.service` (stable OpenAI-compatible entrypoint for chat, embeddings, and rerank)
   * `18010`: `vllm-aeon-27b-dflash.service` (raw AEON chat backend)
   * `18012`: `vllm-embedding.service` (raw Qwen3-Embedding-8B backend routed by guard)
-  * `18013`: `vllm-qwen3-reranker-8b.service` (raw Qwen3-Reranker-8B backend routed by guard)
+  * `18013`: `querit-4b-reranker.service` (raw Querit-4B backend; preserves Qwen3 reranker model aliases for Guard)
   * `18002`: `llm-guard-proxy.service` legacy embedding-compatible listener; only embedding upstream profiles are allowed
   * `18003`: `llm-guard-proxy.service` legacy reranker-compatible listener; only reranker upstream profiles are allowed
   * `18005`: `llm-guard-proxy.service` aggregate listener for chat, embedding, and rerank profiles
 
 ## Current Reference Runtime
 
-* vLLM image for embedding, AEON chat, and reranker: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0` (`sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c`).
-* `vllm-embedding.service`: `max-model-len=40960`, `max-num-batched-tokens=8192`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
-* `vllm-aeon-27b-dflash.service`: DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-batched-tokens=32768`, `kv-cache-memory-bytes=15360M`, verified 269,589 KV tokens.
-* `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
-* `llm-guard-proxy` routes by request `model` to AEON chat (`aeon-ultimate`, `qwen3.6-27b-decensor-by-aeon`), embedding (`qwen3-embedding-8b`, `Qwen/Qwen3-Embedding-8B`), or reranker (`qwen3-reranker-8b`, `Qwen/Qwen3-Reranker-8B`).
+* Container image for embedding, AEON chat, and the Querit wrapper: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0` (`sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c`).
+* `vllm-embedding.service`: `max-model-len=40960`, `max-num-batched-tokens=8192`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens, Docker `MemoryMax=24G`.
+* `vllm-aeon-27b-dflash.service`: DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-batched-tokens=32768`, `kv-cache-memory-bytes=36864M` (36 GiB, about 2.47 full context windows), Docker `MemoryMax=69G`.
+* `querit-4b-reranker.service`: `Querit/Querit-4B`, `max-model-len=40960`, `max-batch=8`, BF16, Docker `MemoryMax=18G`; it serves the existing `qwen3-reranker-8b` and `Qwen/Qwen3-Reranker-8B` aliases on port 18013.
+* `llm-guard-proxy` routes by request `model` to AEON chat (`aeon-ultimate`, `qwen3.6-27b-decensor-by-aeon`), embedding (`qwen3-embedding-8b`, `Qwen/Qwen3-Embedding-8B`), or the Querit-backed reranker profile (`qwen3-reranker-8b`, `Qwen/Qwen3-Reranker-8B`).
 * `llm-guard-proxy` uses a shielded AEON retry ladder for chat: max thinking, bounded thinking, then no-thinking direct streaming relay if prior streaming attempts trip the loop guard. The legacy 18002/18003 ports are guard-owned downstream listeners, not raw vLLM publishes.
 * `llm-guard-proxy` also hot-reloads `config.toml`. Use `[server]` to change default/chat request parallelism and per-`[[upstreams]]` `max_in_flight_requests` / `max_queued_generation_requests` to tune embedding/reranker independently without restarting vLLM, trading total throughput against single-stream latency.
 
@@ -37,9 +37,11 @@ chat-only mutation disabled for embedding/reranker profiles:
   request `model` field. The default and aggregate listeners still use port
   `18009`/`18005`; legacy `18002` only allows the embedding profile and legacy
   `18003` only allows the reranker profile.
-* **Admission control**: default/chat concurrency is `4` in-flight and `4`
+* **Admission control**: default/AEON chat concurrency is `8` in-flight and `24`
   queued requests. Embedding and reranker each have independent `8` in-flight
-  and `8` queued limits. Full queues return HTTP `429` with `Retry-After: 10`.
+  and `8` queued limits. Generation queue and upstream request deadlines are
+  7,200 seconds; AEON first/inter-chunk stall detection uses a 300-second idle
+  timeout. Full queues return HTTP `429` with `Retry-After: 10`.
 * **Control-plane headroom**: `max_control_plane_in_flight_requests = 128`, so
   health/metrics/debug traffic is not starved by generation work.
 * **Metadata discovery/enrichment**: upstream model metadata discovery and
@@ -54,10 +56,14 @@ chat-only mutation disabled for embedding/reranker profiles:
 * **Thinking policy**: normal chat uses `mode = "bounded_thinking"`,
   `budget_tokens = 32768`, `max_tokens = 50000`,
   `default_injection_schema = "chat_template_kwargs"`, and
-  `no_thinking_marker_policy = "respect_no_thinking_markers"`. Requests that
-  explicitly send `chat_template_kwargs: {"enable_thinking": false}` are
-  preserved as no-thinking requests; do **not** change normal chat back to
-  `force_thinking` unless callers should lose that opt-out.
+  `no_thinking_marker_policy = "respect_no_thinking_markers"`. The current
+  schema reliably controls `enable_thinking`, but its template-level numeric
+  budget is not a sampler-enforced hard bound on the deployed vLLM 0.24 stack;
+  top-level `thinking_token_budget` support must land in Guard before benchmark
+  use. Requests that explicitly send
+  `chat_template_kwargs: {"enable_thinking": false}` are preserved as
+  no-thinking requests; do **not** change normal chat back to `force_thinking`
+  unless callers should lose that opt-out.
 * **Shielded retry ladder**: retry remains enabled with max-thinking,
   bounded-thinking, and no-thinking ladder steps. The thinking ladder steps
   also respect no-thinking markers, so a client opt-out is preserved during
@@ -103,7 +109,10 @@ cp scripts/aeon_vllm_wrapper.py /home/obj/scripts/
 cp scripts/aeon_hang_guard.py /home/obj/scripts/
 cp scripts/aeon_healthcheck.sh /home/obj/scripts/
 cp scripts/aeon_chat_ready.py /home/obj/.local/bin/
+cp scripts/gb10_apply_aeon_querit_profile.sh /home/obj/.local/bin/
+cp scripts/gb10_enforce_docker_cgroup_limits.sh /home/obj/.local/bin/
 cp scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/
+cp scripts/querit_openai_rerank_server.py /home/obj/.local/bin/
 cp scripts/sysmon.sh /home/obj/.local/bin/
 cp scripts/gb10-swap-guard.sh /home/obj/.local/bin/
 
@@ -121,7 +130,7 @@ cp config/llm-guard-proxy/config.toml /home/obj/.config/llm-guard-proxy/config.t
 ```bash
 # Build/update the reviewed main branch from a local workspace checkout with a
 # persistent Cargo target cache. The script uses CARGO_BUILD_JOBS=1 and
-# ionice/nice so rebuilds are safer while the GB10 vLLM stack is resident.
+# ionice/nice so rebuilds are safer while the GB10 model stack is resident.
 /home/obj/.local/bin/llm_guard_proxy_cached_rebuild.sh
 ```
 
@@ -151,25 +160,25 @@ systemctl --user enable --now sysmon.service
 systemctl --user enable --now gb10-swap-guard.service
 systemctl --user enable --now aeon-healthcheck.timer
 
-# Start vLLM stack and shielding proxy
+# Start model stack and shielding proxy
 systemctl --user enable --now vllm-embedding.service
 systemctl --user enable --now vllm-aeon-27b-dflash.service
-systemctl --user enable --now vllm-qwen3-reranker-8b.service
+systemctl --user enable --now querit-4b-reranker.service
 systemctl --user enable --now llm-guard-proxy.service
 ```
 
-For updates on an already-running GB10, do not restart just one vLLM service when
-changing memory/context profiles. Stop the full vLLM stack first to clear stale
+For updates on an already-running GB10, do not restart just one model service when
+changing memory/context profiles. Stop the full model stack first to clear stale
 pages, then start in dependency order:
 
 ```bash
-systemctl --user stop vllm-qwen3-reranker-8b.service
+systemctl --user stop querit-4b-reranker.service
 systemctl --user stop vllm-aeon-27b-dflash.service
 systemctl --user stop vllm-embedding.service
 
 systemctl --user start vllm-embedding.service
 systemctl --user start vllm-aeon-27b-dflash.service
-systemctl --user start vllm-qwen3-reranker-8b.service
+systemctl --user start querit-4b-reranker.service
 systemctl --user start llm-guard-proxy.service
 ```
 
@@ -183,7 +192,7 @@ systemctl --user start llm-guard-proxy.service
 systemctl --user list-units --type=service --state=running
 
 # Check detailed status of core services
-systemctl --user status vllm-embedding vllm-aeon-27b-dflash vllm-qwen3-reranker-8b llm-guard-proxy sysmon gb10-swap-guard
+systemctl --user status vllm-embedding vllm-aeon-27b-dflash querit-4b-reranker llm-guard-proxy sysmon gb10-swap-guard
 ```
 
 ### Retrieve System Resource Log (sysmon output)
@@ -238,7 +247,7 @@ vLLM backend, edit `/home/obj/.config/llm-guard-proxy/config.toml` and adjust:
 
 ```toml
 max_in_flight_requests = 8
-max_queued_generation_requests = 8
+max_queued_generation_requests = 24
 ```
 
 The running Rust proxy hot-reloads the config file. Restarting vLLM is not
@@ -259,7 +268,7 @@ systemctl --user restart vllm-aeon-27b-dflash.service
 If a Docker container gets stuck in a dead state and systemd fails to restart:
 ```bash
 # Explicitly force remove the containers
-docker rm -f vllm-aeon-27b-dflash vllm-aeon-27b-dflash-n12 vllm-qwen3-reranker-8b vllm-embedding
+docker rm -f vllm-aeon-27b-dflash vllm-aeon-27b-dflash-n12 querit-4b-reranker vllm-embedding
 
 # Restart target systemd service
 systemctl --user restart vllm-aeon-27b-dflash.service
@@ -267,7 +276,7 @@ systemctl --user restart vllm-aeon-27b-dflash.service
 
 ### 3. OOM / Swap / Low Free Memory
 Hard memory contract (ordinary container memory + fail-fast):
-- Docker scopes: AEON `MemoryMax=64G`, embedding `24G`, reranker `24G` (**112GiB** total), each with `MemorySwapMax=0` via `gb10_enforce_docker_cgroup_limits.sh`.
+- Docker scopes: AEON `MemoryMax=69G`, embedding `24G`, Querit reranker `18G` (**111GiB** total), each with `MemorySwapMax=0` via `gb10_enforce_docker_cgroup_limits.sh`.
 - Wrapper units also set a small `MemoryMax`/`MemorySwapMax=0` for the docker CLI only.
 - `llm-guard-proxy`: `MemoryMax=2G`, `MemoryHigh=1536M`, `MemorySwapMax=0`.
 - `gb10-swap-guard`: stops **reranker** when `MemAvailable < 1GiB` (`GB10_MEM_AVAIL_STOP_GIB`) **or** swap used ≥ `GB10_SWAP_STOP_GIB` (default 12GiB). This sheds non-critical load; it does not lower chat concurrency.

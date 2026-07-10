@@ -1,7 +1,7 @@
 [Unit]
-Description=llm-guard-proxy guard wrapper for GB10 vLLM upstreams
-After=network.target vllm-embedding.service vllm-aeon-27b-dflash.service vllm-qwen3-reranker-8b.service
-Wants=vllm-embedding.service vllm-aeon-27b-dflash.service vllm-qwen3-reranker-8b.service
+Description=llm-guard-proxy guard wrapper for GB10 model upstreams
+After=network.target vllm-embedding.service vllm-aeon-27b-dflash.service querit-4b-reranker.service
+Wants=vllm-embedding.service vllm-aeon-27b-dflash.service querit-4b-reranker.service
 
 [Service]
 Type=simple
@@ -18,7 +18,7 @@ MemoryDenyWriteExecute=true
 RestrictRealtime=true
 SystemCallArchitectures=native
 # Guard is CPU-side; keep it from unbounded growth / swap thrash.
-# Primary model memory is bounded on the docker-*.scope of each vLLM unit.
+# Primary model memory is bounded on the docker-*.scope of each model unit.
 MemoryMax=2G
 MemoryHigh=1536M
 MemorySwapMax=0

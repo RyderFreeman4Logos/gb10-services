@@ -52,7 +52,8 @@ ExecStart=/usr/bin/docker run --rm --name vllm-qwen3-reranker-8b \
     --trust-remote-code
 # Rootless Docker can accept --memory-swap while leaving memory.swap.max=max.
 # Enforce sets docker-*.scope MemoryMax=24G + MemorySwapMax=0 and verifies both.
-# Stack budget: 64+24+24=112GiB (~9.6GiB headroom on 121.6GiB GB10).
+# Disabled legacy fallback: stop Querit before enabling this 24G unit; never run both.
+# Current active stack budget: AEON 69G + embedding 24G + Querit 18G = 111GiB.
 ExecStartPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh vllm-qwen3-reranker-8b 24
 ExecStop=/usr/bin/docker stop vllm-qwen3-reranker-8b
 StandardOutput=journal

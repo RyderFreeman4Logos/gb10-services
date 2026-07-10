@@ -1,9 +1,9 @@
 [server]
 bind_host = "100.105.4.92"
 port = 18009
-max_in_flight_requests = 4
-max_queued_generation_requests = 4
-generation_queue_timeout_ms = 1800000
+max_in_flight_requests = 8
+max_queued_generation_requests = 24
+generation_queue_timeout_ms = 7200000
 generation_queue_full_status = 429
 generation_queue_retry_after_secs = 10
 max_control_plane_in_flight_requests = 128
@@ -28,7 +28,7 @@ port = 18005
 
 [upstream]
 base_url = "http://100.105.4.92:18010/v1"
-request_timeout_ms = 1800000
+request_timeout_ms = 7200000
 
 [upstream.hot_restart]
 enabled = true
@@ -38,7 +38,7 @@ probe_timeout_secs = 600
 
 [upstream.stall]
 enabled = true
-idle_timeout_ms = 120000
+idle_timeout_ms = 300000
 recovery_timeout_ms = 300000
 recovery_cooldown_ms = 300000
 recovery_budget_window_ms = 900000
@@ -54,9 +54,9 @@ input_token_safety_margin = 512
 name = "aeon-chat"
 base_url = "http://100.105.4.92:18010/v1"
 match_models = ["aeon-ultimate", "qwen3.6-27b-decensor-by-aeon"]
-request_timeout_ms = 1800000
-max_in_flight_requests = 4
-max_queued_generation_requests = 4
+request_timeout_ms = 7200000
+max_in_flight_requests = 8
+max_queued_generation_requests = 24
 
 [upstreams.metadata]
 discovery_enabled = true
@@ -94,7 +94,7 @@ presence_penalty = 0.0
 name = "qwen3-embedding-8b"
 base_url = "http://100.105.4.92:18012/v1"
 match_models = ["qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B"]
-request_timeout_ms = 1800000
+request_timeout_ms = 7200000
 max_in_flight_requests = 8
 max_queued_generation_requests = 8
 
@@ -118,7 +118,7 @@ enabled = false
 name = "qwen3-reranker-8b"
 base_url = "http://100.105.4.92:18013/v1"
 match_models = ["qwen3-reranker-8b", "Qwen/Qwen3-Reranker-8B"]
-request_timeout_ms = 1800000
+request_timeout_ms = 7200000
 max_in_flight_requests = 8
 max_queued_generation_requests = 8
 
@@ -238,6 +238,7 @@ vector_dim = 256
 [retry]
 enabled = true
 max_attempts = 4
+request_deadline_ms = 7200000
 anti_loop_hint_enabled = true
 shielded_streaming_enabled = true
 downstream_drop_policy = "cancel"
