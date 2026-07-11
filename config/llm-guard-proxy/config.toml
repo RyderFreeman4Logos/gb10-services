@@ -38,7 +38,8 @@ probe_timeout_secs = 600
 
 [upstream.stall]
 enabled = true
-idle_timeout_ms = 120000
+first_chunk_timeout_ms = 600000
+idle_timeout_ms = 300000
 recovery_timeout_ms = 300000
 recovery_cooldown_ms = 300000
 recovery_budget_window_ms = 900000
@@ -238,7 +239,7 @@ vector_dim = 256
 [retry]
 enabled = true
 max_attempts = 4
-request_deadline_ms = 600000
+request_deadline_ms = 1200000
 anti_loop_hint_enabled = true
 shielded_streaming_enabled = true
 downstream_drop_policy = "cancel"
