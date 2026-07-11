@@ -38,7 +38,8 @@ probe_timeout_secs = 600
 
 [upstream.stall]
 enabled = true
-idle_timeout_ms = 120000
+first_chunk_timeout_ms = 600000
+idle_timeout_ms = 300000
 recovery_timeout_ms = 300000
 recovery_cooldown_ms = 300000
 recovery_budget_window_ms = 900000
