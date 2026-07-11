@@ -238,6 +238,7 @@ vector_dim = 256
 [retry]
 enabled = true
 max_attempts = 4
+request_deadline_ms = 600000
 anti_loop_hint_enabled = true
 shielded_streaming_enabled = true
 downstream_drop_policy = "cancel"
@@ -277,7 +278,7 @@ anti_loop_hint = "Previous attempt became repetitive after a deeper retry. Use o
 [[retry.ladder]]
 name = "no-thinking"
 thinking_mode = "force_disable"
-max_tokens = 50000
+max_tokens = 1024
 preserve_answer_budget = true
 tool_request_policy = "apply"
 no_thinking_marker_policy = "force"
