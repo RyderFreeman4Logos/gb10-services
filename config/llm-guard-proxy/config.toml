@@ -239,7 +239,7 @@ vector_dim = 256
 [retry]
 enabled = true
 max_attempts = 4
-request_deadline_ms = 600000
+request_deadline_ms = 1200000
 anti_loop_hint_enabled = true
 shielded_streaming_enabled = true
 downstream_drop_policy = "cancel"
