@@ -1,7 +1,7 @@
 [Unit]
-Description=llm-guard-proxy guard wrapper for GB10 vLLM upstreams
-After=network.target vllm-embedding.service vllm-aeon-27b-dflash.service vllm-qwen3-reranker-8b.service
-Wants=vllm-embedding.service vllm-aeon-27b-dflash.service vllm-qwen3-reranker-8b.service
+Description=llm-guard-proxy guard wrapper for GB10 model upstreams
+After=network.target vllm-embedding.service vllm-aeon-27b-dflash.service querit-4b-reranker.service
+Wants=vllm-embedding.service vllm-aeon-27b-dflash.service
 
 [Service]
 Type=simple
@@ -12,13 +12,20 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadOnlyPaths=/home/obj/.config/llm-guard-proxy /home/obj/.local/bin/llm-guard-proxy
 ReadWritePaths=/home/obj/.local/state /home/obj/.local/state/llm-guard-proxy
+CacheDirectory=llm-guard-proxy-evidence
+CacheDirectoryMode=0700
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=true
 MemoryDenyWriteExecute=true
 RestrictRealtime=true
 SystemCallArchitectures=native
+MemoryHigh=1792M
+MemoryMax=2G
+MemorySwapMax=0
+OOMScoreAdjust=-200
 ExecStartPre=/usr/bin/test -r /home/obj/.config/llm-guard-proxy/config.toml
 ExecStartPre=/usr/bin/mkdir -p /home/obj/.local/state/llm-guard-proxy
+
 ExecStart=/home/obj/.local/bin/llm-guard-proxy --config /home/obj/.config/llm-guard-proxy/config.toml
 Restart=on-failure
 RestartSec=5
