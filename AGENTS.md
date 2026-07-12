@@ -53,11 +53,13 @@ chat-only mutation disabled for embedding/reranker profiles:
   `max_tokens = 50000`. Embedding/reranker disable parameter override.
 * **Thinking policy**: normal chat uses `mode = "bounded_thinking"`,
   `budget_tokens = 32768`, `max_tokens = 50000`,
-  `default_injection_schema = "chat_template_kwargs"`, and
-  `no_thinking_marker_policy = "respect_no_thinking_markers"`. Requests that
-  explicitly send `chat_template_kwargs: {"enable_thinking": false}` are
-  preserved as no-thinking requests; do **not** change normal chat back to
-  `force_thinking` unless callers should lose that opt-out.
+  `default_injection_schema = "vllm_native"`, and
+  `no_thinking_marker_policy = "respect_no_thinking_markers"`. Guard preserves
+  `chat_template_kwargs.enable_thinking` for explicit enablement or opt-out and
+  emits the effective numeric budget as the top-level `thinking_token_budget`.
+  No-thinking requests remove any positive native thinking budget. Do **not**
+  change normal chat back to `force_thinking` unless callers should lose that
+  opt-out.
 * **Shielded retry ladder**: retry remains enabled with max-thinking,
   bounded-thinking, and no-thinking ladder steps. The thinking ladder steps
   also respect no-thinking markers, so a client opt-out is preserved during
