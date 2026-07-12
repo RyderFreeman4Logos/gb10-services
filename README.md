@@ -190,6 +190,11 @@ The GB10 user manager rejects `PrivateDevices`, `ProtectClock`,
 four directives are intentionally omitted. The unprivileged service retains
 `NoNewPrivileges` and the remaining namespace, filesystem, address-family,
 and kernel-tunable restrictions.
+GB10 also clamps unprivileged user units to an effective
+`OOMScoreAdjust=100`; lower configured values are not applied. The units state
+that real floor explicitly. The guardian remains below the large model
+services (200/500/800), while its verified 64 MiB cgroup `MemoryMin` protects
+the resident emergency mapping directly.
 The 64 MiB reserve is an explicit anonymous `mmap`; emergency release uses
 `munmap`, and the reserve is not rearmed until `MemAvailable` reaches the
 1 GiB stop threshold plus the reserve size.
