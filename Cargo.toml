@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "crates/gb10-memory-guardian-core",
+    "crates/gb10-memory-guardian",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+libc = "0.2"

@@ -1,0 +1,30 @@
+[Unit]
+Description=GB10 memory guardian disposable cgroup.kill sandbox canary
+
+[Service]
+Type=oneshot
+Environment=GB10_MEMORY_GUARDIAN_RESERVE_MIB=64
+Environment=GB10_MEMORY_GUARDIAN_MEM_AVAIL_STOP_GIB=1
+Environment=GB10_MEMORY_GUARDIAN_POLL_SECONDS=1
+Environment=GB10_MEMORY_GUARDIAN_RETRY_SECONDS=5
+ExecStart=%h/.local/bin/gb10-memory-guardian --disposable-canary
+MemoryMin=64M
+MemoryMax=96M
+MemorySwapMax=0
+OOMScoreAdjust=-1000
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectHome=read-only
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
