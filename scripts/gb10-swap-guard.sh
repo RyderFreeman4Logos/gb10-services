@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# GB10 vLLM swap guard. Runs locally on gb10 as a user service.
+# GB10 vLLM swap / free-memory guard. Runs locally on gb10 as a user service.
+# The detection loop is intentionally faster than telemetry logging so a rapid
+# unified-memory collapse cannot fit entirely between two guard samples.
 set -euo pipefail
 
 LOG_DIR="${GB10_SWAP_GUARD_LOG_DIR:-$HOME/log}"
 LOG="${GB10_SWAP_GUARD_LOG:-$LOG_DIR/gb10_swap_guard.log}"
-INTERVAL="${GB10_SWAP_GUARD_INTERVAL:-20}"
+INTERVAL="${GB10_SWAP_GUARD_INTERVAL:-1}"
+SAMPLE_LOG_INTERVAL="${GB10_SWAP_GUARD_SAMPLE_LOG_INTERVAL:-20}"
 WARN_GIB="${GB10_SWAP_WARN_GIB:-7.5}"
 STOP_GIB="${GB10_SWAP_STOP_GIB:-12}"
+MEM_AVAIL_STOP_GIB="${GB10_MEM_AVAIL_STOP_GIB:-1}"
 ATTRIBUTION_INTERVAL="${GB10_SWAP_ATTRIBUTION_INTERVAL:-300}"
+ONESHOT="${GB10_SWAP_GUARD_ONESHOT:-0}"
+SKIP_DIAGNOSTICS="${GB10_SWAP_GUARD_SKIP_DIAGNOSTICS:-0}"
 DOCKER_HOST="${DOCKER_HOST:-unix:///run/user/$(id -u)/docker.sock}"
 export DOCKER_HOST
 
@@ -23,28 +29,39 @@ PY
 
 WARN_BYTES=$(bytes_from_gib "$WARN_GIB")
 STOP_BYTES=$(bytes_from_gib "$STOP_GIB")
+MEM_AVAIL_STOP_BYTES=$(bytes_from_gib "$MEM_AVAIL_STOP_GIB")
 
 log() {
     printf '[%s] %s\n' "$(date -Is)" "$*" | tee -a "$LOG"
 }
 
 read_mem_bytes() {
-    python3 <<'PY'
-from pathlib import Path
-mem = {}
-for line in Path('/proc/meminfo').read_text().splitlines():
-    key, value = line.split(':', 1)
-    mem[key] = int(value.strip().split()[0]) * 1024
-mem_total = mem.get('MemTotal', 0)
-mem_available = mem.get('MemAvailable', 0)
-swap_total = mem.get('SwapTotal', 0)
-swap_free = mem.get('SwapFree', 0)
-print(max(0, mem_total - mem_available), mem_available, max(0, swap_total - swap_free), swap_total)
-PY
+    local key rest value
+    local mem_total_kib=0 mem_available_kib=0 swap_total_kib=0 swap_free_kib=0
+    while IFS=: read -r key rest; do
+        read -r value _ <<< "$rest"
+        case "$key" in
+            MemTotal) mem_total_kib="${value:-0}" ;;
+            MemAvailable) mem_available_kib="${value:-0}" ;;
+            SwapTotal) swap_total_kib="${value:-0}" ;;
+            SwapFree) swap_free_kib="${value:-0}" ;;
+        esac
+    done < "${GB10_SWAP_GUARD_MEMINFO_PATH:-/proc/meminfo}"
+
+    local mem_total_bytes=$((mem_total_kib * 1024))
+    local mem_available_bytes=$((mem_available_kib * 1024))
+    local swap_total_bytes=$((swap_total_kib * 1024))
+    local swap_free_bytes=$((swap_free_kib * 1024))
+    mem_used=$((mem_total_bytes > mem_available_bytes ? mem_total_bytes - mem_available_bytes : 0))
+    mem_avail="$mem_available_bytes"
+    swap_used=$((swap_total_bytes > swap_free_bytes ? swap_total_bytes - swap_free_bytes : 0))
+    swap_total="$swap_total_bytes"
 }
 
 bytes_to_gib() {
-    awk -v b="$1" 'BEGIN {printf "%.1f", b/1024/1024/1024}'
+    local bytes="$1" gib=$((1024 * 1024 * 1024)) tenths
+    tenths=$(((bytes * 10 + gib / 2) / gib))
+    printf '%d.%d' "$((tenths / 10))" "$((tenths % 10))"
 }
 
 log_vmstat() {
@@ -62,7 +79,6 @@ log_swap_attribution() {
 from __future__ import annotations
 from collections import defaultdict
 from pathlib import Path
-import os
 import subprocess
 
 print('--- top swap attribution ---')
@@ -153,27 +169,36 @@ PY
 }
 
 stop_reranker() {
-    log "STOP_SWAP: swap >= ${STOP_GIB}GiB; stopping vllm-qwen3-reranker-8b.service"
+    reason="${1:-unspecified}"
+    log "STOP_RERANKER: reason=${reason}; stopping reranker services"
+    systemctl --user stop querit-4b-reranker.service 2>&1 | tee -a "$LOG" || true
     systemctl --user stop vllm-qwen3-reranker-8b.service 2>&1 | tee -a "$LOG" || true
+    docker stop querit-4b-reranker 2>&1 | tee -a "$LOG" || true
     docker stop vllm-qwen3-reranker-8b 2>&1 | tee -a "$LOG" || true
-    log_vmstat
-    log_swap_attribution
+    if [[ "$SKIP_DIAGNOSTICS" != "1" ]]; then
+        log_vmstat
+        log_swap_attribution
+    fi
 }
 
-log "GB10 swap guard started warn=${WARN_GIB}GiB stop=${STOP_GIB}GiB interval=${INTERVAL}s attribution_interval=${ATTRIBUTION_INTERVAL}s"
+log "GB10 swap/memory guard started warn_swap=${WARN_GIB}GiB stop_swap=${STOP_GIB}GiB mem_avail_stop=${MEM_AVAIL_STOP_GIB}GiB interval=${INTERVAL}s sample_log_interval=${SAMPLE_LOG_INTERVAL}s attribution_interval=${ATTRIBUTION_INTERVAL}s"
 warned=0
-stopped=0
+stopped_swap=0
+stopped_mem=0
 last_attribution=0
+last_sample_log=0
 
 while true; do
-    read -r mem_used mem_avail swap_used swap_total <<< "$(read_mem_bytes)"
-    mem_used_gib=$(bytes_to_gib "$mem_used")
-    mem_avail_gib=$(bytes_to_gib "$mem_avail")
-    swap_used_gib=$(bytes_to_gib "$swap_used")
-    swap_total_gib=$(bytes_to_gib "$swap_total")
-    log "sample mem_used=${mem_used_gib}GiB mem_avail=${mem_avail_gib}GiB swap_used=${swap_used_gib}GiB swap_total=${swap_total_gib}GiB"
-
-    now=$(date +%s)
+    read_mem_bytes
+    now="${EPOCHSECONDS:-$(date +%s)}"
+    if (( now - last_sample_log >= SAMPLE_LOG_INTERVAL )); then
+        mem_used_gib=$(bytes_to_gib "$mem_used")
+        mem_avail_gib=$(bytes_to_gib "$mem_avail")
+        swap_used_gib=$(bytes_to_gib "$swap_used")
+        swap_total_gib=$(bytes_to_gib "$swap_total")
+        log "sample mem_used=${mem_used_gib}GiB mem_avail=${mem_avail_gib}GiB swap_used=${swap_used_gib}GiB swap_total=${swap_total_gib}GiB"
+        last_sample_log="$now"
+    fi
     if (( swap_used >= WARN_BYTES )) && (( warned == 0 )); then
         warned=1
         log "WARN_SWAP: swap >= ${WARN_GIB}GiB"
@@ -187,13 +212,30 @@ while true; do
         last_attribution="$now"
     fi
 
-    if (( swap_used >= STOP_BYTES )) && (( stopped == 0 )); then
-        stopped=1
-        stop_reranker
+    if (( mem_avail < MEM_AVAIL_STOP_BYTES )) && (( stopped_mem == 0 )); then
+        stopped_mem=1
+        mem_avail_gib=$(bytes_to_gib "$mem_avail")
+        stop_reranker "mem_avail<${MEM_AVAIL_STOP_GIB}GiB (avail=${mem_avail_gib}GiB)"
+    fi
+
+    if (( swap_used >= STOP_BYTES )) && (( stopped_swap == 0 )); then
+        stopped_swap=1
+        swap_used_gib=$(bytes_to_gib "$swap_used")
+        stop_reranker "swap>=${STOP_GIB}GiB (used=${swap_used_gib}GiB)"
     fi
 
     if (( swap_used < WARN_BYTES )); then
         warned=0
+    fi
+    if (( mem_avail >= MEM_AVAIL_STOP_BYTES * 2 )); then
+        stopped_mem=0
+    fi
+    if (( swap_used < STOP_BYTES )); then
+        stopped_swap=0
+    fi
+
+    if [[ "$ONESHOT" == "1" ]]; then
+        break
     fi
 
     sleep "$INTERVAL"
