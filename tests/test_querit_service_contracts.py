@@ -157,6 +157,20 @@ class QueritServiceContractTests(unittest.TestCase):
             profiles["qwen3-reranker-8b"]["max_queued_generation_requests"], 64
         )
 
+    def test_guard_uses_vllm_native_thinking_budget_schema_everywhere(self) -> None:
+        config = tomllib.loads(CONFIG.read_text())
+        profiles = {profile["name"]: profile for profile in config["upstreams"]}
+        schemas = [
+            profiles["aeon-chat"]["thinking"]["default_injection_schema"],
+            config["thinking"]["default_injection_schema"],
+            *[
+                rung["default_injection_schema"]
+                for rung in config["retry"]["ladder"]
+            ],
+        ]
+        self.assertEqual(len(schemas), 6)
+        self.assertEqual(set(schemas), {"vllm_native"})
+
     def test_guard_queue_body_residency_fits_memory_budget(self) -> None:
         config = tomllib.loads(CONFIG.read_text())
         server = config["server"]

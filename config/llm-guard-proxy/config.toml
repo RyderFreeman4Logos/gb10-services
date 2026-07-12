@@ -80,7 +80,7 @@ budget_tokens = 32768
 preserve_answer_budget = true
 tool_request_policy = "apply"
 no_thinking_marker_policy = "respect_no_thinking_markers"
-default_injection_schema = "chat_template_kwargs"
+default_injection_schema = "vllm_native"
 
 [upstreams.param_override]
 enabled = true
@@ -201,7 +201,7 @@ budget_tokens = 32768
 preserve_answer_budget = true
 tool_request_policy = "apply"
 no_thinking_marker_policy = "respect_no_thinking_markers"
-default_injection_schema = "chat_template_kwargs"
+default_injection_schema = "vllm_native"
 
 [loop_guard]
 enabled = true
@@ -252,7 +252,7 @@ thinking_token_budget = 32768
 preserve_answer_budget = true
 tool_request_policy = "apply"
 no_thinking_marker_policy = "respect_no_thinking_markers"
-default_injection_schema = "chat_template_kwargs"
+default_injection_schema = "vllm_native"
 
 [[retry.ladder]]
 name = "bounded-thinking-deep"
@@ -262,7 +262,7 @@ thinking_token_budget = 16384
 preserve_answer_budget = true
 tool_request_policy = "apply"
 no_thinking_marker_policy = "respect_no_thinking_markers"
-default_injection_schema = "chat_template_kwargs"
+default_injection_schema = "vllm_native"
 anti_loop_hint = "Previous attempt became repetitive. Do not repeat prior analysis; answer directly."
 
 [[retry.ladder]]
@@ -273,7 +273,7 @@ thinking_token_budget = 8192
 preserve_answer_budget = true
 tool_request_policy = "apply"
 no_thinking_marker_policy = "respect_no_thinking_markers"
-default_injection_schema = "chat_template_kwargs"
+default_injection_schema = "vllm_native"
 anti_loop_hint = "Previous attempt became repetitive after a deeper retry. Use only the useful prior work and answer directly."
 
 [[retry.ladder]]
@@ -283,7 +283,7 @@ max_tokens = 1024
 preserve_answer_budget = true
 tool_request_policy = "apply"
 no_thinking_marker_policy = "force"
-default_injection_schema = "chat_template_kwargs"
+default_injection_schema = "vllm_native"
 
 [heartbeat]
 mode = "sse"
