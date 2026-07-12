@@ -185,6 +185,11 @@ sha256sum target/release/gb10-memory-guardian | tee /tmp/gb10-memory-guardian.so
 
 The only external Rust dependency is `libc`. Every Linux FFI call is localized
 to a documented unsafe block; the service binary contains no subprocess API.
+The GB10 user manager rejects `PrivateDevices`, `ProtectClock`,
+`ProtectKernelLogs`, and `ProtectKernelModules` with `218/CAPABILITIES`; those
+four directives are intentionally omitted. The unprivileged service retains
+`NoNewPrivileges` and the remaining namespace, filesystem, address-family,
+and kernel-tunable restrictions.
 The 64 MiB reserve is an explicit anonymous `mmap`; emergency release uses
 `munmap`, and the reserve is not rearmed until `MemAvailable` reaches the
 1 GiB stop threshold plus the reserve size.
