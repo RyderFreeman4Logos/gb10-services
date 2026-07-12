@@ -50,7 +50,7 @@ class MemoryGuardianContractTests(unittest.TestCase):
             "MemoryMin=64M",
             "MemoryMax=96M",
             "MemorySwapMax=0",
-            "OOMScoreAdjust=-1000",
+            "OOMScoreAdjust=100",
             "RuntimeDirectory=gb10-memory-guardian",
             "RuntimeDirectoryMode=0700",
             "RuntimeDirectoryPreserve=yes",
@@ -95,6 +95,8 @@ class MemoryGuardianContractTests(unittest.TestCase):
             self.assertIn(protected, canary)
         self.assertIn("--disposable-canary", driver)
         production = GUARDIAN_UNIT.read_text()
+        self.assertIn("OOMScoreAdjust=100", production)
+        self.assertIn("OOMScoreAdjust=100", driver)
         for hardening in (
             "NoNewPrivileges=yes",
             "ProtectSystem=strict",
