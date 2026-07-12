@@ -55,7 +55,9 @@ graph TD
    max/bounded/no-thinking comparisons are recorded within bounded retention.
 
    Normal chat uses `mode = "bounded_thinking"` with a 32,768-token thinking
-   budget and `chat_template_kwargs` injection. Client no-thinking markers are respected:
+   budget and explicit `vllm_native` injection: Guard preserves the template
+   `enable_thinking` marker and sends the effective budget through vLLM's
+   top-level `thinking_token_budget` field. Client no-thinking markers are respected:
    a request with `"chat_template_kwargs": {"enable_thinking": false}` should
    pass through without `reasoning_content`. Embedding and reranker profiles
    explicitly disable chat-only hot-restart probes, thinking rewrites, and
