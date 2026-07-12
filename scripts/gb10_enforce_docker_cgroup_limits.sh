@@ -15,6 +15,8 @@ expected_gib="${2:?expected GiB required}"
 docker_timeout_seconds="${GB10_DOCKER_TIMEOUT_SECONDS:-3}"
 systemctl_timeout_seconds="${GB10_SYSTEMCTL_TIMEOUT_SECONDS:-10}"
 wait_seconds="${GB10_CGROUP_WAIT_SECONDS:-120}"
+registration_path="${GB10_CGROUP_REGISTRATION_PATH:-}"
+registration_published=0
 if [[ ! "$expected_gib" =~ ^[1-9][0-9]*$ ]]; then
   echo "expected GiB must be a positive integer: $expected_gib" >&2
   exit 2
@@ -36,6 +38,17 @@ run_systemctl() {
   /usr/bin/timeout --signal=TERM --kill-after=2 "$systemctl_timeout_seconds" \
     /usr/bin/systemctl --user "$@"
 }
+
+fail_closed_registration() {
+  local status=$?
+  trap - ERR
+  if [[ -n "$registration_path" && "$name" == "querit-4b-reranker" && "$registration_published" != "1" ]]; then
+    rm -f -- "$registration_path"
+    run_docker stop --time 5 "$name" >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
+trap fail_closed_registration ERR
 
 cid=""
 cg=""
@@ -79,6 +92,44 @@ fi
 if [[ "$mem_max" != "$expected_bytes" ]]; then
   echo "unexpected $name memory.max=$mem_max expected=$expected_bytes scope=$scope cg=$cg" >&2
   exit 1
+fi
+
+# Only Querit may publish a kill registration. Other callers keep the existing
+# cap-only behavior even if this helper is reused by AEON or embedding units.
+if [[ -n "$registration_path" ]]; then
+  if [[ "$name" != "querit-4b-reranker" ]]; then
+    echo "refusing cgroup registration for non-Querit container: $name" >&2
+    exit 2
+  fi
+  expected_registration_path="${XDG_RUNTIME_DIR:-/run/user/${UID}}/gb10-memory-guardian/querit-cgroup.v1"
+  if [[ "$registration_path" != "$expected_registration_path" ]]; then
+    echo "unexpected guardian registration path: $registration_path" >&2
+    exit 2
+  fi
+  expected_control_group="/user.slice/user-${UID}.slice/user@${UID}.service/app.slice/${scope}"
+  if [[ ! "$cid" =~ ^[0-9a-f]{64}$ || "$scope" != "docker-${cid}.scope" || "$cg" != "$expected_control_group" ]]; then
+    echo "refusing unsafe Querit registration cid=$cid scope=$scope cg=$cg expected=$expected_control_group" >&2
+    exit 1
+  fi
+
+  registration_dir="${registration_path%/*}"
+  /usr/bin/install -d -m 0700 "$registration_dir"
+  registration_tmp="$(mktemp "${registration_path}.tmp.XXXXXX")"
+  cleanup_registration_tmp() {
+    rm -f -- "$registration_tmp"
+  }
+  trap cleanup_registration_tmp EXIT
+  chmod 0600 "$registration_tmp"
+  {
+    printf 'version=1\n'
+    printf 'container_id=%s\n' "$cid"
+    printf 'scope=%s\n' "$scope"
+    printf 'control_group=%s\n' "$cg"
+  } >"$registration_tmp"
+  chmod 0600 "$registration_tmp"
+  mv -f -- "$registration_tmp" "$registration_path"
+  registration_published=1
+  trap - EXIT
 fi
 
 echo "verified $name cgroup memory.max=$mem_max memory.swap.max=$swap_max scope=$scope"

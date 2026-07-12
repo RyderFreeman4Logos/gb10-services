@@ -3,7 +3,8 @@ Description=Querit-4B transformers rerank server (raw :18013; Qwen3 reranker ali
 Requires=vllm-aeon-27b-dflash.service
 BindsTo=vllm-aeon-27b-dflash.service
 PartOf=vllm-aeon-27b-dflash.service
-After=network.target vllm-aeon-27b-dflash.service
+Wants=gb10-memory-guardian.service
+After=network.target vllm-aeon-27b-dflash.service gb10-memory-guardian.service
 Conflicts=vllm-qwen3-reranker-8b.service
 StartLimitIntervalSec=600
 StartLimitBurst=3
@@ -13,21 +14,23 @@ Type=simple
 Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
 Environment=HF_HUB_OFFLINE=1
 Environment=TRANSFORMERS_OFFLINE=1
+Environment=GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/querit-cgroup.v1
 # Wrapper/docker-CLI only. The generated docker scope is capped separately.
 MemoryMax=256M
 MemorySwapMax=0
 OOMScoreAdjust=800
-Restart=on-failure
-RestartSec=30
+Restart=no
 TimeoutStartSec=1800
 TimeoutStopSec=60
 
 # Do not let a Guard restart pull the reranker back into a low-headroom host.
 ExecStartPre=/home/obj/.local/bin/gb10_check_mem_available.sh 2
+ExecStartPre=/usr/bin/rm -f %t/gb10-memory-guardian/querit-cgroup.v1
 # Wait for AEON model metadata, not chat completion (queued chat can stall readiness).
 ExecStartPre=/bin/bash -c 'for i in $(seq 1 120); do curl -fsS --max-time 3 http://100.105.4.92:18010/v1/models >/dev/null 2>&1 && exit 0; sleep 2; done; echo "aeon models not ready after 10min"; exit 1'
 ExecStartPre=-/usr/bin/docker rm -f querit-4b-reranker vllm-qwen3-reranker-8b
 ExecStart=/usr/bin/docker run --rm --name querit-4b-reranker \
+  --cgroup-parent app.slice \
   --gpus all --ipc host \
   -p 100.105.4.92:18013:8000 \
   -v /home/obj/.cache/huggingface/hub/models--Querit--Querit-4B:/models/querit-repo:ro \
