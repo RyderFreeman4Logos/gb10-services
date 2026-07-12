@@ -60,11 +60,11 @@ class MemoryGuardianContractTests(unittest.TestCase):
         self.assertIn("GB10_MEMORY_GUARDIAN_MEM_AVAIL_STOP_GIB=1", unit)
         for hardening in (
             "NoNewPrivileges=yes",
-            "PrivateDevices=yes",
             "ProtectSystem=strict",
             "RestrictNamespaces=yes",
         ):
             self.assertIn(hardening, unit)
+        self.assertNotIn("CapabilityBoundingSet", unit)
 
     def test_cgroup_helper_publishes_registration_atomically(self) -> None:
         helper = CGROUP_HELPER.read_text()
@@ -97,15 +97,21 @@ class MemoryGuardianContractTests(unittest.TestCase):
         production = GUARDIAN_UNIT.read_text()
         for hardening in (
             "NoNewPrivileges=yes",
-            "PrivateDevices=yes",
-            "ProtectClock=yes",
-            "ProtectKernelLogs=yes",
-            "ProtectKernelModules=yes",
             "ProtectSystem=strict",
             "RestrictNamespaces=yes",
         ):
             self.assertIn(hardening, production)
             self.assertIn(hardening, driver)
+        self.assertNotIn("CapabilityBoundingSet", production)
+        self.assertNotIn("CapabilityBoundingSet", driver)
+        for unsupported in (
+            "PrivateDevices=yes",
+            "ProtectClock=yes",
+            "ProtectKernelLogs=yes",
+            "ProtectKernelModules=yes",
+        ):
+            self.assertNotIn(unsupported, production)
+            self.assertNotIn(unsupported, driver)
 
     def test_querit_uses_guardian_and_app_slice_without_auto_restart(self) -> None:
         unit = QUERIT_UNIT.read_text()
