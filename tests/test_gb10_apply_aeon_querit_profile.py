@@ -1,0 +1,295 @@
+from __future__ import annotations
+
+import os
+import re
+import signal
+import subprocess
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEPLOYER = ROOT / "scripts" / "gb10_apply_aeon_querit_profile.sh"
+
+
+class QueritDeployerContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.source = DEPLOYER.read_text()
+
+    def _make_fake_stack(
+        self,
+        tmp: Path,
+        *,
+        guard_mode: str = "fail",
+        docker_mode: str = "ok",
+    ) -> tuple[dict[str, str], Path, Path, Path]:
+        fake_bin = tmp / "bin"
+        fake_bin.mkdir()
+        calls = tmp / "calls"
+        rerank_active = tmp / "rerank-active"
+        signal_marker = tmp / "guard-score-entered"
+        docker_marker = tmp / "docker-entered"
+
+        systemctl = fake_bin / "systemctl"
+        systemctl.write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf \'systemctl %s\\n\' "$*" >> {calls}\n'
+            'if [[ "$*" == *"is-enabled"* ]]; then\n'
+            '  [[ "$*" == *"querit-4b-reranker.service"* ]] && { echo disabled; exit 1; }\n'
+            '  [[ "$*" == *"vllm-qwen3-reranker-8b.service"* ]] && { echo enabled; exit 0; }\n'
+            "fi\n"
+            'if [[ "$*" == *"is-active"* ]]; then\n'
+            f'  if [[ "$*" == *"querit-4b-reranker.service"* ]]; then [[ -f {rerank_active} ]] && {{ echo active; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
+            "  echo active; exit 0\n"
+            "fi\n"
+            'if [[ "$*" == *"start querit-4b-reranker.service"* ]]; then\n'
+            f'  : > {rerank_active}\n'
+            "fi\n"
+            'if [[ "$*" == *"stop querit-4b-reranker.service"* ]]; then\n'
+            f'  rm -f {rerank_active}\n'
+            "fi\n"
+            "exit 0\n"
+        )
+        systemctl.chmod(0o755)
+
+        docker = fake_bin / "docker"
+        docker.write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf \'docker %s\\n\' "$*" >> {calls}\n'
+            'if [[ "${FAKE_DOCKER_MODE:-ok}" == hang ]]; then\n'
+            f"  : > {docker_marker}\n"
+            "  /bin/sleep 30\n"
+            "fi\n"
+            'if [[ "$*" == *"Config.Cmd"* ]]; then '
+            'echo \'["--kv-cache-memory-bytes","36864M"]\'; '
+            "else echo 74088185856; fi\n"
+        )
+        docker.chmod(0o755)
+
+        curl = fake_bin / "curl"
+        curl.write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf \'curl %s\\n\' "$*" >> {calls}\n'
+            'if [[ "$*" == *"/v1/score"* ]]; then\n'
+            '  if [[ "${FAKE_GUARD_MODE:-fail}" == fail ]]; then exit 22; fi\n'
+            '  if [[ "${FAKE_GUARD_MODE:-fail}" == hang ]]; then\n'
+            f"    : > {signal_marker}\n"
+            "    /bin/sleep 30\n"
+            "  fi\n"
+            "  echo '{\"data\":[{\"score\":1.0}]}'\n"
+            "  exit 0\n"
+            "fi\n"
+            'if [[ "$*" == *"/v1/rerank"* ]]; then '
+            'echo \'{"results":[{"index":0,"relevance_score":1.0}]}\'; '
+            "else echo '{}'; fi\n"
+        )
+        curl.chmod(0o755)
+
+        python = fake_bin / "python3"
+        python.write_text("#!/usr/bin/env bash\necho RAW_RERANK_OK\n")
+        python.chmod(0o755)
+
+        meminfo = tmp / "meminfo"
+        meminfo.write_text("MemAvailable: 8388608 kB\n")
+        guard_config = tmp / "guard-config.toml"
+        guard_config.write_text("original-guard-config\n")
+        env = os.environ | {
+            "HOME": str(tmp),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "TMPDIR": str(tmp),
+            "GB10_MEMINFO_PATH": str(meminfo),
+            "GB10_GUARD_CONFIG_PATH": str(guard_config),
+            "GB10_AEON_READY_ATTEMPTS": "1",
+            "GB10_RERANK_READY_ATTEMPTS": "1",
+            "FAKE_GUARD_MODE": guard_mode,
+            "FAKE_DOCKER_MODE": docker_mode,
+        }
+        return env, calls, signal_marker, docker_marker
+
+    def test_matches_committed_production_aeon_profile(self) -> None:
+        self.assertIn(
+            "EXPECTED_AEON_MEMORY_GIB=${GB10_EXPECTED_AEON_MEMORY_GIB:-69}",
+            self.source,
+        )
+        self.assertIn(
+            "EXPECTED_AEON_KV_MIB=${GB10_EXPECTED_AEON_KV_MIB:-36864}",
+            self.source,
+        )
+        self.assertNotIn("EXPECTED_AEON_MEMORY_GIB:-64", self.source)
+
+    def test_does_not_restart_aeon_by_default(self) -> None:
+        self.assertIn("--restart-aeon", self.source)
+        restart = self.source.index('run_systemctl_start restart "$AEON_UNIT"')
+        guarded_region = self.source[max(0, restart - 250) : restart]
+        self.assertRegex(guarded_region, r"RESTART_AEON.*1")
+
+    def test_snapshots_and_restores_reranker_state(self) -> None:
+        for contract in (
+            "LEGACY_UNIT=vllm-qwen3-reranker-8b.service",
+            "unit_enabled_state",
+            "unit_active_state",
+            "rollback_runtime_state",
+            'run_systemctl disable --now "$LEGACY_UNIT"',
+            "restore_unit_enablement",
+        ):
+            self.assertIn(contract, self.source)
+        rollback = re.search(
+            r"rollback_runtime_state\(\) \{(?P<body>.*?)\n\}",
+            self.source,
+            re.DOTALL,
+        )
+        if rollback is None:
+            self.fail("rollback_runtime_state function missing")
+        body = rollback.group("body")
+        self.assertIn('restore_unit_enablement "$RERANK_UNIT"', body)
+        self.assertIn('restore_unit_enablement "$LEGACY_UNIT"', body)
+        self.assertIn('run_systemctl_start start "$LEGACY_UNIT"', body)
+
+    def test_guard_config_is_part_of_the_rollback_transaction(self) -> None:
+        for contract in (
+            "GB10_GUARD_CONFIG_PATH",
+            "GUARD_CONFIG_EXISTED",
+            "config/llm-guard-proxy/config.toml",
+            '"$BACKUP_DIR/guard-config.toml"',
+        ):
+            self.assertIn(contract, self.source)
+
+    def test_signal_and_exit_paths_share_idempotent_cleanup(self) -> None:
+        for contract in (
+            "trap 'cleanup_on_signal INT 130' INT",
+            "trap 'cleanup_on_signal TERM 143' TERM",
+            "trap cleanup_on_exit EXIT",
+            "CLEANUP_STARTED=1",
+        ):
+            self.assertIn(contract, self.source)
+
+    def test_external_commands_have_hard_timeouts(self) -> None:
+        self.assertIn("run_systemctl()", self.source)
+        self.assertIn("run_docker()", self.source)
+        self.assertIn("/usr/bin/timeout --signal=TERM", self.source)
+        self.assertNotIn('command_json="$(docker inspect', self.source)
+
+    def test_enables_querit_only_after_readiness_and_smoke(self) -> None:
+        ready = self.source.index("RERANK_READY")
+        smoke = self.source.index("RAW_RERANK_OK")
+        enable = self.source.rindex('run_systemctl enable "$RERANK_UNIT"')
+        self.assertLess(ready, smoke)
+        self.assertLess(smoke, enable)
+
+    def test_shell_syntax(self) -> None:
+        result = subprocess.run(
+            ["bash", "-n", str(DEPLOYER)], capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_guard_smoke_failure_restores_previous_reranker_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            env, calls, _, _ = self._make_fake_stack(Path(raw_tmp))
+            result = subprocess.run(
+                ["bash", str(DEPLOYER)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stderr.count("DEPLOY_FAILED"), 1, result.stderr)
+            recorded = calls.read_text().splitlines()
+            self.assertEqual(
+                recorded.count("systemctl --user stop querit-4b-reranker.service"),
+                1,
+                recorded,
+            )
+            switched = recorded.index(
+                "systemctl --user disable --now vllm-qwen3-reranker-8b.service"
+            )
+            started = recorded.index(
+                "systemctl --user start querit-4b-reranker.service"
+            )
+            stopped = len(recorded) - 1 - recorded[::-1].index(
+                "systemctl --user stop querit-4b-reranker.service"
+            )
+            disabled = len(recorded) - 1 - recorded[::-1].index(
+                "systemctl --user disable querit-4b-reranker.service"
+            )
+            expected_restore = (
+                "systemctl --user start vllm-qwen3-reranker-8b.service"
+            )
+            self.assertIn(
+                expected_restore,
+                recorded,
+                f"stdout={result.stdout!r} stderr={result.stderr!r} calls={recorded!r}",
+            )
+            restored = len(recorded) - 1 - recorded[::-1].index(expected_restore)
+            self.assertLess(switched, started)
+            self.assertLess(started, stopped)
+            self.assertLess(stopped, disabled)
+            self.assertLess(disabled, restored)
+            self.assertEqual(
+                (Path(raw_tmp) / "guard-config.toml").read_text(),
+                "original-guard-config\n",
+            )
+
+    def test_sigterm_after_switch_rolls_back_once(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            env, calls, signal_marker, _ = self._make_fake_stack(
+                Path(raw_tmp), guard_mode="hang"
+            )
+            process = subprocess.Popen(
+                ["bash", str(DEPLOYER)],
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + 3
+            while not signal_marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(signal_marker.exists(), "deployer did not reach Guard smoke")
+            os.killpg(process.pid, signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 143, (stdout, stderr))
+            self.assertEqual(stderr.count("DEPLOY_FAILED"), 1, stderr)
+            recorded = calls.read_text().splitlines()
+            self.assertEqual(
+                recorded.count("systemctl --user stop querit-4b-reranker.service"),
+                1,
+                recorded,
+            )
+            self.assertIn(
+                "systemctl --user start vllm-qwen3-reranker-8b.service",
+                recorded,
+            )
+
+    def test_hung_docker_inspect_fails_within_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            env, calls, _, docker_marker = self._make_fake_stack(
+                Path(raw_tmp), docker_mode="hang"
+            )
+            env["GB10_DOCKER_TIMEOUT_SECONDS"] = "1"
+            started = time.monotonic()
+            result = subprocess.run(
+                ["bash", str(DEPLOYER)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            elapsed = time.monotonic() - started
+            self.assertTrue(docker_marker.exists())
+            self.assertNotEqual(result.returncode, 0)
+            self.assertLess(elapsed, 4)
+            self.assertEqual(result.stderr.count("DEPLOY_FAILED"), 1, result.stderr)
+            self.assertNotIn(
+                "systemctl --user disable --now vllm-qwen3-reranker-8b.service",
+                calls.read_text().splitlines(),
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

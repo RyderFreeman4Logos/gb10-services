@@ -2,12 +2,12 @@
 bind_host = "100.105.4.92"
 port = 18009
 max_in_flight_requests = 4
-max_queued_generation_requests = 4
+max_queued_generation_requests = 128
 generation_queue_timeout_ms = 1800000
 generation_queue_full_status = 429
 generation_queue_retry_after_secs = 10
 max_control_plane_in_flight_requests = 128
-max_request_body_bytes = 67108864
+max_request_body_bytes = 4194304
 
 [[listeners]]
 name = "embedding-legacy"
@@ -57,7 +57,7 @@ base_url = "http://100.105.4.92:18010/v1"
 match_models = ["aeon-ultimate", "qwen3.6-27b-decensor-by-aeon"]
 request_timeout_ms = 1800000
 max_in_flight_requests = 4
-max_queued_generation_requests = 4
+max_queued_generation_requests = 64
 
 [upstreams.metadata]
 discovery_enabled = true
@@ -97,7 +97,7 @@ base_url = "http://100.105.4.92:18012/v1"
 match_models = ["qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B"]
 request_timeout_ms = 1800000
 max_in_flight_requests = 8
-max_queued_generation_requests = 8
+max_queued_generation_requests = 64
 
 [upstreams.metadata]
 discovery_enabled = true
@@ -121,7 +121,7 @@ base_url = "http://100.105.4.92:18013/v1"
 match_models = ["qwen3-reranker-8b", "Qwen/Qwen3-Reranker-8B"]
 request_timeout_ms = 1800000
 max_in_flight_requests = 8
-max_queued_generation_requests = 8
+max_queued_generation_requests = 64
 
 [upstreams.metadata]
 discovery_enabled = true
