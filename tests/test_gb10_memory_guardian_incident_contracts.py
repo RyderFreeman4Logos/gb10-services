@@ -45,7 +45,9 @@ class RegistrationPublicationFailureTests(unittest.TestCase):
                 "printf 'docker' >>\"$COMMAND_LOG\"\n"
                 "printf ' %q' \"$@\" >>\"$COMMAND_LOG\"\n"
                 "printf '\\n' >>\"$COMMAND_LOG\"\n"
-                "if [[ $1 == inspect ]]; then printf '%s\\n' \"$FAKE_CONTAINER_ID\"; fi\n"
+                "if [[ $1 == inspect && $* == *State.Running* ]]; then printf 'false\\n'; "
+                "elif [[ $1 == inspect ]]; then printf '%s\\n' \"$FAKE_CONTAINER_ID\"; "
+                "elif [[ $1 == stop && ${FAIL_STOP:-0} == 1 ]]; then exit 1; fi\n"
             )
             docker.chmod(0o755)
 
@@ -66,12 +68,19 @@ class RegistrationPublicationFailureTests(unittest.TestCase):
             mv.write_text(
                 "#!/usr/bin/env bash\n"
                 "destination=\"${@: -1}\"\n"
-                "printf 'version=1\\ncontainer_id=corrupt\\n' >\"$destination\"\n"
-                "rm -f -- \"${@: -2:1}\"\n"
+                "if [[ ${CORRUPT_MV:-0} == 1 ]]; then\n"
+                "  printf 'version=1\\ncontainer_id=corrupt\\n' >\"$destination\"\n"
+                "  rm -f -- \"${@: -2:1}\"\n"
+                "else\n"
+                "  /usr/bin/mv \"$@\"\n"
+                "fi\n"
             )
             mv.chmod(0o755)
 
             registration = runtime / "gb10-memory-guardian" / "text-cgroup.v1"
+            registration.parent.mkdir(parents=True)
+            cidfile = registration.parent / "aeon-text.cid"
+            cidfile.write_text(f"{container_id}\n")
             env = os.environ.copy()
             env.update(
                 {
@@ -81,10 +90,12 @@ class RegistrationPublicationFailureTests(unittest.TestCase):
                     "FAKE_CONTROL_GROUP": control_group,
                     "XDG_RUNTIME_DIR": str(runtime),
                     "GB10_CGROUP_REGISTRATION_PATH": str(registration),
+                    "GB10_CONTAINER_CIDFILE": str(cidfile),
                     "GB10_CGROUP_WAIT_SECONDS": "1",
                     "GB10_DOCKER_BIN": str(docker),
                     "GB10_SYSTEMCTL_BIN": str(systemctl),
                     "GB10_CGROUP_ROOT": str(cgroup_root),
+                    "CORRUPT_MV": "1",
                 }
             )
             result = subprocess.run(
@@ -110,6 +121,81 @@ class RegistrationPublicationFailureTests(unittest.TestCase):
                     any(line.startswith(broad_action) for line in command_lines),
                     command_lines,
                 )
+
+            # Rejecting the publication path is also a post-launch failure.
+            # Cleanup must still use the immutable cidfile identity, never the
+            # reusable container name.
+            commands.write_text("")
+            env["GB10_CGROUP_REGISTRATION_PATH"] = str(
+                root / "outside-runtime" / "text-cgroup.v1"
+            )
+            rejected = subprocess.run(
+                ["bash", str(CGROUP_HELPER), container_name, "69"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            rejected_lines = commands.read_text().splitlines()
+            self.assertEqual(
+                [line for line in rejected_lines if line.startswith("docker stop ")],
+                [f"docker stop --time 5 {container_id}"],
+                rejected_lines,
+            )
+            self.assertFalse(
+                any(line == f"docker stop --time 5 {container_name}" for line in rejected_lines),
+                rejected_lines,
+            )
+
+            # A TERM-resistant launched container escalates only to an exact-CID
+            # kill; no name-based or fleet-wide cleanup is permitted.
+            commands.write_text("")
+            env["FAIL_STOP"] = "1"
+            resistant = subprocess.run(
+                ["bash", str(CGROUP_HELPER), container_name, "69"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertNotEqual(resistant.returncode, 0)
+            resistant_lines = commands.read_text().splitlines()
+            self.assertIn(f"docker stop --time 5 {container_id}", resistant_lines)
+            self.assertIn(f"docker kill {container_id}", resistant_lines)
+            self.assertFalse(
+                any(container_name in line for line in resistant_lines), resistant_lines
+            )
+
+            # The unchanged success path publishes the validated bytes and
+            # never invokes cleanup.
+            commands.write_text("")
+            env.pop("FAIL_STOP")
+            env["CORRUPT_MV"] = "0"
+            env["GB10_CGROUP_REGISTRATION_PATH"] = str(registration)
+            successful = subprocess.run(
+                ["bash", str(CGROUP_HELPER), container_name, "69"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(successful.returncode, 0, successful.stdout + successful.stderr)
+            self.assertEqual(
+                registration.read_text(),
+                "version=1\n"
+                f"container_id={container_id}\n"
+                f"scope={scope}\n"
+                f"control_group={control_group}\n",
+            )
+            success_lines = commands.read_text().splitlines()
+            self.assertFalse(
+                any(line.startswith(("docker stop ", "docker kill ")) for line in success_lines),
+                success_lines,
+            )
 
 
 class CanaryHarness(unittest.TestCase):
@@ -236,6 +322,7 @@ class CanaryHarness(unittest.TestCase):
     @staticmethod
     def _state(
         *,
+        load: str = "loaded",
         active: str,
         sub: str,
         pid: int,
@@ -246,7 +333,7 @@ class CanaryHarness(unittest.TestCase):
         environment: str = "",
     ) -> str:
         return (
-            "LoadState=loaded\n"
+            f"LoadState={load}\n"
             f"ActiveState={active}\n"
             f"SubState={sub}\n"
             f"MainPID={pid}\n"
@@ -348,6 +435,17 @@ class CanaryHarness(unittest.TestCase):
 
 
 class StrictCanaryStateTests(CanaryHarness):
+    def test_disposable_canary_rejects_missing_protected_unit(self) -> None:
+        self._write_state(
+            "vllm-embedding.service",
+            self._state(load="not-found", active="inactive", sub="dead", pid=0),
+        )
+        stamp = self.runtime / "gb10-memory-guardian" / "disposable-canary.passed"
+        stamp.unlink()
+        result = self._run("disposable")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(stamp.exists())
+
     def test_configured_target_check_is_read_only_and_proves_text_identity(self) -> None:
         result = self._run("configured-target")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

@@ -122,7 +122,11 @@ class MemoryGuardianContractTests(unittest.TestCase):
 
     def test_cgroup_helper_publishes_registration_atomically(self) -> None:
         helper = CGROUP_HELPER.read_text()
+        text_unit = TEXT_UNIT.read_text()
         self.assertIn("GB10_CGROUP_REGISTRATION_PATH", helper)
+        self.assertIn("GB10_CONTAINER_CIDFILE", helper)
+        self.assertIn("GB10_CONTAINER_CIDFILE", text_unit)
+        self.assertIn("--cidfile=", text_unit)
         self.assertIn("container_id=", helper)
         self.assertIn("control_group=", helper)
         self.assertRegex(helper, r"mktemp|\.tmp")
@@ -136,15 +140,17 @@ class MemoryGuardianContractTests(unittest.TestCase):
         self.assertIn("app.slice/${scope}", helper)
         cleanup_trap = helper.index("trap fail_closed_registration EXIT")
         self.assertLess(
-            helper.index('if [[ "$registration_dir" != "$expected_registration_dir"'),
+            helper.index("acquire_launch_cid"),
             cleanup_trap,
-            "the cleanup trap must never see an unvalidated registration path",
+            "the immutable launch CID must be captured before any fallible publication work",
         )
         self.assertLess(
-            helper.index('/usr/bin/install -d -m 0700 "$registration_dir"'),
             cleanup_trap,
-            "the cleanup trap must never traverse an unvalidated parent directory",
+            helper.index('if [[ "$registration_dir" != "$expected_registration_dir"'),
+            "registration-path rejection must still trigger exact CID cleanup",
         )
+        self.assertIn('"$registration_path_valid" == "1"', helper)
+        self.assertNotIn('run_docker stop --time 5 "$name"', helper)
         for hardcoded_target in (
             "querit-4b-reranker",
             "vllm-aeon-27b-dflash",

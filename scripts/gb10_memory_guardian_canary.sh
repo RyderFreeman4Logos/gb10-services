@@ -171,6 +171,10 @@ require_running_unit() {
 unit_fingerprint() {
   local unit="$1"
   load_unit_state "$unit"
+  [[ "$UNIT_LOAD_STATE" == "loaded" ]] || {
+    echo "protected unit is not loaded and cannot be safely snapshotted: $unit load=$UNIT_LOAD_STATE" >&2
+    return 1
+  }
   printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
     "$UNIT_LOAD_STATE" "$UNIT_ACTIVE_STATE" "$UNIT_SUB_STATE" "$UNIT_MAIN_PID" \
     "$UNIT_RESULT" "$UNIT_EXEC_MAIN_CODE" "$UNIT_EXEC_MAIN_STATUS" "$UNIT_NRESTARTS"

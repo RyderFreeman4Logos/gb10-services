@@ -14,21 +14,13 @@ docker_timeout_seconds="${GB10_DOCKER_TIMEOUT_SECONDS:-3}"
 systemctl_timeout_seconds="${GB10_SYSTEMCTL_TIMEOUT_SECONDS:-10}"
 wait_seconds="${GB10_CGROUP_WAIT_SECONDS:-120}"
 registration_path="${GB10_CGROUP_REGISTRATION_PATH:-}"
+container_cidfile="${GB10_CONTAINER_CIDFILE:-}"
 registration_published=0
+registration_path_valid=0
 registration_tmp=""
 docker_bin="${GB10_DOCKER_BIN:-/usr/bin/docker}"
 systemctl_bin="${GB10_SYSTEMCTL_BIN:-/usr/bin/systemctl}"
 cgroup_root="${GB10_CGROUP_ROOT:-/sys/fs/cgroup}"
-if [[ ! "$expected_gib" =~ ^[1-9][0-9]*$ ]]; then
-  echo "expected GiB must be a positive integer: $expected_gib" >&2
-  exit 2
-fi
-for value in "$docker_timeout_seconds" "$systemctl_timeout_seconds" "$wait_seconds"; do
-  if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
-    echo "timeout values must be positive integers: $value" >&2
-    exit 2
-  fi
-done
 export DOCKER_HOST="${DOCKER_HOST:-unix://${XDG_RUNTIME_DIR:-/run/user/${UID}}/docker.sock}"
 
 run_docker() {
@@ -41,11 +33,87 @@ run_systemctl() {
     "$systemctl_bin" --user "$@"
 }
 
+acquire_launch_cid() {
+  local expected_cidfile_dir cid_lines=() attempt
+  expected_cidfile_dir="${XDG_RUNTIME_DIR:-/run/user/${UID}}/gb10-memory-guardian"
+  if [[ -z "$container_cidfile" || "${container_cidfile%/*}" != "$expected_cidfile_dir" \
+    || "${container_cidfile##*/}" != "aeon-text.cid" ]]; then
+    echo "registered container requires the reviewed runtime cidfile path" >&2
+    return 1
+  fi
+  for attempt in {1..10}; do
+    if [[ -f "$container_cidfile" && ! -L "$container_cidfile" ]]; then
+      mapfile -t cid_lines < "$container_cidfile"
+      if [[ "${#cid_lines[@]}" == "1" && "${cid_lines[0]}" =~ ^[0-9a-f]{64}$ ]]; then
+        cid="${cid_lines[0]}"
+        return
+      fi
+    fi
+    sleep 1
+  done
+  echo "could not acquire immutable launch CID from $container_cidfile" >&2
+  return 1
+}
+
 reject_registration_destination() {
   echo "$1" >&2
-  run_docker stop --time 5 "$name" >/dev/null 2>&1 || true
   exit 2
 }
+
+cid=""
+if [[ -n "$registration_path" ]]; then
+  # Docker --cidfile publishes this immutable identity before ExecStartPost.
+  # Capture it before any fallible validation/publication operation so EXIT
+  # cleanup never has to resolve a reusable container name.
+  acquire_launch_cid
+fi
+
+fail_closed_registration() {
+  local status=$? running=""
+  trap - EXIT
+  if [[ -n "$registration_tmp" ]]; then
+    rm -f -- "$registration_tmp"
+  fi
+  if [[ "$status" != "0" && -n "$registration_path" && "$registration_published" != "1" ]]; then
+    if [[ "$registration_path_valid" == "1" ]]; then
+      rm -f -- "$registration_path"
+    fi
+    if [[ -z "$cid" ]]; then
+      echo "registration publication failed before exact container identity was captured" >&2
+      status=1
+    else
+      if ! run_docker stop --time 5 "$cid" >/dev/null 2>&1; then
+        echo "graceful cleanup failed for exact launched container $cid; forcing exact cleanup" >&2
+        if ! run_docker kill "$cid" >/dev/null 2>&1; then
+          echo "exact launched container cleanup failed: $cid" >&2
+          status=1
+        fi
+      fi
+      running="$(run_docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || true)"
+      if [[ "$running" == "true" ]]; then
+        run_docker kill "$cid" >/dev/null 2>&1 || status=1
+        running="$(run_docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || true)"
+      fi
+      if [[ -n "$running" && "$running" != "false" ]]; then
+        echo "exact launched container still has unsafe state after cleanup: $cid state=$running" >&2
+        status=1
+      fi
+    fi
+  fi
+  exit "$status"
+}
+trap fail_closed_registration EXIT
+
+if [[ ! "$expected_gib" =~ ^[1-9][0-9]*$ ]]; then
+  echo "expected GiB must be a positive integer: $expected_gib" >&2
+  exit 2
+fi
+for value in "$docker_timeout_seconds" "$systemctl_timeout_seconds" "$wait_seconds"; do
+  if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+    echo "timeout values must be positive integers: $value" >&2
+    exit 2
+  fi
+done
 
 expected_registration_dir=""
 registration_dir=""
@@ -73,37 +141,15 @@ if [[ -n "$registration_path" ]]; then
     reject_registration_destination \
       "guardian registration directory is unsafe: $registration_dir"
   fi
+  registration_path_valid=1
 fi
-
-fail_closed_registration() {
-  local status=$?
-  trap - EXIT
-  if [[ -n "$registration_tmp" ]]; then
-    rm -f -- "$registration_tmp"
-  fi
-  if [[ "$status" != "0" && -n "$registration_path" && "$registration_published" != "1" ]]; then
-    rm -f -- "$registration_path"
-    if [[ -z "$cid" ]]; then
-      echo "registration publication failed before exact container identity was captured" >&2
-      status=1
-    elif ! run_docker stop --time 5 "$cid" >/dev/null 2>&1; then
-      echo "graceful cleanup failed for exact launched container $cid; forcing exact cleanup" >&2
-      if ! run_docker kill "$cid" >/dev/null 2>&1; then
-        echo "exact launched container cleanup failed: $cid" >&2
-        status=1
-      fi
-    fi
-  fi
-  exit "$status"
-}
-trap fail_closed_registration EXIT
-
-cid=""
 cg=""
 scope=""
 deadline=$((SECONDS + wait_seconds))
 while (( SECONDS < deadline )); do
-  cid="$(run_docker inspect -f '{{.Id}}' "$name" 2>/dev/null || true)"
+  if [[ -z "$cid" ]]; then
+    cid="$(run_docker inspect -f '{{.Id}}' "$name" 2>/dev/null || true)"
+  fi
   if [[ -z "$cid" ]]; then
     sleep 1
     continue

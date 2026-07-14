@@ -12,6 +12,7 @@ Type=simple
 Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
 Environment=HF_HUB_OFFLINE=1
 Environment=GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1
+Environment=GB10_CONTAINER_CIDFILE=%t/gb10-memory-guardian/aeon-text.cid
 OOMScoreAdjust=500
 # Wrapper/docker-CLI only. Real AEON memory hard-cap is docker --memory 69g plus
 # ExecStartPost MemoryMax=69G / MemorySwapMax=0 on docker-*.scope.
@@ -28,9 +29,10 @@ TimeoutStartSec=1200
 TimeoutStopSec=60
 
 ExecStartPre=/bin/bash -c 'for i in $(seq 1 120); do curl -fsS --max-time 3 http://100.105.4.92:18012/v1/models >/dev/null 2>&1 && exit 0; sleep 5; done; echo "embedding not ready after 10min"; exit 1'
-ExecStartPre=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1
+ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-memory-guardian
+ExecStartPre=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1 %t/gb10-memory-guardian/aeon-text.cid
 ExecStartPre=-/usr/bin/docker rm -f vllm-aeon-27b-dflash-n12 vllm-aeon-27b-dflash vllm-aeon-27b
-ExecStart=/usr/bin/docker run --rm --name vllm-aeon-27b-dflash-n12 \
+ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.cid --name vllm-aeon-27b-dflash-n12 \
   --cgroup-parent app.slice \
   --gpus all --ipc host \
   -p 100.105.4.92:18010:8000 \
@@ -76,7 +78,8 @@ ExecStart=/usr/bin/docker run --rm --name vllm-aeon-27b-dflash-n12 \
 # Ordinary stack budget: 69+20+18=107GiB (AEON+embedding+querit-4b).
 ExecStartPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh vllm-aeon-27b-dflash-n12 69
 ExecStop=/usr/bin/timeout --signal=TERM --kill-after=5 30 /usr/bin/docker stop --time 20 vllm-aeon-27b-dflash-n12
-ExecStopPost=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1
+ExecStopPost=/bin/bash -c 'cidfile=%t/gb10-memory-guardian/aeon-text.cid; [[ -f "$cidfile" && ! -L "$cidfile" ]] || exit 0; IFS= read -r cid <"$cidfile"; [[ "$cid" =~ ^[0-9a-f]{64}$ ]] || exit 1; /usr/bin/timeout --signal=TERM --kill-after=2 3 /usr/bin/docker inspect "$cid" >/dev/null 2>&1 || exit 0; /usr/bin/timeout --signal=TERM --kill-after=2 8 /usr/bin/docker stop --time 5 "$cid" >/dev/null 2>&1 || /usr/bin/timeout --signal=TERM --kill-after=2 3 /usr/bin/docker kill "$cid" >/dev/null 2>&1; running=$(/usr/bin/timeout --signal=TERM --kill-after=2 3 /usr/bin/docker inspect -f "{{.State.Running}}" "$cid" 2>/dev/null || true); [[ -z "$running" || "$running" == false ]]'
+ExecStopPost=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1 %t/gb10-memory-guardian/aeon-text.cid
 StandardOutput=journal
 StandardError=journal
 
