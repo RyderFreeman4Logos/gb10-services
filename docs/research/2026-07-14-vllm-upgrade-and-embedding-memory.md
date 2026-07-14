@@ -1,7 +1,7 @@
 # vLLM upgrade and Qwen3 embedding memory profile research
 
 - **Date:** 2026-07-14
-- **Last updated:** 2026-07-14T08:44:18-07:00
+- **Last updated:** 2026-07-14T09:33:48-07:00
 - **Question:** Can the reliability-critical `Qwen/Qwen3-Embedding-8B` service safely move from a 40,960-token / 5,820 MiB KV / 24 GiB container profile to a 32,768-token / 4,800 MiB KV / 20 GiB source contract, and should the service move to raw vLLM v0.25.x now?
 - **Scope:** Source and read-only evidence only. No service, Docker, systemd, deployment, or model-runtime mutation was performed.
 - **Decision status:** Commit the smaller source profile; defer live activation to a maintenance-window canary. Keep the pinned v0.24.0 image for now while preparing a qualified v0.25.x route. This is a deferral, not a decision to never upgrade.
@@ -67,7 +67,7 @@ That is `69 + 24 + 18 = 111 GiB`. Older unit comments referring to `64 + 24 + 24
 - Hugging Face Text Embeddings Inference (TEI) lists native Qwen3 embedding support and an **experimental** SM121/GB10 image, not a stable production-qualified path. Issue [TEI #845](https://github.com/huggingface/text-embeddings-inference/issues/845) reproduces Qwen3-Embedding-8B all-NaN vectors from FP16 overflow and explains that native BF16 support is the required fix, targeted for a later release. The current audited route therefore cannot preserve the existing BF16 embedding contract safely.
 - TEI's published reranker matrix does not establish support for Qwen3-Reranker or Querit. The open Qwen3 reranker request [#643](https://github.com/huggingface/text-embeddings-inference/issues/643) confirms that native embedding support must not be generalized into reranker compatibility.
 - Infinity issues [#598](https://github.com/michaelfeil/infinity/issues/598), [#611](https://github.com/michaelfeil/infinity/issues/611), and [#642](https://github.com/michaelfeil/infinity/issues/642) leave model/version and exact post-processing quality concerns. Infinity is not a source-grounded drop-in replacement for this stack.
-- SGLang evaluation remains pending and is recorded as an unknown below rather than assumed unsuitable.
+- SGLang evaluation is complete. The overall verdict is **NO-GO** for this stack; only Qwen3-Embedding-8B at the required 32,768-token contract merits a conditional, isolated canary. The source and artifact evidence is recorded in the running log below.
 
 ## Calculations and inferences
 
@@ -358,9 +358,53 @@ only restoration of the previous embedding source; it does not validate the new
 - The post-change representative cgroup peak and true UMA residency reduction are unknown; proportional KV and peak reductions are projections.
 - Whether #44490 alone fully explains this host's historical memory steps is unknown; its upstream bug class is relevant, but no private workload replay has been performed on a fixed image.
 - Whether a future formal release will contain both #44490 and #48483, with adequate tests and SM121 artifacts, is unknown.
-- SGLang embedding/reranker contract fidelity, SM121 artifact quality, memory profile, and OpenAI-compatible alias/dimension behavior remain pending research.
+- Whether an isolated SGLang Qwen3-Embedding-8B canary can load on SM121 and preserve publisher-runtime quality at exactly 32,768 tokens remains unknown; it is a canary question, not a production approval.
 
 ## Running log
 
 - **2026-07-14T08:44:18-07:00:** Recorded current source/live aggregate evidence, proportional KV sizing, 20 GiB cap reasoning, v0.25.x fix/provenance gaps, and source-first decision. SGLang remains pending.
-- **Future entry:** Add SGLang source/artifact/quality findings without rewriting the facts above; record new evidence and decision deltas with a new timestamp.
+
+### 2026-07-14T09:33:48-07:00 — SGLang pooling verdict
+
+**Overall verdict: NO-GO.** No SGLang production, systemd, Docker, or model-runtime
+change is approved. The only conditional next step is an isolated
+`Qwen/Qwen3-Embedding-8B` canary capped at the required 32,768-token embedding
+contract; reranking and Querit remain excluded.
+
+- **Qwen3-Embedding-8B: conditional isolated canary only.** SGLang has a native
+  `/v1/embeddings` route and its Qwen3 model path uses LAST-token pooling plus L2
+  normalization. The registered suite names the 8B checkpoint and compares the
+  SRT runner with the Hugging Face runner, but the asserted evidence is for
+  short model-level inputs, not the HTTP endpoint or exact 32,768-token parity.
+  Therefore it establishes an implementation path, not production-equivalent
+  quality. Primary evidence: [Qwen3 pooling implementation](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/qwen3.py#L472-L543),
+  [registered embedding tests](https://github.com/sgl-project/sglang/blob/main/test/registered/prefill_only/test_embedding_models.py#L40-L43), and
+  [embedding handler](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/openai/serving_embedding.py).
+- **Qwen3-Reranker-8B: no-go.** `/v1/rerank` is native, but the adapter renders a
+  prompt, extracts `yes`/`no` logits, and normalizes them rather than executing a
+  publisher classification head. SGLang's template differs from the publisher
+  template, and the support PR supplies no real-8B golden exact-score or ranking
+  parity. Primary evidence: [rerank implementation](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/openai/serving_rerank.py#L354-L396),
+  [SGLang template](https://github.com/sgl-project/sglang/blob/main/examples/chat_template/qwen3_reranker.jinja),
+  [publisher template](https://huggingface.co/Qwen/Qwen3-Reranker-8B/raw/main/chat_template.jinja), and
+  [support PR #16403](https://github.com/sgl-project/sglang/pull/16403).
+- **Querit-4B: unsupported by stock SGLang.** The checkpoint uses a custom
+  two-class head and scoring path, while no stock model/head adapter or exact-ID
+  registration evidence was found. Generic Qwen3 loading or
+  `--trust-remote-code` is not sufficient evidence. Primary evidence:
+  [Querit config](https://huggingface.co/Querit/Querit-4B/raw/main/config.json) and
+  [model implementation](https://huggingface.co/Querit/Querit-4B/raw/main/modeling_querit_4b.py).
+- **GB10 artifact gate: unresolved.** SGLang v0.5.15 has an official CUDA 13
+  Dockerfile and ARM64 multi-architecture build chain, but the open SM121
+  `sglang-kernel` wheel gap can fail during import before model load. The open
+  fallback does not add the missing SM121 kernels. Primary evidence:
+  [v0.5.15 Dockerfile](https://github.com/sgl-project/sglang/blob/v0.5.15/docker/Dockerfile),
+  [multi-arch workflow](https://github.com/sgl-project/sglang/blob/v0.5.15/.github/workflows/_docker-build-and-publish.yml),
+  [issue #29317](https://github.com/sgl-project/sglang/issues/29317), and
+  [PR #30562](https://github.com/sgl-project/sglang/pull/30562).
+
+Any future embedding canary must first pass the SM121 import/startup gate, pin
+the release image digest and BF16 checkpoint/tokenizer revisions, use the
+publisher query instruction, and compare HTTP vectors plus retrieval neighbors
+against the publisher runtime at exactly 32,768 tokens. This is not approval to
+change production.
