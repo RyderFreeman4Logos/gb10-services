@@ -18,7 +18,7 @@ OOMScoreAdjust=500
 # ExecStartPost MemoryMax=69G / MemorySwapMax=0 on docker-*.scope.
 # 2026-07-09: 36GiB KV keeps ~2.47 full 262144-token windows while leaving
 # headroom for the reranker's observed 116.74GiB startup peak at 40GiB AEON KV.
-# Three-service target: ~110.7GiB steady / ~112.7GiB equivalent startup peak.
+# Co-residency still requires UMA telemetry; container caps are ceilings.
 MemoryMax=256M
 MemorySwapMax=0
 # Recover from real vLLM/container crashes such as EngineDeadError exits.
@@ -74,7 +74,7 @@ ExecStart=/usr/bin/docker run --rm --name vllm-aeon-27b-dflash-n12 \
     --trust-remote-code
 # Rootless Docker can accept --memory-swap while leaving memory.swap.max=max.
 # Enforce sets docker-*.scope MemoryMax=69G + MemorySwapMax=0 and verifies both.
-# Ordinary stack budget: 69+24+18=111GiB (AEON+embedding+querit-4b).
+# Ordinary stack budget: 69+20+18=107GiB (AEON+embedding+querit-4b).
 ExecStartPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh vllm-aeon-27b-dflash-n12 69
 ExecStop=/usr/bin/timeout --signal=TERM --kill-after=5 30 /usr/bin/docker stop --time 20 vllm-aeon-27b-dflash-n12
 ExecStopPost=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1

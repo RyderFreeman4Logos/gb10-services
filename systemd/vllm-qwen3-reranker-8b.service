@@ -43,8 +43,8 @@ ExecStart=/usr/bin/docker run --rm --name vllm-qwen3-reranker-8b \
     --hf-overrides '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}' \
     --trust-remote-code
 # Rootless Docker can accept --memory-swap while leaving memory.swap.max=max.
-# Enforce the generated docker scope directly and verify the 64+24+24=112GiB
-# vLLM budget leaves ~9.6GiB headroom on the 121.6GiB GB10 host.
+# Enforce the generated docker scope directly. This disabled 24G fallback is not
+# part of the ordinary 69+20+18=107GiB AEON+embedding+Querit source profile.
 ExecStartPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh vllm-qwen3-reranker-8b 24
 ExecStop=/usr/bin/docker stop vllm-qwen3-reranker-8b
 StandardOutput=journal

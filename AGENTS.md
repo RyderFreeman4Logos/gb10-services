@@ -18,8 +18,8 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 
 ## Current Reference Runtime
 
-* vLLM image for embedding, AEON chat, and reranker: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0` (`sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c`).
-* `vllm-embedding.service`: `max-model-len=40960`, `max-num-batched-tokens=8192`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
+* vLLM image for embedding, AEON chat, and the disabled vLLM reranker fallback: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0` (`sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c`).
+* `vllm-embedding.service` tracked source contract: BF16 Qwen3-Embedding-8B with 4,096-dimensional output, `max-model-len=32768`, `max-num-batched-tokens=8192`, `max-num-seqs=64`, `kv-cache-memory-bytes=4800M`, and a 20 GiB no-swap hard cap. The validated 5,820 MiB baseline yielded 41,376 KV tokens; 4,800 MiB projects about 34,124 tokens (4.14% above 32,768) but is not production-verified until a live restart prints at least 32,768 tokens.
 * `vllm-aeon-27b-dflash.service`: DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-batched-tokens=32768`, `kv-cache-memory-bytes=15360M`, verified 269,589 KV tokens.
 * `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
 * `llm-guard-proxy` routes by request `model` to AEON chat (`aeon-ultimate`, `qwen3.6-27b-decensor-by-aeon`), embedding (`qwen3-embedding-8b`, `Qwen/Qwen3-Embedding-8B`), or reranker (`qwen3-reranker-8b`, `Qwen/Qwen3-Reranker-8B`).
@@ -206,6 +206,19 @@ systemctl --user start vllm-aeon-27b-dflash.service
 systemctl --user start querit-4b-reranker.service
 systemctl --user start llm-guard-proxy.service
 ```
+
+The embedding 32K/4,800 MiB/20 GiB profile is source-first and must be activated
+only in an approved maintenance window. Before stopping the stack, snapshot the
+embedding `ActiveState`, `MainPID`, `NRestarts`, endpoint quality/dimensions,
+startup capacity log, cgroup current/peak/max/swap, and text/reranker state,
+PIDs, and restart counts. After startup, require at least 32,768 reported KV
+tokens, exact 4,096-dimensional finite embeddings through both aliases, no cap
+or swap event, and unchanged text/reranker invariants. Roll back to
+`max-model-len=40960`, `kv-cache-memory-bytes=5820M`, Docker
+`--memory/--memory-swap=24g`, and helper cap `24G` if startup, capacity, cap, or
+quality checks fail. See
+`docs/research/2026-07-14-vllm-upgrade-and-embedding-memory.md` for evidence and
+the full canary criteria.
 
 ---
 

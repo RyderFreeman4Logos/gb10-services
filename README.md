@@ -27,7 +27,7 @@ graph TD
 1. **vllm-aeon-27b-dflash.service**
    Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside the pinned AEON v0.24 GB10 Docker image for long-context processing up to 256k tokens, with FP8 KV cache and DFlash `TRITON_ATTN` enabled.
 2. **vllm-embedding.service**
-   Serves `Qwen/Qwen3-Embedding-8B` to handle vector embeddings. This is considered the reliability-critical baseline service. Its raw backend listens only on port `18012`; clients should use `llm-guard-proxy` on port `18009` or the guard-owned legacy listener `18002` with model `qwen3-embedding-8b`.
+   Serves BF16 `Qwen/Qwen3-Embedding-8B` with its full 4,096-dimensional output. This is the reliability-critical baseline service. The tracked source profile contracts for 32,768 tokens, 4,800 MiB explicit KV, and a 20 GiB no-swap hard cap while preserving 8,192 batched tokens, 64 sequences, aliases, and quality semantics. Its raw backend listens only on port `18012`; clients should use `llm-guard-proxy` on port `18009` or the guard-owned legacy listener `18002` with model `qwen3-embedding-8b`.
 3. **querit-4b-reranker.service**
    Serves the pinned `Querit/Querit-4B` snapshot through a bounded, single-inference Transformers adapter. It keeps the `qwen3-reranker-8b` and `Qwen/Qwen3-Reranker-8B` aliases, a 40,960-token input profile, and an 18 GiB no-swap container cap. Its raw backend listens on `18013`; clients should use `llm-guard-proxy` on `18009` or the restricted listener `18003`. The old `vllm-qwen3-reranker-8b.service` remains tracked only as a disabled rollback artifact.
 4. **llm-guard-proxy.service**
@@ -78,7 +78,7 @@ direct cgroup kill. Embedding and both rerankers are lifecycle-independent and
 must retain the same state, `MainPID`, and restart count during text recovery.
 The Bash swap observer remains enabled only for alerts and evidence.
 
-### Reference Production Profile (2026-07-11)
+### Reference Production Profile (source updated 2026-07-14)
 
 The reference host runs all three model containers from this pinned image digest:
 
@@ -87,15 +87,16 @@ ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0
 digest: sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c
 ```
 
-Verified startup capacities:
+Capacity contracts and evidence:
 
 ```text
-embedding:  max-model-len 40,960, KV 5,820M -> 41,376 tokens = 1.01015625x
+embedding:  source max-model-len 32,768, KV 4,800M -> projected 34,124 tokens (4.14% margin; live verification pending)
+            validated baseline: KV 5,820M -> 41,376 tokens
 AEON chat:  max-model-len 262,144, FP8 KV 36,864M, MemoryMax 69G
 Querit:     snapshot 7b796de30ad8dc772d6c46c75659c1341283a665, max-model-len 40,960, MemoryMax 18G
 ```
 
-The committed ordinary model caps are AEON 69G + embedding 24G + Querit 18G = 111 GiB. Use `scripts/gb10_apply_aeon_querit_profile.sh` for the reranker migration; it verifies the production AEON 36,864 MiB KV profile and does not restart AEON unless `--restart-aeon` is explicit.
+The committed ordinary model caps are AEON 69G + embedding 20G + Querit 18G = 107 GiB, about 14.6 GiB below the 121.6 GiB host total. These are hard ceilings, not reservations; the expected UMA headroom gain comes mainly from reducing embedding's explicit KV allocation by 1,020 MiB. The 4,800 MiB capacity is proportional source reasoning, not production verification. Use `scripts/gb10_apply_aeon_querit_profile.sh` for the reranker migration; it verifies the production AEON 36,864 MiB KV profile and does not restart AEON unless `--restart-aeon` is explicit.
 
 ---
 
@@ -116,6 +117,7 @@ gb10-services/
 ├── crates/
 │   ├── gb10-memory-guardian-core/ # Parsers, registration, retained FDs, kill path
 │   └── gb10-memory-guardian/      # Polling user-service binary
+├── docs/research/          # Tracked dated source/live research and decisions
 ├── scripts/
 │   ├── aeon_chat_ready.py  # Waits for Chat vLLM metrics endpoint before starting reranker
 │   ├── aeon_hang_guard.py  # Python hook script for Docker container hang protection
@@ -306,6 +308,25 @@ text-readiness startup gate. The Querit unit neither publishes a guardian
 registration nor pulls in the guardian. `llm-guard-proxy.service` has ordering
 only and owns no backend lifecycle. The AEON healthcheck can restart text but
 has no embedding/reranker action.
+
+### Embedding 32K profile activation and rollback
+
+The tracked 32,768-token / 4,800 MiB KV / 20 GiB profile is source-first; do
+not copy it onto a running host and restart embedding in isolation. In an
+approved maintenance window, install the reviewed unit, snapshot embedding
+state/PID/restart count, cgroup current/peak/max/swap, startup capacity, and a
+fixed synthetic 4,096-dimensional quality canary, then use the full-stack
+memory-profile stop/start order documented in `AGENTS.md`. Snapshot text and
+both rerankers before and after as invariants.
+
+Accept the profile only when startup reports at least 32,768 KV tokens, both
+embedding aliases return finite 4,096-dimensional vectors within the accepted
+quality tolerance, no cap/swap event occurs, and neighboring model state is
+unchanged. Otherwise restore the reviewed 40,960-token / 5,820 MiB KV unit with
+24 GiB Docker memory/swap and a 24G helper cap, then repeat the same maintenance
+procedure. Preserve the failed canary receipts. The detailed calculations,
+vLLM upgrade rationale, and unknowns are in
+`docs/research/2026-07-14-vllm-upgrade-and-embedding-memory.md`.
 
 ### Memory-guardian canary and explicit text recovery test
 
