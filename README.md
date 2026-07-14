@@ -16,7 +16,7 @@ graph TD
     Proxy -->|Port 18013| Rerank[Querit-4B Reranker]
 
     subgraph Monitoring & Health
-        Sysmon[sysmon.sh] -->|Logs 1Hz Stats| CSV[(~/log/sysmon_*.csv)]
+        Sysmon[sysmon.sh] -->|Logs target-interval stats + observed cadence| CSV[(~/log/sysmon_*.csv)]
         RustGuardian[gb10-memory-guardian] -->|Pre-opened cgroup.kill FD| TextRecovery[Text-only Recovery]
         SwapGuard[gb10-swap-guard.sh] -->|Observer-only alerts + evidence| Ops[Operator]
         HCheck[aeon_healthcheck.sh] -->|Timer 2m| HangRecovery[CUDA Hang Recovery]
@@ -63,7 +63,13 @@ graph TD
    explicitly disable chat-only hot-restart probes, thinking rewrites, and
    parameter overrides.
 5. **sysmon.service**
-   A lightweight system monitor script executing at 1Hz, recording system load, temperatures, GPU metrics, disk I/O rates, swap-in/out, and top process RSS/swap memory consumption.
+   A lightweight observer-only system monitor targeting a one-second interval,
+   recording system load, exact Linux `MemAvailable`, temperatures, GPU metrics,
+   disk I/O rates, swap-in/out, top process RSS/swap memory, and observed cadence.
+   CSV v5 appends `mem_available_mb`, `sample_cadence_ms`,
+   `sample_elapsed_ms`, and `sample_lag_ms` without reordering v4 columns. A
+   2–3 second loop overrun is recorded as such; the service does not claim a
+   guaranteed 1 Hz sampling rate and performs no recovery action.
 
 ### Auxiliary Services
 *   **gb10-memory-guardian.service**: Keeps a touched 64 MiB reserve, polls a pre-opened `/proc/meminfo` descriptor once per second, and releases the reserve before writing directly to the configured text target's retained `cgroup.kill` descriptor below the strict 1 GiB `MemAvailable` threshold. It hot-reloads an owner-only TOML config transactionally and accepts only an atomic registration for the exact rootless Docker path under the current user's `app.slice`; invalid config candidates preserve the last-good target, while missing, stale, malformed, traversal, or symlinked active registrations disarm it.
@@ -130,7 +136,7 @@ gb10-services/
 │   ├── gb10_memory_guardian_canary.sh # Disposable canary/read-only identity proof
 │   ├── gb10-swap-guard.sh  # Observer-only MemAvailable/swap evidence
 │   ├── querit_openai_rerank_server.py # Bounded OpenAI-compatible adapter
-│   └── sysmon.sh           # System performance and process metric logger (1Hz)
+│   └── sysmon.sh           # Observer-only metrics with measured sample cadence
 └── systemd/
     ├── aeon-healthcheck.service
     ├── aeon-healthcheck.timer
