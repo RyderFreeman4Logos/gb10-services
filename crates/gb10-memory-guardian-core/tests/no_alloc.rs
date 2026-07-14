@@ -1,7 +1,9 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use gb10_memory_guardian_core::{kill_direct, EmergencyReserve, RegistrationManager};
+use gb10_memory_guardian_core::{
+    kill_direct, read_mem_available_fd, EmergencyReserve, MemInfoError, RegistrationManager,
+};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -94,4 +96,22 @@ fn reserve_release_and_direct_write_allocate_nothing() {
     assert_eq!(allocations, 0, "direct emergency function allocated");
     assert!(!reserve.is_allocated());
     fs::remove_dir_all(root).expect("remove fake cgroup tree");
+}
+
+#[test]
+fn malformed_meminfo_error_allocates_nothing() {
+    let root = unique_temp_dir();
+    fs::create_dir_all(&root).expect("create root");
+    let path = root.join("meminfo");
+    fs::write(&path, b"malformed\n").expect("write malformed meminfo");
+    let file = fs::File::open(&path).expect("open malformed meminfo");
+    let mut buffer = [0_u8; 128];
+
+    ALLOCATIONS.store(0, Ordering::SeqCst);
+    let result = read_mem_available_fd(&file, &mut buffer);
+    let allocations = ALLOCATIONS.load(Ordering::SeqCst);
+
+    assert_eq!(result, Err(MemInfoError::InvalidData));
+    assert_eq!(allocations, 0, "compact meminfo failure allocated");
+    fs::remove_dir_all(root).expect("remove meminfo fixture");
 }

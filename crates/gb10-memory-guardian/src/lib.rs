@@ -1,12 +1,12 @@
 //! Transactional configuration snapshots for the GB10 memory guardian.
 //!
-//! Filesystem notifications only produce candidates. The production loop must
+//! Healthy-loop polling only produces candidates. The production loop must
 //! validate and arm the candidate registration before explicitly committing it.
 
 use gb10_memory_guardian_core::{
-    effective_uid, CgroupTarget, GuardianError, RefreshStatus, RegistrationManager,
+    effective_uid, AttemptOutcome, CgroupTarget, EmergencyController, GuardianError, RefreshStatus,
+    RegistrationManager,
 };
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Deserialize;
 use std::env;
 use std::error::Error;
@@ -15,7 +15,6 @@ use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const RUNTIME_SUBDIRECTORY: &str = "gb10-memory-guardian";
@@ -126,6 +125,21 @@ pub enum TargetTransition {
     Superseded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmergencyIteration {
+    NoTarget,
+    Waiting,
+    Retry,
+    Verified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmergencyRefresh {
+    Unchanged,
+    Replaced,
+    NoTarget,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
@@ -190,14 +204,13 @@ impl FileGeneration {
     }
 }
 
-/// Watches the config's parent directory so atomic rename replacements are seen.
+/// Polls the config generation only from the healthy loop. This deliberately
+/// avoids a watcher thread that could allocate while the daemon is latched.
 pub struct TargetConfigMonitor {
     config_path: PathBuf,
     runtime_dir: PathBuf,
     active: TargetSnapshot,
     pending: Option<TargetSnapshot>,
-    receiver: Receiver<notify::Result<Event>>,
-    _watcher: RecommendedWatcher,
 }
 
 impl fmt::Debug for TargetConfigMonitor {
@@ -216,25 +229,12 @@ impl TargetConfigMonitor {
     pub fn new(config_path: &Path, runtime_dir: &Path) -> Result<Self, ConfigError> {
         let config_path = absolute_path(config_path)?;
         let runtime_dir = absolute_path(runtime_dir)?;
-        let parent = config_path
-            .parent()
-            .ok_or_else(|| ConfigError::MissingParent(config_path.clone()))?;
-        let (sender, receiver) = mpsc::channel();
-        let mut watcher = notify::recommended_watcher(move |event| {
-            let _ = sender.send(event);
-        })
-        .map_err(ConfigError::Watch)?;
-        watcher
-            .watch(parent, RecursiveMode::NonRecursive)
-            .map_err(ConfigError::Watch)?;
         let active = load_snapshot(&config_path, &runtime_dir)?;
         Ok(Self {
             config_path,
             runtime_dir,
             active,
             pending: None,
-            receiver,
-            _watcher: watcher,
         })
     }
 
@@ -262,35 +262,20 @@ impl TargetConfigMonitor {
     }
 
     fn reload_pending(&mut self) -> Result<(), ConfigError> {
-        let mut relevant_change = false;
-        loop {
-            match self.receiver.try_recv() {
-                Ok(Ok(event)) => {
-                    if event_is_relevant(&event, &self.config_path) {
-                        relevant_change = true;
-                    }
-                }
-                Ok(Err(error)) => {
-                    self.pending = None;
-                    return Err(ConfigError::WatchEvent(error));
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    self.pending = None;
-                    return Err(ConfigError::Invalid(
-                        "config notification channel disconnected".to_owned(),
-                    ));
-                }
-            }
+        let generation = current_generation(&self.config_path)?;
+        if generation == self.active.generation
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.generation == generation)
+        {
+            return Ok(());
         }
-
-        if relevant_change {
-            match load_snapshot(&self.config_path, &self.runtime_dir) {
-                Ok(snapshot) => self.pending = Some(snapshot),
-                Err(error) => {
-                    self.pending = None;
-                    return Err(error);
-                }
+        match load_snapshot(&self.config_path, &self.runtime_dir) {
+            Ok(snapshot) => self.pending = Some(snapshot),
+            Err(error) => {
+                self.pending = None;
+                return Err(error);
             }
         }
         Ok(())
@@ -355,6 +340,36 @@ impl TargetRegistrationSet {
         self.active.clear();
     }
 
+    /// Refresh only the immutable registration selected by the active config.
+    /// Pending config changes are intentionally ignored during an emergency.
+    pub fn reconcile_active_registration(
+        &mut self,
+    ) -> Result<TargetTransition, TargetRegistrationError> {
+        let was_armed = self.active.target().is_some();
+        let refresh = self.active.refresh()?;
+        if matches!(refresh, RefreshStatus::Replaced) {
+            if was_armed {
+                Ok(TargetTransition::Refreshed)
+            } else {
+                Ok(TargetTransition::Armed)
+            }
+        } else {
+            Ok(TargetTransition::Unchanged)
+        }
+    }
+
+    /// Allocation-free registration refresh for the emergency latch. Active
+    /// compact errors degrade to NoTarget only when they disarm the descriptor
+    /// set; transient errors retain and continue attacking the current target.
+    fn refresh_active_registration_emergency(&mut self) -> EmergencyRefresh {
+        match self.active.refresh() {
+            Ok(RefreshStatus::Replaced) => EmergencyRefresh::Replaced,
+            Ok(RefreshStatus::Unchanged) => EmergencyRefresh::Unchanged,
+            Err(_) if self.active.target().is_none() => EmergencyRefresh::NoTarget,
+            Err(_) => EmergencyRefresh::Unchanged,
+        }
+    }
+
     /// Reconcile configuration and registration state while memory is healthy.
     pub fn reconcile(&mut self) -> Result<TargetTransition, TargetRegistrationError> {
         let candidate = match self.monitor.pending_snapshot() {
@@ -405,17 +420,56 @@ impl TargetRegistrationSet {
             }
         }
 
-        let was_armed = self.active.target().is_some();
-        let refresh = self.active.refresh()?;
-        if matches!(refresh, RefreshStatus::Replaced) {
-            if was_armed {
-                Ok(TargetTransition::Refreshed)
-            } else {
-                Ok(TargetTransition::Armed)
+        self.reconcile_active_registration()
+    }
+}
+
+/// Execute one allocation-free low-memory iteration. The current generation is
+/// attempted before the immutable registration is probed. A changed or
+/// same-scope-recreated generation resets retry state and is attempted in this
+/// same iteration.
+pub fn emergency_iteration(
+    controller: &mut EmergencyController,
+    targets: &mut TargetRegistrationSet,
+    now_millis: u64,
+) -> EmergencyIteration {
+    controller.enter_emergency();
+    let first = match targets.target() {
+        Some(target) => attempt_iteration(controller, target, now_millis),
+        None => EmergencyIteration::NoTarget,
+    };
+
+    match targets.refresh_active_registration_emergency() {
+        EmergencyRefresh::Replaced => {
+            controller.reset_for_target_generation();
+            let Some(target) = targets.target() else {
+                return EmergencyIteration::NoTarget;
+            };
+            let replacement = attempt_iteration(controller, target, now_millis);
+            if matches!(replacement, EmergencyIteration::Verified) {
+                targets.disarm();
             }
-        } else {
-            Ok(TargetTransition::Unchanged)
+            replacement
         }
+        EmergencyRefresh::NoTarget => EmergencyIteration::NoTarget,
+        EmergencyRefresh::Unchanged => {
+            if matches!(first, EmergencyIteration::Verified) {
+                targets.disarm();
+            }
+            first
+        }
+    }
+}
+
+fn attempt_iteration(
+    controller: &mut EmergencyController,
+    target: &CgroupTarget,
+    now_millis: u64,
+) -> EmergencyIteration {
+    match controller.attempt(now_millis, target) {
+        AttemptOutcome::Waiting => EmergencyIteration::Waiting,
+        AttemptOutcome::Retry { .. } => EmergencyIteration::Retry,
+        AttemptOutcome::Verified { .. } => EmergencyIteration::Verified,
     }
 }
 
@@ -516,13 +570,6 @@ fn validate_registration_file(name: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn event_is_relevant(event: &Event, config_path: &Path) -> bool {
-    if event.kind.is_access() {
-        return false;
-    }
-    event.paths.is_empty() || event.paths.iter().any(|path| path == config_path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,13 +578,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn notification_channel_failure_preserves_last_good_snapshot() {
+    fn malformed_polled_candidate_preserves_last_good_snapshot() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock before epoch")
             .as_nanos();
         let root = env::temp_dir().join(format!(
-            "gb10-memory-guardian-notify-test-{}-{nonce}",
+            "gb10-memory-guardian-poll-test-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&root).expect("create test root");
@@ -552,17 +599,12 @@ mod tests {
         let mut monitor =
             TargetConfigMonitor::new(&config_path, &root).expect("create config monitor");
         let last_good = monitor.active().clone();
-        let (sender, disconnected) = mpsc::channel();
-        drop(sender);
-        monitor.receiver = disconnected;
+        fs::write(&config_path, "not valid toml").expect("replace with invalid config");
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).expect("chmod config");
 
-        let error = monitor
+        let _error = monitor
             .pending_snapshot()
-            .expect_err("disconnected notification channel must fail closed");
-        assert!(matches!(
-            error,
-            ConfigError::Invalid(message) if message.contains("notification channel disconnected")
-        ));
+            .expect_err("invalid polled candidate must fail closed");
         assert_eq!(monitor.active(), &last_good);
 
         drop(monitor);

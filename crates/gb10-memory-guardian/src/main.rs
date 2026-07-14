@@ -1,14 +1,16 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use gb10_memory_guardian::{TargetRegistrationSet, TargetTransition};
+use gb10_memory_guardian::{emergency_iteration, TargetRegistrationSet, TargetTransition};
 use gb10_memory_guardian_core::{
     effective_uid, read_mem_available_fd, should_rearm, should_shed, AttemptOutcome, CgroupTarget,
     EmergencyController, EmergencyReserve, DEFAULT_RESERVE_BYTES, DEFAULT_RETRY_MILLIS,
     DEFAULT_THRESHOLD_BYTES,
 };
 use std::env;
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread;
@@ -159,6 +161,53 @@ fn parse_positive_env(name: &str, default: u64) -> Result<u64, String> {
     Ok(value)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopAction {
+    Emergency,
+    Rearm,
+    Healthy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EmergencyLatch {
+    latched: bool,
+}
+
+impl EmergencyLatch {
+    fn new() -> Self {
+        Self { latched: false }
+    }
+
+    fn is_latched(self) -> bool {
+        self.latched
+    }
+
+    fn next_action(
+        &mut self,
+        mem_available: u64,
+        threshold_bytes: u64,
+        reserve_bytes: usize,
+    ) -> LoopAction {
+        if should_shed(mem_available, threshold_bytes) {
+            self.latched = true;
+            return LoopAction::Emergency;
+        }
+        if self.latched {
+            if should_rearm(mem_available, threshold_bytes, reserve_bytes) {
+                LoopAction::Rearm
+            } else {
+                LoopAction::Emergency
+            }
+        } else {
+            LoopAction::Healthy
+        }
+    }
+
+    fn acknowledge_rearmed(&mut self) {
+        self.latched = false;
+    }
+}
+
 fn run_production(config: Config) -> Result<(), String> {
     debug_assert_eq!(DEFAULT_RESERVE_BYTES, 64 * 1024 * 1024);
     debug_assert_eq!(DEFAULT_THRESHOLD_BYTES, 1024 * 1024 * 1024);
@@ -182,10 +231,12 @@ fn run_production(config: Config) -> Result<(), String> {
         )
     })?;
     enforce_expected_target_identity(&targets, &config)?;
+    publish_guardian_status(&config, &targets)?;
     let initial_transition = targets.reconcile();
     if initial_transition.is_ok() {
         enforce_expected_target_identity(&targets, &config)?;
     }
+    publish_guardian_status(&config, &targets)?;
     let mut degraded_logged = match initial_transition {
         Ok(TargetTransition::Armed | TargetTransition::Refreshed | TargetTransition::Swapped) => {
             controller.reset_for_target_generation();
@@ -203,73 +254,206 @@ fn run_production(config: Config) -> Result<(), String> {
     };
     let started = Instant::now();
     let mut meminfo_buffer = [0_u8; MEMINFO_BUFFER_BYTES];
+    let mut latch = EmergencyLatch::new();
+    let mut emergency_status_deferred = false;
+    let mut reserve_failure_deferred = false;
 
     loop {
         let mem_available = match read_mem_available_fd(&meminfo, &mut meminfo_buffer) {
             Ok(value) => value,
             Err(error) => {
-                eprintln!("gb10-memory-guardian: degraded meminfo read: {error}");
+                if latch.is_latched() {
+                    let _iteration =
+                        emergency_iteration(&mut controller, &mut targets, elapsed_millis(started));
+                    emergency_status_deferred = true;
+                } else {
+                    eprintln!("gb10-memory-guardian: degraded meminfo read: {error}");
+                }
                 thread::sleep(config.poll_interval);
                 continue;
             }
         };
 
-        if should_shed(mem_available, config.threshold_bytes) {
-            controller.enter_emergency();
-            if let Some(target) = targets.target() {
-                let now = elapsed_millis(started);
-                if matches!(
-                    controller.attempt(now, target),
-                    AttemptOutcome::Verified { .. }
-                ) {
-                    targets.disarm();
-                }
+        match latch.next_action(mem_available, config.threshold_bytes, config.reserve_bytes) {
+            LoopAction::Emergency => {
+                let _iteration =
+                    emergency_iteration(&mut controller, &mut targets, elapsed_millis(started));
+                emergency_status_deferred = true;
             }
-        } else {
-            let transition = targets.reconcile();
-            if transition.is_ok() {
-                enforce_expected_target_identity(&targets, &config)?;
-            }
-            match transition {
-                Ok(
-                    TargetTransition::Armed
-                    | TargetTransition::Refreshed
-                    | TargetTransition::Swapped,
-                ) => {
-                    controller.reset_for_target_generation();
-                    degraded_logged = false;
-                    eprintln!(
-                        "gb10-memory-guardian: armed target {}",
-                        targets.active_label()
-                    );
-                }
-                Ok(TargetTransition::Unchanged | TargetTransition::Superseded) => {
-                    degraded_logged = false;
-                }
-                Err(error) if !degraded_logged => {
-                    eprintln!("gb10-memory-guardian: retaining last-good target: {error}");
-                    degraded_logged = true;
-                }
-                Err(_) => {}
-            }
-            if !controller.reserve().is_allocated()
-                && should_rearm(mem_available, config.threshold_bytes, config.reserve_bytes)
-            {
-                match controller.ensure_reserve(config.reserve_bytes) {
-                    Ok(true) => {
-                        eprintln!("gb10-memory-guardian: emergency reserve rearmed");
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
+            LoopAction::Rearm => match controller.ensure_reserve(config.reserve_bytes) {
+                Ok(_) => {
+                    latch.acknowledge_rearmed();
+                    if reserve_failure_deferred {
                         eprintln!(
-                            "gb10-memory-guardian: degraded reserve could not be rearmed: {error}"
+                            "gb10-memory-guardian: reserve rearm recovered after a deferred failure"
                         );
+                        reserve_failure_deferred = false;
+                    }
+                    eprintln!("gb10-memory-guardian: emergency reserve rearmed");
+                    if emergency_status_deferred {
+                        run_healthy_iteration(
+                            &mut controller,
+                            &mut targets,
+                            &config,
+                            &mut degraded_logged,
+                        )?;
+                        emergency_status_deferred = false;
                     }
                 }
+                Err(_) => {
+                    reserve_failure_deferred = true;
+                    let _iteration =
+                        emergency_iteration(&mut controller, &mut targets, elapsed_millis(started));
+                    emergency_status_deferred = true;
+                }
+            },
+            LoopAction::Healthy => {
+                run_healthy_iteration(
+                    &mut controller,
+                    &mut targets,
+                    &config,
+                    &mut degraded_logged,
+                )?;
             }
         }
         thread::sleep(config.poll_interval);
     }
+}
+
+fn run_healthy_iteration(
+    controller: &mut EmergencyController,
+    targets: &mut TargetRegistrationSet,
+    config: &Config,
+    degraded_logged: &mut bool,
+) -> Result<(), String> {
+    let transition = targets.reconcile();
+    if transition.is_ok() {
+        enforce_expected_target_identity(targets, config)?;
+    }
+    publish_guardian_status(config, targets)?;
+    match transition {
+        Ok(TargetTransition::Armed | TargetTransition::Refreshed | TargetTransition::Swapped) => {
+            controller.reset_for_target_generation();
+            *degraded_logged = false;
+            eprintln!(
+                "gb10-memory-guardian: armed target {}",
+                targets.active_label()
+            );
+        }
+        Ok(TargetTransition::Unchanged | TargetTransition::Superseded) => {
+            *degraded_logged = false;
+        }
+        Err(error) if !*degraded_logged => {
+            eprintln!("gb10-memory-guardian: retaining last-good target: {error}");
+            *degraded_logged = true;
+        }
+        Err(_) => {}
+    }
+    Ok(())
+}
+
+fn publish_guardian_status(config: &Config, targets: &TargetRegistrationSet) -> Result<(), String> {
+    let status_dir = config.runtime_dir.join("gb10-memory-guardian");
+    fs::create_dir_all(&status_dir)
+        .map_err(|error| format!("create status directory {}: {error}", status_dir.display()))?;
+    let directory_metadata = fs::symlink_metadata(&status_dir)
+        .map_err(|error| format!("inspect status directory {}: {error}", status_dir.display()))?;
+    if !directory_metadata.is_dir() || directory_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "status directory is not a real directory: {}",
+            status_dir.display()
+        ));
+    }
+
+    let registration_file = targets
+        .active_registration_path()
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "active registration path has no UTF-8 file name".to_owned())?;
+    let (state, container_id, scope, control_group, device, inode) =
+        if let Some(target) = targets.target() {
+            let scope = target
+                .scope_name()
+                .map_err(|error| format!("read armed scope identity: {error}"))?;
+            let container_id = scope
+                .strip_prefix("docker-")
+                .and_then(|value| value.strip_suffix(".scope"))
+                .ok_or_else(|| "armed scope is not an exact Docker scope".to_owned())?;
+            if container_id.len() != 64
+                || !container_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err("armed scope contains an invalid container identity".to_owned());
+            }
+            let (device, inode) = target
+                .generation_identity()
+                .map_err(|error| format!("read armed cgroup generation: {error}"))?;
+            (
+                "armed",
+                container_id.to_owned(),
+                scope.to_owned(),
+                format!(
+                    "/user.slice/user-{}.slice/user@{}.service/app.slice/{scope}",
+                    effective_uid(),
+                    effective_uid()
+                ),
+                device,
+                inode,
+            )
+        } else {
+            (
+                "disarmed",
+                "-".to_owned(),
+                "-".to_owned(),
+                "-".to_owned(),
+                0,
+                0,
+            )
+        };
+
+    let status_path = status_dir.join("guardian-status.v1");
+    let temporary_path = status_dir.join(format!(".guardian-status.v1.tmp.{}", std::process::id()));
+    match fs::remove_file(&temporary_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "remove stale status temporary {}: {error}",
+                temporary_path.display()
+            ));
+        }
+    }
+    let mut temporary = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary_path)
+        .map_err(|error| {
+            format!(
+                "create status temporary {}: {error}",
+                temporary_path.display()
+            )
+        })?;
+    let write_result = writeln!(temporary, "version=1")
+        .and_then(|()| writeln!(temporary, "state={state}"))
+        .and_then(|()| writeln!(temporary, "label={}", targets.active_label()))
+        .and_then(|()| writeln!(temporary, "registration_file={registration_file}"))
+        .and_then(|()| writeln!(temporary, "container_id={container_id}"))
+        .and_then(|()| writeln!(temporary, "scope={scope}"))
+        .and_then(|()| writeln!(temporary, "control_group={control_group}"))
+        .and_then(|()| writeln!(temporary, "cgroup_device={device}"))
+        .and_then(|()| writeln!(temporary, "cgroup_inode={inode}"))
+        .and_then(|()| writeln!(temporary, "guardian_pid={}", std::process::id()))
+        .and_then(|()| temporary.sync_all());
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!("write guardian status receipt: {error}"));
+    }
+    fs::rename(&temporary_path, &status_path).map_err(|error| {
+        let _ = fs::remove_file(&temporary_path);
+        format!("publish guardian status {}: {error}", status_path.display())
+    })
 }
 
 fn enforce_expected_target_identity(
@@ -354,4 +538,43 @@ fn run_bounded_direct_test(
         now = now.saturating_add(config.retry_millis);
     }
     Err(format!("{label} target was not verified empty or gone"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emergency_latch_blocks_healthy_work_until_rearm_is_acknowledged() {
+        let threshold = 1_000;
+        let reserve = 100;
+        let mut latch = EmergencyLatch::new();
+
+        assert_eq!(
+            latch.next_action(threshold - 1, threshold, reserve),
+            LoopAction::Emergency
+        );
+        assert!(latch.is_latched());
+        assert_eq!(
+            latch.next_action(threshold, threshold, reserve),
+            LoopAction::Emergency,
+            "the recovery band must remain emergency-only"
+        );
+        assert_eq!(
+            latch.next_action(threshold + reserve as u64, threshold, reserve),
+            LoopAction::Rearm
+        );
+        assert_eq!(
+            latch.next_action(threshold + reserve as u64, threshold, reserve),
+            LoopAction::Rearm,
+            "selecting rearm must not clear the latch"
+        );
+
+        latch.acknowledge_rearmed();
+        assert!(!latch.is_latched());
+        assert_eq!(
+            latch.next_action(threshold, threshold, reserve),
+            LoopAction::Healthy
+        );
+    }
 }

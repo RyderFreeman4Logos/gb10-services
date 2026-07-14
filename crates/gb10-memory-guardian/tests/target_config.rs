@@ -1,6 +1,8 @@
 use gb10_memory_guardian::{
-    TargetConfigMonitor, TargetRegistrationSet, TargetSnapshot, TargetTransition,
+    emergency_iteration, EmergencyIteration, TargetConfigMonitor, TargetRegistrationSet,
+    TargetSnapshot, TargetTransition,
 };
+use gb10_memory_guardian_core::{EmergencyController, EmergencyReserve};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -39,6 +41,13 @@ impl TempTree {
         self.root.join("cgroup")
     }
 
+    fn cgroup_path(&self, id_byte: char) -> PathBuf {
+        let container_id: String = std::iter::repeat_n(id_byte, 64).collect();
+        self.cgroup_root().join(format!(
+            "user.slice/user-{UID}.slice/user@{UID}.service/app.slice/docker-{container_id}.scope"
+        ))
+    }
+
     fn write_config(&self, label: &str, registration_file: &str) {
         fs::write(
             self.config_path(),
@@ -49,6 +58,12 @@ impl TempTree {
         .expect("write config");
         fs::set_permissions(self.config_path(), fs::Permissions::from_mode(0o600))
             .expect("chmod config");
+        fs::create_dir_all(self.runtime_dir().join("gb10-memory-guardian"))
+            .expect("create registration authority");
+        fs::create_dir_all(self.cgroup_root().join(format!(
+            "user.slice/user-{UID}.slice/user@{UID}.service/app.slice"
+        )))
+        .expect("create cgroup authority");
     }
 
     fn replace_config_atomically(&self, label: &str, registration_file: &str) {
@@ -378,4 +393,100 @@ fn missing_hot_reload_registration_preserves_last_good_armed_target() {
     assert_eq!(targets.active_label(), "new-text");
     assert!(targets.pending_label().is_none());
     assert!(targets.target().is_some());
+}
+
+#[test]
+fn replacement_before_old_empty_is_attacked_in_same_emergency_iteration() {
+    let tree = TempTree::new();
+    tree.write_config("aeon-text", "text-cgroup.v1");
+    tree.publish_registration("text-cgroup.v1", 'a');
+    let mut targets = TargetRegistrationSet::new(
+        &tree.config_path(),
+        &tree.runtime_dir(),
+        &tree.cgroup_root(),
+        UID,
+    )
+    .expect("load target config");
+    assert_eq!(
+        targets.reconcile().expect("arm first generation"),
+        TargetTransition::Armed
+    );
+
+    let first_kill = tree.cgroup_path('a').join("cgroup.kill");
+    tree.publish_registration("text-cgroup.v1", 'b');
+    let reserve = EmergencyReserve::with_page_size(4096, 4096).expect("reserve");
+    let mut controller = EmergencyController::new(reserve, 5_000);
+
+    assert!(matches!(
+        emergency_iteration(&mut controller, &mut targets, 0),
+        EmergencyIteration::Retry
+    ));
+    assert_eq!(
+        fs::read(first_kill).expect("read first cgroup.kill"),
+        b"1",
+        "the already-open generation must be attacked before registration refresh"
+    );
+    let replacement_kill = tree.cgroup_path('b').join("cgroup.kill");
+    assert_eq!(
+        fs::read(replacement_kill).expect("read replacement cgroup.kill"),
+        b"1",
+        "a replacement published before the old generation empties must be attacked immediately"
+    );
+    assert!(
+        targets.target().is_some(),
+        "a still-populated replacement must remain armed for bounded retries"
+    );
+}
+
+#[test]
+fn recreated_same_scope_generation_is_reopened_and_attacked() {
+    let tree = TempTree::new();
+    tree.write_config("aeon-text", "text-cgroup.v1");
+    tree.publish_registration("text-cgroup.v1", 'a');
+    let mut targets = TargetRegistrationSet::new(
+        &tree.config_path(),
+        &tree.runtime_dir(),
+        &tree.cgroup_root(),
+        UID,
+    )
+    .expect("load target config");
+    assert_eq!(
+        targets.reconcile().expect("arm generation"),
+        TargetTransition::Armed
+    );
+    let first_generation = targets
+        .target()
+        .expect("armed generation")
+        .generation_identity()
+        .expect("first generation identity");
+    let reserve = EmergencyReserve::with_page_size(4096, 4096).expect("reserve");
+    let mut controller = EmergencyController::new(reserve, 5_000);
+    assert!(matches!(
+        emergency_iteration(&mut controller, &mut targets, 0),
+        EmergencyIteration::Retry
+    ));
+
+    let scope = tree.cgroup_path('a');
+    fs::remove_file(scope.join("cgroup.kill")).expect("remove old kill");
+    fs::remove_file(scope.join("cgroup.events")).expect("remove old events");
+    fs::remove_dir(&scope).expect("remove old scope");
+    fs::create_dir(&scope).expect("recreate scope");
+    fs::write(scope.join("cgroup.kill"), "").expect("create new kill");
+    fs::write(scope.join("cgroup.events"), "populated 1\n").expect("create new events");
+
+    assert!(matches!(
+        emergency_iteration(&mut controller, &mut targets, 5_000),
+        EmergencyIteration::Retry
+    ));
+    assert_eq!(
+        fs::read(scope.join("cgroup.kill")).expect("read new kill"),
+        b"1",
+        "the recreated scope inode must be attacked in the detecting iteration"
+    );
+    let replacement_generation = targets
+        .target()
+        .expect("replacement remains armed")
+        .generation_identity()
+        .expect("replacement generation identity");
+    assert_ne!(first_generation, replacement_generation);
 }

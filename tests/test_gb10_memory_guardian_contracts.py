@@ -10,6 +10,7 @@ WORKSPACE = ROOT / "Cargo.toml"
 CORE = ROOT / "crates" / "gb10-memory-guardian-core" / "src" / "lib.rs"
 CORE_NO_ALLOC_TEST = ROOT / "crates" / "gb10-memory-guardian-core" / "tests" / "no_alloc.rs"
 BINARY = ROOT / "crates" / "gb10-memory-guardian" / "src" / "main.rs"
+SERVICE_LIB = ROOT / "crates" / "gb10-memory-guardian" / "src" / "lib.rs"
 GUARDIAN_UNIT = ROOT / "systemd" / "gb10-memory-guardian.service"
 TARGET_CONFIG = ROOT / "config" / "gb10-memory-guardian" / "config.toml"
 CANARY_DRIVER_UNIT = ROOT / "systemd" / "gb10-memory-guardian-canary.service"
@@ -34,6 +35,7 @@ class MemoryGuardianContractTests(unittest.TestCase):
     def test_emergency_path_is_direct_and_subprocess_free(self) -> None:
         core = CORE.read_text()
         binary = BINARY.read_text()
+        service_lib = SERVICE_LIB.read_text()
         self.assertIn("cgroup.kill", core)
         self.assertIn("EmergencyReserve", binary)
         self.assertIn("kill_direct", core)
@@ -51,11 +53,56 @@ class MemoryGuardianContractTests(unittest.TestCase):
             self.assertNotIn(forbidden, core)
             self.assertNotIn(forbidden, binary)
 
-        emergency_branch = binary.split("controller.enter_emergency();", 1)[1].split(
-            "} else {", 1
+        emergency_iteration = service_lib.split("pub fn emergency_iteration", 1)[1]
+        first_attack = emergency_iteration.split("let iteration =", 1)[0]
+        self.assertIn("controller.enter_emergency();", first_attack)
+        self.assertIn("controller.attempt(now_millis, target)", emergency_iteration)
+        self.assertNotIn("eprintln!", first_attack)
+        self.assertNotIn("active_label", first_attack)
+
+    def test_emergency_latch_defers_allocating_work_until_reserve_rearm(self) -> None:
+        binary = BINARY.read_text()
+        loop = binary.split("loop {", 1)[1].split(
+            "fn publish_guardian_status", 1
         )[0]
-        self.assertNotIn("eprintln!", emergency_branch)
-        self.assertNotIn("active_label", emergency_branch)
+        emergency = loop.split("LoopAction::Emergency =>", 1)[1].split(
+            "LoopAction::Rearm =>", 1
+        )[0]
+        for forbidden in (
+            "targets.reconcile()",
+            "publish_guardian_status",
+            "enforce_expected_target_identity",
+            "eprintln!",
+            "format!",
+        ):
+            self.assertNotIn(forbidden, emergency)
+
+        rearm_branch = loop.split("LoopAction::Rearm =>", 1)[1].split(
+            "LoopAction::Healthy =>", 1
+        )[0]
+        self.assertIn("controller.ensure_reserve", rearm_branch)
+        self.assertIn("latch.acknowledge_rearmed", rearm_branch)
+        self.assertIn("run_healthy_iteration", rearm_branch)
+        self.assertLess(
+            rearm_branch.index("controller.ensure_reserve"),
+            rearm_branch.index("latch.acknowledge_rearmed"),
+        )
+        self.assertLess(
+            rearm_branch.index("latch.acknowledge_rearmed"),
+            rearm_branch.index("run_healthy_iteration"),
+        )
+        rearm_failure = rearm_branch.split("Err(_) => {", 1)[1]
+        self.assertIn("emergency_iteration", rearm_failure)
+
+        meminfo_failure = loop.split("Err(error) => {", 1)[1].split(
+            "match latch.next_action", 1
+        )[0]
+        self.assertIn("if latch.is_latched()", meminfo_failure)
+        self.assertIn("emergency_iteration", meminfo_failure)
+
+        guardian = SERVICE_LIB.read_text()
+        self.assertNotIn("recommended_watcher", guardian)
+        self.assertNotIn("mpsc::channel", guardian)
 
     def test_guardian_unit_reserves_and_protects_memory(self) -> None:
         unit = GUARDIAN_UNIT.read_text()
