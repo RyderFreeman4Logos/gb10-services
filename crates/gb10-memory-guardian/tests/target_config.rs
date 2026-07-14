@@ -47,6 +47,8 @@ impl TempTree {
             ),
         )
         .expect("write config");
+        fs::set_permissions(self.config_path(), fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
     }
 
     fn replace_config_atomically(&self, label: &str, registration_file: &str) {
@@ -58,12 +60,16 @@ impl TempTree {
             ),
         )
         .expect("write replacement");
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))
+            .expect("chmod replacement");
         fs::rename(replacement, self.config_path()).expect("replace config");
     }
 
     fn replace_config_contents_atomically(&self, contents: &str) {
         let replacement = self.root.join("config.toml.new");
         fs::write(&replacement, contents).expect("write replacement");
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))
+            .expect("chmod replacement");
         fs::rename(replacement, self.config_path()).expect("replace config");
     }
 
@@ -142,6 +148,8 @@ fn rejects_unsafe_or_ambiguous_registration_names() {
         "../embedding-cgroup.v1",
         "/run/user/1001/embedding-cgroup.v1",
         "nested/text-cgroup.v1",
+        "text cgroup.v1",
+        "tèxt-cgroup.v1",
         ".",
         "",
     ] {
@@ -154,6 +162,48 @@ fn rejects_unsafe_or_ambiguous_registration_names() {
             "unexpected error for {registration_file:?}: {error}"
         );
     }
+
+    let tree = TempTree::new();
+    let overlong = "a".repeat(129);
+    tree.write_config("aeon-text", &overlong);
+    TargetConfigMonitor::new(&tree.config_path(), &tree.runtime_dir())
+        .expect_err("overlong registration name must fail");
+}
+
+#[test]
+fn rejects_insecure_config_source_mode_and_unknown_fields() {
+    let tree = TempTree::new();
+    tree.write_config("aeon-text", "text-cgroup.v1");
+    fs::set_permissions(tree.config_path(), fs::Permissions::from_mode(0o644))
+        .expect("make config insecure");
+    let mode_error = TargetConfigMonitor::new(&tree.config_path(), &tree.runtime_dir())
+        .expect_err("group/world-readable config must fail closed");
+    assert!(mode_error.to_string().contains("mode"), "{mode_error}");
+
+    fs::set_permissions(tree.config_path(), fs::Permissions::from_mode(0o700))
+        .expect("make config executable");
+    let executable_error = TargetConfigMonitor::new(&tree.config_path(), &tree.runtime_dir())
+        .expect_err("config mode must be exactly 0600");
+    assert!(
+        executable_error.to_string().contains("mode"),
+        "{executable_error}"
+    );
+
+    fs::set_permissions(tree.config_path(), fs::Permissions::from_mode(0o600))
+        .expect("restore secure mode");
+    let hard_link = tree.root.join("config.toml.link");
+    fs::hard_link(tree.config_path(), &hard_link).expect("create config hard link");
+    let link_error = TargetConfigMonitor::new(&tree.config_path(), &tree.runtime_dir())
+        .expect_err("multiply linked config must fail closed");
+    assert!(link_error.to_string().contains("hard link"), "{link_error}");
+    fs::remove_file(hard_link).expect("remove config hard link");
+
+    tree.replace_config_contents_atomically(
+        "schema_version = 1\nunexpected = true\n[target]\nlabel = \"aeon-text\"\nregistration_file = \"text-cgroup.v1\"\n",
+    );
+    let field_error = TargetConfigMonitor::new(&tree.config_path(), &tree.runtime_dir())
+        .expect_err("unknown fields must fail closed");
+    assert!(field_error.to_string().contains("parse"), "{field_error}");
 }
 
 #[test]

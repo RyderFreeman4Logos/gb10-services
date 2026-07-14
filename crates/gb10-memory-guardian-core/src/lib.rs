@@ -879,7 +879,7 @@ mod tests {
                 std::process::id()
             ));
             fs::create_dir_all(&root).expect("create fake root");
-            let registration = root.join("querit-cgroup.v1");
+            let registration = root.join("target-cgroup.v1");
             Self { root, registration }
         }
 
@@ -1104,30 +1104,34 @@ mod tests {
     }
 
     #[test]
-    fn fake_cgroup_kills_only_registered_querit_target() {
+    fn fake_cgroup_kills_only_registered_target() {
         let tree = FakeTree::new();
-        let querit = id('a');
-        let aeon = id('b');
-        let embedding = id('c');
-        for target in [&querit, &aeon, &embedding] {
+        let selected = id('a');
+        let protected_one = id('b');
+        let protected_two = id('c');
+        for target in [&selected, &protected_one, &protected_two] {
             tree.add_target(target, "1");
         }
-        tree.publish(&querit);
+        tree.publish(&selected);
         let mut manager = RegistrationManager::new(&tree.registration, &tree.root, UID);
         manager.refresh().expect("refresh");
         let mut reserve = EmergencyReserve::with_page_size(8192, 4096).expect("reserve");
         kill_direct(&mut reserve, manager.target().expect("target")).expect("kill direct");
 
         assert_eq!(
-            fs::read(tree.cgroup_path(&querit).join("cgroup.kill")).unwrap(),
+            fs::read(tree.cgroup_path(&selected).join("cgroup.kill")).unwrap(),
             b"1"
         );
-        assert!(fs::read(tree.cgroup_path(&aeon).join("cgroup.kill"))
-            .unwrap()
-            .is_empty());
-        assert!(fs::read(tree.cgroup_path(&embedding).join("cgroup.kill"))
-            .unwrap()
-            .is_empty());
+        assert!(
+            fs::read(tree.cgroup_path(&protected_one).join("cgroup.kill"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            fs::read(tree.cgroup_path(&protected_two).join("cgroup.kill"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1202,7 +1206,7 @@ mod tests {
         assert!(manager.target().is_some());
 
         let temporary = tree.root.join("bad.tmp");
-        fs::write(&temporary, b"version=1\ncontainer_id=../../aeon\n").unwrap();
+        fs::write(&temporary, b"version=1\ncontainer_id=../../target\n").unwrap();
         fs::rename(temporary, &tree.registration).unwrap();
         assert!(manager.refresh().is_err());
         assert!(manager.target().is_none());

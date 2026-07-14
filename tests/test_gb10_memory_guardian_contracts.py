@@ -8,13 +8,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE = ROOT / "Cargo.toml"
 CORE = ROOT / "crates" / "gb10-memory-guardian-core" / "src" / "lib.rs"
+CORE_NO_ALLOC_TEST = ROOT / "crates" / "gb10-memory-guardian-core" / "tests" / "no_alloc.rs"
 BINARY = ROOT / "crates" / "gb10-memory-guardian" / "src" / "main.rs"
 GUARDIAN_UNIT = ROOT / "systemd" / "gb10-memory-guardian.service"
 TARGET_CONFIG = ROOT / "config" / "gb10-memory-guardian" / "config.toml"
 CANARY_DRIVER_UNIT = ROOT / "systemd" / "gb10-memory-guardian-canary.service"
 QUERIT_UNIT = ROOT / "systemd" / "querit-4b-reranker.service"
+TEXT_UNIT = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
+EMBEDDING_UNIT = ROOT / "systemd" / "vllm-embedding.service"
+LEGACY_RERANKER_UNIT = ROOT / "systemd" / "vllm-qwen3-reranker-8b.service"
+GUARD_UNIT = ROOT / "systemd" / "llm-guard-proxy.service"
 CGROUP_HELPER = ROOT / "scripts" / "gb10_enforce_docker_cgroup_limits.sh"
 CANARY = ROOT / "scripts" / "gb10_memory_guardian_canary.sh"
+HEALTHCHECK = ROOT / "scripts" / "aeon_healthcheck.sh"
 README = ROOT / "README.md"
 
 
@@ -45,6 +51,12 @@ class MemoryGuardianContractTests(unittest.TestCase):
         for forbidden in ("Command::new", "process::Command"):
             self.assertNotIn(forbidden, core)
             self.assertNotIn(forbidden, binary)
+
+        emergency_branch = binary.split("controller.enter_emergency();", 1)[1].split(
+            "} else {", 1
+        )[0]
+        self.assertNotIn("eprintln!", emergency_branch)
+        self.assertNotIn("active_label", emergency_branch)
 
     def test_guardian_unit_reserves_and_protects_memory(self) -> None:
         unit = GUARDIAN_UNIT.read_text()
@@ -81,6 +93,10 @@ class MemoryGuardianContractTests(unittest.TestCase):
         self.assertIn("XDG_CONFIG_HOME", binary)
         self.assertIn("HOME", binary)
         self.assertNotIn("REGISTRATION_NAME", binary)
+        self.assertNotIn("querit", binary.lower())
+        self.assertNotIn("--shed-registered-querit", binary)
+        self.assertNotIn("querit-cgroup", CORE.read_text().lower())
+        self.assertNotIn("querit-cgroup", CORE_NO_ALLOC_TEST.read_text().lower())
         self.assertIn(
             "Environment=GB10_MEMORY_GUARDIAN_CONFIG_PATH=%h/.config/gb10-memory-guardian/config.toml",
             unit,
@@ -96,6 +112,28 @@ class MemoryGuardianContractTests(unittest.TestCase):
         self.assertIn('chmod 0600 "$registration_tmp"', helper)
         self.assertIn("fail_closed_registration", helper)
         self.assertRegex(helper, r"run_docker stop")
+        self.assertIn('"$registration_dir" != "$expected_registration_dir"', helper)
+        self.assertIn('[[ -L "$registration_dir" ]]', helper)
+        self.assertIn("^[0-9a-f]{64}$", helper)
+        self.assertIn("app.slice/${scope}", helper)
+        cleanup_trap = helper.index("trap fail_closed_registration ERR")
+        self.assertLess(
+            helper.index('if [[ "$registration_dir" != "$expected_registration_dir"'),
+            cleanup_trap,
+            "the cleanup trap must never see an unvalidated registration path",
+        )
+        self.assertLess(
+            helper.index('/usr/bin/install -d -m 0700 "$registration_dir"'),
+            cleanup_trap,
+            "the cleanup trap must never traverse an unvalidated parent directory",
+        )
+        for hardcoded_target in (
+            "querit-4b-reranker",
+            "vllm-aeon-27b-dflash",
+            "vllm-embedding",
+            "vllm-qwen3-reranker",
+        ):
+            self.assertNotIn(hardcoded_target, helper.lower())
 
     def test_canary_has_only_fixed_safe_targets_and_benchmark_gate(self) -> None:
         canary = CANARY.read_text()
@@ -103,12 +141,21 @@ class MemoryGuardianContractTests(unittest.TestCase):
         self.assertIn("GB10_BENCHMARK_EXCLUDED", canary)
         self.assertIn("gb10-memory-guardian-disposable-canary.service", canary)
         self.assertIn("gb10-memory-guardian-canary.service", canary)
-        self.assertIn("--shed-registered-querit", canary)
+        self.assertIn("--kill-configured-target", canary)
+        self.assertIn("configured-target", canary)
+        self.assertIn("I_UNDERSTAND_CONFIGURED_TARGET_WILL_BE_KILLED", canary)
+        self.assertIn("GB10_MEMORY_GUARDIAN_CANARY_TARGET_UNIT", canary)
+        self.assertIn("tomllib", canary)
+        self.assertIn("registration_file", canary)
+        self.assertIn("GB10_CGROUP_REGISTRATION_PATH", canary)
+        self.assertIn("-p Restart --value", canary)
         self.assertIn("MainPID", canary)
+        self.assertIn("NRestarts", canary)
         self.assertNotIn("--target", canary)
         for protected in (
-            "vllm-aeon-27b-dflash.service",
             "vllm-embedding.service",
+            "querit-4b-reranker.service",
+            "vllm-qwen3-reranker-8b.service",
             "llm-guard-proxy.service",
             "gb10-memory-guardian.service",
         ):
@@ -144,21 +191,63 @@ class MemoryGuardianContractTests(unittest.TestCase):
             self.assertNotIn(unsupported, production)
             self.assertNotIn(unsupported, driver)
 
-    def test_querit_uses_guardian_and_app_slice_without_auto_restart(self) -> None:
-        unit = QUERIT_UNIT.read_text()
-        self.assertRegex(unit, r"(?m)^Wants=.*gb10-memory-guardian\.service")
-        self.assertRegex(unit, r"(?m)^After=.*gb10-memory-guardian\.service")
-        self.assertIn("--cgroup-parent app.slice", unit)
-        self.assertIn("GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/querit-cgroup.v1", unit)
-        self.assertRegex(unit, r"(?m)^Restart=no$")
+    def test_text_is_the_only_registered_automatic_target(self) -> None:
+        text = TEXT_UNIT.read_text()
+        text_unit_section = text.split("[Service]", 1)[0]
+        self.assertNotIn("Requires=vllm-embedding.service", text_unit_section)
+        self.assertNotIn("Wants=vllm-embedding.service", text_unit_section)
+        self.assertIn("After=network.target vllm-embedding.service", text_unit_section)
+        self.assertIn("Wants=gb10-memory-guardian.service", text_unit_section)
+        self.assertIn("--cgroup-parent app.slice", text)
+        self.assertIn(
+            "GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1",
+            text,
+        )
+        self.assertRegex(text, r"(?m)^Restart=on-failure$")
 
-    def test_readme_documents_canary_rollback_and_bash_guard_overlap(self) -> None:
+        for protected in (
+            EMBEDDING_UNIT.read_text(),
+            QUERIT_UNIT.read_text(),
+            LEGACY_RERANKER_UNIT.read_text(),
+        ):
+            self.assertNotIn("GB10_CGROUP_REGISTRATION_PATH", protected)
+            self.assertNotIn("text-cgroup.v1", protected)
+
+    def test_rerankers_and_guard_do_not_own_text_lifecycle(self) -> None:
+        for path in (QUERIT_UNIT, LEGACY_RERANKER_UNIT):
+            unit = path.read_text()
+            unit_section = unit.split("[Service]", 1)[0]
+            for relationship in ("Requires=", "BindsTo=", "PartOf="):
+                self.assertNotRegex(
+                    unit_section,
+                    rf"(?m)^{relationship}.*vllm-aeon-27b-dflash\.service",
+                )
+            self.assertNotIn("http://100.105.4.92:18010", unit)
+            self.assertIn("lifecycle-independent", unit)
+        self.assertIn("Conflicts=vllm-qwen3-reranker-8b.service", QUERIT_UNIT.read_text())
+        self.assertIn("querit-4b-reranker.service", LEGACY_RERANKER_UNIT.read_text())
+        self.assertNotIn("gb10-memory-guardian.service", QUERIT_UNIT.read_text())
+
+        guard_section = GUARD_UNIT.read_text().split("[Service]", 1)[0]
+        self.assertNotRegex(guard_section, r"(?m)^Wants=.*vllm-")
+        self.assertIn("Ordering only", guard_section)
+
+        healthcheck = HEALTHCHECK.read_text().lower()
+        for protected in ("vllm-embedding", "querit", "qwen3-reranker"):
+            self.assertNotIn(protected, healthcheck)
+
+    def test_readme_documents_text_policy_install_canary_and_rollback(self) -> None:
         readme = README.read_text()
         for phrase in (
             "gb10-memory-guardian.service",
             "cgroup.kill",
             "disposable user cgroup",
             "gb10-swap-guard.service",
+            "observer-only",
+            "config/gb10-memory-guardian/config.toml",
+            "install -m 0600",
+            "text-cgroup.v1",
+            "embedding and both rerankers",
             "rollback",
         ):
             self.assertIn(phrase, readme)

@@ -76,7 +76,7 @@ fn make_target(root: &Path, registration: &Path, uid: u32, id: &str) {
 fn reserve_release_and_direct_write_allocate_nothing() {
     let root = unique_temp_dir();
     fs::create_dir_all(&root).expect("create root");
-    let registration = root.join("querit-cgroup.v1");
+    let registration = root.join("target-cgroup.v1");
     let uid = 1001;
     let id = "a".repeat(64);
     make_target(&root, &registration, uid, &id);

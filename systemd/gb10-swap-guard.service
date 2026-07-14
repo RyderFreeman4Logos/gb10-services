@@ -1,20 +1,16 @@
 [Unit]
-Description=GB10 vLLM swap/free-memory guard (1s detection; stop reranker on low MemAvailable or high swap)
+Description=GB10 swap/free-memory observer-only alert and evidence collector
 After=default.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 Environment=GB10_SWAP_WARN_GIB=7.5
-Environment=GB10_SWAP_STOP_GIB=12
-Environment=GB10_MEM_AVAIL_STOP_GIB=1
+Environment=GB10_SWAP_ALERT_GIB=12
+Environment=GB10_MEM_AVAIL_ALERT_GIB=1
 Environment=GB10_SWAP_GUARD_INTERVAL=1
 Environment=GB10_SWAP_GUARD_SAMPLE_LOG_INTERVAL=20
-Environment=GB10_SWAP_GUARD_STOP_RETRY_INTERVAL=5
-Environment=GB10_SWAP_GUARD_DOCKER_STOP_TIMEOUT=3
-Environment=GB10_SWAP_GUARD_DOCKER_KILL_AFTER=1
-Environment=GB10_SWAP_GUARD_SYSTEMCTL_STOP_TIMEOUT=1
-Environment=GB10_SWAP_GUARD_SYSTEMCTL_KILL_AFTER=1
+Environment=GB10_SWAP_GUARD_ALERT_REPEAT_INTERVAL=60
 Environment=GB10_SWAP_ATTRIBUTION_INTERVAL=300
 ExecStart=%h/.local/bin/gb10-swap-guard.sh
 Restart=always

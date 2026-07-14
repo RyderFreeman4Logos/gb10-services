@@ -4,8 +4,8 @@
 use gb10_memory_guardian::{TargetRegistrationSet, TargetTransition};
 use gb10_memory_guardian_core::{
     effective_uid, read_mem_available_fd, should_rearm, should_shed, AttemptOutcome, CgroupTarget,
-    EmergencyController, EmergencyReserve, RegistrationManager, DEFAULT_RESERVE_BYTES,
-    DEFAULT_RETRY_MILLIS, DEFAULT_THRESHOLD_BYTES,
+    EmergencyController, EmergencyReserve, DEFAULT_RESERVE_BYTES, DEFAULT_RETRY_MILLIS,
+    DEFAULT_THRESHOLD_BYTES,
 };
 use std::env;
 use std::fs::File;
@@ -23,7 +23,7 @@ const CONFIG_SUBPATH: &str = "gb10-memory-guardian/config.toml";
 enum Mode {
     Production,
     DisposableCanary,
-    ShedRegisteredQuerit,
+    KillConfiguredTarget,
 }
 
 #[derive(Debug)]
@@ -36,7 +36,6 @@ struct Config {
     cgroup_root: PathBuf,
     runtime_dir: PathBuf,
     target_config_path: PathBuf,
-    legacy_registration_path: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -55,7 +54,7 @@ fn run() -> Result<(), String> {
     match mode {
         Mode::Production => run_production(config),
         Mode::DisposableCanary => run_disposable_canary(config),
-        Mode::ShedRegisteredQuerit => run_registered_shed(config),
+        Mode::KillConfiguredTarget => run_configured_target_test(config),
     }
 }
 
@@ -64,7 +63,7 @@ fn parse_mode() -> Result<Mode, String> {
     let mode = match arguments.next().as_deref() {
         None => Mode::Production,
         Some("--disposable-canary") => Mode::DisposableCanary,
-        Some("--shed-registered-querit") => Mode::ShedRegisteredQuerit,
+        Some("--kill-configured-target") => Mode::KillConfiguredTarget,
         Some(argument) => return Err(format!("unsupported argument: {argument}")),
     };
     if arguments.next().is_some() {
@@ -101,8 +100,6 @@ impl Config {
             cgroup_root: path_env("GB10_MEMORY_GUARDIAN_CGROUP_ROOT", CGROUP_ROOT),
             runtime_dir,
             target_config_path: target_config_path()?,
-            legacy_registration_path: env::var_os("GB10_MEMORY_GUARDIAN_REGISTRATION_PATH")
-                .map(PathBuf::from),
         })
     }
 }
@@ -193,21 +190,12 @@ fn run_production(config: Config) -> Result<(), String> {
             controller.enter_emergency();
             if let Some(target) = targets.target() {
                 let now = elapsed_millis(started);
-                let outcome = controller.attempt(now, target);
-                // Emergency logging is intentionally after the direct write attempt.
-                if outcome.attempted() {
-                    eprintln!(
-                        "gb10-memory-guardian: direct {} kill attempt: {outcome:?}; reserve_allocated={}",
-                        targets.active_label(),
-                        controller.reserve().is_allocated()
-                    );
-                }
-                if matches!(outcome, AttemptOutcome::Verified { .. }) {
+                if matches!(
+                    controller.attempt(now, target),
+                    AttemptOutcome::Verified { .. }
+                ) {
                     targets.disarm();
                 }
-            } else if !degraded_logged {
-                eprintln!("gb10-memory-guardian: no validated target registration is armed");
-                degraded_logged = true;
             }
         } else {
             match targets.reconcile() {
@@ -262,19 +250,22 @@ fn run_disposable_canary(config: Config) -> Result<(), String> {
     run_bounded_direct_test(config, &target, "disposable canary")
 }
 
-fn run_registered_shed(config: Config) -> Result<(), String> {
-    let registration_path = config.legacy_registration_path.as_ref().ok_or_else(|| {
-        "GB10_MEMORY_GUARDIAN_REGISTRATION_PATH is required for the legacy canary".to_owned()
-    })?;
-    let mut registrations =
-        RegistrationManager::new(registration_path, &config.cgroup_root, effective_uid());
-    registrations
-        .refresh()
-        .map_err(|error| format!("open legacy canary registration: {error}"))?;
-    let target = registrations
+fn run_configured_target_test(config: Config) -> Result<(), String> {
+    let mut targets = TargetRegistrationSet::new(
+        &config.target_config_path,
+        &config.runtime_dir,
+        &config.cgroup_root,
+        effective_uid(),
+    )
+    .map_err(|error| format!("configured-target initialization failed: {error}"))?;
+    targets
+        .reconcile()
+        .map_err(|error| format!("configured-target validation failed: {error}"))?;
+    let label = targets.active_label().to_string();
+    let target = targets
         .target()
-        .ok_or_else(|| "legacy canary registration has no armed target".to_owned())?;
-    run_bounded_direct_test(config, target, "legacy registered canary")
+        .ok_or_else(|| "configured target is not armed".to_string())?;
+    run_bounded_direct_test(config, target, &label)
 }
 
 fn run_bounded_direct_test(

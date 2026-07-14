@@ -36,15 +36,17 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertNotIn("--dns", unit)
         self.assertNotRegex(unit, r"aeon-vllm-ultimate:[^\s\\]+(?:\s|\\)")
 
-    def test_unit_has_safe_lifecycle_memory_gate_and_readiness(self) -> None:
+    def test_unit_has_independent_lifecycle_memory_gate_and_readiness(self) -> None:
         unit = QUERIT_UNIT.read_text()
-        for relationship in (
-            "Requires=vllm-aeon-27b-dflash.service",
-            "BindsTo=vllm-aeon-27b-dflash.service",
-            "PartOf=vllm-aeon-27b-dflash.service",
-            "Conflicts=vllm-qwen3-reranker-8b.service",
-        ):
-            self.assertIn(relationship, unit)
+        unit_section = unit.split("[Service]", 1)[0]
+        for relationship in ("Requires=", "BindsTo=", "PartOf="):
+            self.assertNotRegex(
+                unit_section,
+                rf"(?m)^{relationship}.*vllm-aeon-27b-dflash\.service",
+            )
+        self.assertIn("Conflicts=vllm-qwen3-reranker-8b.service", unit)
+        self.assertIn("lifecycle-independent", unit)
+        self.assertNotIn("http://100.105.4.92:18010", unit)
         self.assertIn("gb10_check_mem_available.sh 2", unit)
         self.assertIn("--memory 18g", unit)
         self.assertIn("--memory-swap 18g", unit)
@@ -58,7 +60,7 @@ class QueritServiceContractTests(unittest.TestCase):
             r"seq 1 (\d+).*?--max-time (\d+).*?sleep (\d+); done",
             unit,
         )
-        self.assertEqual(len(readiness_loops), 2)
+        self.assertEqual(len(readiness_loops), 1)
         readiness_budget = sum(
             int(attempts) * (int(curl_timeout) + int(sleep_seconds))
             for attempts, curl_timeout, sleep_seconds in readiness_loops
@@ -79,15 +81,13 @@ class QueritServiceContractTests(unittest.TestCase):
         )
         self.assertGreaterEqual(int(timeout.group(1)), worst_case_seconds + 60)
 
-    def test_guard_depends_on_querit_and_has_live_hardening(self) -> None:
+    def test_guard_orders_after_backends_without_owning_lifecycle(self) -> None:
         unit = GUARD_UNIT.read_text()
         unit_section = unit.split("[Service]", 1)[0]
         self.assertIn("querit-4b-reranker.service", unit_section)
         self.assertNotIn("vllm-qwen3-reranker-8b.service", unit_section)
-        wants = next(
-            line for line in unit_section.splitlines() if line.startswith("Wants=")
-        )
-        self.assertNotIn("querit-4b-reranker.service", wants)
+        self.assertNotRegex(unit_section, r"(?m)^Wants=.*vllm-")
+        self.assertIn("Ordering only", unit_section)
         for setting in (
             "MemoryHigh=1792M",
             "MemoryMax=2G",
@@ -105,6 +105,7 @@ class QueritServiceContractTests(unittest.TestCase):
             "--memory-swap 69g",
             "--kv-cache-memory-bytes 36864M",
             "gb10_enforce_docker_cgroup_limits.sh vllm-aeon-27b-dflash-n12 69",
+            "GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1",
             f"@{IMAGE_DIGEST}",
         ):
             self.assertIn(contract, unit)

@@ -101,12 +101,16 @@ Run these commands sequentially to deploy the stack from this repository:
 ```bash
 # Ensure target folders exist
 mkdir -p /home/obj/scripts /home/obj/.local/bin /home/obj/.config/llm-guard-proxy /home/obj/log
+install -d -m 0700 /home/obj/.config/gb10-memory-guardian
 
 # Copy all scripts
 cp scripts/aeon_vllm_wrapper.py /home/obj/scripts/
 cp scripts/aeon_hang_guard.py /home/obj/scripts/
 cp scripts/aeon_healthcheck.sh /home/obj/scripts/
 cp scripts/aeon_chat_ready.py /home/obj/.local/bin/
+cp scripts/gb10_check_mem_available.sh /home/obj/.local/bin/
+cp scripts/gb10_enforce_docker_cgroup_limits.sh /home/obj/.local/bin/
+cp scripts/gb10_memory_guardian_canary.sh /home/obj/.local/bin/
 cp scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/
 cp scripts/sysmon.sh /home/obj/.local/bin/
 cp scripts/gb10-swap-guard.sh /home/obj/.local/bin/
@@ -119,6 +123,9 @@ chmod +x /home/obj/scripts/*.sh /home/obj/.local/bin/*
 ```bash
 # Copy llm-guard-proxy config
 cp config/llm-guard-proxy/config.toml /home/obj/.config/llm-guard-proxy/config.toml
+# Guardian config is security-sensitive and must be owner-only.
+install -m 0600 config/gb10-memory-guardian/config.toml \
+  /home/obj/.config/gb10-memory-guardian/config.toml
 ```
 
 ### 3. Build llm-guard-proxy
@@ -138,7 +145,16 @@ If the running guard process still points at a deleted old inode after a
 standalone rebuild, the script restarts only `llm-guard-proxy.service` and
 smokes `/health`; it does not restart any vLLM backend.
 
-### 4. Systemd User Services Installation
+### 4. Build and install the memory guardian
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked
+cargo build --release --locked -p gb10-memory-guardian
+install -m 0755 target/release/gb10-memory-guardian /home/obj/.local/bin/
+```
+
+### 5. Systemd User Services Installation
 ```bash
 # Create user-level systemd directory if missing
 mkdir -p /home/obj/.config/systemd/user/
@@ -150,32 +166,44 @@ cp systemd/* /home/obj/.config/systemd/user/
 systemctl --user daemon-reload
 ```
 
-### 5. Enable and Start Services
+### 6. Enable and Start Services
 ```bash
 # Start auxiliary services first
 systemctl --user enable --now sysmon.service
 systemctl --user enable --now gb10-swap-guard.service
+systemctl --user enable --now gb10-memory-guardian.service
 systemctl --user enable --now aeon-healthcheck.timer
 
 # Start vLLM stack and shielding proxy
 systemctl --user enable --now vllm-embedding.service
 systemctl --user enable --now vllm-aeon-27b-dflash.service
-systemctl --user enable --now vllm-qwen3-reranker-8b.service
+systemctl --user disable --now vllm-qwen3-reranker-8b.service
+systemctl --user enable --now querit-4b-reranker.service
 systemctl --user enable --now llm-guard-proxy.service
 ```
+
+Memory recovery is source-first and text-only. Deploy the owner-only guardian
+config, generic cgroup helper, Rust binary, and all reviewed units before
+`daemon-reload`; restart the text unit only in an approved maintenance window
+to publish `%t/gb10-memory-guardian/text-cgroup.v1`. The text unit uses
+`app.slice` and `Restart=on-failure`. It has no `Requires=`/`Wants=` edge to
+embedding. Both rerankers have no `Requires=`, `BindsTo=`, `PartOf=`, or
+text-readiness gate, while Guard has ordering only. The Rust guardian is the
+sole automatic recovery actor; `gb10-swap-guard.service` is observer-only and
+must never stop, kill, or restart a model.
 
 For updates on an already-running GB10, do not restart just one vLLM service when
 changing memory/context profiles. Stop the full vLLM stack first to clear stale
 pages, then start in dependency order:
 
 ```bash
-systemctl --user stop vllm-qwen3-reranker-8b.service
+systemctl --user stop querit-4b-reranker.service vllm-qwen3-reranker-8b.service
 systemctl --user stop vllm-aeon-27b-dflash.service
 systemctl --user stop vllm-embedding.service
 
 systemctl --user start vllm-embedding.service
 systemctl --user start vllm-aeon-27b-dflash.service
-systemctl --user start vllm-qwen3-reranker-8b.service
+systemctl --user start querit-4b-reranker.service
 systemctl --user start llm-guard-proxy.service
 ```
 
@@ -189,7 +217,8 @@ systemctl --user start llm-guard-proxy.service
 systemctl --user list-units --type=service --state=running
 
 # Check detailed status of core services
-systemctl --user status vllm-embedding vllm-aeon-27b-dflash vllm-qwen3-reranker-8b llm-guard-proxy sysmon gb10-swap-guard
+systemctl --user status vllm-embedding vllm-aeon-27b-dflash querit-4b-reranker \
+  llm-guard-proxy gb10-memory-guardian gb10-swap-guard sysmon
 ```
 
 ### Retrieve System Resource Log (sysmon output)
@@ -272,7 +301,8 @@ systemctl --user restart vllm-aeon-27b-dflash.service
 ```
 
 ### 3. OOM / Swap Critical
-If the swap guard alerts or kills workloads:
+If the swap observer alerts, inspect its evidence and the Rust guardian log.
+The observer does not mutate service or container state:
 ```bash
 # Check memory allocation
 free -h

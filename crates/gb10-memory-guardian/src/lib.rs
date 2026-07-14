@@ -3,7 +3,9 @@
 //! Filesystem notifications only produce candidates. The production loop must
 //! validate and arm the candidate registration before explicitly committing it.
 
-use gb10_memory_guardian_core::{CgroupTarget, GuardianError, RefreshStatus, RegistrationManager};
+use gb10_memory_guardian_core::{
+    effective_uid, CgroupTarget, GuardianError, RefreshStatus, RegistrationManager,
+};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Deserialize;
 use std::env;
@@ -12,7 +14,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 const CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -145,6 +147,8 @@ struct FileGeneration {
     size: u64,
     modified_seconds: i64,
     modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
 }
 
 impl FileGeneration {
@@ -156,12 +160,32 @@ impl FileGeneration {
                 "config must be a regular file",
             ));
         }
+        if metadata.uid() != effective_uid() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "config must be owned by the effective user",
+            ));
+        }
+        if metadata.nlink() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "config must have exactly one hard link",
+            ));
+        }
+        if metadata.mode() & 0o7777 != 0o600 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "config mode must be exactly 0600",
+            ));
+        }
         Ok(Self {
             device: metadata.dev(),
             inode: metadata.ino(),
             size: metadata.size(),
             modified_seconds: metadata.mtime(),
             modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
         })
     }
 }
@@ -474,13 +498,15 @@ fn validate_label(label: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_registration_file(name: &str) -> Result<(), ConfigError> {
-    let mut components = Path::new(name).components();
-    let valid = matches!(components.next(), Some(Component::Normal(_)))
-        && components.next().is_none()
-        && !name.is_empty();
+    let mut bytes = name.bytes();
+    let valid = name.len() <= 128
+        && bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
     if !valid {
         return Err(ConfigError::Invalid(
-            "target registration_file must be exactly one relative filename".to_owned(),
+            "target registration_file must be one safe 1-128 byte ASCII filename".to_owned(),
         ));
     }
     Ok(())
@@ -491,4 +517,51 @@ fn event_is_relevant(event: &Event, config_path: &Path) -> bool {
         return false;
     }
     event.paths.is_empty() || event.paths.iter().any(|path| path == config_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn notification_channel_failure_preserves_last_good_snapshot() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "gb10-memory-guardian-notify-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create test root");
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            "schema_version = 1\n[target]\nlabel = \"aeon-text\"\nregistration_file = \"text-cgroup.v1\"\n",
+        )
+        .expect("write config");
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).expect("chmod config");
+
+        let mut monitor =
+            TargetConfigMonitor::new(&config_path, &root).expect("create config monitor");
+        let last_good = monitor.active().clone();
+        let (sender, disconnected) = mpsc::channel();
+        drop(sender);
+        monitor.receiver = disconnected;
+
+        let error = monitor
+            .pending_snapshot()
+            .expect_err("disconnected notification channel must fail closed");
+        assert!(matches!(
+            error,
+            ConfigError::Invalid(message) if message.contains("notification channel disconnected")
+        ));
+        assert_eq!(monitor.active(), &last_good);
+
+        drop(monitor);
+        fs::remove_dir_all(root).expect("remove test root");
+    }
 }

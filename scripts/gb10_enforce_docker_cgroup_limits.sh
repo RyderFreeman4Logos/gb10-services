@@ -2,13 +2,11 @@
 # Enforce and verify rootless Docker container cgroup memory/swap limits.
 # Usage: gb10_enforce_docker_cgroup_limits.sh <container-name> <expected-memory-gib>
 #
-# Rootless Docker + systemd cgroup driver places the workload in
-# docker-<id>.scope. Service-level MemoryMax on the wrapper unit does not
-# constrain the container. This helper:
-#   1) waits for the generated docker scope
-#   2) sets MemoryMax=<N>G and MemorySwapMax=0 on that scope
-#   3) verifies live cgroup files match the intended hard cap
+# Set GB10_CGROUP_REGISTRATION_PATH only for a unit that opts into publishing a
+# guardian target. The path selects the registration file; this helper contains
+# no model or service identity policy.
 set -Eeuo pipefail
+umask 077
 
 name="${1:?container name required}"
 expected_gib="${2:?expected GiB required}"
@@ -27,7 +25,7 @@ for value in "$docker_timeout_seconds" "$systemctl_timeout_seconds" "$wait_secon
     exit 2
   fi
 done
-export DOCKER_HOST="${DOCKER_HOST:-unix:///run/user/1001/docker.sock}"
+export DOCKER_HOST="${DOCKER_HOST:-unix://${XDG_RUNTIME_DIR:-/run/user/${UID}}/docker.sock}"
 
 run_docker() {
   /usr/bin/timeout --signal=TERM --kill-after=2 "$docker_timeout_seconds" \
@@ -39,10 +37,44 @@ run_systemctl() {
     /usr/bin/systemctl --user "$@"
 }
 
+reject_registration_destination() {
+  echo "$1" >&2
+  run_docker stop --time 5 "$name" >/dev/null 2>&1 || true
+  exit 2
+}
+
+expected_registration_dir=""
+registration_dir=""
+registration_file=""
+if [[ -n "$registration_path" ]]; then
+  expected_registration_dir="${XDG_RUNTIME_DIR:-/run/user/${UID}}/gb10-memory-guardian"
+  registration_dir="${registration_path%/*}"
+  registration_file="${registration_path##*/}"
+  if [[ "$registration_dir" != "$expected_registration_dir" ]]; then
+    reject_registration_destination \
+      "guardian registration must be directly below $expected_registration_dir"
+  fi
+  if [[ ! "$registration_file" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ || "$registration_file" == "." || "$registration_file" == ".." ]]; then
+    reject_registration_destination \
+      "unsafe guardian registration filename: $registration_file"
+  fi
+  if [[ -L "$registration_dir" ]]; then
+    reject_registration_destination \
+      "guardian registration directory must not be a symlink: $registration_dir"
+  fi
+  /usr/bin/install -d -m 0700 "$registration_dir" || \
+    reject_registration_destination \
+      "could not create guardian registration directory: $registration_dir"
+  if [[ ! -d "$registration_dir" || -L "$registration_dir" ]]; then
+    reject_registration_destination \
+      "guardian registration directory is unsafe: $registration_dir"
+  fi
+fi
+
 fail_closed_registration() {
   local status=$?
   trap - ERR
-  if [[ -n "$registration_path" && "$name" == "querit-4b-reranker" && "$registration_published" != "1" ]]; then
+  if [[ -n "$registration_path" && "$registration_published" != "1" ]]; then
     rm -f -- "$registration_path"
     run_docker stop --time 5 "$name" >/dev/null 2>&1 || true
   fi
@@ -75,15 +107,14 @@ fi
 
 expected_bytes=$((expected_gib * 1024 * 1024 * 1024))
 
-# Hard-cap ordinary container memory and ban additional swap. Re-apply both
-# properties so Docker's incomplete --memory-swap mapping cannot leave
-# memory.swap.max=max after start.
+# Docker can leave memory.swap.max=max even with --memory-swap. Enforce both
+# properties directly on the generated scope and verify the live cgroup files.
 run_systemctl set-property --runtime "$scope" \
   "MemoryMax=${expected_gib}G" \
   MemorySwapMax=0
 
-swap_max="$(cat "/sys/fs/cgroup${cg}/memory.swap.max")"
-mem_max="$(cat "/sys/fs/cgroup${cg}/memory.max")"
+swap_max="$(<"/sys/fs/cgroup${cg}/memory.swap.max")"
+mem_max="$(<"/sys/fs/cgroup${cg}/memory.max")"
 
 if [[ "$swap_max" != "0" ]]; then
   echo "unexpected $name memory.swap.max=$swap_max expected=0 scope=$scope cg=$cg" >&2
@@ -94,26 +125,13 @@ if [[ "$mem_max" != "$expected_bytes" ]]; then
   exit 1
 fi
 
-# Only Querit may publish a kill registration. Other callers keep the existing
-# cap-only behavior even if this helper is reused by AEON or embedding units.
 if [[ -n "$registration_path" ]]; then
-  if [[ "$name" != "querit-4b-reranker" ]]; then
-    echo "refusing cgroup registration for non-Querit container: $name" >&2
-    exit 2
-  fi
-  expected_registration_path="${XDG_RUNTIME_DIR:-/run/user/${UID}}/gb10-memory-guardian/querit-cgroup.v1"
-  if [[ "$registration_path" != "$expected_registration_path" ]]; then
-    echo "unexpected guardian registration path: $registration_path" >&2
-    exit 2
-  fi
   expected_control_group="/user.slice/user-${UID}.slice/user@${UID}.service/app.slice/${scope}"
   if [[ ! "$cid" =~ ^[0-9a-f]{64}$ || "$scope" != "docker-${cid}.scope" || "$cg" != "$expected_control_group" ]]; then
-    echo "refusing unsafe Querit registration cid=$cid scope=$scope cg=$cg expected=$expected_control_group" >&2
+    echo "refusing unsafe guardian registration cid=$cid scope=$scope cg=$cg expected=$expected_control_group" >&2
     exit 1
   fi
 
-  registration_dir="${registration_path%/*}"
-  /usr/bin/install -d -m 0700 "$registration_dir"
   registration_tmp="$(mktemp "${registration_path}.tmp.XXXXXX")"
   cleanup_registration_tmp() {
     rm -f -- "$registration_tmp"
