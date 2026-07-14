@@ -67,6 +67,8 @@ run_disposable() {
   snapshot_protected
   rm -f -- "$stamp"
   systemctl --user stop "$canary_unit" >/dev/null 2>&1 || true
+  systemctl --user reset-failed "$canary_unit" >/dev/null 2>&1 || true
+  systemctl --user revert "$canary_unit" >/dev/null 2>&1 || true
   systemd-run --user \
     --unit="$canary_unit" \
     --slice=app.slice \
@@ -75,6 +77,8 @@ run_disposable() {
     /usr/bin/sleep infinity >/dev/null
   cleanup_canary() {
     systemctl --user stop "$canary_unit" >/dev/null 2>&1 || true
+    systemctl --user reset-failed "$canary_unit" >/dev/null 2>&1 || true
+    systemctl --user revert "$canary_unit" >/dev/null 2>&1 || true
   }
   trap cleanup_canary EXIT
 

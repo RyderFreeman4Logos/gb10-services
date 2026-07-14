@@ -1,2 +1,5 @@
 # Allow AGENTS.md in this repository despite global ignores
 !AGENTS.md
+
+# Cargo and local-gate scratch artifacts
+/target/

@@ -1,0 +1,9 @@
+pre-commit:
+  commands:
+    quick-check:
+      run: just quick-check
+
+pre-push:
+  commands:
+    local-quality-gate:
+      run: just pre-push

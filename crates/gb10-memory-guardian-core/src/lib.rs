@@ -730,7 +730,7 @@ fn read_fixed(file: &mut File, buffer: &mut [u8; REGISTRATION_LIMIT]) -> io::Res
 /// subprocess or IPC mechanism.
 pub fn kill_direct(reserve: &mut EmergencyReserve, target: &CgroupTarget) -> io::Result<()> {
     reserve.release();
-    let command = [b'1'];
+    let command = *b"1";
     loop {
         // SAFETY: command points to one readable byte and target.kill is retained.
         let result = unsafe {
