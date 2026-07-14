@@ -94,6 +94,15 @@ class MemoryGuardianContractTests(unittest.TestCase):
         ):
             self.assertIn(protected, canary)
         self.assertIn("--disposable-canary", driver)
+        self.assertGreaterEqual(
+            canary.count('systemctl --user revert "$canary_unit"'),
+            2,
+            "the disposable transient unit must be reverted before create and during cleanup",
+        )
+        self.assertLess(
+            canary.index('systemctl --user revert "$canary_unit"'),
+            canary.index("systemd-run --user"),
+        )
         production = GUARDIAN_UNIT.read_text()
         self.assertIn("OOMScoreAdjust=100", production)
         self.assertIn("OOMScoreAdjust=100", driver)
