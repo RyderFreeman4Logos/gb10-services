@@ -9,7 +9,11 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from test_embedding_service_contracts import _logical_directive_argv, _option_values
+from test_embedding_service_contracts import (
+    _logical_directive_argv,
+    _option_values,
+    _split_docker_run_argv,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,11 +52,23 @@ def _aeon_contract(unit: str) -> dict[str, int]:
             f"expected exactly one ExecStart, found {len(exec_starts)}"
         )
     argv = exec_starts[0]
-    if argv[:2] != ["/usr/bin/docker", "run"]:
-        raise AssertionError("ExecStart must be the canonical docker run command")
+    image = (
+        "ghcr.io/aeon-7/aeon-vllm-ultimate@"
+        "sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c"
+    )
+    host_argv, container_argv = _split_docker_run_argv(argv, image)
+    for flag, expected in {
+        "--memory": "69g",
+        "--memory-swap": "69g",
+        "--memory-swappiness": "0",
+        "--oom-score-adj": "500",
+    }.items():
+        actual = _option_values(host_argv, flag)[0]
+        if actual != expected:
+            raise AssertionError(f"{flag} must be {expected}, found {actual}")
 
-    model_len = _option_values(argv, "--max-model-len")[0]
-    kv_budget = _option_values(argv, "--kv-cache-memory-bytes")[0]
+    model_len = _option_values(container_argv, "--max-model-len")[0]
+    kv_budget = _option_values(container_argv, "--kv-cache-memory-bytes")[0]
     if not model_len.isdecimal():
         raise AssertionError(f"invalid --max-model-len value: {model_len}")
     kv_match = re.fullmatch(r"([1-9][0-9]*)M", kv_budget)
@@ -123,6 +139,33 @@ class AeonLiveReceiptTests(unittest.TestCase):
         note = (ROOT / receipt["documentation"]["research_note_path"]).read_text()
         self.assertIn(f"**{end_gib:.3f} GiB**", note)
         self.assertIn(f"**{text_gib:.3f} GiB** NVML", note)
+
+
+class HostileAeonUnitMutationTests(unittest.TestCase):
+    def assert_contract_rejects(self, unit: str) -> None:
+        with self.assertRaises(AssertionError):
+            _aeon_contract(unit)
+
+    def test_rejects_docker_memory_option_after_image_boundary(self) -> None:
+        unit = AEON_UNIT.read_text()
+        image = (
+            "ghcr.io/aeon-7/aeon-vllm-ultimate@"
+            "sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c"
+        )
+        unit = unit.replace("  --memory 69g \\\n", "", 1).replace(
+            f"  {image} \\\n",
+            f"  {image} \\\n  --memory 69g \\\n",
+            1,
+        )
+        self.assert_contract_rejects(unit)
+
+    def test_rejects_extra_docker_memory_alias(self) -> None:
+        unit = AEON_UNIT.read_text().replace(
+            "  --memory 69g \\\n",
+            "  --memory 69g -m 68g \\\n",
+            1,
+        )
+        self.assert_contract_rejects(unit)
 
 
 class QueritServiceContractTests(unittest.TestCase):

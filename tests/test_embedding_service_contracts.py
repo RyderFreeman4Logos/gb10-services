@@ -62,6 +62,88 @@ def _logical_directive_argv(unit: str, directive: str) -> list[list[str]]:
     return commands
 
 
+_DOCKER_HOST_OPTION_ARITY = {
+    "--rm": 0,
+    "--name": 1,
+    "--cgroup-parent": 1,
+    "--gpus": 1,
+    "--ipc": 1,
+    "--dns": 1,
+    "-p": 1,
+    "-v": 1,
+    "-e": 1,
+    "--memory": 1,
+    "--memory-swap": 1,
+    "--memory-swappiness": 1,
+    "--oom-score-adj": 1,
+    "--entrypoint": 1,
+}
+
+
+def _split_docker_run_argv(
+    argv: list[str], expected_image: str
+) -> tuple[list[str], list[str]]:
+    if argv[:2] != ["/usr/bin/docker", "run"]:
+        raise AssertionError("ExecStart must be the canonical docker run command")
+    host: list[str] = []
+    index = 2
+    while index < len(argv):
+        token = argv[index]
+        if not token.startswith("-"):
+            break
+        if token.startswith("--cidfile="):
+            if token == "--cidfile=":
+                raise AssertionError("empty --cidfile assignment")
+            host.append(token)
+            index += 1
+            continue
+        if "=" in token or token not in _DOCKER_HOST_OPTION_ARITY:
+            raise AssertionError(f"unknown or noncanonical Docker host option: {token}")
+        arity = _DOCKER_HOST_OPTION_ARITY[token]
+        values = argv[index + 1 : index + 1 + arity]
+        if len(values) != arity or any(value.startswith("-") for value in values):
+            raise AssertionError(f"wrong arity for Docker host option: {token}")
+        host.extend([token, *values])
+        index += 1 + arity
+    if index >= len(argv) or argv[index] != expected_image:
+        actual = argv[index] if index < len(argv) else "<missing>"
+        raise AssertionError(f"wrong Docker image boundary: {actual}")
+    container = argv[index + 1 :]
+    docker_aliases = {"-m", "--memory-reservation", *list(_DOCKER_HOST_OPTION_ARITY)}
+    for token in container:
+        lowered = token.lower()
+        if lowered in docker_aliases or any(
+            lowered.startswith(f"{flag}=") for flag in docker_aliases if flag.startswith("--")
+        ):
+            raise AssertionError(f"Docker host option after image boundary: {token}")
+    return host, container
+
+
+def _exact_container_options(
+    argv: list[str], prefix: list[str], arities: dict[str, int]
+) -> dict[str, list[str]]:
+    if argv[: len(prefix)] != prefix:
+        raise AssertionError(f"wrong container command prefix: {argv[:len(prefix)]}")
+    options: dict[str, list[str]] = {}
+    index = len(prefix)
+    while index < len(argv):
+        token = argv[index]
+        if token not in arities:
+            raise AssertionError(f"unknown option, positional alias, or spelling: {token}")
+        if token in options:
+            raise AssertionError(f"duplicate container option: {token}")
+        arity = arities[token]
+        values = argv[index + 1 : index + 1 + arity]
+        if len(values) != arity or any(value.startswith("-") for value in values):
+            raise AssertionError(f"wrong arity for container option: {token}")
+        options[token] = values
+        index += 1 + arity
+    if set(options) != set(arities):
+        missing = sorted(set(arities) - set(options))
+        raise AssertionError(f"missing exact container options: {missing}")
+    return options
+
+
 def _option_values(argv: list[str], flag: str, count: int = 1) -> list[str]:
     indices: list[int] = []
     canonical_prefix = f"{flag}="
@@ -116,16 +198,42 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         )
 
     argv = exec_starts[0]
-    if argv[:2] != ["/usr/bin/docker", "run"]:
-        raise AssertionError("ExecStart must be the canonical docker run command")
-
-    expected_options = {
+    image = "ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0"
+    host_argv, container_argv = _split_docker_run_argv(argv, image)
+    expected_host_options = {
         "--name": ["vllm-embedding"],
         "-p": ["100.105.4.92:18012:8000"],
         "--memory": ["20g"],
         "--memory-swap": ["20g"],
         "--memory-swappiness": ["0"],
         "--oom-score-adj": ["0"],
+    }
+    for flag, expected in expected_host_options.items():
+        actual = _option_values(host_argv, flag, len(expected))
+        if actual != expected:
+            raise AssertionError(f"{flag} must be {expected}, found {actual}")
+
+    option_arities = {
+        "--host": 1,
+        "--port": 1,
+        "--served-model-name": 2,
+        "--convert": 1,
+        "--dtype": 1,
+        "--max-model-len": 1,
+        "--max-num-batched-tokens": 1,
+        "--max-num-seqs": 1,
+        "--kv-cache-memory-bytes": 1,
+        "--enforce-eager": 0,
+    }
+    model_command = [
+        "/usr/local/bin/vllm",
+        "serve",
+        "Qwen/Qwen3-Embedding-8B",
+    ]
+    parsed_options = _exact_container_options(
+        container_argv, model_command, option_arities
+    )
+    expected_container_options = {
         "--host": ["0.0.0.0"],
         "--port": ["8000"],
         "--served-model-name": [
@@ -138,29 +246,15 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         "--max-num-batched-tokens": ["8192"],
         "--max-num-seqs": ["64"],
         "--kv-cache-memory-bytes": ["4800M"],
+        "--enforce-eager": [],
     }
-    for flag, expected in expected_options.items():
-        actual = _option_values(argv, flag, len(expected))
+    for flag, expected in expected_container_options.items():
+        actual = parsed_options[flag]
         if actual != expected:
             raise AssertionError(f"{flag} must be {expected}, found {actual}")
 
-    _standalone_option(argv, "--enforce-eager")
-
-    model_command = [
-        "/usr/local/bin/vllm",
-        "serve",
-        "Qwen/Qwen3-Embedding-8B",
-    ]
-    starts = [
-        index
-        for index in range(len(argv) - len(model_command) + 1)
-        if argv[index : index + len(model_command)] == model_command
-    ]
-    if len(starts) != 1:
-        raise AssertionError("expected one canonical vLLM model command")
-
     forbidden_options = ("--quantization", "--kv-cache-dtype", "--truncate-dim")
-    for token in argv:
+    for token in container_argv:
         lowered = token.lower()
         for forbidden in forbidden_options:
             if lowered == forbidden or lowered.startswith(f"{forbidden}="):
@@ -178,13 +272,13 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         )
 
     return {
-        "model_len": int(expected_options["--max-model-len"][0]),
-        "kv_mib": int(expected_options["--kv-cache-memory-bytes"][0][:-1]),
-        "memory_gib": int(expected_options["--memory"][0][:-1]),
-        "swap_gib": int(expected_options["--memory-swap"][0][:-1]),
+        "model_len": int(expected_container_options["--max-model-len"][0]),
+        "kv_mib": int(expected_container_options["--kv-cache-memory-bytes"][0][:-1]),
+        "memory_gib": int(expected_host_options["--memory"][0][:-1]),
+        "swap_gib": int(expected_host_options["--memory-swap"][0][:-1]),
         "helper_gib": int(expected_helper[-1]),
-        "batched_tokens": int(expected_options["--max-num-batched-tokens"][0]),
-        "seqs": int(expected_options["--max-num-seqs"][0]),
+        "batched_tokens": int(expected_container_options["--max-num-batched-tokens"][0]),
+        "seqs": int(expected_container_options["--max-num-seqs"][0]),
     }
 
 
@@ -310,6 +404,32 @@ class HostileEmbeddingUnitMutationTests(unittest.TestCase):
         )
         self.assertTrue(separator)
         unit = prefix + "--oom-score-adj 100" + suffix
+        self.assert_contract_rejects(unit)
+
+    def test_rejects_docker_memory_option_after_image_boundary(self) -> None:
+        unit = EMBEDDING_UNIT.read_text()
+        unit = unit.replace("  --memory 20g \\\n", "", 1).replace(
+            "  ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0 \\\n",
+            "  ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0 \\\n"
+            "  --memory 20g \\\n",
+            1,
+        )
+        self.assert_contract_rejects(unit)
+
+    def test_rejects_extra_docker_memory_alias(self) -> None:
+        unit = EMBEDDING_UNIT.read_text().replace(
+            "  --memory 20g \\\n",
+            "  --memory 20g -m 24g \\\n",
+            1,
+        )
+        self.assert_contract_rejects(unit)
+
+    def test_rejects_extra_served_model_alias(self) -> None:
+        unit = EMBEDDING_UNIT.read_text().replace(
+            "--served-model-name qwen3-embedding-8b Qwen/Qwen3-Embedding-8B",
+            "--served-model-name qwen3-embedding-8b Qwen/Qwen3-Embedding-8B extra-alias",
+            1,
+        )
         self.assert_contract_rejects(unit)
 
 
