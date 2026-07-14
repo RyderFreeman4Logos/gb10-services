@@ -311,22 +311,58 @@ has no embedding/reranker action.
 
 ### Embedding 32K profile activation and rollback
 
-The tracked 32,768-token / 4,800 MiB KV / 20 GiB profile is source-first; do
-not copy it onto a running host and restart embedding in isolation. In an
-approved maintenance window, install the reviewed unit, snapshot embedding
-state/PID/restart count, cgroup current/peak/max/swap, startup capacity, and a
-fixed synthetic 4,096-dimensional quality canary, then use the full-stack
-memory-profile stop/start order documented in `AGENTS.md`. Snapshot text and
-both rerankers before and after as invariants.
+The tracked 32,768-token / 4,800 MiB KV / 20 GiB profile is source-first and
+must be activated as a **single-unit** canary. Do not stop or restart text or
+either reranker, and do not copy/sync unrelated files from this branch. Before
+installation, use the complete canary in
+`docs/research/2026-07-14-vllm-upgrade-and-embedding-memory.md` to save the
+installed embedding unit, embedding state/runtime/cgroup receipts, a fixed
+synthetic output from both aliases, and text/reranker `ActiveState`, `MainPID`,
+and `NRestarts`.
 
-Accept the profile only when startup reports at least 32,768 KV tokens, both
-embedding aliases return finite 4,096-dimensional vectors within the accepted
-quality tolerance, no cap/swap event occurs, and neighboring model state is
-unchanged. Otherwise restore the reviewed 40,960-token / 5,820 MiB KV unit with
-24 GiB Docker memory/swap and a 24G helper cap, then repeat the same maintenance
-procedure. Preserve the failed canary receipts. The detailed calculations,
-vLLM upgrade rationale, and unknowns are in
-`docs/research/2026-07-14-vllm-upgrade-and-embedding-memory.md`.
+Run the activation from the repository root only after those pre-state receipts
+exist:
+
+```bash
+install -m 0644 systemd/vllm-embedding.service \
+  "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/vllm-embedding.service"
+timeout 10s systemctl --user daemon-reload
+ACTIVATED_AT=$(date --iso-8601=seconds)
+timeout 15s systemctl --user --no-block restart vllm-embedding.service
+timeout 92s bash -c '
+  until systemctl --user is-active --quiet vllm-embedding.service &&
+    curl --fail --silent --show-error --max-time 2 \
+      http://100.105.4.92:18012/v1/models >/dev/null; do
+    sleep 2
+  done
+'
+```
+
+Accept only after the detailed canary verifies the running Docker argv has
+`--max-model-len 32768`, startup reports at least 32,768 KV tokens, both aliases
+return finite 4,096-dimensional vectors at the documented cosine-parity
+threshold, Docker and cgroup limits are exactly 20 GiB with no swap/cap event,
+and every saved text/reranker state/PID/restart-count tuple is byte-for-byte
+unchanged. Until those receipts exist, the profile is projected and **not
+production-verified**.
+
+On any failure, preserve the failed receipts, restore only the saved embedding
+unit, reload systemd, and restart only embedding; do not attempt a full-stack
+recovery:
+
+```bash
+: "${EVIDENCE:?set EVIDENCE to the canary receipt directory}"
+install -m 0644 "$EVIDENCE/vllm-embedding.service.before" \
+  "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/vllm-embedding.service"
+timeout 10s systemctl --user daemon-reload
+timeout 15s systemctl --user --no-block restart vllm-embedding.service
+timeout 92s bash -c '
+  until systemctl --user is-active --quiet vllm-embedding.service; do sleep 2; done
+'
+```
+
+The research note contains executable pre/post snapshots, deterministic output
+comparison, capacity/cgroup checks, neighbor comparison, and rollback receipts.
 
 ### Memory-guardian canary and explicit text recovery test
 

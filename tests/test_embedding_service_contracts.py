@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import re
+import shlex
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 EMBEDDING_UNIT = ROOT / "systemd" / "vllm-embedding.service"
+README = ROOT / "README.md"
+AGENT_PLAYBOOK = ROOT / "AGENTS.md"
+RESEARCH_NOTE = (
+    ROOT / "docs" / "research" / "2026-07-14-vllm-upgrade-and-embedding-memory.md"
+)
 
 VALIDATED_KV_MIB = 5_820
 VALIDATED_KV_TOKENS = 41_376
@@ -18,26 +25,178 @@ EXPECTED_KV_REDUCTION_MIB = 1_020
 MIN_PROJECTED_CAP_MARGIN_GIB = 5
 
 
-def _numeric_arg(unit: str, flag: str, suffix: str = "") -> int:
-    match = re.search(
-        rf"{re.escape(flag)}\s+(\d+){re.escape(suffix)}(?:\s|\\|$)", unit
-    )
-    if match is None:
-        raise AssertionError(f"missing numeric argument: {flag}")
-    return int(match.group(1))
+def _logical_directive_argv(unit: str, directive: str) -> list[list[str]]:
+    commands: list[list[str]] = []
+    pending: list[str] = []
+    prefix = f"{directive}="
+
+    for raw_line in unit.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+
+        if pending:
+            value = line
+        elif line.startswith(prefix):
+            value = line[len(prefix) :]
+        else:
+            continue
+
+        continued = value.endswith("\\")
+        if continued:
+            value = value[:-1].rstrip()
+        pending.append(value)
+
+        if not continued:
+            logical_command = " ".join(pending)
+            try:
+                commands.append(shlex.split(logical_command, posix=True))
+            except ValueError as error:
+                raise AssertionError(
+                    f"invalid {directive} shell syntax: {error}"
+                ) from error
+            pending = []
+
+    if pending:
+        raise AssertionError(f"unterminated {directive} continuation")
+    return commands
+
+
+def _option_values(argv: list[str], flag: str, count: int = 1) -> list[str]:
+    indices: list[int] = []
+    canonical_prefix = f"{flag}="
+    for index, token in enumerate(argv):
+        if token == flag:
+            indices.append(index)
+        elif token.lower() == flag.lower() or token.lower().startswith(
+            canonical_prefix.lower()
+        ):
+            raise AssertionError(f"noncanonical option spelling: {token}")
+
+    if len(indices) != 1:
+        raise AssertionError(
+            f"expected exactly one {flag}, found {len(indices)}"
+        )
+    start = indices[0] + 1
+    values = argv[start : start + count]
+    if len(values) != count or any(value.startswith("-") for value in values):
+        raise AssertionError(f"missing value for {flag}")
+    return values
+
+
+def _standalone_option(argv: list[str], flag: str) -> None:
+    matches = [token for token in argv if token == flag]
+    noncanonical = [
+        token
+        for token in argv
+        if token != flag
+        and (
+            token.lower() == flag.lower()
+            or token.lower().startswith(f"{flag.lower()}=")
+        )
+    ]
+    if noncanonical:
+        raise AssertionError(f"noncanonical option spelling: {noncanonical[0]}")
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected exactly one {flag}, found {len(matches)}"
+        )
+
+
+def _embedding_contract(unit: str) -> dict[str, int]:
+    exec_starts = _logical_directive_argv(unit, "ExecStart")
+    exec_start_posts = _logical_directive_argv(unit, "ExecStartPost")
+    if len(exec_starts) != 1:
+        raise AssertionError(
+            f"expected exactly one ExecStart, found {len(exec_starts)}"
+        )
+    if len(exec_start_posts) != 1:
+        raise AssertionError(
+            f"expected exactly one ExecStartPost, found {len(exec_start_posts)}"
+        )
+
+    argv = exec_starts[0]
+    if argv[:2] != ["/usr/bin/docker", "run"]:
+        raise AssertionError("ExecStart must be the canonical docker run command")
+
+    expected_options = {
+        "--name": ["vllm-embedding"],
+        "-p": ["100.105.4.92:18012:8000"],
+        "--memory": ["20g"],
+        "--memory-swap": ["20g"],
+        "--memory-swappiness": ["0"],
+        "--oom-score-adj": ["0"],
+        "--host": ["0.0.0.0"],
+        "--port": ["8000"],
+        "--served-model-name": [
+            "qwen3-embedding-8b",
+            "Qwen/Qwen3-Embedding-8B",
+        ],
+        "--convert": ["embed"],
+        "--dtype": ["bfloat16"],
+        "--max-model-len": ["32768"],
+        "--max-num-batched-tokens": ["8192"],
+        "--max-num-seqs": ["64"],
+        "--kv-cache-memory-bytes": ["4800M"],
+    }
+    for flag, expected in expected_options.items():
+        actual = _option_values(argv, flag, len(expected))
+        if actual != expected:
+            raise AssertionError(f"{flag} must be {expected}, found {actual}")
+
+    _standalone_option(argv, "--enforce-eager")
+
+    model_command = [
+        "/usr/local/bin/vllm",
+        "serve",
+        "Qwen/Qwen3-Embedding-8B",
+    ]
+    starts = [
+        index
+        for index in range(len(argv) - len(model_command) + 1)
+        if argv[index : index + len(model_command)] == model_command
+    ]
+    if len(starts) != 1:
+        raise AssertionError("expected one canonical vLLM model command")
+
+    forbidden_options = ("--quantization", "--kv-cache-dtype", "--truncate-dim")
+    for token in argv:
+        lowered = token.lower()
+        for forbidden in forbidden_options:
+            if lowered == forbidden or lowered.startswith(f"{forbidden}="):
+                raise AssertionError(f"forbidden embedding option: {token}")
+
+    helper = exec_start_posts[0]
+    expected_helper = [
+        "/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh",
+        "vllm-embedding",
+        "20",
+    ]
+    if helper != expected_helper:
+        raise AssertionError(
+            f"ExecStartPost must be exactly {expected_helper}, found {helper}"
+        )
+
+    return {
+        "model_len": int(expected_options["--max-model-len"][0]),
+        "kv_mib": int(expected_options["--kv-cache-memory-bytes"][0][:-1]),
+        "memory_gib": int(expected_options["--memory"][0][:-1]),
+        "swap_gib": int(expected_options["--memory-swap"][0][:-1]),
+        "helper_gib": int(expected_helper[-1]),
+        "batched_tokens": int(expected_options["--max-num-batched-tokens"][0]),
+        "seqs": int(expected_options["--max-num-seqs"][0]),
+    }
 
 
 class EmbeddingServiceContractTests(unittest.TestCase):
     def test_32k_profile_has_bounded_kv_and_container_headroom(self) -> None:
         unit = EMBEDDING_UNIT.read_text()
-        model_len = _numeric_arg(unit, "--max-model-len")
-        kv_mib = _numeric_arg(unit, "--kv-cache-memory-bytes", "M")
-        memory_gib = _numeric_arg(unit, "--memory", "g")
-        swap_gib = _numeric_arg(unit, "--memory-swap", "g")
-        helper_gib = _numeric_arg(
-            unit,
-            "gb10_enforce_docker_cgroup_limits.sh vllm-embedding",
-        )
+        contract = _embedding_contract(unit)
+        model_len = contract["model_len"]
+        kv_mib = contract["kv_mib"]
+        memory_gib = contract["memory_gib"]
+        swap_gib = contract["swap_gib"]
+        helper_gib = contract["helper_gib"]
 
         self.assertEqual(model_len, CONTRACT_TOKENS)
         self.assertEqual(kv_mib, 4_800)
@@ -65,18 +224,180 @@ class EmbeddingServiceContractTests(unittest.TestCase):
 
     def test_quality_and_throughput_semantics_remain_unchanged(self) -> None:
         unit = EMBEDDING_UNIT.read_text()
-        self.assertIn("vllm serve Qwen/Qwen3-Embedding-8B", unit)
-        self.assertIn(
-            "--served-model-name qwen3-embedding-8b Qwen/Qwen3-Embedding-8B",
-            unit,
+        contract = _embedding_contract(unit)
+        self.assertEqual(contract["batched_tokens"], 8_192)
+        self.assertEqual(contract["seqs"], 64)
+
+
+class HostileEmbeddingUnitMutationTests(unittest.TestCase):
+    CONTRACT_TESTS = (
+        "test_32k_profile_has_bounded_kv_and_container_headroom",
+        "test_quality_and_throughput_semantics_remain_unchanged",
+    )
+
+    def assert_contract_rejects(self, unit: str) -> None:
+        suite = unittest.TestSuite(
+            EmbeddingServiceContractTests(test_name)
+            for test_name in self.CONTRACT_TESTS
         )
-        self.assertIn("--convert embed", unit)
-        self.assertIn("--dtype bfloat16", unit)
-        self.assertEqual(_numeric_arg(unit, "--max-num-batched-tokens"), 8_192)
-        self.assertEqual(_numeric_arg(unit, "--max-num-seqs"), 64)
-        self.assertNotIn("--quantization", unit)
-        self.assertNotIn("--kv-cache-dtype", unit)
-        self.assertNotIn("--truncate-dim", unit)
+        result = unittest.TestResult()
+        with patch.object(Path, "read_text", autospec=True, return_value=unit):
+            suite.run(result)
+        self.assertGreater(
+            len(result.failures) + len(result.errors),
+            0,
+            "mutated unit unexpectedly satisfied the embedding contract",
+        )
+
+    @staticmethod
+    def append_execstart_arg(unit: str, argument: str) -> str:
+        return unit.replace(
+            "    --enforce-eager",
+            f"    --enforce-eager \\\n+    {argument}",
+            1,
+        )
+
+    def test_rejects_appended_conflicting_critical_options(self) -> None:
+        unit = EMBEDDING_UNIT.read_text()
+        for argument in (
+            "--max-model-len 40960",
+            "--dtype float16",
+            "--memory 24g",
+        ):
+            with self.subTest(argument=argument):
+                self.assert_contract_rejects(
+                    self.append_execstart_arg(unit, argument)
+                )
+
+    def test_rejects_comment_that_fakes_the_expected_value(self) -> None:
+        unit = EMBEDDING_UNIT.read_text().replace(
+            "--max-model-len 32768",
+            "# --max-model-len 32768\n    --max-model-len 40960",
+            1,
+        )
+        self.assert_contract_rejects(unit)
+
+    def test_rejects_noncanonical_units_and_case(self) -> None:
+        unit = EMBEDDING_UNIT.read_text()
+        mutations = (
+            unit.replace("4800M", "4800m", 1),
+            unit.replace("--memory 20g", "--memory 20G", 1),
+            unit.replace("--dtype bfloat16", "--dtype BFLOAT16", 1),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.assert_contract_rejects(mutation)
+
+    def test_rejects_duplicate_post_start_helper(self) -> None:
+        unit = EMBEDDING_UNIT.read_text()
+        duplicate = (
+            "\nExecStartPost=/home/obj/.local/bin/"
+            "gb10_enforce_docker_cgroup_limits.sh vllm-embedding 20\n"
+        )
+        self.assert_contract_rejects(unit + duplicate)
+
+    def test_rejects_changed_published_port(self) -> None:
+        unit = EMBEDDING_UNIT.read_text().replace(
+            "100.105.4.92:18012:8000",
+            "100.105.4.92:18014:8000",
+            1,
+        )
+        self.assert_contract_rejects(unit)
+
+    def test_rejects_changed_oom_score_priority(self) -> None:
+        prefix, separator, suffix = EMBEDDING_UNIT.read_text().rpartition(
+            "--oom-score-adj 0"
+        )
+        self.assertTrue(separator)
+        unit = prefix + "--oom-score-adj 100" + suffix
+        self.assert_contract_rejects(unit)
+
+
+class EmbeddingDeploymentContractTests(unittest.TestCase):
+    FORBIDDEN_NEIGHBORS = (
+        "vllm-aeon-27b-dflash.service",
+        "querit-4b-reranker.service",
+        "vllm-qwen3-reranker-8b.service",
+    )
+
+    @staticmethod
+    def section(text: str, start: str, end_pattern: str) -> str:
+        start_at = text.find(start)
+        if start_at < 0:
+            raise AssertionError(f"missing deployment section marker: {start}")
+        remainder = text[start_at:]
+        end = re.search(end_pattern, remainder[len(start) :], re.MULTILINE)
+        if end is None:
+            return remainder
+        return remainder[: len(start) + end.start()]
+
+    @staticmethod
+    def shell_commands(section: str) -> str:
+        blocks = re.findall(r"```(?:bash|sh)\n(.*?)```", section, re.DOTALL)
+        return "\n".join(blocks).replace("\\\n", " ")
+
+    @staticmethod
+    def systemctl_mutations(commands: str) -> list[tuple[str, str]]:
+        actions = {"start", "stop", "restart", "try-restart", "reload-or-restart"}
+        mutations: list[tuple[str, str]] = []
+        for raw_line in commands.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "systemctl --user" not in line:
+                continue
+            tail = line.split("systemctl --user", 1)[1]
+            try:
+                argv = shlex.split(tail, comments=True, posix=True)
+            except ValueError as error:
+                raise AssertionError(
+                    f"invalid documented systemctl command: {line}"
+                ) from error
+            action_index = next(
+                (index for index, token in enumerate(argv) if token in actions),
+                None,
+            )
+            if action_index is None:
+                continue
+            action = argv[action_index]
+            for token in argv[action_index + 1 :]:
+                target = token.rstrip(";")
+                if target.endswith(".service"):
+                    mutations.append((action, target))
+        return mutations
+
+    def test_activation_and_rollback_mutate_only_embedding(self) -> None:
+        sections = (
+            self.section(
+                README.read_text(),
+                "### Embedding 32K profile activation and rollback",
+                r"^### ",
+            ),
+            self.section(
+                AGENT_PLAYBOOK.read_text(),
+                "For updates on an already-running GB10",
+                r"^---$",
+            ),
+            self.section(
+                RESEARCH_NOTE.read_text(),
+                "## Future activation canary",
+                r"^## Unknowns$",
+            ),
+        )
+        commands = self.shell_commands("\n".join(sections))
+
+        self.assertIn(
+            "install -m 0644 systemd/vllm-embedding.service",
+            commands,
+        )
+        self.assertIn("systemctl --user daemon-reload", commands)
+        self.assertIn("timeout 92s", commands)
+        mutations = self.systemctl_mutations(commands)
+        self.assertIn(("restart", "vllm-embedding.service"), mutations)
+        for action, target in mutations:
+            self.assertEqual(
+                target,
+                "vllm-embedding.service",
+                f"{action} must not target neighboring unit {target}",
+            )
 
 
 if __name__ == "__main__":

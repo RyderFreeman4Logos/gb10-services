@@ -192,33 +192,80 @@ text-readiness gate, while Guard has ordering only. The Rust guardian is the
 sole automatic recovery actor; `gb10-swap-guard.service` is observer-only and
 must never stop, kill, or restart a model.
 
-For updates on an already-running GB10, do not restart just one vLLM service when
-changing memory/context profiles. Stop the full vLLM stack first to clear stale
-pages, then start in dependency order:
+For updates on an already-running GB10, the embedding 32K profile is a
+source-first **single-unit** canary. Never use the general stack installation
+commands above for this change, never copy/sync unrelated branch files, and
+never stop, start, or restart text or either reranker. Run from the repository
+root in an approved maintenance window. Before installation, create private
+receipts, save the currently installed embedding unit, snapshot embedding plus
+neighbor `ActiveState`/`MainPID`/`NRestarts`, and capture both deterministic
+alias baselines:
 
 ```bash
-systemctl --user stop querit-4b-reranker.service vllm-qwen3-reranker-8b.service
-systemctl --user stop vllm-aeon-27b-dflash.service
-systemctl --user stop vllm-embedding.service
-
-systemctl --user start vllm-embedding.service
-systemctl --user start vllm-aeon-27b-dflash.service
-systemctl --user start querit-4b-reranker.service
-systemctl --user start llm-guard-proxy.service
+set -euo pipefail
+umask 077
+EVIDENCE="$HOME/log/vllm-embedding-32k-canary-$(date -u +%Y%m%dT%H%M%SZ)"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+mkdir -p "$EVIDENCE"
+install -m 0600 "$UNIT_DIR/vllm-embedding.service" \
+  "$EVIDENCE/vllm-embedding.service.before"
+for unit in vllm-embedding.service vllm-aeon-27b-dflash.service \
+  querit-4b-reranker.service vllm-qwen3-reranker-8b.service; do
+  timeout 10s systemctl --user show "$unit" \
+    --property=Id,ActiveState,MainPID,NRestarts
+done >"$EVIDENCE/units.before"
+models=(qwen3-embedding-8b Qwen/Qwen3-Embedding-8B)
+for index in "${!models[@]}"; do
+  timeout 25s curl --fail-with-body --silent --show-error --max-time 20 \
+    -H 'Content-Type: application/json' \
+    --data "{\"model\":\"${models[$index]}\",\"input\":[\"gb10-embedding-canary-v1\",\"source-safe deterministic parity anchor\"]}" \
+    http://100.105.4.92:18012/v1/embeddings \
+    >"$EVIDENCE/alias-$index.before.json"
+done
 ```
 
-The embedding 32K/4,800 MiB/20 GiB profile is source-first and must be activated
-only in an approved maintenance window. Before stopping the stack, snapshot the
-embedding `ActiveState`, `MainPID`, `NRestarts`, endpoint quality/dimensions,
-startup capacity log, cgroup current/peak/max/swap, and text/reranker state,
-PIDs, and restart counts. After startup, require at least 32,768 reported KV
-tokens, exact 4,096-dimensional finite embeddings through both aliases, no cap
-or swap event, and unchanged text/reranker invariants. Roll back to
-`max-model-len=40960`, `kv-cache-memory-bytes=5820M`, Docker
-`--memory/--memory-swap=24g`, and helper cap `24G` if startup, capacity, cap, or
-quality checks fail. See
-`docs/research/2026-07-14-vllm-upgrade-and-embedding-memory.md` for evidence and
-the full canary criteria.
+Then install **only** the reviewed embedding unit, reload, restart only
+embedding without blocking on its 600-second systemd start timeout, and use the
+hard 92-second readiness bound:
+
+```bash
+install -m 0644 systemd/vllm-embedding.service \
+  "$UNIT_DIR/vllm-embedding.service"
+timeout 10s systemctl --user daemon-reload
+ACTIVATED_AT=$(date --iso-8601=seconds)
+timeout 15s systemctl --user --no-block restart vllm-embedding.service
+timeout 92s bash -c '
+  until systemctl --user is-active --quiet vllm-embedding.service &&
+    curl --fail --silent --show-error --max-time 2 \
+      http://100.105.4.92:18012/v1/models >/dev/null; do
+    sleep 2
+  done
+'
+```
+
+The complete executable checks in
+`docs/research/2026-07-14-vllm-upgrade-and-embedding-memory.md` must then prove
+that the running argv has `--max-model-len 32768`, startup KV capacity is at
+least 32,768, both aliases still produce finite 4,096-dimensional vectors at
+the recorded cosine threshold, Docker and cgroup memory are exactly 20 GiB with
+zero swap/cap events, and text plus both rerankers have unchanged
+`ActiveState`, `MainPID`, and `NRestarts`. This profile remains projected, not
+production-verified, until those live receipts exist.
+
+Any failed check requires restoring the saved embedding unit and restarting
+**only** embedding. Preserve the failed receipts; do not recover by cycling the
+stack:
+
+```bash
+: "${EVIDENCE:?set EVIDENCE to the canary receipt directory}"
+install -m 0644 "$EVIDENCE/vllm-embedding.service.before" \
+  "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/vllm-embedding.service"
+timeout 10s systemctl --user daemon-reload
+timeout 15s systemctl --user --no-block restart vllm-embedding.service
+timeout 92s bash -c '
+  until systemctl --user is-active --quiet vllm-embedding.service; do sleep 2; done
+'
+```
 
 ---
 
