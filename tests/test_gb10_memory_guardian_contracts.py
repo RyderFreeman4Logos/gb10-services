@@ -102,6 +102,24 @@ class MemoryGuardianContractTests(unittest.TestCase):
             unit,
         )
 
+    def test_guardian_initial_reconcile_emits_armed_identity_receipt(self) -> None:
+        binary = BINARY.read_text()
+        initial_reconcile = binary.split(
+            "let initial_transition = targets.reconcile()", 1
+        )[1].split("let started", 1)[0]
+        self.assertIn("armed target", initial_reconcile)
+        self.assertIn("targets.active_label()", initial_reconcile)
+
+    def test_guardian_unit_pins_and_binary_enforces_production_target_identity(self) -> None:
+        unit = GUARDIAN_UNIT.read_text()
+        binary = BINARY.read_text()
+        self.assertIn("GB10_MEMORY_GUARDIAN_EXPECTED_LABEL=aeon-text", unit)
+        self.assertIn(
+            "GB10_MEMORY_GUARDIAN_EXPECTED_REGISTRATION_FILE=text-cgroup.v1", unit
+        )
+        self.assertIn("enforce_expected_target_identity", binary)
+        self.assertGreaterEqual(binary.count("enforce_expected_target_identity"), 3)
+
     def test_cgroup_helper_publishes_registration_atomically(self) -> None:
         helper = CGROUP_HELPER.read_text()
         self.assertIn("GB10_CGROUP_REGISTRATION_PATH", helper)
@@ -116,7 +134,7 @@ class MemoryGuardianContractTests(unittest.TestCase):
         self.assertIn('[[ -L "$registration_dir" ]]', helper)
         self.assertIn("^[0-9a-f]{64}$", helper)
         self.assertIn("app.slice/${scope}", helper)
-        cleanup_trap = helper.index("trap fail_closed_registration ERR")
+        cleanup_trap = helper.index("trap fail_closed_registration EXIT")
         self.assertLess(
             helper.index('if [[ "$registration_dir" != "$expected_registration_dir"'),
             cleanup_trap,
@@ -141,15 +159,20 @@ class MemoryGuardianContractTests(unittest.TestCase):
         self.assertIn("GB10_BENCHMARK_EXCLUDED", canary)
         self.assertIn("gb10-memory-guardian-disposable-canary.service", canary)
         self.assertIn("gb10-memory-guardian-canary.service", canary)
-        self.assertIn("--kill-configured-target", canary)
         self.assertIn("configured-target", canary)
-        self.assertIn("I_UNDERSTAND_CONFIGURED_TARGET_WILL_BE_KILLED", canary)
+        self.assertIn("read-only", canary)
+        self.assertNotIn("--kill-configured-target", canary)
+        self.assertNotIn("I_UNDERSTAND_CONFIGURED_TARGET_WILL_BE_KILLED", canary)
         self.assertIn("GB10_MEMORY_GUARDIAN_CANARY_TARGET_UNIT", canary)
         self.assertIn("tomllib", canary)
         self.assertIn("registration_file", canary)
         self.assertIn("GB10_CGROUP_REGISTRATION_PATH", canary)
-        self.assertIn("-p Restart --value", canary)
+        self.assertIn("LoadState", canary)
+        self.assertIn("ActiveState", canary)
+        self.assertIn("SubState", canary)
         self.assertIn("MainPID", canary)
+        self.assertIn("Result", canary)
+        self.assertIn("ExecMainStatus", canary)
         self.assertIn("NRestarts", canary)
         self.assertNotIn("--target", canary)
         for protected in (
@@ -162,13 +185,16 @@ class MemoryGuardianContractTests(unittest.TestCase):
             self.assertIn(protected, canary)
         self.assertIn("--disposable-canary", driver)
         self.assertGreaterEqual(
-            canary.count('systemctl --user revert "$canary_unit"'),
+            canary.count('run_systemctl revert "$canary_unit"'),
             2,
             "the disposable transient unit must be reverted before create and during cleanup",
         )
+        disposable = canary.split("run_disposable()", 1)[1].split(
+            "run_configured_target()", 1
+        )[0]
         self.assertLess(
-            canary.index('systemctl --user revert "$canary_unit"'),
-            canary.index("systemd-run --user"),
+            disposable.index('run_systemctl revert "$canary_unit"'),
+            disposable.index("run_systemd_run"),
         )
         production = GUARDIAN_UNIT.read_text()
         self.assertIn("OOMScoreAdjust=100", production)
@@ -197,7 +223,7 @@ class MemoryGuardianContractTests(unittest.TestCase):
         self.assertNotIn("Requires=vllm-embedding.service", text_unit_section)
         self.assertNotIn("Wants=vllm-embedding.service", text_unit_section)
         self.assertIn("After=network.target vllm-embedding.service", text_unit_section)
-        self.assertIn("Wants=gb10-memory-guardian.service", text_unit_section)
+        self.assertNotIn("gb10-memory-guardian.service", text_unit_section)
         self.assertIn("--cgroup-parent app.slice", text)
         self.assertIn(
             "GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1",
@@ -217,13 +243,25 @@ class MemoryGuardianContractTests(unittest.TestCase):
         for path in (QUERIT_UNIT, LEGACY_RERANKER_UNIT):
             unit = path.read_text()
             unit_section = unit.split("[Service]", 1)[0]
-            for relationship in ("Requires=", "BindsTo=", "PartOf="):
+            for relationship in (
+                "Requires=",
+                "BindsTo=",
+                "PartOf=",
+                "PropagatesStopTo=",
+                "StopPropagatedFrom=",
+            ):
                 self.assertNotRegex(
                     unit_section,
                     rf"(?m)^{relationship}.*vllm-aeon-27b-dflash\.service",
                 )
             self.assertNotIn("http://100.105.4.92:18010", unit)
             self.assertIn("lifecycle-independent", unit)
+        text_unit_section = TEXT_UNIT.read_text().split("[Service]", 1)[0]
+        for relationship in ("Conflicts=", "PropagatesStopTo="):
+            for line in text_unit_section.splitlines():
+                if line.startswith(relationship):
+                    self.assertNotIn("querit-4b-reranker.service", line)
+                    self.assertNotIn("vllm-qwen3-reranker-8b.service", line)
         self.assertIn("Conflicts=vllm-qwen3-reranker-8b.service", QUERIT_UNIT.read_text())
         self.assertIn("querit-4b-reranker.service", LEGACY_RERANKER_UNIT.read_text())
         self.assertNotIn("gb10-memory-guardian.service", QUERIT_UNIT.read_text())

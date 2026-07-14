@@ -10,6 +10,8 @@ Environment=GB10_MEMORY_GUARDIAN_MEM_AVAIL_STOP_GIB=1
 Environment=GB10_MEMORY_GUARDIAN_POLL_SECONDS=1
 Environment=GB10_MEMORY_GUARDIAN_RETRY_SECONDS=5
 Environment=GB10_MEMORY_GUARDIAN_CONFIG_PATH=%h/.config/gb10-memory-guardian/config.toml
+Environment=GB10_MEMORY_GUARDIAN_EXPECTED_LABEL=aeon-text
+Environment=GB10_MEMORY_GUARDIAN_EXPECTED_REGISTRATION_FILE=text-cgroup.v1
 ExecStart=%h/.local/bin/gb10-memory-guardian
 Restart=always
 RestartSec=1

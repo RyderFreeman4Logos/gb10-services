@@ -15,6 +15,10 @@ systemctl_timeout_seconds="${GB10_SYSTEMCTL_TIMEOUT_SECONDS:-10}"
 wait_seconds="${GB10_CGROUP_WAIT_SECONDS:-120}"
 registration_path="${GB10_CGROUP_REGISTRATION_PATH:-}"
 registration_published=0
+registration_tmp=""
+docker_bin="${GB10_DOCKER_BIN:-/usr/bin/docker}"
+systemctl_bin="${GB10_SYSTEMCTL_BIN:-/usr/bin/systemctl}"
+cgroup_root="${GB10_CGROUP_ROOT:-/sys/fs/cgroup}"
 if [[ ! "$expected_gib" =~ ^[1-9][0-9]*$ ]]; then
   echo "expected GiB must be a positive integer: $expected_gib" >&2
   exit 2
@@ -29,12 +33,12 @@ export DOCKER_HOST="${DOCKER_HOST:-unix://${XDG_RUNTIME_DIR:-/run/user/${UID}}/d
 
 run_docker() {
   /usr/bin/timeout --signal=TERM --kill-after=2 "$docker_timeout_seconds" \
-    /usr/bin/docker "$@"
+    "$docker_bin" "$@"
 }
 
 run_systemctl() {
   /usr/bin/timeout --signal=TERM --kill-after=2 "$systemctl_timeout_seconds" \
-    /usr/bin/systemctl --user "$@"
+    "$systemctl_bin" --user "$@"
 }
 
 reject_registration_destination() {
@@ -73,14 +77,26 @@ fi
 
 fail_closed_registration() {
   local status=$?
-  trap - ERR
-  if [[ -n "$registration_path" && "$registration_published" != "1" ]]; then
+  trap - EXIT
+  if [[ -n "$registration_tmp" ]]; then
+    rm -f -- "$registration_tmp"
+  fi
+  if [[ "$status" != "0" && -n "$registration_path" && "$registration_published" != "1" ]]; then
     rm -f -- "$registration_path"
-    run_docker stop --time 5 "$name" >/dev/null 2>&1 || true
+    if [[ -z "$cid" ]]; then
+      echo "registration publication failed before exact container identity was captured" >&2
+      status=1
+    elif ! run_docker stop --time 5 "$cid" >/dev/null 2>&1; then
+      echo "graceful cleanup failed for exact launched container $cid; forcing exact cleanup" >&2
+      if ! run_docker kill "$cid" >/dev/null 2>&1; then
+        echo "exact launched container cleanup failed: $cid" >&2
+        status=1
+      fi
+    fi
   fi
   exit "$status"
 }
-trap fail_closed_registration ERR
+trap fail_closed_registration EXIT
 
 cid=""
 cg=""
@@ -94,13 +110,13 @@ while (( SECONDS < deadline )); do
   fi
   scope="docker-${cid}.scope"
   cg="$(run_systemctl show -p ControlGroup --value "$scope" 2>/dev/null || true)"
-  if [[ -n "$cg" && "$cg" != "/" && -e "/sys/fs/cgroup${cg}/memory.swap.max" ]]; then
+  if [[ -n "$cg" && "$cg" != "/" && -e "${cgroup_root}${cg}/memory.swap.max" ]]; then
     break
   fi
   sleep 1
 done
 
-if [[ -z "$cid" || -z "$scope" || -z "$cg" || "$cg" == "/" || ! -e "/sys/fs/cgroup${cg}/memory.swap.max" ]]; then
+if [[ -z "$cid" || -z "$scope" || -z "$cg" || "$cg" == "/" || ! -e "${cgroup_root}${cg}/memory.swap.max" ]]; then
   echo "could not locate docker cgroup for $name cid=${cid:-missing} scope=${scope:-missing} cg=${cg:-missing}" >&2
   exit 1
 fi
@@ -113,8 +129,8 @@ run_systemctl set-property --runtime "$scope" \
   "MemoryMax=${expected_gib}G" \
   MemorySwapMax=0
 
-swap_max="$(<"/sys/fs/cgroup${cg}/memory.swap.max")"
-mem_max="$(<"/sys/fs/cgroup${cg}/memory.max")"
+swap_max="$(<"${cgroup_root}${cg}/memory.swap.max")"
+mem_max="$(<"${cgroup_root}${cg}/memory.max")"
 
 if [[ "$swap_max" != "0" ]]; then
   echo "unexpected $name memory.swap.max=$swap_max expected=0 scope=$scope cg=$cg" >&2
@@ -133,10 +149,6 @@ if [[ -n "$registration_path" ]]; then
   fi
 
   registration_tmp="$(mktemp "${registration_path}.tmp.XXXXXX")"
-  cleanup_registration_tmp() {
-    rm -f -- "$registration_tmp"
-  }
-  trap cleanup_registration_tmp EXIT
   chmod 0600 "$registration_tmp"
   {
     printf 'version=1\n'
@@ -146,8 +158,21 @@ if [[ -n "$registration_path" ]]; then
   } >"$registration_tmp"
   chmod 0600 "$registration_tmp"
   mv -f -- "$registration_tmp" "$registration_path"
+  registration_tmp=""
+
+  registration_lines=()
+  mapfile -t registration_lines <"$registration_path"
+  if [[ ! -f "$registration_path" || -L "$registration_path" \
+    || "${#registration_lines[@]}" != "4" \
+    || "${registration_lines[0]:-}" != "version=1" \
+    || "${registration_lines[1]:-}" != "container_id=$cid" \
+    || "${registration_lines[2]:-}" != "scope=$scope" \
+    || "${registration_lines[3]:-}" != "control_group=$cg" ]]; then
+    echo "guardian registration publication did not preserve the validated bytes: $registration_path" >&2
+    exit 1
+  fi
   registration_published=1
-  trap - EXIT
 fi
 
 echo "verified $name cgroup memory.max=$mem_max memory.swap.max=$swap_max scope=$scope"
+trap - EXIT

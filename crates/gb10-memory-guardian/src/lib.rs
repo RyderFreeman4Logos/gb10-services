@@ -337,6 +337,10 @@ impl TargetRegistrationSet {
         self.monitor.active().label()
     }
 
+    pub fn active_registration_path(&self) -> &Path {
+        self.monitor.active().registration_path()
+    }
+
     pub fn pending_label(&self) -> Option<&str> {
         self.pending
             .as_ref()

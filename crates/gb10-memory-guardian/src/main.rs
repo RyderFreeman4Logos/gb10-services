@@ -36,6 +36,8 @@ struct Config {
     cgroup_root: PathBuf,
     runtime_dir: PathBuf,
     target_config_path: PathBuf,
+    expected_target_label: Option<String>,
+    expected_registration_file: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -100,6 +102,10 @@ impl Config {
             cgroup_root: path_env("GB10_MEMORY_GUARDIAN_CGROUP_ROOT", CGROUP_ROOT),
             runtime_dir,
             target_config_path: target_config_path()?,
+            expected_target_label: optional_string_env("GB10_MEMORY_GUARDIAN_EXPECTED_LABEL")?,
+            expected_registration_file: optional_string_env(
+                "GB10_MEMORY_GUARDIAN_EXPECTED_REGISTRATION_FILE",
+            )?,
         })
     }
 }
@@ -123,6 +129,19 @@ fn path_env(name: &str, default: &str) -> PathBuf {
     env::var_os(name)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(default))
+}
+
+fn optional_string_env(name: &str) -> Result<Option<String>, String> {
+    let Some(raw) = env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = raw
+        .into_string()
+        .map_err(|_| format!("{name} is not UTF-8"))?;
+    if value.is_empty() {
+        return Err(format!("{name} must not be empty"));
+    }
+    Ok(Some(value))
 }
 
 fn parse_positive_env(name: &str, default: u64) -> Result<u64, String> {
@@ -162,9 +181,18 @@ fn run_production(config: Config) -> Result<(), String> {
             config.target_config_path.display()
         )
     })?;
-    let mut degraded_logged = match targets.reconcile() {
+    enforce_expected_target_identity(&targets, &config)?;
+    let initial_transition = targets.reconcile();
+    if initial_transition.is_ok() {
+        enforce_expected_target_identity(&targets, &config)?;
+    }
+    let mut degraded_logged = match initial_transition {
         Ok(TargetTransition::Armed | TargetTransition::Refreshed | TargetTransition::Swapped) => {
             controller.reset_for_target_generation();
+            eprintln!(
+                "gb10-memory-guardian: armed target {}",
+                targets.active_label()
+            );
             false
         }
         Ok(TargetTransition::Unchanged | TargetTransition::Superseded) => false,
@@ -198,7 +226,11 @@ fn run_production(config: Config) -> Result<(), String> {
                 }
             }
         } else {
-            match targets.reconcile() {
+            let transition = targets.reconcile();
+            if transition.is_ok() {
+                enforce_expected_target_identity(&targets, &config)?;
+            }
+            match transition {
                 Ok(
                     TargetTransition::Armed
                     | TargetTransition::Refreshed
@@ -238,6 +270,37 @@ fn run_production(config: Config) -> Result<(), String> {
         }
         thread::sleep(config.poll_interval);
     }
+}
+
+fn enforce_expected_target_identity(
+    targets: &TargetRegistrationSet,
+    config: &Config,
+) -> Result<(), String> {
+    let expected_label = config.expected_target_label.as_deref().ok_or_else(|| {
+        "GB10_MEMORY_GUARDIAN_EXPECTED_LABEL is required in production".to_owned()
+    })?;
+    let expected_registration_file =
+        config
+            .expected_registration_file
+            .as_deref()
+            .ok_or_else(|| {
+                "GB10_MEMORY_GUARDIAN_EXPECTED_REGISTRATION_FILE is required in production"
+                    .to_owned()
+            })?;
+    let active_registration_file = targets
+        .active_registration_path()
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "active registration path has no UTF-8 file name".to_owned())?;
+    if targets.active_label() != expected_label
+        || active_registration_file != expected_registration_file
+    {
+        return Err(format!(
+            "configured target identity mismatch: expected {expected_label}/{expected_registration_file}, got {}/{active_registration_file}",
+            targets.active_label()
+        ));
+    }
+    Ok(())
 }
 
 fn elapsed_millis(started: Instant) -> u64 {

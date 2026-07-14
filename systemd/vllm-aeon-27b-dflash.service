@@ -1,8 +1,7 @@
 [Unit]
 Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.24.0, FP8 KV, port 18010, 262144 ctx, util=0.49, kv-mem=36864M, seq=64, docker-mem=69g, post-start cgroup enforce)
 # Ordering only: text recovery must not start, stop, or restart embedding.
-Wants=gb10-memory-guardian.service
-After=network.target vllm-embedding.service gb10-memory-guardian.service
+After=network.target vllm-embedding.service
 # Direct AEON text endpoint moved behind llm-guard-proxy; wrapper owns stable 18009.
 Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
 StartLimitIntervalSec=600

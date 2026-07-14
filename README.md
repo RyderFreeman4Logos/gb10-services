@@ -125,8 +125,9 @@ gb10-services/
 │   ├── aeon_vllm_wrapper.py# Wrapper startup script for vLLM container
 │   ├── gb10_apply_aeon_querit_profile.sh # Guarded Querit migration/deployer
 │   ├── gb10_check_mem_available.sh # Model startup headroom gate
+│   ├── gb10_deploy_memory_guardian.sh # Fail-closed guardian installer/activator
 │   ├── gb10_enforce_docker_cgroup_limits.sh # Rootless container hard caps
-│   ├── gb10_memory_guardian_canary.sh # Disposable/configured-target canary
+│   ├── gb10_memory_guardian_canary.sh # Disposable canary/read-only identity proof
 │   ├── gb10-swap-guard.sh  # Observer-only MemAvailable/swap evidence
 │   ├── querit_openai_rerank_server.py # Bounded OpenAI-compatible adapter
 │   └── sysmon.sh           # System performance and process metric logger (1Hz)
@@ -231,36 +232,29 @@ cp scripts/aeon_healthcheck.sh ~/scripts/
 cp scripts/aeon_chat_ready.py ~/.local/bin/
 cp scripts/gb10_apply_aeon_querit_profile.sh ~/.local/bin/
 cp scripts/gb10_check_mem_available.sh ~/.local/bin/
-cp scripts/gb10_enforce_docker_cgroup_limits.sh ~/.local/bin/
-cp scripts/gb10_memory_guardian_canary.sh ~/.local/bin/
 cp scripts/llm_guard_proxy_cached_rebuild.sh ~/.local/bin/
 cp scripts/querit_openai_rerank_server.py ~/.local/bin/
 cp scripts/sysmon.sh ~/.local/bin/
 cp scripts/gb10-swap-guard.sh ~/.local/bin/
-install -m 0755 target/release/gb10-memory-guardian ~/.local/bin/gb10-memory-guardian
 
 # Make scripts executable
 chmod +x ~/scripts/*.sh ~/.local/bin/*
 
-# Confirm that the reviewed source build is exactly what will run.
-test "$(sha256sum target/release/gb10-memory-guardian | awk '{print $1}')" = \
-  "$(sha256sum ~/.local/bin/gb10-memory-guardian | awk '{print $1}')"
-
 # Copy llm-guard-proxy config
 cp config/llm-guard-proxy/config.toml ~/.config/llm-guard-proxy/config.toml
-# The guardian rejects group/world-readable, linked, or non-owner config files.
-install -m 0600 config/gb10-memory-guardian/config.toml \
-  ~/.config/gb10-memory-guardian/config.toml
 ```
 
 > [!NOTE]
 > Update the IP address `100.105.4.92` in `systemd/*.service` and `config/llm-guard-proxy/config.toml` to match your local or Tailscale network interface IP address.
 
-### Step 2: Install Systemd Services
-Copy the user services to your user systemd configuration directory:
+### Step 2: Install non-guardian Systemd Services
+Install only units outside the guardian/text/reranker activation transaction:
 ```bash
 mkdir -p ~/.config/systemd/user/
-cp systemd/* ~/.config/systemd/user/
+install -m 0644 systemd/aeon-healthcheck.service systemd/aeon-healthcheck.timer \
+  systemd/gb10-swap-guard.service systemd/llm-guard-proxy.service \
+  systemd/sysmon.service systemd/vllm-embedding.service \
+  ~/.config/systemd/user/
 ```
 
 ### Step 3: Enable and Start the Stack
@@ -271,34 +265,48 @@ systemctl --user daemon-reload
 # Enable auxiliary services
 systemctl --user enable --now sysmon.service
 systemctl --user enable --now gb10-swap-guard.service
-systemctl --user enable --now gb10-memory-guardian.service
 systemctl --user enable --now aeon-healthcheck.timer
 
-# Enable model services
+# Install the complete reviewed guardian/text/reranker transaction while the
+# automatic actor remains stopped and disabled.
+export GB10_BENCHMARK_EXCLUDED=YES
+scripts/gb10_deploy_memory_guardian.sh install
+
+# Enable model services. Starting text is a separate operator action; the
+# deployer itself never restarts or kills a production model.
 systemctl --user enable --now vllm-embedding.service
 systemctl --user enable --now vllm-aeon-27b-dflash.service
 systemctl --user disable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now querit-4b-reranker.service
 systemctl --user enable --now llm-guard-proxy.service
+
+# On a stale upgrade, inspect and explicitly remove the obsolete volatile
+# Querit registration only after confirming the installed reranker is decoupled.
+test ! -e "$XDG_RUNTIME_DIR/gb10-memory-guardian/querit-cgroup.v1" || {
+  grep -q 'lifecycle-independent' ~/.config/systemd/user/querit-4b-reranker.service
+  rm -f "$XDG_RUNTIME_DIR/gb10-memory-guardian/querit-cgroup.v1"
+}
+scripts/gb10_deploy_memory_guardian.sh activate
 ```
 
-For an update on an already-running host, install the helper, units, guardian
-binary, and owner-only config before reloading systemd. The text unit is the only
-publisher: it uses `--cgroup-parent app.slice` and atomically writes
-`%t/gb10-memory-guardian/text-cgroup.v1`. The registration contains only the
-version, exact 64-character lowercase Docker ID, exact scope, and exact
-control-group path. The helper is generic and fails the opted-in unit closed if
-publication cannot be validated.
+Activate the guardian separately with the fail-closed source-first deployer.
+It first stops any stale guardian, then installs the current release binary,
+helper, canary, owner-only `config.toml`, guardian units, text unit, and both
+reviewed lifecycle-independent reranker units. No wildcard unit copy or manual
+guardian `enable --now` is an acceptable activation path. The exact target must
+remain label `aeon-text` with `registration_file = "text-cgroup.v1"`.
+The deployer uses `install -m 0600` for that owner-only config.
 
-```bash
-systemd-analyze --user verify ~/.config/systemd/user/*.service
-systemctl --user daemon-reload
-systemctl --user enable --now gb10-memory-guardian.service
-# Restart text only in an approved maintenance window so it publishes the new registration.
-systemctl --user restart vllm-aeon-27b-dflash.service
-systemctl --user is-active vllm-embedding.service querit-4b-reranker.service \
-  gb10-memory-guardian.service
-```
+The install phase leaves the automatic actor disabled. Activation refuses and
+keeps it stopped if the owner-only config is missing or wrong, any stale
+`querit-cgroup.v1` exists, the text unit does not publish `text-cgroup.v1`, the
+disposable canary fails, strict bounded systemd status is not
+`loaded/active/running`, or the post-start journal does not contain an exact
+`armed target aeon-text` receipt. The final configured-target phase is a
+read-only configured-target identity check; it never kills production text.
+The registration contains only the version, exact 64-character lowercase
+Docker ID, exact scope, and exact control-group path. Publication failure stops
+only that unit's exact launched container before systemd can manage it further.
 
 The text unit has `Restart=on-failure`, so a guardian cgroup kill converges
 through systemd. It has only non-owning ordering after embedding; neither text
@@ -364,7 +372,7 @@ timeout 92s bash -c '
 The research note contains executable pre/post snapshots, deterministic output
 comparison, capacity/cgroup checks, neighbor comparison, and rollback receipts.
 
-### Memory-guardian canary and explicit text recovery test
+### Memory-guardian disposable canary and read-only identity proof
 
 These are deployment procedures, not automated tests. Do not run either phase
 while a benchmark is active, and do not move, rewrite, truncate, or otherwise
@@ -382,29 +390,29 @@ The script creates only
 binary's disposable mode accepts no target path. The kill is executed through
 `gb10-memory-guardian-canary.service`, a sandboxed oneshot with production
 hardening. It snapshots text, embedding, both rerankers, Guard, and the
-production guardian (`ActiveState`, `MainPID`, and `NRestarts`) and writes a
-one-hour, binary-checksum-bound attestation only when they remain invariant.
+production guardian with strictly parsed `LoadState`, `ActiveState`, `SubState`,
+`MainPID`, `Result`, exit status, and `NRestarts`. Every systemd query has a hard
+timeout. A one-hour, binary-checksum-bound attestation is written only when all
+protected tuples remain invariant.
 
-The real configured-target phase is explicit and destructive: it kills the
-currently configured text cgroup. Do not run it during ordinary deployment.
-After recording service and memory evidence, supply the expected text unit and
-the exact confirmation phrase:
+The configured-target phase is read-only. It never invokes the guardian's
+`--kill-configured-target` mode and never stops, starts, or restarts text. Supply
+the exact activation timestamp so the bounded journal query cannot accept an
+old `armed target` receipt:
 
 ```bash
-systemctl --user is-active vllm-aeon-27b-dflash.service vllm-embedding.service \
-  querit-4b-reranker.service gb10-memory-guardian.service
-grep '^MemAvailable:' /proc/meminfo
 GB10_BENCHMARK_EXCLUDED=YES \
 GB10_MEMORY_GUARDIAN_CANARY_TARGET_UNIT=vllm-aeon-27b-dflash.service \
-  ~/.local/bin/gb10_memory_guardian_canary.sh configured-target \
-  I_UNDERSTAND_CONFIGURED_TARGET_WILL_BE_KILLED
+GB10_MEMORY_GUARDIAN_JOURNAL_SINCE="$ACTIVATED_AT" \
+  ~/.local/bin/gb10_memory_guardian_canary.sh configured-target
 ```
 
-The canary uses `--kill-configured-target`, never accepts a cgroup path, and
-refuses any protected unit identity. It waits for text to converge through
-`Restart=on-failure` while requiring embedding and both rerankers, Guard, and
-the guardian to preserve state, PID, and restart count. It does not stop or
-restore any protected service.
+It accepts only the owner-only `aeon-text` / `text-cgroup.v1` config, validates
+the exact current-user `app.slice` registration, checks that the text unit
+publishes that path with `Restart=on-failure`, requires a strict running guardian
+state, and matches an exact `gb10-memory-guardian: armed target aeon-text`
+journal line without changing embedding and both rerankers. Missing or hostile fields, substring matches, stale
+`querit-cgroup.v1`, and unbounded status reads fail closed.
 
 ### Guardian rollback
 
