@@ -39,7 +39,9 @@ chat-only mutation disabled for embedding/reranker profiles:
   `18003` only allows the reranker profile.
 * **Admission control**: default/chat concurrency is `4` in-flight and `4`
   queued requests. Embedding and reranker each have independent `8` in-flight
-  and `8` queued limits. Full queues return HTTP `429` with `Retry-After: 10`.
+  and `8` queued limits. Guard workflow alias/pre/post execution has a separate
+  hard limit of `4` in-flight executions. Full queues return HTTP `429` with
+  `Retry-After: 10`.
 * **Control-plane headroom**: `max_control_plane_in_flight_requests = 128`, so
   health/metrics/debug traffic is not starved by generation work.
 * **Metadata discovery/enrichment**: upstream model metadata discovery and
@@ -130,6 +132,8 @@ cp config/llm-guard-proxy/config.toml /home/obj/.config/llm-guard-proxy/config.t
 The cached rebuild script keeps Cargo build artifacts under
 `/home/obj/.cache/cargo-target/llm-guard-proxy-main`, then atomically relinks
 `/home/obj/.local/bin/llm-guard-proxy` to the workspace-built release binary.
+It explicitly builds with Cargo feature `guard`; production must not inherit the
+package's empty default feature set.
 If the running guard process still points at a deleted old inode after a
 standalone rebuild, the script restarts only `llm-guard-proxy.service` and
 smokes `/health`; it does not restart any vLLM backend.

@@ -203,6 +203,9 @@ tool_request_policy = "apply"
 no_thinking_marker_policy = "respect_no_thinking_markers"
 default_injection_schema = "vllm_native"
 
+[guard_workflows]
+max_in_flight_executions = 4
+
 [loop_guard]
 enabled = true
 mode = "enforce"
