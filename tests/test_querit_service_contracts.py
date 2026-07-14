@@ -141,7 +141,8 @@ class QueritServiceContractTests(unittest.TestCase):
         for contract in (
             "--memory 69g",
             "--memory-swap 69g",
-            "gb10_enforce_docker_cgroup_limits.sh vllm-aeon-27b-dflash-n12 69",
+            "gb10_enforce_docker_cgroup_limits.sh --publish-registration "
+            "vllm-aeon-27b-dflash-n12 69",
             "GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1",
             f"@{IMAGE_DIGEST}",
         ):

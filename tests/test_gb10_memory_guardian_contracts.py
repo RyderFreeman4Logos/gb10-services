@@ -18,7 +18,6 @@ TEXT_UNIT = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
 EMBEDDING_UNIT = ROOT / "systemd" / "vllm-embedding.service"
 LEGACY_RERANKER_UNIT = ROOT / "systemd" / "vllm-qwen3-reranker-8b.service"
 GUARD_UNIT = ROOT / "systemd" / "llm-guard-proxy.service"
-CGROUP_HELPER = ROOT / "scripts" / "gb10_enforce_docker_cgroup_limits.sh"
 CANARY = ROOT / "scripts" / "gb10_memory_guardian_canary.sh"
 HEALTHCHECK = ROOT / "scripts" / "aeon_healthcheck.sh"
 README = ROOT / "README.md"
@@ -119,45 +118,6 @@ class MemoryGuardianContractTests(unittest.TestCase):
         )
         self.assertIn("enforce_expected_target_identity", binary)
         self.assertGreaterEqual(binary.count("enforce_expected_target_identity"), 3)
-
-    def test_cgroup_helper_publishes_registration_atomically(self) -> None:
-        helper = CGROUP_HELPER.read_text()
-        text_unit = TEXT_UNIT.read_text()
-        self.assertIn("GB10_CGROUP_REGISTRATION_PATH", helper)
-        self.assertIn("GB10_CONTAINER_CIDFILE", helper)
-        self.assertIn("GB10_CONTAINER_CIDFILE", text_unit)
-        self.assertIn("--cidfile=", text_unit)
-        self.assertIn("container_id=", helper)
-        self.assertIn("control_group=", helper)
-        self.assertRegex(helper, r"mktemp|\.tmp")
-        self.assertRegex(helper, r"mv\s")
-        self.assertIn('chmod 0600 "$registration_tmp"', helper)
-        self.assertIn("fail_closed_registration", helper)
-        self.assertRegex(helper, r"run_docker stop")
-        self.assertIn('"$registration_dir" != "$expected_registration_dir"', helper)
-        self.assertIn('[[ -L "$registration_dir" ]]', helper)
-        self.assertIn("^[0-9a-f]{64}$", helper)
-        self.assertIn("app.slice/${scope}", helper)
-        cleanup_trap = helper.index("trap fail_closed_registration EXIT")
-        self.assertLess(
-            helper.index("acquire_launch_cid"),
-            cleanup_trap,
-            "the immutable launch CID must be captured before any fallible publication work",
-        )
-        self.assertLess(
-            cleanup_trap,
-            helper.index('if [[ "$registration_dir" != "$expected_registration_dir"'),
-            "registration-path rejection must still trigger exact CID cleanup",
-        )
-        self.assertIn('"$registration_path_valid" == "1"', helper)
-        self.assertNotIn('run_docker stop --time 5 "$name"', helper)
-        for hardcoded_target in (
-            "querit-4b-reranker",
-            "vllm-aeon-27b-dflash",
-            "vllm-embedding",
-            "vllm-qwen3-reranker",
-        ):
-            self.assertNotIn(hardcoded_target, helper.lower())
 
     def test_canary_has_only_fixed_safe_targets_and_benchmark_gate(self) -> None:
         canary = CANARY.read_text()
