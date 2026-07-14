@@ -98,11 +98,11 @@ Capacity contracts and evidence:
 ```text
 embedding:  source max-model-len 32,768, KV 4,800M -> projected 34,124 tokens (4.14% margin; live verification pending)
             validated baseline: KV 5,820M -> 41,376 tokens
-AEON chat:  max-model-len 262,144, FP8 KV 36,864M, MemoryMax 69G
+AEON chat:  max-model-len 262,144, FP8 KV 15,360M -> verified 269,589 tokens (1.028 full contexts)
 Querit:     snapshot 7b796de30ad8dc772d6c46c75659c1341283a665, max-model-len 40,960, MemoryMax 18G
 ```
 
-The committed ordinary model caps are AEON 69G + embedding 20G + Querit 18G = 107 GiB, about 14.6 GiB below the 121.6 GiB host total. These are hard ceilings, not reservations; the expected UMA headroom gain comes mainly from reducing embedding's explicit KV allocation by 1,020 MiB. The 4,800 MiB capacity is proportional source reasoning, not production verification. Use `scripts/gb10_apply_aeon_querit_profile.sh` for the reranker migration; it verifies the production AEON 36,864 MiB KV profile and does not restart AEON unless `--restart-aeon` is explicit.
+The committed container/cgroup caps are AEON 69G + embedding 20G + Querit 18G = 107 GiB, but that arithmetic is policy and does not guarantee physical NVML/UMA headroom. With the former 36 GiB text KV profile, stable all-three samples left only about 1.8–2.3 GiB `MemAvailable`, and the same text configuration had previously grown another 8,466 MiB. The live 15 GiB text KV activation reported 269,589 cache tokens, a 2.84% margin above one 262,144-token request, and the first 3,300-second attribution window ended with about 31.6 GiB `MemAvailable`, zero threshold events, and zero cgroup OOM kills. Two concurrent maximum-length requests are not supported; this is intentional under the service priority embedding > reranker > text. Use `scripts/gb10_apply_aeon_querit_profile.sh` for the reranker migration; it verifies the source AEON 15,360 MiB KV profile and does not restart AEON unless `--restart-aeon` is explicit.
 
 ---
 

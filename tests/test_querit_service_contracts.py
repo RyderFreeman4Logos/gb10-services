@@ -7,6 +7,8 @@ import tomllib
 import unittest
 from pathlib import Path
 
+from test_embedding_service_contracts import _logical_directive_argv, _option_values
+
 
 ROOT = Path(__file__).resolve().parents[1]
 QUERIT_UNIT = ROOT / "systemd" / "querit-4b-reranker.service"
@@ -21,6 +23,42 @@ README = ROOT / "README.md"
 IMAGE_DIGEST = "sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c"
 MODEL_SNAPSHOT = "7b796de30ad8dc772d6c46c75659c1341283a665"
 SHORT_GENERATION_REQUEST_TOKENS = 8_192
+AEON_CONTEXT_TOKENS = 262_144
+AEON_KV_BUDGET_MIB = 15_360
+MAX_AEON_KV_MIB_WITH_CURRENT_HEADROOM_EVIDENCE = 15_360
+VERIFIED_15_GIB_KV_CAPACITY_TOKENS = 269_589
+OBSERVED_FRESH_MEM_AVAILABLE_KIB = 1_916_912
+OBSERVED_TEXT_GROWTH_MIB = 8_466
+
+
+def _aeon_contract(unit: str) -> dict[str, int]:
+    exec_starts = _logical_directive_argv(unit, "ExecStart")
+    if len(exec_starts) != 1:
+        raise AssertionError(
+            f"expected exactly one ExecStart, found {len(exec_starts)}"
+        )
+    argv = exec_starts[0]
+    if argv[:2] != ["/usr/bin/docker", "run"]:
+        raise AssertionError("ExecStart must be the canonical docker run command")
+
+    model_len = _option_values(argv, "--max-model-len")[0]
+    kv_budget = _option_values(argv, "--kv-cache-memory-bytes")[0]
+    if not model_len.isdecimal():
+        raise AssertionError(f"invalid --max-model-len value: {model_len}")
+    kv_match = re.fullmatch(r"([1-9][0-9]*)M", kv_budget)
+    if kv_match is None:
+        raise AssertionError(f"invalid --kv-cache-memory-bytes value: {kv_budget}")
+    return {
+        "model_len": int(model_len),
+        "kv_mib": int(kv_match.group(1)),
+    }
+
+
+def _assert_aeon_headroom_evidence(contract: dict[str, int]) -> None:
+    if contract["kv_mib"] > MAX_AEON_KV_MIB_WITH_CURRENT_HEADROOM_EVIDENCE:
+        raise AssertionError(
+            "raising text KV above 15 GiB requires updated UMA headroom evidence"
+        )
 
 
 class QueritServiceContractTests(unittest.TestCase):
@@ -98,12 +136,11 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertIn("CacheDirectory=llm-guard-proxy-evidence", unit)
         self.assertIn("CacheDirectoryMode=0700", unit)
 
-    def test_aeon_unit_matches_pinned_live_memory_profile(self) -> None:
+    def test_aeon_unit_matches_source_memory_profile(self) -> None:
         unit = AEON_UNIT.read_text()
         for contract in (
             "--memory 69g",
             "--memory-swap 69g",
-            "--kv-cache-memory-bytes 36864M",
             "gb10_enforce_docker_cgroup_limits.sh vllm-aeon-27b-dflash-n12 69",
             "GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1",
             f"@{IMAGE_DIGEST}",
@@ -111,6 +148,48 @@ class QueritServiceContractTests(unittest.TestCase):
             self.assertIn(contract, unit)
         self.assertNotIn("--dns", unit)
         self.assertNotRegex(unit, r"aeon-vllm-ultimate:[^\s\\]+(?:\s|\\)")
+
+    def test_aeon_text_kv_budget_preserves_one_context_and_uma_headroom(self) -> None:
+        contract = _aeon_contract(AEON_UNIT.read_text())
+        self.assertEqual(contract["model_len"], AEON_CONTEXT_TOKENS)
+        self.assertEqual(contract["kv_mib"], AEON_KV_BUDGET_MIB)
+        _assert_aeon_headroom_evidence(contract)
+
+        self.assertGreaterEqual(
+            VERIFIED_15_GIB_KV_CAPACITY_TOKENS, contract["model_len"]
+        )
+        self.assertLess(
+            VERIFIED_15_GIB_KV_CAPACITY_TOKENS, 2 * contract["model_len"]
+        )
+
+        released_kib = (36 * 1024 - contract["kv_mib"]) * 1024
+        projected_fresh_kib = OBSERVED_FRESH_MEM_AVAILABLE_KIB + released_kib
+        projected_worst_kib = (
+            projected_fresh_kib - OBSERVED_TEXT_GROWTH_MIB * 1024
+        )
+        self.assertGreaterEqual(projected_fresh_kib, 22 * 1024**2)
+        self.assertGreaterEqual(projected_worst_kib, 14 * 1024**2)
+
+    def test_aeon_unit_documents_current_headroom_evidence(self) -> None:
+        unit = AEON_UNIT.read_text()
+        description = unit.splitlines()[1]
+        self.assertIn("kv-mem=15360M", description)
+        self.assertIn("one full 262144-token context", unit)
+        self.assertIn("15GiB KV verified 269589 tokens", unit)
+        self.assertIn("~31.6GiB MemAvailable", unit)
+        self.assertIn("not physical NVML/UMA ceilings", unit)
+        self.assertNotIn("36GiB KV keeps ~2.47", unit)
+
+    def test_aeon_headroom_contract_rejects_kv_above_15_gib(self) -> None:
+        unit, replacements = re.subn(
+            r"--kv-cache-memory-bytes [1-9][0-9]*M",
+            "--kv-cache-memory-bytes 15361M",
+            AEON_UNIT.read_text(),
+            count=1,
+        )
+        self.assertEqual(replacements, 1)
+        with self.assertRaisesRegex(AssertionError, "updated UMA headroom evidence"):
+            _assert_aeon_headroom_evidence(_aeon_contract(unit))
 
     def test_legacy_unit_remains_canonical_fallback(self) -> None:
         self.assertTrue(LEGACY_UNIT.exists())

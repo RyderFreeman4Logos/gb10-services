@@ -1,10 +1,10 @@
 # vLLM upgrade and Qwen3 embedding memory profile research
 
 - **Date:** 2026-07-14
-- **Last updated:** 2026-07-14T09:33:48-07:00
+- **Last updated:** 2026-07-14T12:43:15-07:00
 - **Question:** Can the reliability-critical `Qwen/Qwen3-Embedding-8B` service safely move from a 40,960-token / 5,820 MiB KV / 24 GiB container profile to a 32,768-token / 4,800 MiB KV / 20 GiB source contract, and should the service move to raw vLLM v0.25.x now?
-- **Scope:** Source and read-only evidence only. No service, Docker, systemd, deployment, or model-runtime mutation was performed.
-- **Decision status:** Commit the smaller source profile; defer live activation to a maintenance-window canary. Keep the pinned v0.24.0 image for now while preparing a qualified v0.25.x route. This is a deferral, not a decision to never upgrade.
+- **Scope:** Source analysis, bounded live activation on GB10, API smoke tests, and read-only memory attribution. The pinned model image was not upgraded.
+- **Decision status:** Commit the smaller embedding source profile and the live-verified AEON text profile with 15 GiB explicit KV while preserving `max-model-len=262144`. Keep the pinned v0.24.0 image for now while preparing a qualified v0.25.x route. This is a deferral, not a decision to never upgrade.
 
 An existing ignored draft contains a longer incident chronology. This tracked note intentionally preserves only the aggregate non-secret facts needed for the service decision; the historical draft was not modified.
 
@@ -495,20 +495,52 @@ part of this investigation.
 - No production service, Docker container, text KV allocation, model cap, or
   fallback policy was changed while writing or validating these source repairs.
 
-#### Unknowns and explicitly pending work
+#### Remaining unknowns and pending work
 
-- The allocation responsible for text's growth from 65,324 MiB to 71,024 MiB,
-  and the stable post-start residency after the 84,080 MiB transient, remain
-  unknown. Text KV sizing and cap changes require stable post-start evidence and
-  are deliberately outside this repair.
+- The allocation responsible for text's earlier growth from 65,324 MiB to
+  71,024 MiB and the stable post-start residency after the 84,080 MiB transient
+  remain unknown. The 15 GiB profile restores headroom but does not identify
+  that allocation.
 - The exact scheduler/poll alignment that produced no live guardian attempt in
-  the roughly three-second strict-below-threshold window is unknown. Deployment
-  of the reviewed binary/config/unit/helper followed by the disposable and
-  read-only configured-target canaries is still required before judging current
-  guardian runtime behavior.
+  the roughly three-second strict-below-threshold window remains unknown.
+- The immutable-cidfile cleanup follow-up is committed in source but still
+  requires a reviewed installation after merge. The deployed guardian is
+  text-target-only and passed disposable plus read-only configured-target
+  canaries, but its earlier helper snapshot predates that follow-up.
 - A coordinated all-three-service fallback remains pending and was not
   implemented here. Its ownership, trigger semantics, and protection against
   collateral model loss require separate design and evidence.
-- The reviewed source contracts have not yet been installed on the live host;
-  this diary must not be read as a deployment, production activation, or stable
-  memory-sizing receipt.
+
+### 2026-07-14T12:43:15-07:00 — final 15 GiB activation and UMA receipt
+
+A coordinated restart brought embedding, AEON text, and Querit back to active
+and ready. Stable all-three samples then attributed **21,742 MiB** to embedding,
+**62,946 MiB** to text, and **20,635–20,681 MiB** to Querit, while Linux
+`MemAvailable` remained only **1,916,912 KiB to approximately 2.38 million
+KiB** (about **1.8–2.3 GiB**).
+
+At **11:13:36**, the old guardian directly killed Querit. Systemd recorded
+status **137**, with no kernel OOM evidence. Querit's release raised
+`MemAvailable` to about **23,782,900 KiB**. This incident confirms that the old
+automatic actor still targeted the wrong service; it does not make Querit the
+root cause of the earlier pressure.
+
+The same text configuration had previously reached **71,412 MiB**, which is
+**8,466 MiB** above the fresh **62,946 MiB** sample. A 20 GiB source proposal
+would have released 16 GiB, but it was superseded before commit by the final
+service-priority decision. The deployed source contract uses **15,360 MiB**,
+releasing 21 GiB relative to the 36 GiB profile. Projection from the lowest old
+sample gives **23,937,008 KiB / 22.83 GiB** fresh headroom and **15,267,824 KiB
+/ 14.56 GiB** after the previously observed text growth.
+
+The bounded live activation retained `--max-model-len 262144` and startup
+reported **269,589 KV tokens**, or **1.0284** complete contexts and a **2.84%**
+token margin. Embedding, Querit, and text all returned successful API smokes;
+the wrong-target guardian stayed disabled during the transition. The first
+3,300-second PID-segmented attribution window crossed the old and new text
+identities, ended with text at **40.486 GiB** NVML and `MemAvailable` at
+**31.576 GiB**, and recorded zero threshold events and zero cgroup OOM kills.
+Swap varied by only about 28.7 MiB and PSI full averages returned to zero. This
+55-minute window verifies the activation and near-term headroom, not a long-term
+leak certification. Two concurrent maximum-length text requests remain outside
+the contract under the priority **embedding > reranker > text**.
