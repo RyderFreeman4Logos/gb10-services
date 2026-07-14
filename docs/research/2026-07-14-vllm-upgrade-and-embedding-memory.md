@@ -539,8 +539,18 @@ token margin. Embedding, Querit, and text all returned successful API smokes;
 the wrong-target guardian stayed disabled during the transition. The first
 3,300-second PID-segmented attribution window crossed the old and new text
 identities, ended with text at **40.486 GiB** NVML and `MemAvailable` at
-**31.576 GiB**, and recorded zero threshold events and zero cgroup OOM kills.
-Swap varied by only about 28.7 MiB and PSI full averages returned to zero. This
-55-minute window verifies the activation and near-term headroom, not a long-term
-leak certification. Two concurrent maximum-length text requests remain outside
-the contract under the priority **embedding > reranker > text**.
+**31.576 GiB**. Its final sample had zero cgroup events for all three services,
+but whole-window event coverage was incomplete for text and reranker. The second
+3,300-second run had complete all-three event coverage and every cgroup event
+counter remained zero. First-run swap variation was **28.582 MiB** and PSI full
+averages returned to zero. These windows verify activation and near-term
+headroom, not a long-term leak certification. Two concurrent maximum-length text
+requests remain outside the contract under the priority **embedding > reranker >
+text**.
+
+The privacy-safe immutable receipt at
+`docs/evidence/2026-07-14-aeon-15g-live-receipt.json` pins the source/image and
+container identities, startup source lines, hashed service identities, cgroup
+counters, content-free API statuses, and stable watchdog byte-range hashes. It
+also records the one-sample declared-versus-observed watchdog discrepancy and
+marks unavailable historical artifacts instead of reconstructing them.
