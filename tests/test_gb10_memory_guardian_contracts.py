@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -9,6 +10,7 @@ WORKSPACE = ROOT / "Cargo.toml"
 CORE = ROOT / "crates" / "gb10-memory-guardian-core" / "src" / "lib.rs"
 BINARY = ROOT / "crates" / "gb10-memory-guardian" / "src" / "main.rs"
 GUARDIAN_UNIT = ROOT / "systemd" / "gb10-memory-guardian.service"
+TARGET_CONFIG = ROOT / "config" / "gb10-memory-guardian" / "config.toml"
 CANARY_DRIVER_UNIT = ROOT / "systemd" / "gb10-memory-guardian-canary.service"
 QUERIT_UNIT = ROOT / "systemd" / "querit-4b-reranker.service"
 CGROUP_HELPER = ROOT / "scripts" / "gb10_enforce_docker_cgroup_limits.sh"
@@ -34,7 +36,7 @@ class MemoryGuardianContractTests(unittest.TestCase):
         for override in (
             "GB10_MEMORY_GUARDIAN_MEMINFO_PATH",
             "GB10_MEMORY_GUARDIAN_CGROUP_ROOT",
-            "GB10_MEMORY_GUARDIAN_REGISTRATION_PATH",
+            "GB10_MEMORY_GUARDIAN_CONFIG_PATH",
         ):
             self.assertIn(override, binary)
         self.assertNotIn("std::process::Command", core)
@@ -65,6 +67,24 @@ class MemoryGuardianContractTests(unittest.TestCase):
         ):
             self.assertIn(hardening, unit)
         self.assertNotIn("CapabilityBoundingSet", unit)
+
+    def test_guardian_uses_tracked_config_without_hardcoded_target_identity(self) -> None:
+        binary = BINARY.read_text()
+        unit = GUARDIAN_UNIT.read_text()
+        config = tomllib.loads(TARGET_CONFIG.read_text())
+
+        self.assertEqual(config["schema_version"], 1)
+        self.assertEqual(config["target"]["label"], "aeon-text")
+        self.assertEqual(config["target"]["registration_file"], "text-cgroup.v1")
+        self.assertIn("TargetRegistrationSet", binary)
+        self.assertIn("GB10_MEMORY_GUARDIAN_CONFIG_PATH", binary)
+        self.assertIn("XDG_CONFIG_HOME", binary)
+        self.assertIn("HOME", binary)
+        self.assertNotIn("REGISTRATION_NAME", binary)
+        self.assertIn(
+            "Environment=GB10_MEMORY_GUARDIAN_CONFIG_PATH=%h/.config/gb10-memory-guardian/config.toml",
+            unit,
+        )
 
     def test_cgroup_helper_publishes_registration_atomically(self) -> None:
         helper = CGROUP_HELPER.read_text()

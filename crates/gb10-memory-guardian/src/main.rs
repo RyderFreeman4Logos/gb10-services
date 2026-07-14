@@ -1,11 +1,11 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+use gb10_memory_guardian::{TargetRegistrationSet, TargetTransition};
 use gb10_memory_guardian_core::{
-    effective_uid, read_mem_available_fd, should_rearm, should_shed, target_state_requires_disarm,
-    AttemptOutcome, CgroupTarget, EmergencyController, EmergencyReserve, RefreshStatus,
-    RegistrationManager, TargetState, DEFAULT_RESERVE_BYTES, DEFAULT_RETRY_MILLIS,
-    DEFAULT_THRESHOLD_BYTES,
+    effective_uid, read_mem_available_fd, should_rearm, should_shed, AttemptOutcome, CgroupTarget,
+    EmergencyController, EmergencyReserve, RegistrationManager, DEFAULT_RESERVE_BYTES,
+    DEFAULT_RETRY_MILLIS, DEFAULT_THRESHOLD_BYTES,
 };
 use std::env;
 use std::fs::File;
@@ -15,9 +15,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
-const REGISTRATION_NAME: &str = "gb10-memory-guardian/querit-cgroup.v1";
 const MEMINFO_PATH: &str = "/proc/meminfo";
 const MEMINFO_BUFFER_BYTES: usize = 8 * 1024;
+const CONFIG_SUBPATH: &str = "gb10-memory-guardian/config.toml";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -34,7 +34,9 @@ struct Config {
     retry_millis: u64,
     meminfo_path: PathBuf,
     cgroup_root: PathBuf,
-    registration_path: PathBuf,
+    runtime_dir: PathBuf,
+    target_config_path: PathBuf,
+    legacy_registration_path: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -90,7 +92,6 @@ impl Config {
         let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", effective_uid())));
-        let default_registration = runtime_dir.join(REGISTRATION_NAME);
         Ok(Self {
             reserve_bytes,
             threshold_bytes,
@@ -98,11 +99,27 @@ impl Config {
             retry_millis,
             meminfo_path: path_env("GB10_MEMORY_GUARDIAN_MEMINFO_PATH", MEMINFO_PATH),
             cgroup_root: path_env("GB10_MEMORY_GUARDIAN_CGROUP_ROOT", CGROUP_ROOT),
-            registration_path: env::var_os("GB10_MEMORY_GUARDIAN_REGISTRATION_PATH")
-                .map(PathBuf::from)
-                .unwrap_or(default_registration),
+            runtime_dir,
+            target_config_path: target_config_path()?,
+            legacy_registration_path: env::var_os("GB10_MEMORY_GUARDIAN_REGISTRATION_PATH")
+                .map(PathBuf::from),
         })
     }
+}
+
+fn target_config_path() -> Result<PathBuf, String> {
+    if let Some(path) = env::var_os("GB10_MEMORY_GUARDIAN_CONFIG_PATH") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(config_home) = env::var_os("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(config_home).join(CONFIG_SUBPATH));
+    }
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".config").join(CONFIG_SUBPATH))
+        .ok_or_else(|| {
+            "GB10_MEMORY_GUARDIAN_CONFIG_PATH, XDG_CONFIG_HOME, or HOME is required".to_owned()
+        })
 }
 
 fn path_env(name: &str, default: &str) -> PathBuf {
@@ -136,22 +153,33 @@ fn run_production(config: Config) -> Result<(), String> {
     let reserve = EmergencyReserve::new(config.reserve_bytes)
         .map_err(|error| format!("allocate and touch reserve: {error}"))?;
     let mut controller = EmergencyController::new(reserve, config.retry_millis);
-    let mut registrations = RegistrationManager::new(
-        &config.registration_path,
+    let mut targets = TargetRegistrationSet::new(
+        &config.target_config_path,
+        &config.runtime_dir,
         &config.cgroup_root,
         effective_uid(),
-    );
+    )
+    .map_err(|error| {
+        format!(
+            "load target config {}: {error}",
+            config.target_config_path.display()
+        )
+    })?;
+    let mut degraded_logged = match targets.reconcile() {
+        Ok(TargetTransition::Armed | TargetTransition::Refreshed | TargetTransition::Swapped) => {
+            controller.reset_for_target_generation();
+            false
+        }
+        Ok(TargetTransition::Unchanged | TargetTransition::Superseded) => false,
+        Err(error) => {
+            eprintln!("gb10-memory-guardian: waiting for initial target registration: {error}");
+            true
+        }
+    };
     let started = Instant::now();
     let mut meminfo_buffer = [0_u8; MEMINFO_BUFFER_BYTES];
-    let mut degraded_logged = false;
 
     loop {
-        let refresh = registrations.refresh();
-        if matches!(refresh, Ok(RefreshStatus::Replaced)) {
-            controller.reset_for_target_generation();
-            degraded_logged = false;
-        }
-
         let mem_available = match read_mem_available_fd(&meminfo, &mut meminfo_buffer) {
             Ok(value) => value,
             Err(error) => {
@@ -163,29 +191,47 @@ fn run_production(config: Config) -> Result<(), String> {
 
         if should_shed(mem_available, config.threshold_bytes) {
             controller.enter_emergency();
-            if let Some(target) = registrations.target() {
+            if let Some(target) = targets.target() {
                 let now = elapsed_millis(started);
                 let outcome = controller.attempt(now, target);
                 // Emergency logging is intentionally after the direct write attempt.
                 if outcome.attempted() {
                     eprintln!(
-                        "gb10-memory-guardian: direct Querit kill attempt: {outcome:?}; reserve_allocated={}",
+                        "gb10-memory-guardian: direct {} kill attempt: {outcome:?}; reserve_allocated={}",
+                        targets.active_label(),
                         controller.reserve().is_allocated()
                     );
                 }
                 if matches!(outcome, AttemptOutcome::Verified { .. }) {
-                    registrations.clear();
+                    targets.disarm();
                 }
-            } else if let Err(error) = &refresh {
-                if !degraded_logged {
-                    eprintln!(
-                        "gb10-memory-guardian: degraded registration {}: {error}",
-                        config.registration_path.display()
-                    );
-                    degraded_logged = true;
-                }
+            } else if !degraded_logged {
+                eprintln!("gb10-memory-guardian: no validated target registration is armed");
+                degraded_logged = true;
             }
         } else {
+            match targets.reconcile() {
+                Ok(
+                    TargetTransition::Armed
+                    | TargetTransition::Refreshed
+                    | TargetTransition::Swapped,
+                ) => {
+                    controller.reset_for_target_generation();
+                    degraded_logged = false;
+                    eprintln!(
+                        "gb10-memory-guardian: armed target {}",
+                        targets.active_label()
+                    );
+                }
+                Ok(TargetTransition::Unchanged | TargetTransition::Superseded) => {
+                    degraded_logged = false;
+                }
+                Err(error) if !degraded_logged => {
+                    eprintln!("gb10-memory-guardian: retaining last-good target: {error}");
+                    degraded_logged = true;
+                }
+                Err(_) => {}
+            }
             if !controller.reserve().is_allocated()
                 && should_rearm(mem_available, config.threshold_bytes, config.reserve_bytes)
             {
@@ -199,32 +245,6 @@ fn run_production(config: Config) -> Result<(), String> {
                             "gb10-memory-guardian: degraded reserve could not be rearmed: {error}"
                         );
                     }
-                }
-            }
-            if let Some(target) = registrations.target() {
-                let target_state = target.state();
-                if matches!(target_state, Ok(TargetState::Populated)) {
-                    controller.reset_for_target_generation();
-                } else if target_state_requires_disarm(&target_state) {
-                    registrations.clear();
-                    if !degraded_logged {
-                        eprintln!("gb10-memory-guardian: registered cgroup is stale; disarmed");
-                        degraded_logged = true;
-                    }
-                } else if !degraded_logged {
-                    eprintln!(
-                        "gb10-memory-guardian: registered cgroup state unreadable; retaining armed target"
-                    );
-                    degraded_logged = true;
-                }
-            }
-            if let Err(error) = &refresh {
-                if !degraded_logged {
-                    eprintln!(
-                        "gb10-memory-guardian: degraded registration {}: {error}",
-                        config.registration_path.display()
-                    );
-                    degraded_logged = true;
                 }
             }
         }
@@ -243,18 +263,18 @@ fn run_disposable_canary(config: Config) -> Result<(), String> {
 }
 
 fn run_registered_shed(config: Config) -> Result<(), String> {
-    let mut registrations = RegistrationManager::new(
-        &config.registration_path,
-        &config.cgroup_root,
-        effective_uid(),
-    );
+    let registration_path = config.legacy_registration_path.as_ref().ok_or_else(|| {
+        "GB10_MEMORY_GUARDIAN_REGISTRATION_PATH is required for the legacy canary".to_owned()
+    })?;
+    let mut registrations =
+        RegistrationManager::new(registration_path, &config.cgroup_root, effective_uid());
     registrations
         .refresh()
-        .map_err(|error| format!("open strict Querit registration: {error}"))?;
+        .map_err(|error| format!("open legacy canary registration: {error}"))?;
     let target = registrations
         .target()
-        .ok_or_else(|| "strict Querit registration has no armed target".to_owned())?;
-    run_bounded_direct_test(config, target, "registered Querit")
+        .ok_or_else(|| "legacy canary registration has no armed target".to_owned())?;
+    run_bounded_direct_test(config, target, "legacy registered canary")
 }
 
 fn run_bounded_direct_test(

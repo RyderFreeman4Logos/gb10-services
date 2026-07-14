@@ -1,0 +1,5 @@
+schema_version = 1
+
+[target]
+label = "aeon-text"
+registration_file = "text-cgroup.v1"
