@@ -408,3 +408,107 @@ the release image digest and BF16 checkpoint/tokenizer revisions, use the
 publisher query instruction, and compare HTTP vectors plus retrieval neighbors
 against the publisher runtime at exactly 32,768 tokens. This is not approval to
 change production.
+
+### 2026-07-14T11:11:46-07:00 — `LOWMEM_UNSHED` incident diary
+
+This entry records the real 2026-07-14 10:08 PDT low-memory event. It separates
+observed evidence from inference and open questions. It contains no request
+payloads or credentials. Source repairs cited below were **not** deployed as
+part of this investigation.
+
+#### Facts and timestamped evidence
+
+- The external watchdog measured Linux `MemAvailable` at **6.7 GiB at
+  10:08:11**, **839,544 KiB at 10:08:19**, and **1,139,832 KiB at 10:08:22**.
+  It exited with code **48** because the text service had not restarted.
+- An operator manually restarted `vllm-aeon-27b-dflash.service` at **10:09:15**.
+  `MemAvailable` then rose to about **90 GiB**. The embedding process remained
+  PID **45224** throughout the event.
+- Before the event, NVML attributed **21,742 MiB** to embedding, **12,931 MiB**
+  to Querit, and text had grown from an earlier **65,324 MiB** to **71,024 MiB**.
+  During startup after the manual restart, text transiently reached
+  **84,080 MiB** while Querit remained stopped.
+- The stale live dependency graph stopped Querit as collateral when text was
+  restarted. The old live Querit unit still had a text-readiness
+  `ExecStartPre` loop (`seq 1 120; sleep 2`): its real bound was about four
+  minutes although its message said ten minutes. It failed at about **10:14**,
+  before text became ready. The reviewed source units already removed these
+  text lifecycle/readiness edges.
+- At evidence collection time, the live sysmon script checksum matched the
+  then-current pre-v5 `scripts/sysmon.sh`, and the service had been healthy
+  since **July 11**. It wrote `~/log/sysmon_YYYY-MM-DD.csv`; neither its script
+  nor unit had a memory threshold, recovery command, or `OnFailure` actor.
+  Its `free(1)` used-memory rows recorded **117,705 MiB at 10:08:07**,
+  **122,275 MiB at 10:08:18**, a **123,474 MiB peak at 10:08:54**, and
+  **32,234 MiB at 10:09:18** after text restart. Despite `INTERVAL=1`, expensive
+  loop work produced two-to-three-second timestamp gaps, and that schema did
+  not record `MemAvailable`.
+- The Bash swap guard was also observer-only, with an effective twenty-second
+  evidence cadence: **6.7 GiB at 10:08:12**, **1.1 GiB at 10:08:32 and
+  10:08:52**, **1.0 GiB at 10:09:12**, and **90.1 GiB at 10:09:32**. It missed
+  the 839,544 KiB point and did not act, by design.
+- The live Rust guardian was a stale Querit-target build, not the reviewed
+  text-target source. Its unit supplied a **1 GiB** threshold and **1 second**
+  poll interval, but `~/.config/gb10-memory-guardian/config.toml` was absent and
+  its runtime directory contained only `querit-cgroup.v1`. Its journal recorded
+  a `direct Querit kill attempt` at about **03:55 PDT** and no attempt during
+  the 10:08 event. Therefore that live installation could not restart text and,
+  if triggered, addressed the wrong service.
+- The reviewed guardian core reads the already-open meminfo descriptor with
+  `pread` and uses a strict **less-than 1 GiB** trigger. The only measured point
+  below that boundary was 839,544 KiB; the measured below-threshold window was
+  about three seconds. The evidence establishes **no guardian attempt** during
+  that window, but does not establish a code-level polling defect.
+- Docker `--memory 69g` did not prevent CUDA/UMA residency above 69 GiB: text
+  was observed at 71,024 MiB before the event and 84,080 MiB during startup.
+  The Docker cgroup cap is therefore not evidence of a physical CUDA/UMA
+  residency ceiling on this platform.
+
+#### Inferences bounded by the evidence
+
+- The immediate pressure source was text: restarting text, while leaving
+  embedding PID 45224 unchanged, released roughly tens of GiB and restored
+  about 90 GiB of `MemAvailable`. This does not yet identify which text-runtime
+  allocation class grew.
+- `LOWMEM_UNSHED` was principally a deployment-contract failure: the sole
+  automatic recovery actor installed live was stale, had no owner-only target
+  config, and was armed only with a Querit registration. The evidence does not
+  justify relabelling the event as a proven one-second polling-loop bug; the
+  short strict-below-threshold window could also have been missed.
+- Querit loss was collateral from stale live lifecycle/readiness edges, not
+  evidence that Querit caused the low-memory condition. The unchanged embedding
+  PID likewise argues against an embedding restart as the source of recovery.
+- The sysmon and swap-guard gaps explain why neither telemetry stream contains
+  the 839,544 KiB instant. They do not justify giving either observer recovery
+  authority; the Rust guardian remains the sole automatic actor.
+
+#### Source response, not live-deployment evidence
+
+- Commit `784168af9bfef522aa9404bbcfeafd18b6cccdb2` closes registration
+  publication cleanup, makes disposable/configured canary state parsing strict,
+  pins the production identity to `aeon-text` / `text-cgroup.v1`, rejects stale
+  Querit registration surfaces, installs the complete reviewed unit bundle
+  before activation, and keeps both rerankers lifecycle-independent from text.
+- Commit `56eee2fa10a4e042013a165df4923fe8df94dd54` evolves sysmon to append exact
+  procfs `MemAvailable` in MiB plus measured sample cadence, loop elapsed time,
+  and overrun lag while preserving prior column order and observer-only scope.
+- No production service, Docker container, text KV allocation, model cap, or
+  fallback policy was changed while writing or validating these source repairs.
+
+#### Unknowns and explicitly pending work
+
+- The allocation responsible for text's growth from 65,324 MiB to 71,024 MiB,
+  and the stable post-start residency after the 84,080 MiB transient, remain
+  unknown. Text KV sizing and cap changes require stable post-start evidence and
+  are deliberately outside this repair.
+- The exact scheduler/poll alignment that produced no live guardian attempt in
+  the roughly three-second strict-below-threshold window is unknown. Deployment
+  of the reviewed binary/config/unit/helper followed by the disposable and
+  read-only configured-target canaries is still required before judging current
+  guardian runtime behavior.
+- A coordinated all-three-service fallback remains pending and was not
+  implemented here. Its ownership, trigger semantics, and protection against
+  collateral model loss require separate design and evidence.
+- The reviewed source contracts have not yet been installed on the live host;
+  this diary must not be read as a deployment, production activation, or stable
+  memory-sizing receipt.
