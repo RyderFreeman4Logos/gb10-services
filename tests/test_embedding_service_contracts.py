@@ -6,14 +6,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from embedding_activation_fixtures import ActivationFixture, UNIT
+
 
 ROOT = Path(__file__).resolve().parents[1]
 EMBEDDING_UNIT = ROOT / "systemd" / "vllm-embedding.service"
 README = ROOT / "README.md"
 AGENT_PLAYBOOK = ROOT / "docs" / "deployment" / "AGENTS.md"
-RESEARCH_NOTE = (
-    ROOT / "docs" / "research" / "2026-07-14-vllm-upgrade-and-embedding-memory.md"
-)
 
 VALIDATED_KV_MIB = 5_820
 VALIDATED_KV_TOKENS = 41_376
@@ -496,28 +495,21 @@ class EmbeddingDeploymentContractTests(unittest.TestCase):
                 "For updates on an already-running GB10",
                 r"^---$",
             ),
-            self.section(
-                RESEARCH_NOTE.read_text(),
-                "## Future activation canary",
-                r"^## Unknowns$",
-            ),
         )
-        commands = self.shell_commands("\n".join(sections))
-
-        self.assertIn(
-            "install -m 0644 systemd/vllm-embedding.service",
-            commands,
-        )
-        self.assertIn("systemctl --user daemon-reload", commands)
-        self.assertIn("timeout 92s", commands)
-        mutations = self.systemctl_mutations(commands)
-        self.assertIn(("restart", "vllm-embedding.service"), mutations)
-        for action, target in mutations:
-            self.assertEqual(
-                target,
-                "vllm-embedding.service",
-                f"{action} must not target neighboring unit {target}",
-            )
+        for section in sections:
+            commands = self.shell_commands(section)
+            self.assertIn("scripts/gb10_activate_embedding_profile.sh", commands)
+            self.assertNotIn("install -m 0644 systemd/vllm-embedding.service", commands)
+            self.assertNotIn("systemctl --user --no-block restart", commands)
+        with ActivationFixture() as fixture:
+            fixture.state["verify_status"] = 9
+            result = fixture.run()
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            log = fixture.log()
+            self.assertGreaterEqual(log.count(f"restart {UNIT}"), 2)
+            for neighbor in self.FORBIDDEN_NEIGHBORS:
+                self.assertNotIn(f"restart {neighbor}", log)
+                self.assertNotIn(f"stop {neighbor}", log)
 
 
 if __name__ == "__main__":
