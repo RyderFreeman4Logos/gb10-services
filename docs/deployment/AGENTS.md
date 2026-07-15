@@ -112,6 +112,7 @@ cp scripts/gb10_check_mem_available.sh /home/obj/.local/bin/
 cp scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/
 cp scripts/sysmon.sh /home/obj/.local/bin/
 cp scripts/gb10-swap-guard.sh /home/obj/.local/bin/
+cp scripts/gb10_stack_recovery.sh /home/obj/.local/bin/
 
 # Make executable
 chmod +x /home/obj/scripts/*.sh /home/obj/.local/bin/*
@@ -157,7 +158,8 @@ mkdir -p /home/obj/.config/systemd/user/
 
 # Install only units outside the guardian/text/reranker transaction.
 install -m 0644 systemd/aeon-healthcheck.service systemd/aeon-healthcheck.timer \
-  systemd/gb10-swap-guard.service systemd/llm-guard-proxy.service \
+  systemd/gb10-swap-guard.service systemd/gb10-stack-recovery.service \
+  systemd/llm-guard-proxy.service \
   systemd/sysmon.service systemd/vllm-embedding.service \
   /home/obj/.config/systemd/user/
 
@@ -204,10 +206,20 @@ fragments.
 The text unit uses `app.slice` and `Restart=on-failure`. It has no
 `Requires=`/`Wants=` edge to embedding. Both rerankers have no `Requires=`,
 `BindsTo=`, `PartOf=`, or text-readiness gate, while Guard has ordering only.
-The Rust guardian is the sole automatic recovery actor;
-`gb10-swap-guard.service` is observer-only and must never stop, kill, or restart
-a model. The deployer itself never changes text, embedding, reranker, or proxy
-lifecycle.
+The Rust guardian is the Tier 1 automatic recovery actor: its allocation-free
+text `cgroup.kill` path remains the first response to critical memory pressure.
+`gb10-stack-recovery.service` is the separate Tier 2 fail-closed oneshot for a
+bounded grace-check failure or failed text restart. It acquires a nonblocking
+runtime lock, permits one attempt per boot, snapshots all three model units,
+stops text, reranker, and embedding, proves their prior PIDs and cgroups are
+gone, and requires at least 40 GiB `MemAvailable` before restoring embedding,
+reranker, then text with raw `/v1/models` readiness gates. It is installed but
+not enabled as an ordinary boot service; only the reviewed escalation trigger
+or an explicitly approved operator action should start it. A failed stop,
+release check, start, or readiness gate does not retry the cycle.
+`gb10-swap-guard.service` remains observer-only and must never stop, kill, or
+restart a model. The guardian deployer itself never changes text, embedding,
+reranker, proxy, or Tier 2 coordinator lifecycle.
 
 For updates on an already-running GB10, the embedding 32K profile is a
 source-first **single-unit** transaction. Never use the general stack installation
