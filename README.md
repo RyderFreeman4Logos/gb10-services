@@ -114,7 +114,6 @@ gb10-services/
 ├── Cargo.lock              # Reviewed dependency lock
 ├── LICENSE
 ├── README.md               # User guide (human-facing)
-├── AGENTS.md               # Automated playbook (agent-facing)
 ├── config/
 │   ├── gb10-memory-guardian/
 │   │   └── config.toml     # Generic runtime-relative recovery target
@@ -123,7 +122,10 @@ gb10-services/
 ├── crates/
 │   ├── gb10-memory-guardian-core/ # Parsers, registration, retained FDs, kill path
 │   └── gb10-memory-guardian/      # Polling user-service binary
-├── docs/research/          # Tracked dated source/live research and decisions
+├── docs/
+│   ├── deployment/
+│   │   └── AGENTS.md       # Agent-facing service deployment playbook
+│   └── research/           # Tracked dated source/live research and decisions
 ├── scripts/
 │   ├── aeon_chat_ready.py  # Waits for Chat vLLM metrics endpoint before starting reranker
 │   ├── aeon_hang_guard.py  # Python hook script for Docker container hang protection
