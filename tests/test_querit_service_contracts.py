@@ -176,6 +176,12 @@ class QueritServiceContractTests(unittest.TestCase):
             "models--Querit--Querit-4B:/models/querit-repo:ro", unit
         )
         self.assertIn(f"--model /models/querit-repo/snapshots/{MODEL_SNAPSHOT}", unit)
+        self.assertIn(
+            "querit_score_contract.py:/opt/querit/querit_score_contract.py:ro", unit
+        )
+        self.assertNotIn(
+            "--score-contract current-prompt-terminal-cls-v1", unit
+        )
         self.assertIn("--entrypoint python3", unit)
         self.assertNotIn("pip install", unit)
         self.assertNotIn("--dns", unit)

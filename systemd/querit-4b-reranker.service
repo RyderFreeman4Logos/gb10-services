@@ -29,6 +29,7 @@ ExecStart=/usr/bin/docker run --rm --name querit-4b-reranker \
   -p 100.105.4.92:18013:8000 \
   -v /home/obj/.cache/huggingface/hub/models--Querit--Querit-4B:/models/querit-repo:ro \
   -v /home/obj/.local/bin/querit_openai_rerank_server.py:/opt/querit/querit_openai_rerank_server.py:ro \
+  -v /home/obj/.local/bin/querit_score_contract.py:/opt/querit/querit_score_contract.py:ro \
   -e HF_HUB_OFFLINE=1 \
   -e TRANSFORMERS_OFFLINE=1 \
   --memory 18g \
