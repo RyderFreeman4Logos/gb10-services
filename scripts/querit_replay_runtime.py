@@ -35,6 +35,53 @@ class RuntimeLoadError(RuntimeError):
     """The local snapshot or runtime could not be strictly attested."""
 
 
+def _load_strict_single_cuda_model(
+    *,
+    model_class: Any,
+    local: Path,
+    config: Any,
+    torch: Any,
+    torch_dtype: Any,
+    checkpoint_keys: set[str],
+) -> tuple[Any, dict[str, Any], str]:
+    """Load, attest, trim, and move the pinned model without Accelerate dispatch."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeLoadError("CUDA is required for offline Querit replay")
+    loaded = model_class.from_pretrained(
+        str(local),
+        config=config,
+        torch_dtype=torch_dtype,
+        local_files_only=True,
+        trust_remote_code=False,
+        use_lm_head=True,
+        output_loading_info=True,
+    )
+    if not isinstance(loaded, tuple) or len(loaded) != 2:
+        raise RuntimeLoadError("model loader did not return strict loading information")
+    model, loading_info = loaded
+    if not isinstance(loading_info, dict):
+        raise RuntimeLoadError("model loader returned malformed model loading information")
+    head = getattr(model, "head", None)
+    weight = getattr(head, "weight", None)
+    bias = getattr(head, "bias", None)
+    if weight is None or bias is None:
+        raise RuntimeLoadError("loaded model has no complete learned Querit head")
+    attest_head_load(
+        checkpoint_keys=checkpoint_keys,
+        loading_info=loading_info,
+        weight_shape=tuple(weight.shape),
+        bias_shape=tuple(bias.shape),
+    )
+    # The generation head is required only while Transformers restores tied weights.
+    # Drop it before the single CUDA transfer; the learned classifier head remains.
+    if hasattr(model, "lm_head") and model.lm_head is not None:
+        model.lm_head = None
+    model.eval()
+    model.to("cuda")
+    return model, loading_info, "cuda"
+
+
 def _local_directory(path: Path) -> Path:
     absolute = Path(os.path.abspath(path))
     try:
@@ -328,27 +375,14 @@ def load_local_runtime(snapshot: Path, dtype: str) -> LocalQueritRuntime:
     if model_class is None:
         raise RuntimeLoadError("pinned snapshot has no QueritModel")
     torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
-    loaded = model_class.from_pretrained(
-        str(local),
+    model, loading_info, device = _load_strict_single_cuda_model(
+        model_class=model_class,
+        local=local,
         config=config,
+        torch=torch,
         torch_dtype=torch_dtype,
-        device_map="auto",
-        local_files_only=True,
-        trust_remote_code=False,
-        use_lm_head=True,
-        output_loading_info=True,
-    )
-    if not isinstance(loaded, tuple) or len(loaded) != 2:
-        raise RuntimeLoadError("model loader did not return strict loading information")
-    model, loading_info = loaded
-    attest_head_load(
         checkpoint_keys=_checkpoint_head_keys(local),
-        loading_info=loading_info,
-        weight_shape=tuple(model.head.weight.shape),
-        bias_shape=tuple(model.head.bias.shape),
     )
-    model.eval()
-    device = str(next(model.parameters()).device)
     return LocalQueritRuntime(tokenizer, model, torch, device, loading_info, local)
 
 
