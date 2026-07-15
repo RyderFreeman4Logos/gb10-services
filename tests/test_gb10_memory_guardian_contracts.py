@@ -138,8 +138,12 @@ class MemoryGuardianContractTests(unittest.TestCase):
             unit,
         )
         self.assertIn(
-            "Environment=GB10_MEMORY_GUARDIAN_ESCALATION_ENABLED=true", unit
+            "Environment=GB10_MEMORY_GUARDIAN_ESCALATION_ENABLED=false", unit
         )
+        # Tier 1 only (text cgroup.kill) is the default anti-freeze mode.
+        # Switching ESCALATION_ENABLED=true enables Tier 2 (stop all three
+        # → restart in priority order) for incidents where Tier 1 alone
+        # cannot recover memory.
 
         emergency = production.split("LoopAction::Emergency =>", 1)[1].split(
             "LoopAction::Rearm =>", 1
