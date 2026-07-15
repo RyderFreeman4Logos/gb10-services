@@ -15,7 +15,10 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVER = ROOT / "scripts" / "querit_openai_rerank_server.py"
+SCRIPTS = ROOT / "scripts"
+SERVER = SCRIPTS / "querit_openai_rerank_server.py"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
 
 
 class QueritServerContractTests(unittest.TestCase):

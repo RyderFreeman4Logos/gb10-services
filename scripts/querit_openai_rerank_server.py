@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import logging
 import math
 import os
+import stat
 import threading
 import time
 import uuid
@@ -30,6 +32,20 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from transformers import AutoConfig, AutoTokenizer
+
+from querit_score_contract import (
+    CURRENT_PROMPT_TERMINAL_CLS_V1,
+    LEGACY_PHYSICAL_LAST_V1,
+    HeadAttestationError,
+    attest_head_load,
+    attest_tokenizer,
+    pack_prompts,
+    render_current_prompt,
+    run_learned_head_path,
+    scores_from_logits,
+    stable_rank,
+    validate_unicode_scalar_text,
+)
 
 Message = dict[str, Any]
 Scope = dict[str, Any]
@@ -46,6 +62,7 @@ MAX_DOCUMENTS = 50
 MAX_QUERY_CHARS = 8192
 MAX_DOCUMENT_CHARS = 32768
 MAX_TOTAL_DOCUMENT_CHARS = 262144
+MAX_CHECKPOINT_INDEX_BYTES = 16 * 1024 * 1024
 
 DEFAULT_ALIASES = [
     "qwen3-reranker-8b",
@@ -117,22 +134,6 @@ class RequestBodyLimitMiddleware:
         await self.app(scope, replay_receive, send)
 
 
-def build_pair_prompt(query: str, document: str) -> str:
-    # Cross-encoder pair format aligned with Qwen3-Reranker-style judges.
-    return (
-        "<|im_start|>system\n"
-        "Judge whether the Document meets the requirements based on the Query "
-        'and the Instruct provided. Note that the answer can only be "yes" or "no".'
-        "<|im_end|>\n"
-        "<|im_start|>user\n"
-        "<Instruct>: Given a web search query, retrieve relevant passages that answer the query\n"
-        f"<Query>: {query}\n"
-        f"<Document>: {document}"
-        "<|im_end|>\n"
-        "<|im_start|>assistant\n"
-    )
-
-
 class RerankRequest(BaseModel):
     model: str | None = None
     query: str
@@ -151,6 +152,7 @@ class AppState:
         self.device = "cuda"
         self.tokenizer = None
         self.model = None
+        self.score_contract = LEGACY_PHYSICAL_LAST_V1
 
 
 STATE = AppState()
@@ -160,7 +162,7 @@ app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=MAX_REQUEST_BODY_B
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "score_contract": STATE.score_contract}
 
 
 @app.get("/v1/models")
@@ -176,9 +178,57 @@ def list_models() -> dict[str, Any]:
                 "owned_by": "querit",
                 "root": STATE.model_id,
                 "max_model_len": STATE.max_model_len,
+                "score_contract": STATE.score_contract,
             }
         )
     return {"object": "list", "data": data}
+
+
+def _tensorize_batch(packed: Any) -> tuple[Any, Any]:
+    input_ids = torch.tensor(packed.input_ids).to(STATE.device)
+    attention_mask = torch.tensor(packed.attention_mask).to(STATE.device)
+    return input_ids, attention_mask
+
+
+def _extract_legacy_scores(output: Any) -> list[float]:
+    """Preserve the exact opaque output path selected by the legacy contract."""
+
+    if isinstance(output, dict) and "score" in output:
+        values = output["score"]
+    elif hasattr(output, "score") and output.score is not None:
+        values = output.score
+    elif hasattr(output, "logits") and output.logits is not None:
+        logits = output.logits
+        return _tensor_scores_from_logits(logits)
+    else:
+        raise RuntimeError(f"unexpected model output type: {type(output)}")
+    return [float(value) for value in values.detach().float().reshape(-1).tolist()]
+
+
+def _tensor_scores_from_logits(logits: Any) -> list[float]:
+    if logits.ndim != 2 or logits.shape[-1] != 2:
+        raise RuntimeError(f"unexpected model output shape: {tuple(logits.shape)}")
+    probabilities = torch.softmax(logits, dim=-1)
+    score_tensor = torch.stack(
+        [
+            probabilities[row, 1] - probabilities[row, 0]
+            for row in range(logits.shape[0])
+        ]
+    )
+    scores = [
+        float(value)
+        for value in score_tensor.detach().float().reshape(-1).tolist()
+    ]
+    # Recompute from float32 logits as an independent finite/range assertion;
+    # runtime scores remain the model-dtype torch softmax/subtraction above.
+    scores_from_logits(logits.detach().float().tolist())
+    if any(not math.isfinite(score) or not -1.0 <= score <= 1.0 for score in scores):
+        raise RuntimeError("learned head returned an invalid score")
+    return scores
+
+
+def _gather_hidden_rows(hidden: Any, positions: list[int]) -> Any:
+    return torch.stack([hidden[row, position] for row, position in enumerate(positions)])
 
 
 @torch.inference_mode()
@@ -187,35 +237,34 @@ def score_pairs(query: str, documents: list[str]) -> list[float]:
     scores: list[float] = []
     for i in range(0, len(documents), STATE.max_batch):
         batch_docs = documents[i : i + STATE.max_batch]
-        texts = [build_pair_prompt(query, d) for d in batch_docs]
-        enc = STATE.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=STATE.max_model_len,
-            return_tensors="pt",
+        prompts = [render_current_prompt(query, document) for document in batch_docs]
+        packed = pack_prompts(
+            STATE.tokenizer,
+            prompts,
+            STATE.score_contract,
+            max_model_length=STATE.max_model_len,
         )
-        enc = {k: v.to(STATE.device) for k, v in enc.items()}
-        out = STATE.model(
-            input_ids=enc["input_ids"],
-            attention_mask=enc["attention_mask"],
-        )
-        # QueritModel returns dict / ModelOutput with "score"
-        if isinstance(out, dict) and "score" in out:
-            batch_scores = out["score"].detach().float().reshape(-1).tolist()
-        elif hasattr(out, "score") and getattr(out, "score") is not None:
-            batch_scores = out.score.detach().float().reshape(-1).tolist()
-        elif hasattr(out, "logits") and out.logits is not None:
-            logits = out.logits
-            if logits.ndim == 2 and logits.shape[-1] == 2:
-                probs = torch.softmax(logits, dim=-1)
-                weights = torch.tensor([-1.0, 1.0], device=probs.device)
-                batch_scores = (probs * weights).sum(dim=-1).float().tolist()
-            else:
-                raise RuntimeError(f"unexpected model output shape: {tuple(logits.shape)}")
+        input_ids, attention_mask = _tensorize_batch(packed)
+        if STATE.score_contract == LEGACY_PHYSICAL_LAST_V1:
+            output = STATE.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            batch_scores = _extract_legacy_scores(output)
         else:
-            raise RuntimeError(f"unexpected model output type: {type(out)}")
-        scores.extend(float(x) for x in batch_scores)
+            logits, _positions = run_learned_head_path(
+                backbone=lambda **_ignored: STATE.model.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                ),
+                head=STATE.model.head,
+                gather_rows=_gather_hidden_rows,
+                input_ids=packed.input_ids,
+                attention_mask=packed.attention_mask,
+                score_contract=STATE.score_contract,
+            )
+            batch_scores = _tensor_scores_from_logits(logits)
+        scores.extend(batch_scores)
     return scores
 
 
@@ -243,6 +292,14 @@ def rerank(req: RerankRequest) -> dict[str, Any]:
         raise HTTPException(
             status_code=400, detail="aggregate document input is too long"
         )
+    try:
+        validate_unicode_scalar_text(req.query)
+        for document in req.documents:
+            validate_unicode_scalar_text(document)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail="input contains invalid Unicode"
+        ) from exc
     if req.top_n is not None and req.top_n <= 0:
         raise HTTPException(status_code=400, detail="top_n must be positive")
     if req.top_n is not None and req.top_n > MAX_DOCUMENTS:
@@ -259,18 +316,17 @@ def rerank(req: RerankRequest) -> dict[str, Any]:
         LOG.exception("rerank failed")
         raise HTTPException(status_code=500, detail="rerank inference failed") from exc
 
-    indexed = list(enumerate(scores))
-    indexed.sort(key=lambda x: x[1], reverse=True)
-    top_n = req.top_n if req.top_n is not None else len(indexed)
-    top_n = min(top_n, len(indexed))
+    ranked = stable_rank(scores)
+    top_n = req.top_n if req.top_n is not None else len(ranked)
+    top_n = min(top_n, len(ranked))
     results = [
         {
             "index": i,
             "document_index": i,
-            "score": s,
-            "relevance_score": s,
+            "score": scores[i],
+            "relevance_score": scores[i],
         }
-        for i, s in indexed[:top_n]
+        for i in ranked[:top_n]
     ]
     return {
         "id": f"rerank-{uuid.uuid4().hex}",
@@ -287,14 +343,80 @@ def _resolve_local_dir(model_path: str) -> str:
     return str(path)
 
 
+def _read_bounded_regular_file(path: Path, maximum_bytes: int) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(f"required local model file is not regular: {path.name}")
+        if metadata.st_size > maximum_bytes:
+            raise RuntimeError(f"required local model file is too large: {path.name}")
+        chunks: list[bytes] = []
+        remaining = maximum_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        if len(content) > maximum_bytes:
+            raise RuntimeError(f"required local model file is too large: {path.name}")
+        return content
+    finally:
+        os.close(descriptor)
+
+
+def _checkpoint_head_keys(local: str) -> set[str]:
+    index_path = Path(local) / "model.safetensors.index.json"
+    try:
+        payload = json.loads(
+            _read_bounded_regular_file(
+                index_path, MAX_CHECKPOINT_INDEX_BYTES
+            ).decode("utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("could not read the local checkpoint index") from exc
+    weight_map = payload.get("weight_map") if isinstance(payload, dict) else None
+    if not isinstance(weight_map, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in weight_map.items()
+    ):
+        raise RuntimeError("local checkpoint index has an invalid weight map")
+    return {key for key in weight_map if key == "head" or key.startswith("head.")}
+
+
+def _attest_loaded_head(
+    model: Any, loading_info: dict[str, Any], checkpoint_keys: set[str]
+) -> None:
+    head = getattr(model, "head", None)
+    if head is None or getattr(head, "weight", None) is None:
+        raise HeadAttestationError(
+            f"loaded {type(model).__name__} without the learned Querit head"
+        )
+    if getattr(head, "bias", None) is None:
+        raise HeadAttestationError("loaded Querit head has no bias")
+    attest_head_load(
+        checkpoint_keys=checkpoint_keys,
+        loading_info=loading_info,
+        weight_shape=tuple(head.weight.shape),
+        bias_shape=tuple(head.bias.shape),
+    )
+
+
 def load_model(model_path: str, dtype: str) -> None:
     LOG.info("loading tokenizer/model from %s", model_path)
+    local = _resolve_local_dir(model_path)
     STATE.tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
+        local,
         trust_remote_code=True,
         local_files_only=True,
         padding_side="right",
     )
+    attest_tokenizer(STATE.tokenizer)
     torch_dtype = {
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
@@ -304,7 +426,6 @@ def load_model(model_path: str, dtype: str) -> None:
     # Querit ships architectures=["MLQwen3Model"] with class QueritModel and
     # no auto_map. AutoModel.from_pretrained loads a plain Qwen3 backbone and
     # drops head.bias/head.weight as UNEXPECTED — always load QueritModel.
-    local = _resolve_local_dir(model_path)
     mod_path = Path(local) / "modeling_querit_4b.py"
     if not mod_path.exists():
         raise RuntimeError(f"missing modeling_querit_4b.py under {local}")
@@ -317,22 +438,25 @@ def load_model(model_path: str, dtype: str) -> None:
     )
     # QueritModel.__init__(use_lm_head=False) sets lm_head=None which breaks
     # transformers tied-weight loading. Keep lm_head for load, drop after.
-    STATE.model = mod.QueritModel.from_pretrained(
+    loaded = mod.QueritModel.from_pretrained(
         local,
         config=cfg,
         torch_dtype=torch_dtype,
         trust_remote_code=True,
         local_files_only=True,
         use_lm_head=True,
+        output_loading_info=True,
     )
+    if not isinstance(loaded, tuple) or len(loaded) != 2:
+        raise RuntimeError("Transformers did not return strict model loading info")
+    model, loading_info = loaded
+    if not isinstance(loading_info, dict):
+        raise RuntimeError("Transformers returned malformed model loading info")
+    _attest_loaded_head(model, loading_info, _checkpoint_head_keys(local))
+    STATE.model = model
     # Free unused generation head once weights are loaded.
     if hasattr(STATE.model, "lm_head") and STATE.model.lm_head is not None:
         STATE.model.lm_head = None
-
-    if not hasattr(STATE.model, "head"):
-        raise RuntimeError(
-            f"loaded {type(STATE.model).__name__} without .head — wrong class path"
-        )
 
     STATE.model.eval()
     STATE.model.to(STATE.device)
@@ -361,6 +485,12 @@ def main() -> None:
     )
     parser.add_argument("--dtype", default=os.environ.get("QUERIT_DTYPE", "bfloat16"))
     parser.add_argument(
+        "--score-contract",
+        choices=(LEGACY_PHYSICAL_LAST_V1, CURRENT_PROMPT_TERMINAL_CLS_V1),
+        default=os.environ.get("QUERIT_SCORE_CONTRACT", LEGACY_PHYSICAL_LAST_V1),
+        help="Explicit scoring contract; legacy remains the selected default",
+    )
+    parser.add_argument(
         "--served-model-name",
         nargs="+",
         default=None,
@@ -373,12 +503,18 @@ def main() -> None:
     STATE.aliases = args.served_model_name or DEFAULT_ALIASES
     STATE.max_model_len = args.max_model_len
     STATE.max_batch = args.max_batch
+    STATE.score_contract = args.score_contract
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for Querit rerank server")
     STATE.device = "cuda"
 
     load_model(args.model, args.dtype)
-    LOG.info("serving aliases=%s max_model_len=%s", STATE.aliases, STATE.max_model_len)
+    LOG.info(
+        "serving aliases=%s max_model_len=%s score_contract=%s",
+        STATE.aliases,
+        STATE.max_model_len,
+        STATE.score_contract,
+    )
     uvicorn.run(
         app,
         host=args.host,

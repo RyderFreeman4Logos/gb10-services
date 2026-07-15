@@ -12,3 +12,6 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 libc = "0.2"
+notify = { version = "8.2.0", default-features = false }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

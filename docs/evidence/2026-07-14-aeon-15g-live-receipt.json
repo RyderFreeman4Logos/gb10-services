@@ -1,0 +1,204 @@
+{
+  "schema": "gb10-live-evidence-v1",
+  "receipt_id": "aeon-15g-2026-07-14",
+  "source_commit": {
+    "sha1": "0edb6b39672844fddf32a1fdae5b2037a4c2c1ee",
+    "committed_at": "2026-07-14T12:45:36-07:00",
+    "subject": "fix(text): reserve UMA headroom with 15 GiB KV"
+  },
+  "privacy": {
+    "payload_content_retained": false,
+    "credentials_retained": false,
+    "service_process_identity_form": "sha256(invocation_id + colon + main_pid)",
+    "collection_scope": "allowlisted operational metadata and content-free HTTP status only"
+  },
+  "provenance": {
+    "remote_transport": "ssh obj@gb10",
+    "remote_collection_mode": "read-only",
+    "remote_collected_at": "2026-07-14T13:51:42-07:00",
+    "remote_sources": [
+      "systemctl user show",
+      "docker inspect",
+      "journalctl user JSON output",
+      "cgroup v2 metric files",
+      "content-free HTTP status checks"
+    ],
+    "local_watchdog_path": "/mnt/ssd/mirror-rootfs/home/obj/tmp/gb10-memory-attribution-wd.log",
+    "local_watchdog_schema": "gb10-memory-attribution-v1"
+  },
+  "documentation": {
+    "research_note_path": "docs/research/2026-07-14-vllm-upgrade-and-embedding-memory.md",
+    "immutable_commit_blob_sha1": "419f353f01adf8bab4af98597f43ae7d897419e5",
+    "immutable_commit_blob_sha256": "19f556b4fd2ac258dcc89f3f7f5f68b04e752f7ae22b67960579fd99d4230cef",
+    "documentary_receipt_timestamp": "2026-07-14T12:43:15-07:00"
+  },
+  "services": {
+    "embedding": {
+      "started_at": "2026-07-14T11:33:43-07:00",
+      "invocation_pid_sha256": "cf0a88d08d38f3086f3204b7a2bc666fdfe90feeb608de2201721935b3169b19",
+      "n_restarts": 0
+    },
+    "reranker": {
+      "started_at": "2026-07-14T11:35:14-07:00",
+      "invocation_pid_sha256": "5fd1da2a447f9c5c2e47847a0efef1639cd4ab40b855520ca9a1b3390769c3cf",
+      "n_restarts": 0
+    },
+    "text": {
+      "started_at": "2026-07-14T11:36:04-07:00",
+      "invocation_pid_sha256": "000d5e49471b5465cc58607105f536bdbe3d583ab366925300c86a51d803d20e",
+      "n_restarts": 0
+    }
+  },
+  "aeon_container": {
+    "container_id": "a920128da0b415e41078c330ee7e7370c8215251e9142d113852b34fe6a2f874",
+    "started_at": "2026-07-14T18:36:04.960631918Z",
+    "configured_image": "ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c",
+    "unit_blob_sha1": "4a6c9d50ad4e530ac5838508f81189d558efe848",
+    "unit_blob_sha256": "f0beb96444b4387166f224c806da88e1b5db8a1859a846849db2daea135988bd",
+    "effective_contract": {
+      "kv_cache_memory_mib": 15360,
+      "kv_cache_dtype": "fp8_e4m3",
+      "max_model_len": 262144,
+      "max_num_batched_tokens": 32768,
+      "max_num_seqs": 64,
+      "docker_memory_bytes": 74088185856,
+      "cgroup_swap_max_bytes": 0
+    }
+  },
+  "startup": {
+    "timestamp": "2026-07-14T11:42:07-07:00",
+    "capacity_source_line": "GPU KV cache size: 269,589 tokens",
+    "concurrency_source_line": "Maximum concurrency for 262,144 tokens per request: 1.03x",
+    "kv_capacity_tokens": 269589,
+    "application_ready_at": "2026-07-14T11:51:18-07:00",
+    "normalized_content_free_journal_sha256": "5afb175666fbed0b4d6cb55b094f65e72e15369c4752c0bea3a28d0b30c23dfa"
+  },
+  "cgroup_snapshot": {
+    "collected_at": "2026-07-14T13:51:42-07:00",
+    "identity_relation": "same container ID and start time; counters are cumulative over this scope lifetime",
+    "memory_peak_bytes": 24474791936,
+    "memory_max_bytes": 74088185856,
+    "memory_swap_current_bytes": 0,
+    "memory_swap_max_bytes": 0,
+    "memory_events": {
+      "low": 0,
+      "high": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_kill": 0,
+      "oom_group_kill": 0
+    }
+  },
+  "api_smokes": {
+    "historical": [
+      {
+        "service": "text",
+        "method_route": "GET models",
+        "timestamp": "2026-07-14T11:51:20-07:00",
+        "http_status": 200,
+        "body_retained": false
+      },
+      {
+        "service": "text",
+        "method_route": "POST chat completions",
+        "timestamp": "2026-07-14T11:51:22-07:00",
+        "http_status": 200,
+        "body_retained": false
+      },
+      {
+        "service": "embedding",
+        "method_route": "POST embeddings",
+        "timestamp": null,
+        "timestamp_status": "unavailable in surviving normalized receipt",
+        "http_status": 200,
+        "body_retained": false
+      },
+      {
+        "service": "reranker",
+        "method_route": "POST rerank",
+        "timestamp": "2026-07-14T11:51:21-07:00",
+        "http_status": 200,
+        "body_retained": false
+      }
+    ],
+    "read_only_recheck": {
+      "collected_at": "2026-07-14T13:51:42-07:00",
+      "statuses": {
+        "text_models": 200,
+        "embedding_models": 200,
+        "reranker_models": 200,
+        "guard_health": 200
+      },
+      "body_retained": false
+    }
+  },
+  "watchdog": {
+    "stable_combined_prefix": {
+      "records": "1-234",
+      "bytes": 1713795,
+      "sha256": "8e6b4e66feb8bf1e754cac42bd68f93180012feacc608bd41a820b78495002f4"
+    },
+    "completed_runs": [
+      {
+        "records": "1-120",
+        "stable_prefix_bytes": 842278,
+        "stable_prefix_sha256": "08930190cc6135d71ea0a5ee3794fa15b1818d79ff06e73f391ab6ef47732c53",
+        "started_at": "2026-07-14T18:16:42.750106Z",
+        "ended_at": "2026-07-14T19:11:43.287042Z",
+        "elapsed_seconds": 3300.536936,
+        "declared_duration_seconds": 3300,
+        "declared_samples": 110,
+        "observed_samples": 109,
+        "sample_indices": "0-108",
+        "sample_discrepancy": 1,
+        "minimum_mem_available_bytes": 13723336704,
+        "end_mem_available_bytes": 33904238592,
+        "end_text_nvml_allocation_bytes": 43471863808,
+        "swap_used_min_bytes": 468783104,
+        "swap_used_max_bytes": 498753536,
+        "swap_variation_bytes": 29970432,
+        "threshold_events": 0,
+        "end_cgroup_events": {
+          "embedding": {"low": 0, "high": 0, "max": 0, "oom": 0, "oom_kill": 0, "oom_group_kill": 0},
+          "text": {"low": 0, "high": 0, "max": 0, "oom": 0, "oom_kill": 0, "oom_group_kill": 0},
+          "reranker": {"low": 0, "high": 0, "max": 0, "oom": 0, "oom_kill": 0, "oom_group_kill": 0}
+        },
+        "coverage_qualification": "end sample complete; whole-run text and reranker event coverage incomplete"
+      },
+      {
+        "records": "121-234",
+        "stable_prefix_bytes": 871517,
+        "stable_prefix_sha256": "c7c8f1dd40cc2a51cd80d953b264e2195ff38337ac4a1dd147622b0168e94509",
+        "started_at": "2026-07-14T19:13:32.878387Z",
+        "ended_at": "2026-07-14T20:08:33.428875Z",
+        "elapsed_seconds": 3300.550488,
+        "declared_duration_seconds": 3300,
+        "declared_samples": 110,
+        "observed_samples": 109,
+        "sample_indices": "0-108",
+        "sample_discrepancy": 1,
+        "minimum_mem_available_bytes": 25808957440,
+        "end_mem_available_bytes": 25827680256,
+        "end_text_nvml_allocation_bytes": 44740640768,
+        "swap_used_min_bytes": 478576640,
+        "swap_used_max_bytes": 479858688,
+        "swap_variation_bytes": 1282048,
+        "threshold_events": 0,
+        "whole_run_cgroup_event_coverage": "complete for all three services; every counter zero"
+      }
+    ],
+    "third_run_status": "incomplete at collection; final hash and summary unavailable"
+  },
+  "planning_inputs": {
+    "evidence_quality": "documentary values retained from immutable source note; not independently reconstructable from the completed watchdog prefix",
+    "pre_activation_mem_available_kib": 1916912,
+    "previously_observed_text_growth_mib": 8466,
+    "old_kv_budget_mib": 36864
+  },
+  "unavailable": [
+    "exact timestamp for the historical embedding POST smoke",
+    "original separate pre-12:43 activation receipt directory",
+    "third watchdog run final hash and summary",
+    "independent raw reconstruction of the pre-activation planning inputs"
+  ]
+}

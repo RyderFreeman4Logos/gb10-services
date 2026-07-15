@@ -1,5 +1,6 @@
 [Unit]
-Description=System monitor (load, temps, GPU, IO, swap) every 1s
+# Observer-only telemetry. Recovery remains exclusively owned by the Rust guardian.
+Description=Observer-only system monitor (1s target interval; measured cadence)
 After=default.target
 # Prevent systemd from ever giving up on restarts.
 StartLimitIntervalSec=0

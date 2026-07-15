@@ -1,6 +1,6 @@
 [Unit]
-Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.24.0, FP8 KV, port 18010, 262144 ctx, util=0.49, kv-mem=36864M, seq=64, docker-mem=69g, post-start cgroup enforce)
-Requires=vllm-embedding.service
+Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.24.0, FP8 KV, port 18010, 262144 ctx, util=0.49, kv-mem=15360M, seq=64, docker-mem=69g, post-start cgroup enforce)
+# Ordering only: text recovery must not start, stop, or restart embedding.
 After=network.target vllm-embedding.service
 # Direct AEON text endpoint moved behind llm-guard-proxy; wrapper owns stable 18009.
 Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
@@ -11,12 +11,16 @@ StartLimitBurst=3
 Type=simple
 Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
 Environment=HF_HUB_OFFLINE=1
+Environment=GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1
+Environment=GB10_CONTAINER_CIDFILE=%t/gb10-memory-guardian/aeon-text.cid
 OOMScoreAdjust=500
 # Wrapper/docker-CLI only. Real AEON memory hard-cap is docker --memory 69g plus
 # ExecStartPost MemoryMax=69G / MemorySwapMax=0 on docker-*.scope.
-# 2026-07-09: 36GiB KV keeps ~2.47 full 262144-token windows while leaving
-# headroom for the reranker's observed 116.74GiB startup peak at 40GiB AEON KV.
-# Three-service target: ~110.7GiB steady / ~112.7GiB equivalent startup peak.
+# 2026-07-14: 15GiB KV verified 269589 tokens (1.028 full contexts).
+# It preserves one full 262144-token context, not two concurrent max requests.
+# The first live all-three 3300s window ended with ~31.6GiB MemAvailable,
+# zero threshold events, and zero cgroup OOM kills.
+# Docker/systemd caps are safety limits, not physical NVML/UMA ceilings.
 MemoryMax=256M
 MemorySwapMax=0
 # Recover from real vLLM/container crashes such as EngineDeadError exits.
@@ -27,8 +31,10 @@ TimeoutStartSec=1200
 TimeoutStopSec=60
 
 ExecStartPre=/bin/bash -c 'for i in $(seq 1 120); do curl -fsS --max-time 3 http://100.105.4.92:18012/v1/models >/dev/null 2>&1 && exit 0; sleep 5; done; echo "embedding not ready after 10min"; exit 1'
-ExecStartPre=-/usr/bin/docker rm -f vllm-aeon-27b-dflash-n12 vllm-aeon-27b-dflash vllm-aeon-27b
-ExecStart=/usr/bin/docker run --rm --name vllm-aeon-27b-dflash-n12 \
+ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-memory-guardian
+ExecStartPre=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh --cleanup-registration
+ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.cid --name vllm-aeon-27b-dflash-n12 \
+  --cgroup-parent app.slice \
   --gpus all --ipc host \
   -p 100.105.4.92:18010:8000 \
   -v /home/obj/.cache/huggingface/hub/models--AEON-7--Qwen3.6-27B-AEON-Ultimate-Uncensored-Multimodal-NVFP4-MTP-XS:/models/aeon-cache:ro \
@@ -58,7 +64,7 @@ ExecStart=/usr/bin/docker run --rm --name vllm-aeon-27b-dflash-n12 \
     --max-num-batched-tokens 32768 \
     --enable-prefix-caching \
     --gpu-memory-utilization 0.49 \
-    --kv-cache-memory-bytes 36864M \
+    --kv-cache-memory-bytes 15360M \
     --speculative-config '{"method":"dflash","model":"/models/dflash-cache/snapshots/0919688658996800f86b895034249700e9481106","num_speculative_tokens":10,"attention_backend":"TRITON_ATTN"}' \
     --enable-chunked-prefill \
     --no-scheduler-reserve-full-isl \
@@ -70,9 +76,10 @@ ExecStart=/usr/bin/docker run --rm --name vllm-aeon-27b-dflash-n12 \
     --trust-remote-code
 # Rootless Docker can accept --memory-swap while leaving memory.swap.max=max.
 # Enforce sets docker-*.scope MemoryMax=69G + MemorySwapMax=0 and verifies both.
-# Ordinary stack budget: 69+24+18=111GiB (AEON+embedding+querit-4b).
-ExecStartPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh vllm-aeon-27b-dflash-n12 69
-ExecStop=/usr/bin/timeout --signal=TERM --kill-after=5 30 /usr/bin/docker stop --time 20 vllm-aeon-27b-dflash-n12
+# Cap arithmetic 69+20+18=107GiB is policy, not guaranteed physical headroom.
+ExecStartPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh --publish-registration vllm-aeon-27b-dflash-n12 69
+ExecStop=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh --cleanup-registration
+ExecStopPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh --cleanup-registration
 StandardOutput=journal
 StandardError=journal
 

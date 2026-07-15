@@ -63,7 +63,7 @@ class QueritDeployerContractTests(unittest.TestCase):
             "  /bin/sleep 30\n"
             "fi\n"
             'if [[ "$*" == *"Config.Cmd"* ]]; then '
-            'echo \'["--kv-cache-memory-bytes","36864M"]\'; '
+            'echo \'["--kv-cache-memory-bytes","15360M"]\'; '
             "else echo 74088185856; fi\n"
         )
         docker.chmod(0o755)
@@ -114,7 +114,7 @@ class QueritDeployerContractTests(unittest.TestCase):
             self.source,
         )
         self.assertIn(
-            "EXPECTED_AEON_KV_MIB=${GB10_EXPECTED_AEON_KV_MIB:-36864}",
+            "EXPECTED_AEON_KV_MIB=${GB10_EXPECTED_AEON_KV_MIB:-15360}",
             self.source,
         )
         self.assertNotIn("EXPECTED_AEON_MEMORY_GIB:-64", self.source)

@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from typing import Any
+
+from test_embedding_service_contracts import (
+    _logical_directive_argv,
+    _option_values,
+    _split_docker_run_argv,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,9 +26,146 @@ MEMORY_GATE = ROOT / "scripts" / "gb10_check_mem_available.sh"
 CONFIG = ROOT / "config" / "llm-guard-proxy" / "config.toml"
 README = ROOT / "README.md"
 
-IMAGE_DIGEST = "sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c"
+LIVE_RECEIPT = ROOT / "docs" / "evidence" / "2026-07-14-aeon-15g-live-receipt.json"
+
+
+def _live_receipt() -> dict[str, Any]:
+    return json.loads(LIVE_RECEIPT.read_text())
+
+
+_RECEIPT = _live_receipt()
+IMAGE_DIGEST = _RECEIPT["aeon_container"]["configured_image"].rsplit("@", 1)[1]
 MODEL_SNAPSHOT = "7b796de30ad8dc772d6c46c75659c1341283a665"
 SHORT_GENERATION_REQUEST_TOKENS = 8_192
+AEON_CONTEXT_TOKENS = _RECEIPT["aeon_container"]["effective_contract"]["max_model_len"]
+AEON_KV_BUDGET_MIB = _RECEIPT["aeon_container"]["effective_contract"]["kv_cache_memory_mib"]
+MAX_AEON_KV_MIB_WITH_CURRENT_HEADROOM_EVIDENCE = AEON_KV_BUDGET_MIB
+VERIFIED_15_GIB_KV_CAPACITY_TOKENS = _RECEIPT["startup"]["kv_capacity_tokens"]
+OBSERVED_FRESH_MEM_AVAILABLE_KIB = _RECEIPT["planning_inputs"]["pre_activation_mem_available_kib"]
+OBSERVED_TEXT_GROWTH_MIB = _RECEIPT["planning_inputs"]["previously_observed_text_growth_mib"]
+
+
+def _aeon_contract(unit: str) -> dict[str, int]:
+    exec_starts = _logical_directive_argv(unit, "ExecStart")
+    if len(exec_starts) != 1:
+        raise AssertionError(
+            f"expected exactly one ExecStart, found {len(exec_starts)}"
+        )
+    argv = exec_starts[0]
+    image = (
+        "ghcr.io/aeon-7/aeon-vllm-ultimate@"
+        "sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c"
+    )
+    host_argv, container_argv = _split_docker_run_argv(argv, image)
+    for flag, expected in {
+        "--memory": "69g",
+        "--memory-swap": "69g",
+        "--memory-swappiness": "0",
+        "--oom-score-adj": "500",
+    }.items():
+        actual = _option_values(host_argv, flag)[0]
+        if actual != expected:
+            raise AssertionError(f"{flag} must be {expected}, found {actual}")
+
+    model_len = _option_values(container_argv, "--max-model-len")[0]
+    kv_budget = _option_values(container_argv, "--kv-cache-memory-bytes")[0]
+    if not model_len.isdecimal():
+        raise AssertionError(f"invalid --max-model-len value: {model_len}")
+    kv_match = re.fullmatch(r"([1-9][0-9]*)M", kv_budget)
+    if kv_match is None:
+        raise AssertionError(f"invalid --kv-cache-memory-bytes value: {kv_budget}")
+    return {
+        "model_len": int(model_len),
+        "kv_mib": int(kv_match.group(1)),
+    }
+
+
+def _assert_aeon_headroom_evidence(contract: dict[str, int]) -> None:
+    if contract["kv_mib"] > MAX_AEON_KV_MIB_WITH_CURRENT_HEADROOM_EVIDENCE:
+        raise AssertionError(
+            "raising text KV above 15 GiB requires updated UMA headroom evidence"
+        )
+
+
+class AeonLiveReceiptTests(unittest.TestCase):
+    def test_receipt_is_structured_privacy_safe_and_source_grounded(self) -> None:
+        receipt = _live_receipt()
+        self.assertEqual(receipt["schema"], "gb10-live-evidence-v1")
+        serialized = json.dumps(receipt, sort_keys=True)
+        self.assertNotRegex(serialized, r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b")
+        self.assertNotRegex(
+            serialized.lower(),
+            r"password|authorization|bearer|prompt|response_body",
+        )
+        self.assertEqual(receipt["privacy"]["payload_content_retained"], False)
+
+        startup = receipt["startup"]
+        match = re.fullmatch(
+            r"GPU KV cache size: ([0-9,]+) tokens",
+            startup["capacity_source_line"],
+        )
+        if match is None:
+            self.fail("receipt startup capacity source line is malformed")
+        self.assertEqual(
+            int(match.group(1).replace(",", "")),
+            startup["kv_capacity_tokens"],
+        )
+        self.assertEqual(startup["kv_capacity_tokens"], 269_589)
+        for service in receipt["services"].values():
+            self.assertRegex(service["invocation_pid_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_watchdog_summary_and_documented_arithmetic_derive_from_receipt(self) -> None:
+        receipt = _live_receipt()
+        run = receipt["watchdog"]["completed_runs"][0]
+        self.assertEqual(
+            run["stable_prefix_sha256"],
+            "08930190cc6135d71ea0a5ee3794fa15b1818d79ff06e73f391ab6ef47732c53",
+        )
+        self.assertEqual(run["observed_samples"], 109)
+        self.assertEqual(run["declared_samples"], 110)
+        self.assertEqual(run["sample_discrepancy"], 1)
+        self.assertEqual(run["threshold_events"], 0)
+        self.assertEqual(run["end_cgroup_events"]["text"]["oom_kill"], 0)
+
+        startup = receipt["startup"]
+        context = receipt["aeon_container"]["effective_contract"]["max_model_len"]
+        ratio = startup["kv_capacity_tokens"] / context
+        margin_percent = (startup["kv_capacity_tokens"] - context) * 100 / context
+        self.assertAlmostEqual(ratio, 1.0284004211425781)
+        self.assertAlmostEqual(margin_percent, 2.8400421142578125)
+        end_gib = run["end_mem_available_bytes"] / 1024**3
+        text_gib = run["end_text_nvml_allocation_bytes"] / 1024**3
+        self.assertIn(f"~{end_gib:.1f}GiB MemAvailable", AEON_UNIT.read_text())
+        note = (ROOT / receipt["documentation"]["research_note_path"]).read_text()
+        self.assertIn(f"**{end_gib:.3f} GiB**", note)
+        self.assertIn(f"**{text_gib:.3f} GiB** NVML", note)
+
+
+class HostileAeonUnitMutationTests(unittest.TestCase):
+    def assert_contract_rejects(self, unit: str) -> None:
+        with self.assertRaises(AssertionError):
+            _aeon_contract(unit)
+
+    def test_rejects_docker_memory_option_after_image_boundary(self) -> None:
+        unit = AEON_UNIT.read_text()
+        image = (
+            "ghcr.io/aeon-7/aeon-vllm-ultimate@"
+            "sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c"
+        )
+        unit = unit.replace("  --memory 69g \\\n", "", 1).replace(
+            f"  {image} \\\n",
+            f"  {image} \\\n  --memory 69g \\\n",
+            1,
+        )
+        self.assert_contract_rejects(unit)
+
+    def test_rejects_extra_docker_memory_alias(self) -> None:
+        unit = AEON_UNIT.read_text().replace(
+            "  --memory 69g \\\n",
+            "  --memory 69g -m 68g \\\n",
+            1,
+        )
+        self.assert_contract_rejects(unit)
 
 
 class QueritServiceContractTests(unittest.TestCase):
@@ -31,20 +176,28 @@ class QueritServiceContractTests(unittest.TestCase):
             "models--Querit--Querit-4B:/models/querit-repo:ro", unit
         )
         self.assertIn(f"--model /models/querit-repo/snapshots/{MODEL_SNAPSHOT}", unit)
+        self.assertIn(
+            "querit_score_contract.py:/opt/querit/querit_score_contract.py:ro", unit
+        )
+        self.assertNotIn(
+            "--score-contract current-prompt-terminal-cls-v1", unit
+        )
         self.assertIn("--entrypoint python3", unit)
         self.assertNotIn("pip install", unit)
         self.assertNotIn("--dns", unit)
         self.assertNotRegex(unit, r"aeon-vllm-ultimate:[^\s\\]+(?:\s|\\)")
 
-    def test_unit_has_safe_lifecycle_memory_gate_and_readiness(self) -> None:
+    def test_unit_has_independent_lifecycle_memory_gate_and_readiness(self) -> None:
         unit = QUERIT_UNIT.read_text()
-        for relationship in (
-            "Requires=vllm-aeon-27b-dflash.service",
-            "BindsTo=vllm-aeon-27b-dflash.service",
-            "PartOf=vllm-aeon-27b-dflash.service",
-            "Conflicts=vllm-qwen3-reranker-8b.service",
-        ):
-            self.assertIn(relationship, unit)
+        unit_section = unit.split("[Service]", 1)[0]
+        for relationship in ("Requires=", "BindsTo=", "PartOf="):
+            self.assertNotRegex(
+                unit_section,
+                rf"(?m)^{relationship}.*vllm-aeon-27b-dflash\.service",
+            )
+        self.assertIn("Conflicts=vllm-qwen3-reranker-8b.service", unit)
+        self.assertIn("lifecycle-independent", unit)
+        self.assertNotIn("http://100.105.4.92:18010", unit)
         self.assertIn("gb10_check_mem_available.sh 2", unit)
         self.assertIn("--memory 18g", unit)
         self.assertIn("--memory-swap 18g", unit)
@@ -58,7 +211,7 @@ class QueritServiceContractTests(unittest.TestCase):
             r"seq 1 (\d+).*?--max-time (\d+).*?sleep (\d+); done",
             unit,
         )
-        self.assertEqual(len(readiness_loops), 2)
+        self.assertEqual(len(readiness_loops), 1)
         readiness_budget = sum(
             int(attempts) * (int(curl_timeout) + int(sleep_seconds))
             for attempts, curl_timeout, sleep_seconds in readiness_loops
@@ -79,15 +232,13 @@ class QueritServiceContractTests(unittest.TestCase):
         )
         self.assertGreaterEqual(int(timeout.group(1)), worst_case_seconds + 60)
 
-    def test_guard_depends_on_querit_and_has_live_hardening(self) -> None:
+    def test_guard_orders_after_backends_without_owning_lifecycle(self) -> None:
         unit = GUARD_UNIT.read_text()
         unit_section = unit.split("[Service]", 1)[0]
         self.assertIn("querit-4b-reranker.service", unit_section)
         self.assertNotIn("vllm-qwen3-reranker-8b.service", unit_section)
-        wants = next(
-            line for line in unit_section.splitlines() if line.startswith("Wants=")
-        )
-        self.assertNotIn("querit-4b-reranker.service", wants)
+        self.assertNotRegex(unit_section, r"(?m)^Wants=.*vllm-")
+        self.assertIn("Ordering only", unit_section)
         for setting in (
             "MemoryHigh=1792M",
             "MemoryMax=2G",
@@ -98,18 +249,61 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertIn("CacheDirectory=llm-guard-proxy-evidence", unit)
         self.assertIn("CacheDirectoryMode=0700", unit)
 
-    def test_aeon_unit_matches_pinned_live_memory_profile(self) -> None:
+    def test_aeon_unit_matches_source_memory_profile(self) -> None:
         unit = AEON_UNIT.read_text()
         for contract in (
             "--memory 69g",
             "--memory-swap 69g",
-            "--kv-cache-memory-bytes 36864M",
-            "gb10_enforce_docker_cgroup_limits.sh vllm-aeon-27b-dflash-n12 69",
+            "gb10_enforce_docker_cgroup_limits.sh --publish-registration "
+            "vllm-aeon-27b-dflash-n12 69",
+            "GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1",
             f"@{IMAGE_DIGEST}",
         ):
             self.assertIn(contract, unit)
         self.assertNotIn("--dns", unit)
         self.assertNotRegex(unit, r"aeon-vllm-ultimate:[^\s\\]+(?:\s|\\)")
+
+    def test_aeon_text_kv_budget_preserves_one_context_and_uma_headroom(self) -> None:
+        contract = _aeon_contract(AEON_UNIT.read_text())
+        self.assertEqual(contract["model_len"], AEON_CONTEXT_TOKENS)
+        self.assertEqual(contract["kv_mib"], AEON_KV_BUDGET_MIB)
+        _assert_aeon_headroom_evidence(contract)
+
+        self.assertGreaterEqual(
+            VERIFIED_15_GIB_KV_CAPACITY_TOKENS, contract["model_len"]
+        )
+        self.assertLess(
+            VERIFIED_15_GIB_KV_CAPACITY_TOKENS, 2 * contract["model_len"]
+        )
+
+        released_kib = (36 * 1024 - contract["kv_mib"]) * 1024
+        projected_fresh_kib = OBSERVED_FRESH_MEM_AVAILABLE_KIB + released_kib
+        projected_worst_kib = (
+            projected_fresh_kib - OBSERVED_TEXT_GROWTH_MIB * 1024
+        )
+        self.assertGreaterEqual(projected_fresh_kib, 22 * 1024**2)
+        self.assertGreaterEqual(projected_worst_kib, 14 * 1024**2)
+
+    def test_aeon_unit_documents_current_headroom_evidence(self) -> None:
+        unit = AEON_UNIT.read_text()
+        description = unit.splitlines()[1]
+        self.assertIn("kv-mem=15360M", description)
+        self.assertIn("one full 262144-token context", unit)
+        self.assertIn("15GiB KV verified 269589 tokens", unit)
+        self.assertIn("~31.6GiB MemAvailable", unit)
+        self.assertIn("not physical NVML/UMA ceilings", unit)
+        self.assertNotIn("36GiB KV keeps ~2.47", unit)
+
+    def test_aeon_headroom_contract_rejects_kv_above_15_gib(self) -> None:
+        unit, replacements = re.subn(
+            r"--kv-cache-memory-bytes [1-9][0-9]*M",
+            "--kv-cache-memory-bytes 15361M",
+            AEON_UNIT.read_text(),
+            count=1,
+        )
+        self.assertEqual(replacements, 1)
+        with self.assertRaisesRegex(AssertionError, "updated UMA headroom evidence"):
+            _assert_aeon_headroom_evidence(_aeon_contract(unit))
 
     def test_legacy_unit_remains_canonical_fallback(self) -> None:
         self.assertTrue(LEGACY_UNIT.exists())

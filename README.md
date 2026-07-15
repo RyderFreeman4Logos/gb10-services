@@ -16,9 +16,9 @@ graph TD
     Proxy -->|Port 18013| Rerank[Querit-4B Reranker]
 
     subgraph Monitoring & Health
-        Sysmon[sysmon.sh] -->|Logs 1Hz Stats| CSV[(~/log/sysmon_*.csv)]
-        RustGuardian[gb10-memory-guardian] -->|Pre-opened cgroup.kill FD| OOMProtect[Proactive Reranker Shedding]
-        SwapGuard[gb10-swap-guard.sh] -->|Checks MemAvailable + Swap| OOMProtect[Proactive Reranker Shedding]
+        Sysmon[sysmon.sh] -->|Logs target-interval stats + observed cadence| CSV[(~/log/sysmon_*.csv)]
+        RustGuardian[gb10-memory-guardian] -->|Pre-opened cgroup.kill FD| TextRecovery[Text-only Recovery]
+        SwapGuard[gb10-swap-guard.sh] -->|Observer-only alerts + evidence| Ops[Operator]
         HCheck[aeon_healthcheck.sh] -->|Timer 2m| HangRecovery[CUDA Hang Recovery]
     end
 ```
@@ -27,7 +27,7 @@ graph TD
 1. **vllm-aeon-27b-dflash.service**
    Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside the pinned AEON v0.24 GB10 Docker image for long-context processing up to 256k tokens, with FP8 KV cache and DFlash `TRITON_ATTN` enabled.
 2. **vllm-embedding.service**
-   Serves `Qwen/Qwen3-Embedding-8B` to handle vector embeddings. This is considered the reliability-critical baseline service. Its raw backend listens only on port `18012`; clients should use `llm-guard-proxy` on port `18009` or the guard-owned legacy listener `18002` with model `qwen3-embedding-8b`.
+   Serves BF16 `Qwen/Qwen3-Embedding-8B` with its full 4,096-dimensional output. This is the reliability-critical baseline service. The tracked source profile contracts for 32,768 tokens, 4,800 MiB explicit KV, and a 20 GiB no-swap hard cap while preserving 8,192 batched tokens, 64 sequences, aliases, and quality semantics. Its raw backend listens only on port `18012`; clients should use `llm-guard-proxy` on port `18009` or the guard-owned legacy listener `18002` with model `qwen3-embedding-8b`.
 3. **querit-4b-reranker.service**
    Serves the pinned `Querit/Querit-4B` snapshot through a bounded, single-inference Transformers adapter. It keeps the `qwen3-reranker-8b` and `Qwen/Qwen3-Reranker-8B` aliases, a 40,960-token input profile, and an 18 GiB no-swap container cap. Its raw backend listens on `18013`; clients should use `llm-guard-proxy` on `18009` or the restricted listener `18003`. The old `vllm-qwen3-reranker-8b.service` remains tracked only as a disabled rollback artifact.
 4. **llm-guard-proxy.service**
@@ -63,21 +63,28 @@ graph TD
    explicitly disable chat-only hot-restart probes, thinking rewrites, and
    parameter overrides.
 5. **sysmon.service**
-   A lightweight system monitor script executing at 1Hz, recording system load, temperatures, GPU metrics, disk I/O rates, swap-in/out, and top process RSS/swap memory consumption.
+   A lightweight observer-only system monitor targeting a one-second interval,
+   recording system load, exact Linux `MemAvailable`, temperatures, GPU metrics,
+   disk I/O rates, swap-in/out, top process RSS/swap memory, and observed cadence.
+   CSV v5 appends `mem_available_mb`, `sample_cadence_ms`,
+   `sample_elapsed_ms`, and `sample_lag_ms` without reordering v4 columns. A
+   2–3 second loop overrun is recorded as such; the service does not claim a
+   guaranteed 1 Hz sampling rate and performs no recovery action.
 
 ### Auxiliary Services
-*   **gb10-memory-guardian.service**: Keeps a touched 64 MiB reserve, polls a pre-opened `/proc/meminfo` descriptor once per second, and releases the reserve before writing directly to Querit's retained `cgroup.kill` descriptor below the strict 1 GiB `MemAvailable` threshold. It accepts only an atomic registration for the exact rootless Docker path under the current user's `app.slice`; malformed, missing, stale, traversal, and symlink targets fail closed.
-*   **gb10-swap-guard.service**: Polls `MemAvailable` every second and swap pressure while logging ordinary samples every 20 seconds. It sheds Querit first below 1 GiB available or at the swap stop threshold, preserving headroom for chat, embedding, Guard, and the control plane.
+*   **gb10-memory-guardian.service**: Keeps a touched 64 MiB reserve, polls a pre-opened `/proc/meminfo` descriptor once per second, and releases the reserve before writing directly to the configured text target's retained `cgroup.kill` descriptor below the strict 1 GiB `MemAvailable` threshold. It hot-reloads an owner-only TOML config transactionally and accepts only an atomic registration for the exact rootless Docker path under the current user's `app.slice`; invalid config candidates preserve the last-good target, while missing, stale, malformed, traversal, or symlinked active registrations disarm it.
+*   **gb10-swap-guard.service**: An observer-only one-second `MemAvailable` and swap monitor. It emits alerts and bounded read-only evidence but never stops, kills, or restarts a service or container.
 *   **aeon-healthcheck.timer & service**: A systemd timer that triggers every 2 minutes to check vLLM metrics. It automatically restarts the chat service if it detects a CUDA kernel hang (running requests with zero tokens/s and low GPU power).
 
-The Rust and Bash guards intentionally overlap. The Rust guardian is the first,
-allocation-audited direct kill path and does not need Docker, D-Bus, or a
-subprocess during its emergency write. The existing Bash
-`gb10-swap-guard.service` remains enabled for swap policy, systemd state
-convergence, diagnostics, and fallback. Neither guard automatically restores
-Querit after direct shedding; recovery is an explicit operator action.
+The Rust guardian is the sole automatic recovery actor. Its allocation-audited
+emergency path needs neither Docker, D-Bus, configuration parsing, nor a
+subprocess after the reserve is released. Only the text unit publishes the
+configured registration; `Restart=on-failure` lets systemd converge after the
+direct cgroup kill. Embedding and both rerankers are lifecycle-independent and
+must retain the same state, `MainPID`, and restart count during text recovery.
+The Bash swap observer remains enabled only for alerts and evidence.
 
-### Reference Production Profile (2026-07-11)
+### Reference Production Profile (source updated 2026-07-14)
 
 The reference host runs all three model containers from this pinned image digest:
 
@@ -86,15 +93,16 @@ ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0
 digest: sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c
 ```
 
-Verified startup capacities:
+Capacity contracts and evidence:
 
 ```text
-embedding:  max-model-len 40,960, KV 5,820M -> 41,376 tokens = 1.01015625x
-AEON chat:  max-model-len 262,144, FP8 KV 36,864M, MemoryMax 69G
+embedding:  source max-model-len 32,768, KV 4,800M -> projected 34,124 tokens (4.14% margin; live verification pending)
+            validated baseline: KV 5,820M -> 41,376 tokens
+AEON chat:  max-model-len 262,144, FP8 KV 15,360M -> verified 269,589 tokens (1.028 full contexts)
 Querit:     snapshot 7b796de30ad8dc772d6c46c75659c1341283a665, max-model-len 40,960, MemoryMax 18G
 ```
 
-The committed ordinary model caps are AEON 69G + embedding 24G + Querit 18G = 111 GiB. Use `scripts/gb10_apply_aeon_querit_profile.sh` for the reranker migration; it verifies the production AEON 36,864 MiB KV profile and does not restart AEON unless `--restart-aeon` is explicit.
+The committed container/cgroup caps are AEON 69G + embedding 20G + Querit 18G = 107 GiB, but that arithmetic is policy and does not guarantee physical NVML/UMA headroom. With the former 36 GiB text KV profile, stable all-three samples left only about 1.8–2.3 GiB `MemAvailable`, and the same text configuration had previously grown another 8,466 MiB. The live 15 GiB text KV activation reported 269,589 cache tokens, a 2.84% margin above one 262,144-token request, and the first 3,300-second attribution window ended with about 31.6 GiB `MemAvailable`, zero threshold events, and zero cgroup OOM kills. Two concurrent maximum-length requests are not supported; this is intentional under the service priority embedding > reranker > text. Use `scripts/gb10_apply_aeon_querit_profile.sh` for the reranker migration; it verifies the source AEON 15,360 MiB KV profile and does not restart AEON unless `--restart-aeon` is explicit.
 
 ---
 
@@ -106,13 +114,18 @@ gb10-services/
 ├── Cargo.lock              # Reviewed dependency lock
 ├── LICENSE
 ├── README.md               # User guide (human-facing)
-├── AGENTS.md               # Automated playbook (agent-facing)
 ├── config/
+│   ├── gb10-memory-guardian/
+│   │   └── config.toml     # Generic runtime-relative recovery target
 │   └── llm-guard-proxy/
 │       └── config.toml     # llm-guard-proxy shielding rules & limits
 ├── crates/
 │   ├── gb10-memory-guardian-core/ # Parsers, registration, retained FDs, kill path
 │   └── gb10-memory-guardian/      # Polling user-service binary
+├── docs/
+│   ├── deployment/
+│   │   └── AGENTS.md       # Agent-facing service deployment playbook
+│   └── research/           # Tracked dated source/live research and decisions
 ├── scripts/
 │   ├── aeon_chat_ready.py  # Waits for Chat vLLM metrics endpoint before starting reranker
 │   ├── aeon_hang_guard.py  # Python hook script for Docker container hang protection
@@ -120,11 +133,12 @@ gb10-services/
 │   ├── aeon_vllm_wrapper.py# Wrapper startup script for vLLM container
 │   ├── gb10_apply_aeon_querit_profile.sh # Guarded Querit migration/deployer
 │   ├── gb10_check_mem_available.sh # Model startup headroom gate
+│   ├── gb10_deploy_memory_guardian.sh # Fail-closed guardian installer/activator
 │   ├── gb10_enforce_docker_cgroup_limits.sh # Rootless container hard caps
-│   ├── gb10_memory_guardian_canary.sh # Rigid disposable/Querit direct-kill canary
-│   ├── gb10-swap-guard.sh  # Fast MemAvailable/swap guard
+│   ├── gb10_memory_guardian_canary.sh # Disposable canary/read-only identity proof
+│   ├── gb10-swap-guard.sh  # Observer-only MemAvailable/swap evidence
 │   ├── querit_openai_rerank_server.py # Bounded OpenAI-compatible adapter
-│   └── sysmon.sh           # System performance and process metric logger (1Hz)
+│   └── sysmon.sh           # Observer-only metrics with measured sample cadence
 └── systemd/
     ├── aeon-healthcheck.service
     ├── aeon-healthcheck.timer
@@ -185,8 +199,10 @@ cargo build --release --locked -p gb10-memory-guardian
 sha256sum target/release/gb10-memory-guardian | tee /tmp/gb10-memory-guardian.source.sha256
 ```
 
-The only external Rust dependency is `libc`. Every Linux FFI call is localized
-to a documented unsafe block; the service binary contains no subprocess API.
+The guardian uses `libc` for its direct Linux path plus `notify`, `serde`, and
+`toml` for healthy-path transactional config reloads. Every Linux FFI call is
+localized to a documented unsafe block; the service binary contains no
+subprocess API.
 The GB10 user manager rejects `PrivateDevices`, `ProtectClock`,
 `ProtectKernelLogs`, and `ProtectKernelModules` with `218/CAPABILITIES`; those
 four directives are intentionally omitted. The unprivileged service retains
@@ -202,9 +218,10 @@ The 64 MiB reserve is an explicit anonymous `mmap`; emergency release uses
 1 GiB stop threshold plus the reserve size.
 Synthetic fault tests may override `GB10_MEMORY_GUARDIAN_MEMINFO_PATH`,
 `GB10_MEMORY_GUARDIAN_CGROUP_ROOT`, and
-`GB10_MEMORY_GUARDIAN_REGISTRATION_PATH`. The production unit sets none of
-these, so its defaults remain `/proc/meminfo`, `/sys/fs/cgroup`, and the rigid
-per-user runtime registration path.
+`GB10_MEMORY_GUARDIAN_CONFIG_PATH`. Production defaults are `/proc/meminfo`,
+`/sys/fs/cgroup`, and `$XDG_CONFIG_HOME/gb10-memory-guardian/config.toml` (or
+`$HOME/.config/gb10-memory-guardian/config.toml`). The config must be a regular,
+single-link, owner-only file; install it with mode `0600`.
 
 ---
 
@@ -214,6 +231,7 @@ per-user runtime registration path.
 Make sure target directories exist, then copy scripts to your local bin and configurations:
 ```bash
 mkdir -p ~/scripts ~/.local/bin ~/.config/llm-guard-proxy ~/log
+install -d -m 0700 ~/.config/gb10-memory-guardian
 
 # Copy scripts
 cp scripts/aeon_vllm_wrapper.py ~/scripts/
@@ -222,20 +240,13 @@ cp scripts/aeon_healthcheck.sh ~/scripts/
 cp scripts/aeon_chat_ready.py ~/.local/bin/
 cp scripts/gb10_apply_aeon_querit_profile.sh ~/.local/bin/
 cp scripts/gb10_check_mem_available.sh ~/.local/bin/
-cp scripts/gb10_enforce_docker_cgroup_limits.sh ~/.local/bin/
-cp scripts/gb10_memory_guardian_canary.sh ~/.local/bin/
 cp scripts/llm_guard_proxy_cached_rebuild.sh ~/.local/bin/
 cp scripts/querit_openai_rerank_server.py ~/.local/bin/
 cp scripts/sysmon.sh ~/.local/bin/
 cp scripts/gb10-swap-guard.sh ~/.local/bin/
-install -m 0755 target/release/gb10-memory-guardian ~/.local/bin/gb10-memory-guardian
 
 # Make scripts executable
 chmod +x ~/scripts/*.sh ~/.local/bin/*
-
-# Confirm that the reviewed source build is exactly what will run.
-test "$(sha256sum target/release/gb10-memory-guardian | awk '{print $1}')" = \
-  "$(sha256sum ~/.local/bin/gb10-memory-guardian | awk '{print $1}')"
 
 # Copy llm-guard-proxy config
 cp config/llm-guard-proxy/config.toml ~/.config/llm-guard-proxy/config.toml
@@ -244,11 +255,14 @@ cp config/llm-guard-proxy/config.toml ~/.config/llm-guard-proxy/config.toml
 > [!NOTE]
 > Update the IP address `100.105.4.92` in `systemd/*.service` and `config/llm-guard-proxy/config.toml` to match your local or Tailscale network interface IP address.
 
-### Step 2: Install Systemd Services
-Copy the user services to your user systemd configuration directory:
+### Step 2: Install non-guardian Systemd Services
+Install only units outside the guardian/text/reranker activation transaction:
 ```bash
 mkdir -p ~/.config/systemd/user/
-cp systemd/* ~/.config/systemd/user/
+install -m 0644 systemd/aeon-healthcheck.service systemd/aeon-healthcheck.timer \
+  systemd/gb10-swap-guard.service systemd/llm-guard-proxy.service \
+  systemd/sysmon.service systemd/vllm-embedding.service \
+  ~/.config/systemd/user/
 ```
 
 ### Step 3: Enable and Start the Stack
@@ -259,97 +273,122 @@ systemctl --user daemon-reload
 # Enable auxiliary services
 systemctl --user enable --now sysmon.service
 systemctl --user enable --now gb10-swap-guard.service
-systemctl --user enable --now gb10-memory-guardian.service
 systemctl --user enable --now aeon-healthcheck.timer
 
-# Enable model services
+# Complete any separately approved model-service maintenance before opening the
+# guardian transaction. The deployer never changes these lifecycles.
 systemctl --user enable --now vllm-embedding.service
 systemctl --user enable --now vllm-aeon-27b-dflash.service
 systemctl --user disable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now querit-4b-reranker.service
 systemctl --user enable --now llm-guard-proxy.service
-```
 
-For an update on an already-running host, first deploy and validate the fast
-memory guard, then use the state-aware migration script. It keeps AEON running
-by default and enables Querit only after raw and Guard smoke tests pass:
-
-```bash
-systemctl --user is-active gb10-swap-guard.service
-systemctl --user is-active gb10-memory-guardian.service
-~/.local/bin/gb10_apply_aeon_querit_profile.sh
-```
-
-The Querit unit now gives rootless Docker `--cgroup-parent app.slice`, publishes
-`%t/gb10-memory-guardian/querit-cgroup.v1` with mode `0600`, and uses
-`Restart=no`. The registration contains only version, 64-character lowercase
-Docker ID, exact scope, and exact control-group path. An atomic replacement
-causes the guardian to discard old descriptors before validating the new
-generation.
-
-### Memory-guardian canary and controlled Querit shed
-
-These are deployment procedures, not automated tests. Do not run either phase
-while a benchmark is active, and do not move, rewrite, truncate, or otherwise
-touch benchmark artifacts or benchmark processes. First confirm that the
-benchmark owner has stopped or explicitly excluded all load, then run the rigid
-disposable user cgroup canary:
-
-```bash
+# Install and immediately activate the complete reviewed guardian/text/reranker
+# artifact transaction. Do not insert model lifecycle, receipt cleanup, copying,
+# reload, or standalone canary commands between these phases.
 export GB10_BENCHMARK_EXCLUDED=YES
-~/.local/bin/gb10_memory_guardian_canary.sh disposable
+scripts/gb10_deploy_memory_guardian.sh install
+scripts/gb10_deploy_memory_guardian.sh activate
 ```
 
-The script creates only
-`gb10-memory-guardian-disposable-canary.service` in the user `app.slice`; the
-binary's canary mode has that name compiled in and accepts no target path. The
-kill is executed through `gb10-memory-guardian-canary.service`, a sandboxed
-oneshot with the production hardening settings. It
-checks that AEON, embedding, Guard, and the production guardian change neither
-state nor `MainPID`. A successful result writes a one-hour,
-binary-checksum-bound attestation.
+Activate the guardian separately with the fail-closed source-first deployer.
+It first stops any stale guardian, then installs the current release binary,
+helper, canary, owner-only `config.toml`, guardian units, text unit, and both
+reviewed lifecycle-independent reranker units. No wildcard unit copy or manual
+guardian `enable --now` is an acceptable activation path. The exact target must
+remain label `aeon-text` with `registration_file = "text-cgroup.v1"`.
+The deployer uses `install -m 0600` for that owner-only config.
 
-Only after that phase passes, capture current memory/service evidence and run
-the explicitly confirmed live Querit test:
+The install phase leaves the automatic actor disabled. Activation refuses and
+keeps it stopped if the owner-only config is missing or wrong, any stale
+`querit-cgroup.v1` exists, the text unit does not publish `text-cgroup.v1`, the
+disposable canary fails, strict bounded systemd status is not
+`loaded/active/running`, or the running guardian's current status receipt does
+not match its `MainPID`, the exact current registration, and the populated cgroup
+device/inode generation. The final configured-target phase is a
+read-only configured-target identity check; it never kills production text.
+The registration contains only the version, exact 64-character lowercase
+Docker ID, exact scope, and exact control-group path. Publication failure stops
+only that unit's exact launched container before systemd can manage it further.
+
+The text unit has `Restart=on-failure`, so a guardian cgroup kill converges
+through systemd. It has only non-owning ordering after embedding; neither text
+nor Guard starts or restarts embedding. Both reranker alternatives are
+lifecycle-independent from text, retain their mutual `Conflicts=`, and have no
+text-readiness startup gate. The Querit unit neither publishes a guardian
+registration nor pulls in the guardian. `llm-guard-proxy.service` has ordering
+only and owns no backend lifecycle. The AEON healthcheck can restart text but
+has no embedding/reranker action.
+
+### Embedding 32K profile activation and rollback
+
+The tracked 32,768-token / 4,800 MiB KV / 20 GiB profile is source-first and
+must be activated as a **single-unit** transaction. Do not stop or restart text,
+either reranker, or the proxy, and do not copy/sync unrelated files from this
+branch. The production entry point accepts no arguments or environment path/tool
+overrides:
 
 ```bash
-systemctl --user is-active vllm-aeon-27b-dflash.service vllm-embedding.service llm-guard-proxy.service gb10-memory-guardian.service
-grep '^MemAvailable:' /proc/meminfo
-GB10_BENCHMARK_EXCLUDED=YES \
-  ~/.local/bin/gb10_memory_guardian_canary.sh querit I_UNDERSTAND_QUERIT_WILL_BE_SHED
-journalctl --user -u gb10-memory-guardian.service -n 50 --no-pager
+scripts/gb10_activate_embedding_profile.sh
 ```
 
-This calls the same reserve-release plus direct `cgroup.kill` path against only
-the validated Querit registration. It does not start or restore Querit. Confirm
-AEON, embedding, Guard, and guardian remain active and that memory recovered.
-For controlled recovery, wait until `gb10_check_mem_available.sh 2` passes and
-then start Querit manually:
+The activator locks a private owner-only state directory, rejects canonical
+source drift, and durably records exact prior unit bytes/mode or explicit
+absence before mutation. It also brackets baseline capture with stable embedding
+and text/reranker generations. It installs atomically, reloads systemd, restarts
+only `vllm-embedding.service`, and requires a new `InvocationID`, PID, and
+monotonic start generation. It then invokes the canonical fail-closed verifier;
+the caller cannot substitute a unit, verifier, Docker command, or evidence path.
 
-```bash
-~/.local/bin/gb10_check_mem_available.sh 2
-systemctl --user start querit-4b-reranker.service
-systemctl --user is-active querit-4b-reranker.service
-```
+Commit requires the canonical 32K/4,800M/20GiB unit and effective Docker argv,
+current systemd/cgroup/container generation, all intended engine-process
+metrics, startup capacity of at least 32,768 tokens, exact model aliases, and
+finite 4,096-dimensional fixture vectors. The fixture proves only repeat/alias
+cosine stability at `0.99999` and unchanged nearest-neighbor ordering; it does
+not claim general embedding quality. Text/reranker generation receipts must
+remain byte-for-byte unchanged. Until a live activation commits these private
+receipts, the profile is projected and **not production-verified**.
 
-### Guardian rollback
+`HUP`, `INT`, `TERM`, exceptions, bounded-command failures, stale transactions,
+and pre-commit receipt failures restore the exact prior unit state, reload, and
+restart only embedding. Activation requires an already-active/running embedding
+service; rollback proves a fresh stable restored generation/readiness and
+unchanged neighbor generations. A failed rollback preserves
+owner-only `rollback_failed` state for the next locked invocation. The durable
+phase is authoritative: interruption after `committed` never rolls back. Private
+activation receipts explicitly require that phase and are not commit claims on
+their own. Activation and rollback evidence lives under
+`$HOME/.local/state/gb10-embedding-activation/`. Never replace this transaction
+with manual copy/reload/restart or stack-cycle fragments.
 
-Keep the previous binary and unit checksums before deployment. To roll back,
-stop and disable only the Rust guardian, restore the audited previous Querit
-unit/helper versions, and remove its volatile registration. Do not restart any
-vLLM backend as part of guardian rollback:
+### Memory-guardian canaries and rollback
 
-```bash
-systemctl --user disable --now gb10-memory-guardian.service
-rm -f "$XDG_RUNTIME_DIR/gb10-memory-guardian/querit-cgroup.v1"
-# Restore reviewed prior files in ~/.config/systemd/user and ~/.local/bin here.
-systemctl --user daemon-reload
-systemctl --user is-active gb10-swap-guard.service
-sha256sum ~/.local/bin/gb10-memory-guardian 2>/dev/null || true
-```
+The deployer owns both canaries as bounded phases of its private durable
+transaction; do not run them as loose deployment commands. It first runs the
+disposable user cgroup canary while the guardian remains disabled, starts the
+guardian without enabling it, and then runs the read-only configured-target
+identity check. Only after both pass does it enable the guardian and durably
+mark the transaction committed.
 
-Because direct shedding leaves Querit stopped, rollback must not implicitly
-recover it. Start Querit manually only after the 2 GiB headroom gate passes.
+The disposable phase can target only
+`gb10-memory-guardian-disposable-canary.service`. The configured-target phase
+never invokes `--kill-configured-target` and never stops, starts, or restarts
+text. It accepts only the owner-only `aeon-text` / `text-cgroup.v1` config and
+matches the current status receipt to the running guardian PID and invocation,
+exact registration generation, and populated cgroup device/inode generation.
+Historical journal lines, missing or hostile fields, stale/disarmed receipts,
+replaced cgroups, stale `querit-cgroup.v1`, and unbounded reads fail closed.
+
+Every install, activation, shell-error, and signal failure disables the
+unverified guardian and restores exact prior artifact bytes, modes, and
+absences before a bounded daemon reload. Failed rollback retains an owner-only
+`rollback_failed` transaction for idempotent recovery; it can never be
+activated. Do not substitute manual copy, removal, reload, canary, or guardian
+enable fragments for `gb10_deploy_memory_guardian.sh`. The deployer leaves
+embedding and both rerankers lifecycle-independent and never changes text,
+model, or proxy lifecycle. Any model lifecycle
+operation remains a separate, explicit operator decision outside the guardian
+transaction.
 
 ---
 

@@ -18,8 +18,8 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 
 ## Current Reference Runtime
 
-* vLLM image for embedding, AEON chat, and reranker: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0` (`sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c`).
-* `vllm-embedding.service`: `max-model-len=40960`, `max-num-batched-tokens=8192`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
+* vLLM image for embedding, AEON chat, and the disabled vLLM reranker fallback: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0` (`sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c`).
+* `vllm-embedding.service` tracked source contract: BF16 Qwen3-Embedding-8B with 4,096-dimensional output, `max-model-len=32768`, `max-num-batched-tokens=8192`, `max-num-seqs=64`, `kv-cache-memory-bytes=4800M`, and a 20 GiB no-swap hard cap. The validated 5,820 MiB baseline yielded 41,376 KV tokens; 4,800 MiB projects about 34,124 tokens (4.14% above 32,768) but is not production-verified until a live restart prints at least 32,768 tokens.
 * `vllm-aeon-27b-dflash.service`: DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-batched-tokens=32768`, `kv-cache-memory-bytes=15360M`, verified 269,589 KV tokens.
 * `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
 * `llm-guard-proxy` routes by request `model` to AEON chat (`aeon-ultimate`, `qwen3.6-27b-decensor-by-aeon`), embedding (`qwen3-embedding-8b`, `Qwen/Qwen3-Embedding-8B`), or reranker (`qwen3-reranker-8b`, `Qwen/Qwen3-Reranker-8B`).
@@ -101,15 +101,18 @@ Run these commands sequentially to deploy the stack from this repository:
 ```bash
 # Ensure target folders exist
 mkdir -p /home/obj/scripts /home/obj/.local/bin /home/obj/.config/llm-guard-proxy /home/obj/log
+install -d -m 0700 /home/obj/.config/gb10-memory-guardian
 
 # Copy all scripts
 cp scripts/aeon_vllm_wrapper.py /home/obj/scripts/
 cp scripts/aeon_hang_guard.py /home/obj/scripts/
 cp scripts/aeon_healthcheck.sh /home/obj/scripts/
 cp scripts/aeon_chat_ready.py /home/obj/.local/bin/
+cp scripts/gb10_check_mem_available.sh /home/obj/.local/bin/
 cp scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/
 cp scripts/sysmon.sh /home/obj/.local/bin/
 cp scripts/gb10-swap-guard.sh /home/obj/.local/bin/
+cp scripts/gb10_stack_recovery.sh /home/obj/.local/bin/
 
 # Make executable
 chmod +x /home/obj/scripts/*.sh /home/obj/.local/bin/*
@@ -119,6 +122,8 @@ chmod +x /home/obj/scripts/*.sh /home/obj/.local/bin/*
 ```bash
 # Copy llm-guard-proxy config
 cp config/llm-guard-proxy/config.toml /home/obj/.config/llm-guard-proxy/config.toml
+# The guardian transaction below owns its owner-only config, binary, helpers,
+# text/reranker units, private backups, rollback, reload, and activation canaries.
 ```
 
 ### 3. Build llm-guard-proxy
@@ -138,46 +143,124 @@ If the running guard process still points at a deleted old inode after a
 standalone rebuild, the script restarts only `llm-guard-proxy.service` and
 smokes `/health`; it does not restart any vLLM backend.
 
-### 4. Systemd User Services Installation
+### 4. Build and install the memory guardian
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked
+cargo build --release --locked -p gb10-memory-guardian
+```
+
+### 5. Systemd User Services Installation
 ```bash
 # Create user-level systemd directory if missing
 mkdir -p /home/obj/.config/systemd/user/
 
-# Copy all systemd service and timer files
-cp systemd/* /home/obj/.config/systemd/user/
+# Install only units outside the guardian/text/reranker transaction.
+install -m 0644 systemd/aeon-healthcheck.service systemd/aeon-healthcheck.timer \
+  systemd/gb10-swap-guard.service systemd/gb10-stack-recovery.service \
+  systemd/llm-guard-proxy.service \
+  systemd/sysmon.service systemd/vllm-embedding.service \
+  /home/obj/.config/systemd/user/
 
 # Reload systemd daemon
 systemctl --user daemon-reload
 ```
 
-### 5. Enable and Start Services
+### 6. Enable and Start Services
 ```bash
 # Start auxiliary services first
 systemctl --user enable --now sysmon.service
 systemctl --user enable --now gb10-swap-guard.service
 systemctl --user enable --now aeon-healthcheck.timer
 
-# Start vLLM stack and shielding proxy
+# Complete any separately approved model-service maintenance before opening the
+# guardian transaction. The deployer never changes these lifecycles.
 systemctl --user enable --now vllm-embedding.service
 systemctl --user enable --now vllm-aeon-27b-dflash.service
-systemctl --user enable --now vllm-qwen3-reranker-8b.service
+systemctl --user disable --now vllm-qwen3-reranker-8b.service
+systemctl --user enable --now querit-4b-reranker.service
 systemctl --user enable --now llm-guard-proxy.service
+
+# Install and immediately activate the complete fail-closed guardian bundle.
+# Do not insert model lifecycle, copy, receipt removal, reload, or standalone
+# canary commands between these transaction phases.
+export GB10_BENCHMARK_EXCLUDED=YES
+scripts/gb10_deploy_memory_guardian.sh install
+scripts/gb10_deploy_memory_guardian.sh activate
 ```
 
-For updates on an already-running GB10, do not restart just one vLLM service when
-changing memory/context profiles. Stop the full vLLM stack first to clear stale
-pages, then start in dependency order:
+Memory recovery is source-first and text-only. The deployer atomically publishes
+an owner-only manifest that binds source and installed hashes/modes plus exact
+prior artifact and parent-directory bytes, modes, and absences. Install leaves
+the guardian disabled in phase `installed`; activation runs bounded disposable
+and the read-only configured-target identity check for `aeon-text` /
+`text-cgroup.v1`,
+starts the guardian unenabled, and
+enables it only after both pass. Every failure or signal restores the complete
+prior generation before a bounded `daemon-reload`; `rollback_failed` state is
+retained for idempotent recovery and can never be activated. Never replace this
+transaction with loose copy, removal, reload, canary, or guardian lifecycle
+fragments.
+
+The text unit uses `app.slice` and `Restart=on-failure`. It has no
+`Requires=`/`Wants=` edge to embedding. Both rerankers have no `Requires=`,
+`BindsTo=`, `PartOf=`, or text-readiness gate, while Guard has ordering only.
+The Rust guardian is the Tier 1 automatic recovery actor: its allocation-free
+text `cgroup.kill` path remains the first response to critical memory pressure.
+`gb10-stack-recovery.service` is the separate Tier 2 fail-closed oneshot for a
+bounded grace-check failure or failed text restart. It acquires a nonblocking
+runtime lock, permits one attempt per boot, snapshots all three model units,
+stops text, reranker, and embedding, proves their prior PIDs and cgroups are
+gone, and requires at least 40 GiB `MemAvailable` before restoring embedding,
+reranker, then text with raw `/v1/models` readiness gates. It is installed but
+not enabled as an ordinary boot service; only the reviewed escalation trigger
+or an explicitly approved operator action should start it. A failed stop,
+release check, start, or readiness gate does not retry the cycle.
+`gb10-swap-guard.service` remains observer-only and must never stop, kill, or
+restart a model. The guardian deployer itself never changes text, embedding,
+reranker, proxy, or Tier 2 coordinator lifecycle.
+
+For updates on an already-running GB10, the embedding 32K profile is a
+source-first **single-unit** transaction. Never use the general stack installation
+commands above for this change, never copy/sync unrelated branch files, and
+never stop, start, or restart text, either reranker, or the proxy. Run only the
+reviewed no-argument production entry point from the repository root in an
+approved maintenance window:
 
 ```bash
-systemctl --user stop vllm-qwen3-reranker-8b.service
-systemctl --user stop vllm-aeon-27b-dflash.service
-systemctl --user stop vllm-embedding.service
-
-systemctl --user start vllm-embedding.service
-systemctl --user start vllm-aeon-27b-dflash.service
-systemctl --user start vllm-qwen3-reranker-8b.service
-systemctl --user start llm-guard-proxy.service
+scripts/gb10_activate_embedding_profile.sh
 ```
+
+Do not create loose pre-state files or manually copy, reload, restart, curl, or
+invoke an alternate verifier. The locked activator owns the private durable
+snapshot: exact prior unit bytes/mode or explicit absence, stable embedding
+systemd generation, stable text/reranker generations, and fixed outputs from
+both aliases. It rejects canonical source mutation, installs atomically,
+daemon-reloads, and restarts only `vllm-embedding.service`. Readiness requires a
+new `InvocationID`, PID, and monotonic start generation before the activator
+invokes the canonical strict verifier with its transaction evidence.
+
+Commit requires the exact effective unit and Docker argv for 32,768 tokens,
+4,800 MiB KV, and a 20 GiB no-swap cgroup/container; a PID in the exact current
+cgroup/container generation; all intended finite engine-process metrics; at
+least 32,768 startup KV tokens; exact aliases; finite nonzero 4,096-dimensional
+vectors; `0.99999` repeat/alias fixture stability; unchanged fixture-neighbor
+ordering; and unchanged text/reranker generations. These are fixture invariants,
+not a claim of general embedding quality. The profile remains projected, not
+production-verified, until the private activation transaction is durably
+`committed`.
+
+`HUP`, `INT`, `TERM`, exceptions, timeouts, stale pre-commit transactions, and
+receipt failures restore exact prior unit state, reload, and restart only
+embedding. Activation requires the embedding service to be active/running;
+rollback proves a fresh stable restored generation/readiness and unchanged
+neighbors. `rollback_failed` remains private and resumable; the next lock holder
+recovers it before any source preflight. A durable `committed` phase is
+authoritative and is never rolled back; an activation receipt explicitly
+requires that phase and is not a commit claim by itself. Evidence is owner-only under
+`$HOME/.local/state/gb10-embedding-activation/`. Never recover by cycling the
+stack or replaying copy/reload/restart fragments.
 
 ---
 
@@ -189,7 +272,8 @@ systemctl --user start llm-guard-proxy.service
 systemctl --user list-units --type=service --state=running
 
 # Check detailed status of core services
-systemctl --user status vllm-embedding vllm-aeon-27b-dflash vllm-qwen3-reranker-8b llm-guard-proxy sysmon gb10-swap-guard
+systemctl --user status vllm-embedding vllm-aeon-27b-dflash querit-4b-reranker \
+  llm-guard-proxy gb10-memory-guardian gb10-swap-guard sysmon
 ```
 
 ### Retrieve System Resource Log (sysmon output)
@@ -272,7 +356,8 @@ systemctl --user restart vllm-aeon-27b-dflash.service
 ```
 
 ### 3. OOM / Swap Critical
-If the swap guard alerts or kills workloads:
+If the swap observer alerts, inspect its evidence and the Rust guardian log.
+The observer does not mutate service or container state:
 ```bash
 # Check memory allocation
 free -h
