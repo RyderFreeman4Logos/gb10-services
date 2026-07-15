@@ -3,3 +3,7 @@ schema_version = 1
 [target]
 label = "aeon-text"
 registration_file = "text-cgroup.v1"
+
+[thresholds]
+mem_avail_stop_gib = 1
+reserve_mib = 64

@@ -16,6 +16,10 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+mod thresholds;
+
+pub use thresholds::{HotReloadableConfig, Thresholds};
+
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const RUNTIME_SUBDIRECTORY: &str = "gb10-memory-guardian";
 const MAX_LABEL_BYTES: usize = 64;
@@ -145,6 +149,8 @@ enum EmergencyRefresh {
 struct FileConfig {
     schema_version: u32,
     target: FileTarget,
+    #[serde(default)]
+    thresholds: thresholds::FileThresholds,
 }
 
 #[derive(Debug, Deserialize)]
@@ -487,6 +493,24 @@ fn absolute_path(path: &Path) -> Result<PathBuf, ConfigError> {
 }
 
 fn load_snapshot(config_path: &Path, runtime_dir: &Path) -> Result<TargetSnapshot, ConfigError> {
+    let (file, generation) = load_file_config(config_path)?;
+    if file.schema_version != CONFIG_SCHEMA_VERSION {
+        return Err(ConfigError::Invalid(format!(
+            "schema_version must be {CONFIG_SCHEMA_VERSION}"
+        )));
+    }
+    validate_label(&file.target.label)?;
+    validate_registration_file(&file.target.registration_file)?;
+    Ok(TargetSnapshot {
+        label: file.target.label,
+        registration_path: runtime_dir
+            .join(RUNTIME_SUBDIRECTORY)
+            .join(file.target.registration_file),
+        generation,
+    })
+}
+
+fn load_file_config(config_path: &Path) -> Result<(FileConfig, FileGeneration), ConfigError> {
     let mut config_file = open_config(config_path)?;
     let generation =
         FileGeneration::from_file(&config_file).map_err(|source| ConfigError::Read {
@@ -510,20 +534,7 @@ fn load_snapshot(config_path: &Path, runtime_dir: &Path) -> Result<TargetSnapsho
         ));
     }
     let file: FileConfig = toml::from_str(&contents).map_err(ConfigError::Parse)?;
-    if file.schema_version != CONFIG_SCHEMA_VERSION {
-        return Err(ConfigError::Invalid(format!(
-            "schema_version must be {CONFIG_SCHEMA_VERSION}"
-        )));
-    }
-    validate_label(&file.target.label)?;
-    validate_registration_file(&file.target.registration_file)?;
-    Ok(TargetSnapshot {
-        label: file.target.label,
-        registration_path: runtime_dir
-            .join(RUNTIME_SUBDIRECTORY)
-            .join(file.target.registration_file),
-        generation,
-    })
+    Ok((file, generation))
 }
 
 fn open_config(path: &Path) -> Result<File, ConfigError> {

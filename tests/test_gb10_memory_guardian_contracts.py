@@ -12,6 +12,7 @@ CORE_NO_ALLOC_TEST = ROOT / "crates" / "gb10-memory-guardian-core" / "tests" / "
 BINARY = ROOT / "crates" / "gb10-memory-guardian" / "src" / "main.rs"
 ESCALATION = ROOT / "crates" / "gb10-memory-guardian" / "src" / "escalation.rs"
 SERVICE_LIB = ROOT / "crates" / "gb10-memory-guardian" / "src" / "lib.rs"
+THRESHOLDS = ROOT / "crates" / "gb10-memory-guardian" / "src" / "thresholds.rs"
 GUARDIAN_UNIT = ROOT / "systemd" / "gb10-memory-guardian.service"
 TARGET_CONFIG = ROOT / "config" / "gb10-memory-guardian" / "config.toml"
 CANARY_DRIVER_UNIT = ROOT / "systemd" / "gb10-memory-guardian-canary.service"
@@ -111,9 +112,28 @@ class MemoryGuardianContractTests(unittest.TestCase):
         self.assertIn("if latch.is_latched()", meminfo_failure)
         self.assertIn("emergency_iteration", meminfo_failure)
 
-        guardian = SERVICE_LIB.read_text()
-        self.assertNotIn("recommended_watcher", guardian)
-        self.assertNotIn("mpsc::channel", guardian)
+        self.assertNotIn("reload_if_changed", emergency)
+
+    def test_thresholds_config_and_notify_hot_reload_contract(self) -> None:
+        binary = BINARY.read_text()
+        thresholds_source = THRESHOLDS.read_text()
+        unit = GUARDIAN_UNIT.read_text()
+        config = tomllib.loads(TARGET_CONFIG.read_text())
+        healthy = binary.split("fn run_healthy_iteration", 1)[1].split(
+            "fn publish_guardian_status", 1
+        )[0]
+
+        self.assertEqual(
+            config["thresholds"],
+            {"mem_avail_stop_gib": 1, "reserve_mib": 64},
+        )
+        self.assertIn("HotReloadableConfig", binary)
+        self.assertIn("notify::RecommendedWatcher", thresholds_source)
+        self.assertIn("notify::recommended_watcher", thresholds_source)
+        self.assertIn("reload_if_changed", healthy)
+        self.assertIn("thresholds reloaded", healthy)
+        self.assertIn("[thresholds]", unit)
+        self.assertIn("overrides these environment defaults at runtime", unit)
 
     def test_guardian_escalation_is_configurable_and_post_emergency(self) -> None:
         binary = BINARY.read_text()

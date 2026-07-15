@@ -5,7 +5,8 @@ mod escalation;
 
 use escalation::{start_unit_with_timeout, validate_unit_name, EscalationEpisode};
 use gb10_memory_guardian::{
-    emergency_iteration, EmergencyIteration, TargetRegistrationSet, TargetTransition,
+    emergency_iteration, EmergencyIteration, HotReloadableConfig, TargetRegistrationSet,
+    TargetTransition, Thresholds,
 };
 use gb10_memory_guardian_core::{
     effective_uid, read_mem_available_fd, should_rearm, should_shed, AttemptOutcome, CgroupTarget,
@@ -38,8 +39,7 @@ enum Mode {
 
 #[derive(Debug)]
 struct Config {
-    reserve_bytes: usize,
-    threshold_bytes: u64,
+    threshold_defaults: Thresholds,
     poll_interval: Duration,
     retry_millis: u64,
     escalation_grace_seconds: u64,
@@ -103,13 +103,8 @@ impl Config {
         )?;
         validate_unit_name(&escalation_unit)?;
         let escalation_enabled = parse_bool_env("GB10_MEMORY_GUARDIAN_ESCALATION_ENABLED", true)?;
-        let reserve_bytes = usize::try_from(reserve_mib)
-            .ok()
-            .and_then(|value| value.checked_mul(1024 * 1024))
-            .ok_or_else(|| "reserve size overflows usize".to_owned())?;
-        let threshold_bytes = threshold_gib
-            .checked_mul(1024 * 1024 * 1024)
-            .ok_or_else(|| "memory threshold overflows u64".to_owned())?;
+        let threshold_defaults =
+            Thresholds::new(threshold_gib, reserve_mib).map_err(|error| error.to_string())?;
         let retry_millis = retry_seconds
             .checked_mul(1_000)
             .ok_or_else(|| "retry interval overflows u64".to_owned())?;
@@ -117,8 +112,7 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", effective_uid())));
         Ok(Self {
-            reserve_bytes,
-            threshold_bytes,
+            threshold_defaults,
             poll_interval: Duration::from_secs(poll_seconds),
             retry_millis,
             escalation_grace_seconds,
@@ -264,7 +258,11 @@ fn run_production(config: Config) -> Result<(), String> {
 
     let meminfo = File::open(&config.meminfo_path)
         .map_err(|error| format!("open {}: {error}", config.meminfo_path.display()))?;
-    let reserve = EmergencyReserve::new(config.reserve_bytes)
+    let thresholds =
+        HotReloadableConfig::new(&config.target_config_path, config.threshold_defaults)
+            .map_err(|error| format!("load threshold config: {error}"))?;
+    let initial_thresholds = thresholds.current();
+    let reserve = EmergencyReserve::new(initial_thresholds.reserve_bytes())
         .map_err(|error| format!("allocate and touch reserve: {error}"))?;
     let mut controller = EmergencyController::new(reserve, config.retry_millis);
     let mut targets = TargetRegistrationSet::new(
@@ -331,11 +329,12 @@ fn run_production(config: Config) -> Result<(), String> {
             }
         };
 
+        let live_thresholds = thresholds.current();
         let mut had_target_before = false;
         let emergency_iteration_result = match latch.next_action(
             mem_available,
-            config.threshold_bytes,
-            config.reserve_bytes,
+            live_thresholds.threshold_bytes(),
+            live_thresholds.reserve_bytes(),
         ) {
             LoopAction::Emergency => {
                 had_target_before = targets.target().is_some();
@@ -344,7 +343,7 @@ fn run_production(config: Config) -> Result<(), String> {
                 emergency_status_deferred = true;
                 Some(iteration)
             }
-            LoopAction::Rearm => match controller.ensure_reserve(config.reserve_bytes) {
+            LoopAction::Rearm => match controller.ensure_reserve(live_thresholds.reserve_bytes()) {
                 Ok(_) => {
                     latch.acknowledge_rearmed();
                     escalation.reset();
@@ -360,6 +359,7 @@ fn run_production(config: Config) -> Result<(), String> {
                             &mut controller,
                             &mut targets,
                             &config,
+                            &thresholds,
                             &mut degraded_logged,
                         )?;
                         emergency_status_deferred = false;
@@ -380,6 +380,7 @@ fn run_production(config: Config) -> Result<(), String> {
                     &mut controller,
                     &mut targets,
                     &config,
+                    &thresholds,
                     &mut degraded_logged,
                 )?;
                 None
@@ -426,8 +427,20 @@ fn run_healthy_iteration(
     controller: &mut EmergencyController,
     targets: &mut TargetRegistrationSet,
     config: &Config,
+    thresholds: &HotReloadableConfig,
     degraded_logged: &mut bool,
 ) -> Result<(), String> {
+    match thresholds.reload_if_changed() {
+        Ok(Some(reloaded)) => eprintln!(
+            "gb10-memory-guardian: thresholds reloaded: mem_avail_stop_gib={} reserve_mib={}",
+            reloaded.mem_avail_stop_gib(),
+            reloaded.reserve_mib()
+        ),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("gb10-memory-guardian: retaining last-good thresholds: {error}");
+        }
+    }
     let transition = targets.reconcile();
     if transition.is_ok() {
         enforce_expected_target_identity(targets, config)?;
@@ -697,7 +710,7 @@ fn run_bounded_direct_test(
     target: &CgroupTarget,
     label: &str,
 ) -> Result<(), String> {
-    let reserve = EmergencyReserve::new(config.reserve_bytes)
+    let reserve = EmergencyReserve::new(config.threshold_defaults.reserve_bytes())
         .map_err(|error| format!("allocate and touch reserve: {error}"))?;
     let mut controller = EmergencyController::new(reserve, config.retry_millis);
     let mut now = 0;

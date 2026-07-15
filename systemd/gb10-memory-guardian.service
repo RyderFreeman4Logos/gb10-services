@@ -5,6 +5,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# [thresholds] in config.toml overrides these environment defaults at runtime.
 Environment=GB10_MEMORY_GUARDIAN_RESERVE_MIB=64
 Environment=GB10_MEMORY_GUARDIAN_MEM_AVAIL_STOP_GIB=1
 Environment=GB10_MEMORY_GUARDIAN_POLL_SECONDS=1
