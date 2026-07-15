@@ -119,238 +119,35 @@ Caps are safety ceilings and do not describe actual simultaneous residency, espe
 ## Future activation canary
 
 Activation belongs in an approved maintenance window and is a source-first,
-single-unit change. Run from the reviewed repository root. Install only
-`systemd/vllm-embedding.service`; do not sync the branch, copy `systemd/*`, or
-stop/start/restart text or either reranker. The following blocks are intended to
-run sequentially in the same Bash session so the private receipt directory and
-snapshot helpers remain available.
-
-First preserve the exact rollback source, embedding runtime/cgroup state, fixed
-synthetic outputs for both aliases, and the three neighbor invariants:
+single-unit transaction. Run the reviewed executable from the repository root;
+do not sync the branch, copy `systemd/*`, or stop/start/restart text or either
+reranker:
 
 ```bash
-set -euo pipefail
-umask 077
-UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-EVIDENCE="$HOME/log/vllm-embedding-32k-canary-$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir -p "$EVIDENCE"
-test -f systemd/vllm-embedding.service
-test -f "$UNIT_DIR/vllm-embedding.service"
-install -m 0600 "$UNIT_DIR/vllm-embedding.service" \
-  "$EVIDENCE/vllm-embedding.service.before"
-
-snapshot_neighbors() {
-  local output=$1 unit
-  : >"$output"
-  for unit in vllm-aeon-27b-dflash.service querit-4b-reranker.service \
-    vllm-qwen3-reranker-8b.service; do
-    timeout 10s systemctl --user show "$unit" \
-      --property=Id --property=ActiveState --property=MainPID \
-      --property=NRestarts >>"$output"
-  done
-}
-
-snapshot_embedding_runtime() {
-  local label=$1 container_pid cgroup_relative cgroup
-  timeout 10s docker inspect vllm-embedding \
-    >"$EVIDENCE/$label.docker.json"
-  container_pid=$(timeout 10s docker inspect \
-    --format '{{.State.Pid}}' vllm-embedding)
-  cgroup_relative=$(awk -F: '$1 == "0" {print $3}' \
-    "/proc/$container_pid/cgroup")
-  case "$cgroup_relative" in /*) ;; *) return 1 ;; esac
-  cgroup="/sys/fs/cgroup$cgroup_relative"
-  {
-    printf 'memory.current='; cat "$cgroup/memory.current"
-    printf 'memory.peak='; cat "$cgroup/memory.peak"
-    printf 'memory.max='; cat "$cgroup/memory.max"
-    printf 'memory.swap.current='; cat "$cgroup/memory.swap.current"
-    printf 'memory.swap.max='; cat "$cgroup/memory.swap.max"
-    while read -r key value; do
-      printf 'memory.events.%s=%s\n' "$key" "$value"
-    done <"$cgroup/memory.events"
-  } >"$EVIDENCE/$label.cgroup"
-}
-
-snapshot_neighbors "$EVIDENCE/neighbors.before"
-timeout 10s systemctl --user show vllm-embedding.service \
-  --property=Id --property=ActiveState --property=MainPID --property=NRestarts \
-  >"$EVIDENCE/embedding.before.systemd"
-timeout 10s journalctl --user -u vllm-embedding.service -n 200 --no-pager \
-  >"$EVIDENCE/embedding.before.journal"
-snapshot_embedding_runtime before
-
-models=(qwen3-embedding-8b Qwen/Qwen3-Embedding-8B)
-for index in "${!models[@]}"; do
-  timeout 25s curl --fail-with-body --silent --show-error --max-time 20 \
-    -H 'Content-Type: application/json' \
-    --data "{\"model\":\"${models[$index]}\",\"input\":[\"gb10-embedding-canary-v1\",\"source-safe deterministic parity anchor\"]}" \
-    http://100.105.4.92:18012/v1/embeddings \
-    >"$EVIDENCE/alias-$index.before.json"
-done
-printf 'EVIDENCE=%q\n' "$EVIDENCE"
+scripts/gb10_activate_embedding_profile.sh
 ```
 
-Install only the reviewed unit, reload systemd, request only the embedding
-restart without waiting on the unit's 600-second startup timeout, and enforce a
-hard 92-second readiness deadline:
+The executable privately records the prior installed unit or an explicit absence,
+plus the prior systemd state. The engine treats `HUP`, `INT`, and `TERM` as
+pre-commit failures and defers additional termination signals until an in-progress
+rollback finishes. It installs only `vllm-embedding.service`, daemon-reloads,
+performs a bounded **synchronous** embedding restart, and refuses readiness until
+both `InvocationID` and `MainPID` differ from the pre-restart values. Its Python
+verifier uses explicit exceptions rather than optimization-sensitive assertions.
 
-```bash
-install -m 0644 systemd/vllm-embedding.service \
-  "$UNIT_DIR/vllm-embedding.service"
-timeout 10s systemctl --user daemon-reload
-ACTIVATED_AT=$(date --iso-8601=seconds)
-timeout 15s systemctl --user --no-block restart vllm-embedding.service
-timeout 92s bash -c '
-  until systemctl --user is-active --quiet vllm-embedding.service &&
-    curl --fail --silent --show-error --max-time 2 \
-      http://100.105.4.92:18012/v1/models >/dev/null; do
-    sleep 2
-  done
-'
-```
+The verifier must establish the exact 32,768-token / 4,800 MiB KV / 20 GiB / BF16
+contract, a populated 20 GiB cgroup with zero swap/cap events, a startup report of
+at least 32,768 KV tokens, and finite 4,096-dimensional responses from both
+aliases. Once the durable transaction is prepared, any timeout, stale identity,
+verification failure, runtime error, or signal restores the exact previous unit (or
+absence), reloads, and performs a bounded synchronous embedding-only rollback.
+Receipts remain owner-only under the account home's
+`.local/state/gb10-embedding-activation/` directory. Never substitute loose manual
+copy/reload/restart fragments for this transaction.
 
-Capture post-state, then verify the running Docker argv, startup KV capacity,
-20 GiB Docker/cgroup cap, zero swap/cap events, both 4,096-dimensional alias
-outputs, and exact neighbor invariants. The cosine threshold is deliberately
-fixed at `0.99999` against each pre-restart alias and between post-restart
-aliases; changing it requires a separately reviewed quality decision.
-
-```bash
-snapshot_neighbors "$EVIDENCE/neighbors.after"
-timeout 10s systemctl --user show vllm-embedding.service \
-  --property=Id --property=ActiveState --property=MainPID --property=NRestarts \
-  >"$EVIDENCE/embedding.after.systemd"
-timeout 10s journalctl --user -u vllm-embedding.service \
-  --since "$ACTIVATED_AT" --no-pager >"$EVIDENCE/embedding.after.journal"
-snapshot_embedding_runtime after
-
-for index in "${!models[@]}"; do
-  timeout 25s curl --fail-with-body --silent --show-error --max-time 20 \
-    -H 'Content-Type: application/json' \
-    --data "{\"model\":\"${models[$index]}\",\"input\":[\"gb10-embedding-canary-v1\",\"source-safe deterministic parity anchor\"]}" \
-    http://100.105.4.92:18012/v1/embeddings \
-    >"$EVIDENCE/alias-$index.after.json"
-done
-
-cmp "$EVIDENCE/neighbors.before" "$EVIDENCE/neighbors.after"
-python3 - "$EVIDENCE" <<'PY'
-import json
-import math
-import re
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-expected_bytes = 20 * 1024**3
-container = json.loads((root / "after.docker.json").read_text())[0]
-host = container["HostConfig"]
-assert host["Memory"] == expected_bytes, host["Memory"]
-assert host["MemorySwap"] == expected_bytes, host["MemorySwap"]
-
-argv = container["Config"]["Cmd"]
-def one_value(flag: str) -> str:
-    assert argv.count(flag) == 1, (flag, argv)
-    index = argv.index(flag)
-    assert index + 1 < len(argv), flag
-    return argv[index + 1]
-assert one_value("--max-model-len") == "32768"
-assert one_value("--kv-cache-memory-bytes") == "4800M"
-assert one_value("--dtype") == "bfloat16"
-assert argv.count("--enforce-eager") == 1
-
-metrics = {}
-for line in (root / "after.cgroup").read_text().splitlines():
-    key, value = line.split("=", 1)
-    metrics[key] = value
-assert metrics["memory.max"] == str(expected_bytes), metrics
-assert metrics["memory.swap.max"] == "0", metrics
-assert metrics["memory.swap.current"] == "0", metrics
-for key in ("memory.events.max", "memory.events.oom", "memory.events.oom_kill"):
-    assert metrics.get(key) == "0", (key, metrics.get(key))
-
-journal = (root / "embedding.after.journal").read_text(errors="replace")
-capacities = [
-    int(value.replace(",", ""))
-    for value in re.findall(r"GPU KV cache size:\s*([0-9,]+)\s*tokens", journal)
-]
-assert capacities and capacities[-1] >= 32768, capacities
-
-def vectors(name: str) -> list[list[float]]:
-    payload = json.loads((root / name).read_text())
-    rows = sorted(payload["data"], key=lambda row: row["index"])
-    result = [row["embedding"] for row in rows]
-    assert len(result) == 2, len(result)
-    assert all(len(vector) == 4096 for vector in result)
-    assert all(math.isfinite(value) for vector in result for value in vector)
-    return result
-
-def cosine(left: list[float], right: list[float]) -> float:
-    numerator = sum(a * b for a, b in zip(left, right, strict=True))
-    left_norm = math.sqrt(sum(value * value for value in left))
-    right_norm = math.sqrt(sum(value * value for value in right))
-    assert left_norm > 0 and right_norm > 0
-    return numerator / (left_norm * right_norm)
-
-before = [vectors(f"alias-{index}.before.json") for index in range(2)]
-after = [vectors(f"alias-{index}.after.json") for index in range(2)]
-comparisons = []
-for alias in range(2):
-    for input_index in range(2):
-        comparisons.append(cosine(before[alias][input_index], after[alias][input_index]))
-for input_index in range(2):
-    comparisons.append(cosine(after[0][input_index], after[1][input_index]))
-assert min(comparisons) >= 0.99999, comparisons
-print({"kv_capacity": capacities[-1], "minimum_cosine": min(comparisons)})
-PY
-```
-
-Do not call the new profile production-verified until every command above exits
-zero and the receipts are retained.
-
-## Rollback criteria and procedure
-
-Rollback on any timeout, startup failure, KV capacity below 32,768, malformed or
-quality-divergent embedding, nonzero cap/swap event, incorrect 20 GiB limit, or
-changed neighbor tuple. Restore the exact saved embedding unit rather than
-reconstructing an assumed 40,960/5,820 MiB/24 GiB profile. Reload systemd and
-restart only embedding; never cycle text or either reranker:
-
-```bash
-set -euo pipefail
-: "${EVIDENCE:?set EVIDENCE to the failed canary receipt directory}"
-UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-test -f "$EVIDENCE/vllm-embedding.service.before"
-install -m 0644 "$EVIDENCE/vllm-embedding.service.before" \
-  "$UNIT_DIR/vllm-embedding.service"
-timeout 10s systemctl --user daemon-reload
-ROLLBACK_AT=$(date --iso-8601=seconds)
-timeout 15s systemctl --user --no-block restart vllm-embedding.service
-timeout 92s bash -c '
-  until systemctl --user is-active --quiet vllm-embedding.service &&
-    curl --fail --silent --show-error --max-time 2 \
-      http://100.105.4.92:18012/v1/models >/dev/null; do
-    sleep 2
-  done
-'
-: >"$EVIDENCE/neighbors.rollback"
-for unit in vllm-aeon-27b-dflash.service querit-4b-reranker.service \
-  vllm-qwen3-reranker-8b.service; do
-  timeout 10s systemctl --user show "$unit" \
-    --property=Id --property=ActiveState --property=MainPID \
-    --property=NRestarts >>"$EVIDENCE/neighbors.rollback"
-done
-cmp "$EVIDENCE/neighbors.before" "$EVIDENCE/neighbors.rollback"
-timeout 10s systemctl --user show vllm-embedding.service \
-  --property=Id --property=ActiveState --property=MainPID --property=NRestarts \
-  >"$EVIDENCE/embedding.rollback.systemd"
-timeout 10s journalctl --user -u vllm-embedding.service \
-  --since "$ROLLBACK_AT" --no-pager >"$EVIDENCE/embedding.rollback.journal"
-```
-
-Preserve both failed-canary and rollback receipts. A rollback restart validates
-only restoration of the previous embedding source; it does not validate the new
-32K profile.
+Do not call the profile production-verified until the durable `committed` phase,
+its phase-bound private activation receipt, and any separately reviewed immutable
+live-receipt checks all pass.
 
 ## Unknowns
 
