@@ -205,6 +205,10 @@ impl HotReloadableConfig {
         }
 
         let reloaded = load_thresholds(&self.config_path, self.defaults)?;
+        let current = self.live.current();
+        if reloaded == current {
+            return Ok(None);
+        }
         self.live.replace(reloaded);
         Ok(Some(reloaded))
     }
