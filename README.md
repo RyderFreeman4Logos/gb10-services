@@ -275,25 +275,19 @@ systemctl --user enable --now sysmon.service
 systemctl --user enable --now gb10-swap-guard.service
 systemctl --user enable --now aeon-healthcheck.timer
 
-# Install the complete reviewed guardian/text/reranker transaction while the
-# automatic actor remains stopped and disabled.
-export GB10_BENCHMARK_EXCLUDED=YES
-scripts/gb10_deploy_memory_guardian.sh install
-
-# Enable model services. Starting text is a separate operator action; the
-# deployer itself never restarts or kills a production model.
+# Complete any separately approved model-service maintenance before opening the
+# guardian transaction. The deployer never changes these lifecycles.
 systemctl --user enable --now vllm-embedding.service
 systemctl --user enable --now vllm-aeon-27b-dflash.service
 systemctl --user disable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now querit-4b-reranker.service
 systemctl --user enable --now llm-guard-proxy.service
 
-# On a stale upgrade, inspect and explicitly remove the obsolete volatile
-# Querit registration only after confirming the installed reranker is decoupled.
-test ! -e "$XDG_RUNTIME_DIR/gb10-memory-guardian/querit-cgroup.v1" || {
-  grep -q 'lifecycle-independent' ~/.config/systemd/user/querit-4b-reranker.service
-  rm -f "$XDG_RUNTIME_DIR/gb10-memory-guardian/querit-cgroup.v1"
-}
+# Install and immediately activate the complete reviewed guardian/text/reranker
+# artifact transaction. Do not insert model lifecycle, receipt cleanup, copying,
+# reload, or standalone canary commands between these phases.
+export GB10_BENCHMARK_EXCLUDED=YES
+scripts/gb10_deploy_memory_guardian.sh install
 scripts/gb10_deploy_memory_guardian.sh activate
 ```
 
@@ -309,8 +303,9 @@ The install phase leaves the automatic actor disabled. Activation refuses and
 keeps it stopped if the owner-only config is missing or wrong, any stale
 `querit-cgroup.v1` exists, the text unit does not publish `text-cgroup.v1`, the
 disposable canary fails, strict bounded systemd status is not
-`loaded/active/running`, or the post-start journal does not contain an exact
-`armed target aeon-text` receipt. The final configured-target phase is a
+`loaded/active/running`, or the running guardian's current status receipt does
+not match its `MainPID`, the exact current registration, and the populated cgroup
+device/inode generation. The final configured-target phase is a
 read-only configured-target identity check; it never kills production text.
 The registration contains only the version, exact 64-character lowercase
 Docker ID, exact scope, and exact control-group path. Publication failure stops
@@ -380,66 +375,34 @@ timeout 92s bash -c '
 The research note contains executable pre/post snapshots, deterministic output
 comparison, capacity/cgroup checks, neighbor comparison, and rollback receipts.
 
-### Memory-guardian disposable canary and read-only identity proof
+### Memory-guardian canaries and rollback
 
-These are deployment procedures, not automated tests. Do not run either phase
-while a benchmark is active, and do not move, rewrite, truncate, or otherwise
-touch benchmark artifacts or benchmark processes. First confirm that the
-benchmark owner has stopped or explicitly excluded all load, then run the rigid
-disposable user cgroup canary:
+The deployer owns both canaries as bounded phases of its private durable
+transaction; do not run them as loose deployment commands. It first runs the
+disposable user cgroup canary while the guardian remains disabled, starts the
+guardian without enabling it, and then runs the read-only configured-target
+identity check. Only after both pass does it enable the guardian and durably
+mark the transaction committed.
 
-```bash
-export GB10_BENCHMARK_EXCLUDED=YES
-~/.local/bin/gb10_memory_guardian_canary.sh disposable
-```
+The disposable phase can target only
+`gb10-memory-guardian-disposable-canary.service`. The configured-target phase
+never invokes `--kill-configured-target` and never stops, starts, or restarts
+text. It accepts only the owner-only `aeon-text` / `text-cgroup.v1` config and
+matches the current status receipt to the running guardian PID and invocation,
+exact registration generation, and populated cgroup device/inode generation.
+Historical journal lines, missing or hostile fields, stale/disarmed receipts,
+replaced cgroups, stale `querit-cgroup.v1`, and unbounded reads fail closed.
 
-The script creates only
-`gb10-memory-guardian-disposable-canary.service` in the user `app.slice`; the
-binary's disposable mode accepts no target path. The kill is executed through
-`gb10-memory-guardian-canary.service`, a sandboxed oneshot with production
-hardening. It snapshots text, embedding, both rerankers, Guard, and the
-production guardian with strictly parsed `LoadState`, `ActiveState`, `SubState`,
-`MainPID`, `Result`, exit status, and `NRestarts`. Every systemd query has a hard
-timeout. A one-hour, binary-checksum-bound attestation is written only when all
-protected tuples remain invariant.
-
-The configured-target phase is read-only. It never invokes the guardian's
-`--kill-configured-target` mode and never stops, starts, or restarts text. Supply
-the exact activation timestamp so the bounded journal query cannot accept an
-old `armed target` receipt:
-
-```bash
-GB10_BENCHMARK_EXCLUDED=YES \
-GB10_MEMORY_GUARDIAN_CANARY_TARGET_UNIT=vllm-aeon-27b-dflash.service \
-GB10_MEMORY_GUARDIAN_JOURNAL_SINCE="$ACTIVATED_AT" \
-  ~/.local/bin/gb10_memory_guardian_canary.sh configured-target
-```
-
-It accepts only the owner-only `aeon-text` / `text-cgroup.v1` config, validates
-the exact current-user `app.slice` registration, checks that the text unit
-publishes that path with `Restart=on-failure`, requires a strict running guardian
-state, and matches an exact `gb10-memory-guardian: armed target aeon-text`
-journal line without changing embedding and both rerankers. Missing or hostile fields, substring matches, stale
-`querit-cgroup.v1`, and unbounded status reads fail closed.
-
-### Guardian rollback
-
-Keep previous binary and unit checksums before deployment. To roll back, stop
-and disable only the Rust guardian, remove the volatile text registration, and
-restore the reviewed prior config/unit/helper files. Do not restart any vLLM
-backend as part of guardian rollback:
-
-```bash
-systemctl --user disable --now gb10-memory-guardian.service
-rm -f "$XDG_RUNTIME_DIR/gb10-memory-guardian/text-cgroup.v1"
-# Restore reviewed prior files in ~/.config/systemd/user and ~/.local/bin here.
-systemctl --user daemon-reload
-systemctl --user is-active gb10-swap-guard.service
-sha256sum ~/.local/bin/gb10-memory-guardian 2>/dev/null || true
-```
-
-The Bash swap guard is observer-only and is not a recovery fallback. Any model
-restart after rollback is a separate, explicit operator decision.
+Every install, activation, shell-error, and signal failure disables the
+unverified guardian and restores exact prior artifact bytes, modes, and
+absences before a bounded daemon reload. Failed rollback retains an owner-only
+`rollback_failed` transaction for idempotent recovery; it can never be
+activated. Do not substitute manual copy, removal, reload, canary, or guardian
+enable fragments for `gb10_deploy_memory_guardian.sh`. The deployer leaves
+embedding and both rerankers lifecycle-independent and never changes text,
+model, or proxy lifecycle. Any model lifecycle
+operation remains a separate, explicit operator decision outside the guardian
+transaction.
 
 ---
 

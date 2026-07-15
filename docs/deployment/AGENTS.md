@@ -109,8 +109,6 @@ cp scripts/aeon_hang_guard.py /home/obj/scripts/
 cp scripts/aeon_healthcheck.sh /home/obj/scripts/
 cp scripts/aeon_chat_ready.py /home/obj/.local/bin/
 cp scripts/gb10_check_mem_available.sh /home/obj/.local/bin/
-cp scripts/gb10_enforce_docker_cgroup_limits.sh /home/obj/.local/bin/
-cp scripts/gb10_memory_guardian_canary.sh /home/obj/.local/bin/
 cp scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/
 cp scripts/sysmon.sh /home/obj/.local/bin/
 cp scripts/gb10-swap-guard.sh /home/obj/.local/bin/
@@ -123,9 +121,8 @@ chmod +x /home/obj/scripts/*.sh /home/obj/.local/bin/*
 ```bash
 # Copy llm-guard-proxy config
 cp config/llm-guard-proxy/config.toml /home/obj/.config/llm-guard-proxy/config.toml
-# Guardian config is security-sensitive and must be owner-only.
-install -m 0600 config/gb10-memory-guardian/config.toml \
-  /home/obj/.config/gb10-memory-guardian/config.toml
+# The guardian transaction below owns its owner-only config, binary, helpers,
+# text/reranker units, private backups, rollback, reload, and activation canaries.
 ```
 
 ### 3. Build llm-guard-proxy
@@ -151,7 +148,6 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 cargo build --release --locked -p gb10-memory-guardian
-install -m 0755 target/release/gb10-memory-guardian /home/obj/.local/bin/
 ```
 
 ### 5. Systemd User Services Installation
@@ -159,8 +155,11 @@ install -m 0755 target/release/gb10-memory-guardian /home/obj/.local/bin/
 # Create user-level systemd directory if missing
 mkdir -p /home/obj/.config/systemd/user/
 
-# Copy all systemd service and timer files
-cp systemd/* /home/obj/.config/systemd/user/
+# Install only units outside the guardian/text/reranker transaction.
+install -m 0644 systemd/aeon-healthcheck.service systemd/aeon-healthcheck.timer \
+  systemd/gb10-swap-guard.service systemd/llm-guard-proxy.service \
+  systemd/sysmon.service systemd/vllm-embedding.service \
+  /home/obj/.config/systemd/user/
 
 # Reload systemd daemon
 systemctl --user daemon-reload
@@ -171,26 +170,44 @@ systemctl --user daemon-reload
 # Start auxiliary services first
 systemctl --user enable --now sysmon.service
 systemctl --user enable --now gb10-swap-guard.service
-systemctl --user enable --now gb10-memory-guardian.service
 systemctl --user enable --now aeon-healthcheck.timer
 
-# Start vLLM stack and shielding proxy
+# Complete any separately approved model-service maintenance before opening the
+# guardian transaction. The deployer never changes these lifecycles.
 systemctl --user enable --now vllm-embedding.service
 systemctl --user enable --now vllm-aeon-27b-dflash.service
 systemctl --user disable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now querit-4b-reranker.service
 systemctl --user enable --now llm-guard-proxy.service
+
+# Install and immediately activate the complete fail-closed guardian bundle.
+# Do not insert model lifecycle, copy, receipt removal, reload, or standalone
+# canary commands between these transaction phases.
+export GB10_BENCHMARK_EXCLUDED=YES
+scripts/gb10_deploy_memory_guardian.sh install
+scripts/gb10_deploy_memory_guardian.sh activate
 ```
 
-Memory recovery is source-first and text-only. Deploy the owner-only guardian
-config, generic cgroup helper, Rust binary, and all reviewed units before
-`daemon-reload`; restart the text unit only in an approved maintenance window
-to publish `%t/gb10-memory-guardian/text-cgroup.v1`. The text unit uses
-`app.slice` and `Restart=on-failure`. It has no `Requires=`/`Wants=` edge to
-embedding. Both rerankers have no `Requires=`, `BindsTo=`, `PartOf=`, or
-text-readiness gate, while Guard has ordering only. The Rust guardian is the
-sole automatic recovery actor; `gb10-swap-guard.service` is observer-only and
-must never stop, kill, or restart a model.
+Memory recovery is source-first and text-only. The deployer atomically publishes
+an owner-only manifest that binds source and installed hashes/modes plus exact
+prior artifact and parent-directory bytes, modes, and absences. Install leaves
+the guardian disabled in phase `installed`; activation runs bounded disposable
+and the read-only configured-target identity check for `aeon-text` /
+`text-cgroup.v1`,
+starts the guardian unenabled, and
+enables it only after both pass. Every failure or signal restores the complete
+prior generation before a bounded `daemon-reload`; `rollback_failed` state is
+retained for idempotent recovery and can never be activated. Never replace this
+transaction with loose copy, removal, reload, canary, or guardian lifecycle
+fragments.
+
+The text unit uses `app.slice` and `Restart=on-failure`. It has no
+`Requires=`/`Wants=` edge to embedding. Both rerankers have no `Requires=`,
+`BindsTo=`, `PartOf=`, or text-readiness gate, while Guard has ordering only.
+The Rust guardian is the sole automatic recovery actor;
+`gb10-swap-guard.service` is observer-only and must never stop, kill, or restart
+a model. The deployer itself never changes text, embedding, reranker, or proxy
+lifecycle.
 
 For updates on an already-running GB10, the embedding 32K profile is a
 source-first **single-unit** canary. Never use the general stack installation
