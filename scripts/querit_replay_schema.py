@@ -377,7 +377,10 @@ def _validate_system_python(value: Any) -> dict[str, Any]:
     resolved = value["resolved_path"]
     if (
         not isinstance(resolved, str)
-        or not re.fullmatch(r"/usr/bin/python3(?:\.[0-9]+)*", resolved)
+        or not re.fullmatch(
+            r"(?:/usr/bin/python3(?:\.[0-9]+)*|/usr/local/bin/python3\.12)",
+            resolved,
+        )
         or os.path.normpath(resolved) != resolved
     ):
         raise SchemaError("resolved system Python path is outside the trusted root")

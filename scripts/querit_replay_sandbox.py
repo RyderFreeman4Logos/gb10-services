@@ -126,38 +126,87 @@ def _attest_python_path(
     launcher: Path,
     *,
     trusted_roots: Sequence[Path],
+    trusted_ancestors: Sequence[Path] = (),
+    allowed_cross_root_links: Sequence[tuple[Path, Path, Path]] = (),
     expected_uid: int,
     expected_gid: int,
 ) -> dict[str, object]:
-    """Resolve and hash one executable through a bounded trusted symlink chain."""
+    """Resolve and hash one executable through a bounded declared trust graph."""
 
-    path = Path(os.path.normpath(os.fspath(launcher)))
-    if not path.is_absolute() or path != launcher:
-        raise SandboxError("Python launcher path is not canonical and absolute")
-    roots = tuple(Path(os.path.normpath(os.fspath(root))) for root in trusted_roots)
-    if not roots or any(not root.is_absolute() for root in roots):
+    def canonical(value: Path) -> Path:
+        normalized = Path(os.path.normpath(os.fspath(value)))
+        if not value.is_absolute() or normalized != value:
+            raise SandboxError("trusted Python path declaration is not canonical and absolute")
+        return normalized
+
+    path = canonical(launcher)
+    roots = tuple(canonical(root) for root in trusted_roots)
+    if (
+        not roots
+        or len(set(roots)) != len(roots)
+        or any(
+            _under(left, right) or _under(right, left)
+            for index, left in enumerate(roots)
+            for right in roots[index + 1 :]
+        )
+    ):
         raise SandboxError("trusted Python root declaration is invalid")
-    root = next((candidate for candidate in roots if _under(path, candidate)), None)
+
+    def selected_root(candidate: Path) -> Path | None:
+        return next((root for root in roots if _under(candidate, root)), None)
+
+    root = selected_root(path)
     if root is None:
         raise SandboxError("Python launcher is outside trusted system roots")
-    try:
-        root_info = root.lstat()
-    except OSError as exc:
-        raise SandboxError("trusted Python root is unavailable") from exc
-    try:
-        root_uid, root_gid = _normalized_owner(root_info, expected_uid, expected_gid)
-    except SandboxError as exc:
-        raise SandboxError("trusted Python root ownership or mode is unsafe") from exc
-    if (
-        not stat.S_ISDIR(root_info.st_mode)
-        or stat.S_ISLNK(root_info.st_mode)
-        or root_info.st_mode & 0o022
-    ):
-        raise SandboxError("trusted Python root ownership or mode is unsafe")
 
+    ancestors = tuple(canonical(ancestor) for ancestor in trusted_ancestors)
+    if len(set(ancestors)) != len(ancestors) or any(
+        not any(_under(candidate_root, ancestor) for candidate_root in roots)
+        for ancestor in ancestors
+    ):
+        raise SandboxError("trusted Python ancestor declaration is invalid")
+
+    transitions: set[tuple[Path, Path, Path]] = set()
+    for source_root, link_path, target_path in allowed_cross_root_links:
+        transition = (canonical(source_root), canonical(link_path), canonical(target_path))
+        target_root = selected_root(transition[2])
+        if (
+            transition[0] not in roots
+            or not _under(transition[1], transition[0])
+            or target_root is None
+            or target_root == transition[0]
+            or transition in transitions
+        ):
+            raise SandboxError("trusted Python cross-root declaration is invalid")
+        transitions.add(transition)
+
+    chain: list[dict[str, object]] = []
+    attested_directories: set[Path] = set()
+
+    def attest_root(candidate_root: Path) -> None:
+        for directory in (*ancestors, candidate_root):
+            if not _under(candidate_root, directory) or directory in attested_directories:
+                continue
+            attested_directories.add(directory)
+            try:
+                info = directory.lstat()
+            except OSError as exc:
+                raise SandboxError("trusted Python root or ancestor is unavailable") from exc
+            try:
+                owner_uid, owner_gid = _normalized_owner(info, expected_uid, expected_gid)
+            except SandboxError as exc:
+                raise SandboxError("trusted Python root or ancestor ownership is unsafe") from exc
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or info.st_mode & 0o022
+            ):
+                raise SandboxError("trusted Python root or ancestor mode is unsafe")
+            chain.append(_chain_row(directory, info, uid=owner_uid, gid=owner_gid))
+
+    attest_root(root)
     pending = list(path.relative_to(root).parts)
     current = root
-    chain = [_chain_row(root, root_info, uid=root_uid, gid=root_gid)]
     followed: set[tuple[int, int]] = set()
     final: Path | None = None
     final_info: os.stat_result | None = None
@@ -172,6 +221,8 @@ def _attest_python_path(
             raise SandboxError("Python symlink chain is unavailable") from exc
         owner_uid, owner_gid = _normalized_owner(info, expected_uid, expected_gid)
         if stat.S_ISLNK(info.st_mode):
+            # Linux ignores symlink mode bits and reports 0777. The fully
+            # attested non-writable parent directory is its mutation authority.
             identity = (info.st_dev, info.st_ino)
             if identity in followed or len(followed) >= _MAX_SYMLINKS:
                 raise SandboxError("Python symlink chain is cyclic or too deep")
@@ -180,22 +231,29 @@ def _attest_python_path(
                 target = os.readlink(candidate)
             except OSError as exc:
                 raise SandboxError("cannot read Python symlink target") from exc
-            if not target or len(os.fsencode(target)) > 4096:
-                raise SandboxError("Python symlink target is empty or oversized")
+            target_path = Path(target)
+            if (
+                not target
+                or len(os.fsencode(target)) > 4096
+                or target.startswith("//")
+                or os.path.normpath(target) != target
+                or any(part in (".", "..") for part in target_path.parts)
+            ):
+                raise SandboxError("Python symlink target is noncanonical or oversized")
             chain.append(
                 _chain_row(candidate, info, uid=owner_uid, gid=owner_gid, target=target)
             )
-            target_path = Path(target)
             combined = target_path if target_path.is_absolute() else candidate.parent / target_path
             combined = Path(os.path.normpath(os.fspath(combined)))
-            target_root = next(
-                (candidate_root for candidate_root in roots if _under(combined, candidate_root)),
-                None,
-            )
-            if target_root is None or target_root != root:
+            target_root = selected_root(combined)
+            if target_root is None:
                 raise SandboxError("Python symlink target escapes trusted system roots")
-            pending = [*combined.relative_to(root).parts, *pending]
-            current = root
+            if target_root != root:
+                if pending or (root, candidate, combined) not in transitions:
+                    raise SandboxError("Python symlink crosses an undeclared trusted root")
+                attest_root(target_root)
+            pending = [*combined.relative_to(target_root).parts, *pending]
+            current = root = target_root
             continue
         chain.append(_chain_row(candidate, info, uid=owner_uid, gid=owner_gid))
         if pending:
@@ -284,24 +342,33 @@ def _attest_python_path(
 def attest_system_python() -> dict[str, object]:
     """Attest the fixed production launcher; caller and environment cannot select it."""
 
-    for directory in (Path("/"), Path("/usr"), Path("/usr/bin")):
-        try:
-            info = directory.lstat()
-        except OSError as exc:
-            raise SandboxError("trusted system Python ancestor is unavailable") from exc
-        _normalized_owner(info, 0, 0)
-        if (
-            not stat.S_ISDIR(info.st_mode)
-            or stat.S_ISLNK(info.st_mode)
-            or info.st_mode & 0o022
-        ):
-            raise SandboxError("trusted system Python ancestor is unsafe")
-    return _attest_python_path(
+    attestation = _attest_python_path(
         Path("/usr/bin/python3"),
-        trusted_roots=(Path("/usr/bin"),),
+        trusted_roots=(Path("/usr/bin"), Path("/usr/local/bin")),
+        trusted_ancestors=(
+            Path("/"),
+            Path("/usr"),
+            Path("/usr/bin"),
+            Path("/usr/local"),
+            Path("/usr/local/bin"),
+        ),
+        allowed_cross_root_links=(
+            (
+                Path("/usr/bin"),
+                Path("/usr/bin/python3"),
+                Path("/usr/local/bin/python3.12"),
+            ),
+        ),
         expected_uid=0,
         expected_gid=0,
     )
+    resolved = attestation["resolved_path"]
+    if not isinstance(resolved, str) or not (
+        re.fullmatch(r"/usr/bin/python3(?:\.[0-9]+)*", resolved)
+        or resolved == "/usr/local/bin/python3.12"
+    ):
+        raise SandboxError("trusted system Python resolved to an undeclared executable")
+    return attestation
 
 
 def attest_running_system_python() -> dict[str, object]:
