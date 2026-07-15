@@ -603,15 +603,7 @@ def _test_config(path: Path) -> RuntimeConfig:
     )
 
 
-def main() -> int:
-    if len(sys.argv) == 2:
-        config = _production_config()
-        evidence = Path(sys.argv[1])
-    elif len(sys.argv) == 4 and sys.argv[1] == "--test-only":
-        config = _test_config(Path(sys.argv[2]))
-        evidence = Path(sys.argv[3])
-    else:
-        fail("usage: gb10_verify_embedding_profile.py EVIDENCE_DIR")
+def _verify(config: RuntimeConfig, evidence: Path) -> None:
     _validate_evidence_dir(evidence)
     _verify_unit_files(config)
     baseline_invocation, baseline_pid, baseline_start = _load_baseline_generation(
@@ -668,6 +660,24 @@ def main() -> int:
             ).hexdigest(),
         },
     )
+
+
+def verify_production(evidence: Path) -> None:
+    """Run the fixed production verifier in the current process."""
+
+    _verify(_production_config(), evidence)
+
+
+def main() -> int:
+    if len(sys.argv) == 2:
+        config = _production_config()
+        evidence = Path(sys.argv[1])
+    elif len(sys.argv) == 4 and sys.argv[1] == "--test-only":
+        config = _test_config(Path(sys.argv[2]))
+        evidence = Path(sys.argv[3])
+    else:
+        fail("usage: gb10_verify_embedding_profile.py EVIDENCE_DIR")
+    _verify(config, evidence)
     return 0
 
 

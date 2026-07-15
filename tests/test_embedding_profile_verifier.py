@@ -153,6 +153,55 @@ class BoundedCommandTests(unittest.TestCase):
                     while time.monotonic() < deadline and Path(f"/proc/{child_pid}").exists():
                         time.sleep(0.02)
 
+    def test_output_and_input_bounds_are_enforced_while_process_runs(self) -> None:
+        verifier = _load_verifier()
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "output exceeded bound"):
+            verifier.command(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os,time; os.write(1, b'x' * (5 * 1024 * 1024)); time.sleep(30)",
+                ],
+                timeout=10,
+            )
+        self.assertLess(time.monotonic() - started, 5)
+        with self.assertRaisesRegex(RuntimeError, "input exceeded bound"):
+            verifier.command(
+                [sys.executable, "-c", "pass"],
+                input_text="x" * (5 * 1024 * 1024),
+            )
+
+    def test_nonzero_parent_cannot_leave_an_orphaned_process_group(self) -> None:
+        verifier = _load_verifier()
+        with tempfile.TemporaryDirectory() as temporary:
+            child_pid_path = Path(temporary) / "child.pid"
+            shim = Path(temporary) / "orphan-on-failure"
+            shim.write_text(
+                "#!/usr/bin/env python3\n"
+                "import subprocess, sys\n"
+                "child = subprocess.Popen([\n"
+                "    '/usr/bin/sleep', '30'\n"
+                "], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+                "stderr=subprocess.DEVNULL)\n"
+                "open(sys.argv[1], 'w').write(str(child.pid))\n"
+                "raise SystemExit(7)\n"
+            )
+            shim.chmod(0o700)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "command failed"):
+                    verifier.command([str(shim), str(child_pid_path)], timeout=4)
+                child_pid = int(child_pid_path.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child_pid, 0)
+            finally:
+                if child_pid_path.exists():
+                    child_pid = int(child_pid_path.read_text())
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
 
 class CurrentGenerationVerifierTests(unittest.TestCase):
     def assert_fixture_rejected(self, fixture: VerifierFixture) -> None:

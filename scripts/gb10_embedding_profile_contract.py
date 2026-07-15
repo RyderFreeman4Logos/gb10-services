@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import shlex
 from pathlib import Path
 from typing import NoReturn
@@ -21,6 +22,7 @@ __all__ = [
 EXPECTED_IMAGE = "ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0"
 EXPECTED_CONTAINER = "vllm-embedding"
 EXPECTED_MODELS = ("qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B")
+EXPECTED_UNIT_SHA256 = "824437af3faa3bf60aec16b3730bdbc4c5914f161202034a1ebb3e1cb145be57"
 EXPECTED_HOST_ARGV = [
     "/usr/bin/docker",
     "run",
@@ -139,6 +141,8 @@ def _expect_single(text: str, directive: str, expected: list[str]) -> None:
 def validate_unit_text(text: str) -> None:
     """Reject any noncanonical command or lifecycle-bearing unit directive."""
 
+    if hashlib.sha256(text.encode()).hexdigest() != EXPECTED_UNIT_SHA256:
+        _fail("unit bytes do not match the canonical embedding source")
     _expect_single(text, "ExecStart", EXPECTED_EXEC_START)
     _expect_single(text, "ExecStartPre", EXPECTED_EXEC_START_PRE)
     _expect_single(text, "ExecStartPost", EXPECTED_EXEC_START_POST)
