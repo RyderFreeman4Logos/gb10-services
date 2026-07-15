@@ -10,6 +10,7 @@ WORKSPACE = ROOT / "Cargo.toml"
 CORE = ROOT / "crates" / "gb10-memory-guardian-core" / "src" / "lib.rs"
 CORE_NO_ALLOC_TEST = ROOT / "crates" / "gb10-memory-guardian-core" / "tests" / "no_alloc.rs"
 BINARY = ROOT / "crates" / "gb10-memory-guardian" / "src" / "main.rs"
+ESCALATION = ROOT / "crates" / "gb10-memory-guardian" / "src" / "escalation.rs"
 SERVICE_LIB = ROOT / "crates" / "gb10-memory-guardian" / "src" / "lib.rs"
 GUARDIAN_UNIT = ROOT / "systemd" / "gb10-memory-guardian.service"
 TARGET_CONFIG = ROOT / "config" / "gb10-memory-guardian" / "config.toml"
@@ -35,6 +36,7 @@ class MemoryGuardianContractTests(unittest.TestCase):
     def test_emergency_path_is_direct_and_subprocess_free(self) -> None:
         core = CORE.read_text()
         binary = BINARY.read_text()
+        escalation = ESCALATION.read_text()
         service_lib = SERVICE_LIB.read_text()
         self.assertIn("cgroup.kill", core)
         self.assertIn("EmergencyReserve", binary)
@@ -52,6 +54,15 @@ class MemoryGuardianContractTests(unittest.TestCase):
         for forbidden in ("Command::new", "process::Command"):
             self.assertNotIn(forbidden, core)
             self.assertNotIn(forbidden, binary)
+            self.assertNotIn(forbidden, service_lib)
+
+        self.assertIn('Command::new("systemctl")', escalation)
+        self.assertIn("try_wait", escalation)
+        self.assertIn("libc::setsid()", escalation)
+        self.assertIn("libc::kill(-self.process_group, SIGTERM)", escalation)
+        self.assertIn("libc::kill(-self.process_group, SIGKILL)", escalation)
+        self.assertIn("child.kill()", escalation)
+        self.assertIn("child.wait()", escalation)
 
         emergency_iteration = service_lib.split("pub fn emergency_iteration", 1)[1]
         first_attack = emergency_iteration.split("let iteration =", 1)[0]
@@ -103,6 +114,44 @@ class MemoryGuardianContractTests(unittest.TestCase):
         guardian = SERVICE_LIB.read_text()
         self.assertNotIn("recommended_watcher", guardian)
         self.assertNotIn("mpsc::channel", guardian)
+
+    def test_guardian_escalation_is_configurable_and_post_emergency(self) -> None:
+        binary = BINARY.read_text()
+        unit = GUARDIAN_UNIT.read_text()
+        production = binary.split("fn run_production", 1)[1].split(
+            "fn run_healthy_iteration", 1
+        )[0]
+
+        for variable in (
+            "GB10_MEMORY_GUARDIAN_ESCALATION_GRACE_SECONDS",
+            "GB10_MEMORY_GUARDIAN_ESCALATION_UNIT",
+            "GB10_MEMORY_GUARDIAN_ESCALATION_ENABLED",
+        ):
+            self.assertIn(variable, binary)
+            self.assertIn(f"Environment={variable}=", unit)
+        self.assertIn("gb10-stack-recovery.service", binary)
+        self.assertIn(
+            "Environment=GB10_MEMORY_GUARDIAN_ESCALATION_GRACE_SECONDS=60", unit
+        )
+        self.assertIn(
+            "Environment=GB10_MEMORY_GUARDIAN_ESCALATION_UNIT=gb10-stack-recovery.service",
+            unit,
+        )
+        self.assertIn(
+            "Environment=GB10_MEMORY_GUARDIAN_ESCALATION_ENABLED=true", unit
+        )
+
+        emergency = production.split("LoopAction::Emergency =>", 1)[1].split(
+            "LoopAction::Rearm =>", 1
+        )[0]
+        self.assertIn("emergency_iteration", emergency)
+        self.assertNotIn("maybe_escalate_after_iteration", emergency)
+        rearm = production.split("LoopAction::Rearm =>", 1)[1].split(
+            "LoopAction::Healthy =>", 1
+        )[0]
+        self.assertIn("escalation.reset()", rearm)
+        post_emergency = production.split("if let Some(iteration)", 1)[1]
+        self.assertIn("maybe_escalate_after_iteration", post_emergency)
 
     def test_guardian_unit_reserves_and_protects_memory(self) -> None:
         unit = GUARDIAN_UNIT.read_text()

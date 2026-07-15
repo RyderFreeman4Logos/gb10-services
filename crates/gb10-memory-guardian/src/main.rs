@@ -1,7 +1,12 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use gb10_memory_guardian::{emergency_iteration, TargetRegistrationSet, TargetTransition};
+mod escalation;
+
+use escalation::{start_unit_with_timeout, validate_unit_name, EscalationEpisode};
+use gb10_memory_guardian::{
+    emergency_iteration, EmergencyIteration, TargetRegistrationSet, TargetTransition,
+};
 use gb10_memory_guardian_core::{
     effective_uid, read_mem_available_fd, should_rearm, should_shed, AttemptOutcome, CgroupTarget,
     EmergencyController, EmergencyReserve, DEFAULT_RESERVE_BYTES, DEFAULT_RETRY_MILLIS,
@@ -20,6 +25,9 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const MEMINFO_PATH: &str = "/proc/meminfo";
 const MEMINFO_BUFFER_BYTES: usize = 8 * 1024;
 const CONFIG_SUBPATH: &str = "gb10-memory-guardian/config.toml";
+const DEFAULT_ESCALATION_GRACE_SECONDS: u64 = 60;
+const DEFAULT_ESCALATION_UNIT: &str = "gb10-stack-recovery.service";
+const ESCALATION_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -34,6 +42,9 @@ struct Config {
     threshold_bytes: u64,
     poll_interval: Duration,
     retry_millis: u64,
+    escalation_grace_seconds: u64,
+    escalation_unit: String,
+    escalation_enabled: bool,
     meminfo_path: PathBuf,
     cgroup_root: PathBuf,
     runtime_dir: PathBuf,
@@ -82,6 +93,16 @@ impl Config {
         let threshold_gib = parse_positive_env("GB10_MEMORY_GUARDIAN_MEM_AVAIL_STOP_GIB", 1)?;
         let poll_seconds = parse_positive_env("GB10_MEMORY_GUARDIAN_POLL_SECONDS", 1)?;
         let retry_seconds = parse_positive_env("GB10_MEMORY_GUARDIAN_RETRY_SECONDS", 5)?;
+        let escalation_grace_seconds = parse_positive_env(
+            "GB10_MEMORY_GUARDIAN_ESCALATION_GRACE_SECONDS",
+            DEFAULT_ESCALATION_GRACE_SECONDS,
+        )?;
+        let escalation_unit = string_env(
+            "GB10_MEMORY_GUARDIAN_ESCALATION_UNIT",
+            DEFAULT_ESCALATION_UNIT,
+        )?;
+        validate_unit_name(&escalation_unit)?;
+        let escalation_enabled = parse_bool_env("GB10_MEMORY_GUARDIAN_ESCALATION_ENABLED", true)?;
         let reserve_bytes = usize::try_from(reserve_mib)
             .ok()
             .and_then(|value| value.checked_mul(1024 * 1024))
@@ -100,6 +121,9 @@ impl Config {
             threshold_bytes,
             poll_interval: Duration::from_secs(poll_seconds),
             retry_millis,
+            escalation_grace_seconds,
+            escalation_unit,
+            escalation_enabled,
             meminfo_path: path_env("GB10_MEMORY_GUARDIAN_MEMINFO_PATH", MEMINFO_PATH),
             cgroup_root: path_env("GB10_MEMORY_GUARDIAN_CGROUP_ROOT", CGROUP_ROOT),
             runtime_dir,
@@ -131,6 +155,31 @@ fn path_env(name: &str, default: &str) -> PathBuf {
     env::var_os(name)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(default))
+}
+
+fn string_env(name: &str, default: &str) -> Result<String, String> {
+    let Some(raw) = env::var_os(name) else {
+        return Ok(default.to_owned());
+    };
+    let value = raw
+        .into_string()
+        .map_err(|_| format!("{name} is not UTF-8"))?;
+    if value.is_empty() {
+        return Err(format!("{name} must not be empty"));
+    }
+    Ok(value)
+}
+
+fn parse_bool_env(name: &str, default: bool) -> Result<bool, String> {
+    let Some(raw) = env::var_os(name) else {
+        return Ok(default);
+    };
+    match raw.to_str() {
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(format!("{name} must be true or false")),
+        None => Err(format!("{name} is not UTF-8")),
+    }
 }
 
 fn optional_string_env(name: &str) -> Result<Option<String>, String> {
@@ -255,6 +304,7 @@ fn run_production(config: Config) -> Result<(), String> {
     let started = Instant::now();
     let mut meminfo_buffer = [0_u8; MEMINFO_BUFFER_BYTES];
     let mut latch = EmergencyLatch::new();
+    let mut escalation = EscalationEpisode::new();
     let mut emergency_status_deferred = false;
     let mut reserve_failure_deferred = false;
 
@@ -263,9 +313,16 @@ fn run_production(config: Config) -> Result<(), String> {
             Ok(value) => value,
             Err(error) => {
                 if latch.is_latched() {
-                    let _iteration =
+                    let had_target_before = targets.target().is_some();
+                    let iteration =
                         emergency_iteration(&mut controller, &mut targets, elapsed_millis(started));
                     emergency_status_deferred = true;
+                    maybe_escalate_after_iteration(
+                        &mut escalation,
+                        iteration,
+                        had_target_before,
+                        &config,
+                    );
                 } else {
                     eprintln!("gb10-memory-guardian: degraded meminfo read: {error}");
                 }
@@ -274,19 +331,27 @@ fn run_production(config: Config) -> Result<(), String> {
             }
         };
 
-        match latch.next_action(mem_available, config.threshold_bytes, config.reserve_bytes) {
+        let mut had_target_before = false;
+        let emergency_iteration_result = match latch.next_action(
+            mem_available,
+            config.threshold_bytes,
+            config.reserve_bytes,
+        ) {
             LoopAction::Emergency => {
-                let _iteration =
+                had_target_before = targets.target().is_some();
+                let iteration =
                     emergency_iteration(&mut controller, &mut targets, elapsed_millis(started));
                 emergency_status_deferred = true;
+                Some(iteration)
             }
             LoopAction::Rearm => match controller.ensure_reserve(config.reserve_bytes) {
                 Ok(_) => {
                     latch.acknowledge_rearmed();
+                    escalation.reset();
                     if reserve_failure_deferred {
                         eprintln!(
-                            "gb10-memory-guardian: reserve rearm recovered after a deferred failure"
-                        );
+                                "gb10-memory-guardian: reserve rearm recovered after a deferred failure"
+                            );
                         reserve_failure_deferred = false;
                     }
                     eprintln!("gb10-memory-guardian: emergency reserve rearmed");
@@ -299,12 +364,15 @@ fn run_production(config: Config) -> Result<(), String> {
                         )?;
                         emergency_status_deferred = false;
                     }
+                    None
                 }
                 Err(_) => {
                     reserve_failure_deferred = true;
-                    let _iteration =
+                    had_target_before = targets.target().is_some();
+                    let iteration =
                         emergency_iteration(&mut controller, &mut targets, elapsed_millis(started));
                     emergency_status_deferred = true;
+                    Some(iteration)
                 }
             },
             LoopAction::Healthy => {
@@ -314,9 +382,43 @@ fn run_production(config: Config) -> Result<(), String> {
                     &config,
                     &mut degraded_logged,
                 )?;
+                None
             }
+        };
+        if let Some(iteration) = emergency_iteration_result {
+            maybe_escalate_after_iteration(&mut escalation, iteration, had_target_before, &config);
         }
         thread::sleep(config.poll_interval);
+    }
+}
+
+fn maybe_escalate_after_iteration(
+    escalation: &mut EscalationEpisode,
+    iteration: EmergencyIteration,
+    had_target_before: bool,
+    config: &Config,
+) {
+    let action_taken = matches!(
+        iteration,
+        EmergencyIteration::Retry | EmergencyIteration::Verified
+    ) || (had_target_before
+        && matches!(iteration, EmergencyIteration::NoTarget));
+    let should_trigger = escalation.after_emergency_iteration(
+        Instant::now(),
+        action_taken,
+        config.escalation_enabled,
+        Duration::from_secs(config.escalation_grace_seconds),
+    );
+    if !should_trigger {
+        return;
+    }
+
+    eprintln!(
+        "gb10-memory-guardian: escalating to Tier 2 after {}s without memory recovery",
+        config.escalation_grace_seconds
+    );
+    if let Err(error) = start_unit_with_timeout(&config.escalation_unit, ESCALATION_START_TIMEOUT) {
+        eprintln!("gb10-memory-guardian: Tier 2 escalation trigger failed: {error}");
     }
 }
 
