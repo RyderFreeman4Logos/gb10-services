@@ -105,7 +105,9 @@ impl From<RegistrationError> for GuardianError {
 
 mod registration;
 
-pub use registration::{parse_registration, RefreshStatus, RegistrationManager};
+pub use registration::{
+    parse_registration, RefreshStatus, RegistrationGeneration, RegistrationManager,
+};
 
 fn decimal_bytes(value: u32, buffer: &mut [u8; 10]) -> &[u8] {
     let mut value = value;

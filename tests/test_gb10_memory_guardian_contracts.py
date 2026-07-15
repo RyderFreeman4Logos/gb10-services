@@ -156,6 +156,27 @@ class MemoryGuardianContractTests(unittest.TestCase):
         self.assertIn("armed target", initial_reconcile)
         self.assertIn("targets.active_label()", initial_reconcile)
 
+    def test_guardian_status_receipt_binds_invocation_and_registration_generation(self) -> None:
+        binary = BINARY.read_text()
+        service_lib = SERVICE_LIB.read_text()
+        core = CORE.read_text()
+        for field in (
+            "version=2",
+            "registration_device",
+            "registration_inode",
+            "registration_size",
+            "registration_modified_seconds",
+            "registration_modified_nanoseconds",
+            "registration_changed_seconds",
+            "registration_changed_nanoseconds",
+            "guardian_pid",
+            "guardian_invocation_id",
+        ):
+            self.assertIn(field, binary)
+        self.assertIn("INVOCATION_ID", binary)
+        self.assertIn("registration_generation", service_lib)
+        self.assertIn("generation_identity", core)
+
     def test_guardian_unit_pins_and_binary_enforces_production_target_identity(self) -> None:
         unit = GUARDIAN_UNIT.read_text()
         binary = BINARY.read_text()

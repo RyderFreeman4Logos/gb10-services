@@ -8,7 +8,6 @@ usage:
   GB10_BENCHMARK_EXCLUDED=YES gb10_memory_guardian_canary.sh disposable
   GB10_BENCHMARK_EXCLUDED=YES \
     GB10_MEMORY_GUARDIAN_CANARY_TARGET_UNIT=vllm-aeon-27b-dflash.service \
-    GB10_MEMORY_GUARDIAN_JOURNAL_SINCE=<activation timestamp> \
     gb10_memory_guardian_canary.sh configured-target
 EOF
   exit 2
@@ -29,7 +28,6 @@ text_unit="vllm-aeon-27b-dflash.service"
 guardian_unit="gb10-memory-guardian.service"
 systemctl_bin="${GB10_MEMORY_GUARDIAN_SYSTEMCTL_BIN:-/usr/bin/systemctl}"
 systemd_run_bin="${GB10_MEMORY_GUARDIAN_SYSTEMD_RUN_BIN:-/usr/bin/systemd-run}"
-journalctl_bin="${GB10_MEMORY_GUARDIAN_JOURNALCTL_BIN:-/usr/bin/journalctl}"
 command_timeout_seconds="${GB10_MEMORY_GUARDIAN_CANARY_COMMAND_TIMEOUT_SECONDS:-10}"
 protected_units=(
   vllm-embedding.service
@@ -58,10 +56,6 @@ run_systemd_run() {
     "$systemd_run_bin" --user "$@"
 }
 
-run_journalctl() {
-  /usr/bin/timeout --signal=TERM --kill-after=2 "$command_timeout_seconds" \
-    "$journalctl_bin" --user "$@"
-}
 
 # Populated by load_unit_state. Every requested systemd field must appear exactly
 # once, with no unrequested lines. Callers then compare exact values rather than
@@ -76,6 +70,7 @@ UNIT_EXEC_MAIN_STATUS=""
 UNIT_NRESTARTS=""
 UNIT_RESTART=""
 UNIT_ENVIRONMENT=""
+UNIT_INVOCATION_ID=""
 load_unit_state() {
   local unit="$1" output line key value
   output="$(run_systemctl show "$unit" \
@@ -88,7 +83,8 @@ load_unit_state() {
     --property=ExecMainStatus \
     --property=NRestarts \
     --property=Restart \
-    --property=Environment)" || {
+    --property=Environment \
+    --property=InvocationID)" || {
       echo "bounded systemd state query failed: $unit" >&2
       return 1
     }
@@ -102,7 +98,7 @@ load_unit_state() {
     key="${line%%=*}"
     value="${line#*=}"
     case "$key" in
-      LoadState|ActiveState|SubState|MainPID|Result|ExecMainCode|ExecMainStatus|NRestarts|Restart|Environment) ;;
+      LoadState|ActiveState|SubState|MainPID|Result|ExecMainCode|ExecMainStatus|NRestarts|Restart|Environment|InvocationID) ;;
       *)
         echo "unexpected systemd state field for $unit: $key" >&2
         return 1
@@ -116,13 +112,13 @@ load_unit_state() {
   done <<<"$output"
 
   local required
-  for required in LoadState ActiveState SubState MainPID Result ExecMainCode ExecMainStatus NRestarts Restart Environment; do
+  for required in LoadState ActiveState SubState MainPID Result ExecMainCode ExecMainStatus NRestarts Restart Environment InvocationID; do
     [[ -v "fields[$required]" ]] || {
       echo "missing systemd state field for $unit: $required" >&2
       return 1
     }
   done
-  [[ "${#fields[@]}" == "10" ]] || {
+  [[ "${#fields[@]}" == "11" ]] || {
     echo "unexpected systemd state field count for $unit" >&2
     return 1
   }
@@ -141,6 +137,10 @@ load_unit_state() {
     echo "malformed systemd enum field for $unit" >&2
     return 1
   }
+  [[ "${fields[InvocationID]}" =~ ^[0-9a-f]{32}$ ]] || {
+    echo "malformed systemd invocation ID for $unit" >&2
+    return 1
+  }
 
   UNIT_LOAD_STATE="${fields[LoadState]}"
   UNIT_ACTIVE_STATE="${fields[ActiveState]}"
@@ -152,6 +152,7 @@ load_unit_state() {
   UNIT_NRESTARTS="${fields[NRestarts]}"
   UNIT_RESTART="${fields[Restart]}"
   UNIT_ENVIRONMENT="${fields[Environment]}"
+  UNIT_INVOCATION_ID="${fields[InvocationID]}"
 }
 
 require_running_unit() {
@@ -175,9 +176,10 @@ unit_fingerprint() {
     echo "protected unit is not loaded and cannot be safely snapshotted: $unit load=$UNIT_LOAD_STATE" >&2
     return 1
   }
-  printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
     "$UNIT_LOAD_STATE" "$UNIT_ACTIVE_STATE" "$UNIT_SUB_STATE" "$UNIT_MAIN_PID" \
-    "$UNIT_RESULT" "$UNIT_EXEC_MAIN_CODE" "$UNIT_EXEC_MAIN_STATUS" "$UNIT_NRESTARTS"
+    "$UNIT_RESULT" "$UNIT_EXEC_MAIN_CODE" "$UNIT_EXEC_MAIN_STATUS" "$UNIT_NRESTARTS" \
+    "$UNIT_INVOCATION_ID"
 }
 
 declare -A protected_before
@@ -341,6 +343,268 @@ if fields["scope"] != scope or fields["control_group"] != expected:
 PY
 }
 
+verify_current_guardian_status() {
+  local registration_path="$1" guardian_pid="$2" guardian_invocation_id="$3"
+  local status_path="$runtime_dir/guardian-status.v2"
+  local cgroup_root="${GB10_MEMORY_GUARDIAN_CGROUP_ROOT:-/sys/fs/cgroup}"
+  /usr/bin/python3 - "$runtime_dir" "$status_path" "$registration_path" "$cgroup_root" \
+    "$guardian_pid" "$guardian_invocation_id" <<'PY'
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+runtime_dir, status_path, registration_path, cgroup_root = map(Path, sys.argv[1:5])
+expected_pid, expected_invocation_id = sys.argv[5:7]
+if status_path.parent != runtime_dir or registration_path.parent != runtime_dir:
+    raise RuntimeError("current receipts escaped the guardian runtime directory")
+if status_path.name != "guardian-status.v2" or registration_path.name != "text-cgroup.v1":
+    raise RuntimeError("unexpected current receipt name")
+
+
+def generation(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns // 1_000_000_000,
+        metadata.st_mtime_ns % 1_000_000_000,
+        metadata.st_ctime_ns // 1_000_000_000,
+        metadata.st_ctime_ns % 1_000_000_000,
+    )
+
+
+def open_owner_directory(path: Path) -> tuple[int, tuple[int, int]]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    metadata = os.fstat(fd)
+    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+        os.close(fd)
+        raise RuntimeError("guardian runtime directory is not owner-only")
+    return fd, (metadata.st_dev, metadata.st_ino)
+
+
+def read_secure_at(directory_fd: int, name: str) -> tuple[bytes, tuple[int, ...]]:
+    fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd)
+    metadata = os.fstat(fd)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+    ):
+        os.close(fd)
+        raise RuntimeError(f"unsafe current-status source: {name}")
+    with os.fdopen(fd, "rb") as source:
+        data = source.read(4097)
+    if len(data) > 4096 or not data or not data.endswith(b"\n") or b"\r" in data:
+        raise RuntimeError(f"invalid current-status size or termination: {name}")
+    return data, generation(metadata)
+
+
+def parse_ordered(data: bytes, keys: list[str]) -> dict[str, str]:
+    try:
+        decoded = data.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("non-ASCII current-status source") from error
+    lines = decoded[:-1].split("\n")
+    if len(lines) != len(keys):
+        raise RuntimeError("wrong current-status field count")
+    fields: dict[str, str] = {}
+    for line, expected_key in zip(lines, keys, strict=True):
+        if "=" not in line:
+            raise RuntimeError("malformed current-status field")
+        key, value = line.split("=", 1)
+        if key != expected_key or not value or key in fields:
+            raise RuntimeError("unexpected or duplicate current-status field")
+        fields[key] = value
+    return fields
+
+
+def exact_nonnegative(value: str, field: str) -> int:
+    if re.fullmatch(r"0|[1-9][0-9]*", value) is None:
+        raise RuntimeError(f"invalid {field}")
+    return int(value)
+
+
+def open_cgroup(control_group: str) -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_fd = os.open(cgroup_root, flags)
+    try:
+        for component in control_group.removeprefix("/").split("/"):
+            next_fd = os.open(component, flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+runtime_fd, runtime_identity = open_owner_directory(runtime_dir)
+try:
+    status_bytes, status_generation = read_secure_at(runtime_fd, status_path.name)
+    registration_bytes, registration_generation = read_secure_at(
+        runtime_fd, registration_path.name
+    )
+    status = parse_ordered(
+        status_bytes,
+        [
+            "version",
+            "state",
+            "label",
+            "registration_file",
+            "registration_device",
+            "registration_inode",
+            "registration_size",
+            "registration_modified_seconds",
+            "registration_modified_nanoseconds",
+            "registration_changed_seconds",
+            "registration_changed_nanoseconds",
+            "container_id",
+            "scope",
+            "control_group",
+            "cgroup_device",
+            "cgroup_inode",
+            "guardian_pid",
+            "guardian_invocation_id",
+        ],
+    )
+    registration = parse_ordered(
+        registration_bytes,
+        ["version", "container_id", "scope", "control_group"],
+    )
+    if status["version"] != "2" or registration["version"] != "1":
+        raise RuntimeError("unsupported current-status version")
+    if status["state"] != "armed":
+        raise RuntimeError("latest guardian state is not armed")
+    if status["label"] != "aeon-text" or status["registration_file"] != registration_path.name:
+        raise RuntimeError("current-status target identity mismatch")
+    if (
+        status["guardian_pid"] != expected_pid
+        or re.fullmatch(r"[1-9][0-9]*", expected_pid) is None
+        or status["guardian_invocation_id"] != expected_invocation_id
+        or re.fullmatch(r"[0-9a-f]{32}", expected_invocation_id) is None
+    ):
+        raise RuntimeError("current-status receipt is not from the running guardian generation")
+
+    registration_fields = (
+        "registration_device",
+        "registration_inode",
+        "registration_size",
+        "registration_modified_seconds",
+        "registration_modified_nanoseconds",
+        "registration_changed_seconds",
+        "registration_changed_nanoseconds",
+    )
+    recorded_registration_generation = tuple(
+        exact_nonnegative(status[field], field) for field in registration_fields
+    )
+    if recorded_registration_generation != registration_generation:
+        raise RuntimeError("current-status receipt does not bind the current registration generation")
+
+    container_id = registration["container_id"]
+    if re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+        raise RuntimeError("invalid current registration container identity")
+    scope = f"docker-{container_id}.scope"
+    control_group = (
+        f"/user.slice/user-{os.geteuid()}.slice/user@{os.geteuid()}.service/"
+        f"app.slice/{scope}"
+    )
+    if registration["scope"] != scope or registration["control_group"] != control_group:
+        raise RuntimeError("registration is not the exact current-user Docker cgroup")
+    for key, expected in (
+        ("container_id", container_id),
+        ("scope", scope),
+        ("control_group", control_group),
+    ):
+        if status[key] != expected:
+            raise RuntimeError("current-status receipt does not match current registration")
+
+    expected_device = exact_nonnegative(status["cgroup_device"], "cgroup device")
+    expected_inode = exact_nonnegative(status["cgroup_inode"], "cgroup inode")
+    if expected_device <= 0 or expected_inode <= 0:
+        raise RuntimeError("missing cgroup generation identity")
+    cgroup_fd = open_cgroup(control_group)
+    try:
+        cgroup_metadata = os.fstat(cgroup_fd)
+        if (
+            cgroup_metadata.st_dev != expected_device
+            or cgroup_metadata.st_ino != expected_inode
+        ):
+            raise RuntimeError("configured cgroup generation was replaced")
+        events_fd = os.open(
+            "cgroup.events",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=cgroup_fd,
+        )
+        events_metadata = os.fstat(events_fd)
+        if not stat.S_ISREG(events_metadata.st_mode) or events_metadata.st_nlink != 1:
+            os.close(events_fd)
+            raise RuntimeError("unsafe cgroup.events identity")
+        with os.fdopen(events_fd, "rb") as events_source:
+            events_data = events_source.read(4097)
+        if (
+            len(events_data) > 4096
+            or not events_data.endswith(b"\n")
+            or b"\r" in events_data
+        ):
+            raise RuntimeError("cgroup.events is oversized or noncanonical")
+        try:
+            event_lines = events_data.decode("ascii")[:-1].split("\n")
+        except UnicodeDecodeError as error:
+            raise RuntimeError("cgroup.events is not ASCII") from error
+        event_fields: dict[str, str] = {}
+        for line in event_lines:
+            parts = line.split(" ")
+            if (
+                len(parts) != 2
+                or not parts[0]
+                or re.fullmatch(r"0|[1-9][0-9]*", parts[1]) is None
+                or parts[0] in event_fields
+            ):
+                raise RuntimeError("malformed or duplicate cgroup.events field")
+            event_fields[parts[0]] = parts[1]
+        if event_fields.get("populated") != "1":
+            raise RuntimeError("configured cgroup is not populated")
+
+        confirming_cgroup_fd = open_cgroup(control_group)
+        try:
+            confirming = os.fstat(confirming_cgroup_fd)
+            if (confirming.st_dev, confirming.st_ino) != (
+                cgroup_metadata.st_dev,
+                cgroup_metadata.st_ino,
+            ):
+                raise RuntimeError("configured cgroup changed during verification")
+        finally:
+            os.close(confirming_cgroup_fd)
+    finally:
+        os.close(cgroup_fd)
+
+    confirming_status, confirming_status_generation = read_secure_at(
+        runtime_fd, status_path.name
+    )
+    confirming_registration, confirming_registration_generation = read_secure_at(
+        runtime_fd, registration_path.name
+    )
+    if (
+        (confirming_status, confirming_status_generation)
+        != (status_bytes, status_generation)
+        or (confirming_registration, confirming_registration_generation)
+        != (registration_bytes, registration_generation)
+    ):
+        raise RuntimeError("current identity changed during verification")
+finally:
+    os.close(runtime_fd)
+
+confirming_runtime_fd, confirming_runtime_identity = open_owner_directory(runtime_dir)
+os.close(confirming_runtime_fd)
+if confirming_runtime_identity != runtime_identity:
+    raise RuntimeError("guardian runtime directory changed during verification")
+PY
+}
+
 run_configured_target() {
   [[ $# -eq 0 ]] || usage
   local target_unit="${GB10_MEMORY_GUARDIAN_CANARY_TARGET_UNIT:-$text_unit}"
@@ -416,34 +680,32 @@ PY
     echo "text unit does not publish exactly $registration_path" >&2
     exit 1
   }
+  local text_generation="$UNIT_MAIN_PID|$UNIT_INVOCATION_ID|$UNIT_RESTART|$UNIT_ENVIRONMENT"
 
   require_running_unit "$guardian_unit"
   [[ "$UNIT_RESTART" == "always" ]] || {
     echo "production guardian must use Restart=always" >&2
     exit 1
   }
+  local guardian_pid="$UNIT_MAIN_PID"
+  local guardian_invocation_id="$UNIT_INVOCATION_ID"
+  local guardian_generation="$UNIT_MAIN_PID|$UNIT_INVOCATION_ID|$UNIT_RESTART"
 
-  local journal_since="${GB10_MEMORY_GUARDIAN_JOURNAL_SINCE:-}"
-  [[ -n "$journal_since" ]] || {
-    echo "GB10_MEMORY_GUARDIAN_JOURNAL_SINCE is required for activation proof" >&2
-    exit 2
-  }
-  local journal line armed_count=0
-  journal="$(run_journalctl -u "$guardian_unit" --since "$journal_since" --no-pager -o cat)" || {
-    echo "bounded guardian journal query failed" >&2
+  verify_current_guardian_status \
+    "$registration_path" "$guardian_pid" "$guardian_invocation_id"
+
+  require_running_unit "$target_unit"
+  [[ "$UNIT_MAIN_PID|$UNIT_INVOCATION_ID|$UNIT_RESTART|$UNIT_ENVIRONMENT" == "$text_generation" ]] || {
+    echo "text target generation changed during current-status verification" >&2
     exit 1
   }
-  while IFS= read -r line; do
-    if [[ "$line" == "gb10-memory-guardian: armed target aeon-text" ]]; then
-      armed_count=$((armed_count + 1))
-    fi
-  done <<<"$journal"
-  [[ "$armed_count" -ge 1 ]] || {
-    echo "guardian journal does not prove aeon-text armed since activation" >&2
+  require_running_unit "$guardian_unit"
+  [[ "$UNIT_MAIN_PID|$UNIT_INVOCATION_ID|$UNIT_RESTART" == "$guardian_generation" ]] || {
+    echo "guardian generation changed during current-status verification" >&2
     exit 1
   }
 
-  echo "configured-target read-only identity check passed; aeon-text is strictly armed"
+  echo "configured-target read-only identity check passed; current aeon-text generation is strictly armed"
 }
 
 case "$mode" in

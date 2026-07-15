@@ -10,7 +10,7 @@ use gb10_memory_guardian_core::{
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread;
@@ -358,11 +358,25 @@ fn publish_guardian_status(config: &Config, targets: &TargetRegistrationSet) -> 
         .map_err(|error| format!("create status directory {}: {error}", status_dir.display()))?;
     let directory_metadata = fs::symlink_metadata(&status_dir)
         .map_err(|error| format!("inspect status directory {}: {error}", status_dir.display()))?;
-    if !directory_metadata.is_dir() || directory_metadata.file_type().is_symlink() {
+    if !directory_metadata.is_dir()
+        || directory_metadata.file_type().is_symlink()
+        || directory_metadata.uid() != effective_uid()
+        || directory_metadata.mode() & 0o7777 != 0o700
+    {
         return Err(format!(
-            "status directory is not a real directory: {}",
+            "status directory is not an owner-only real directory: {}",
             status_dir.display()
         ));
+    }
+
+    let guardian_invocation_id = env::var("INVOCATION_ID")
+        .map_err(|_| "INVOCATION_ID is required for status publication".to_owned())?;
+    if guardian_invocation_id.len() != 32
+        || !guardian_invocation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("INVOCATION_ID must be exactly 32 lowercase hexadecimal bytes".to_owned());
     }
 
     let registration_file = targets
@@ -370,50 +384,80 @@ fn publish_guardian_status(config: &Config, targets: &TargetRegistrationSet) -> 
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| "active registration path has no UTF-8 file name".to_owned())?;
-    let (state, container_id, scope, control_group, device, inode) =
-        if let Some(target) = targets.target() {
-            let scope = target
-                .scope_name()
-                .map_err(|error| format!("read armed scope identity: {error}"))?;
-            let container_id = scope
-                .strip_prefix("docker-")
-                .and_then(|value| value.strip_suffix(".scope"))
-                .ok_or_else(|| "armed scope is not an exact Docker scope".to_owned())?;
-            if container_id.len() != 64
-                || !container_id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                return Err("armed scope contains an invalid container identity".to_owned());
-            }
-            let (device, inode) = target
-                .generation_identity()
-                .map_err(|error| format!("read armed cgroup generation: {error}"))?;
-            (
-                "armed",
-                container_id.to_owned(),
-                scope.to_owned(),
-                format!(
-                    "/user.slice/user-{}.slice/user@{}.service/app.slice/{scope}",
-                    effective_uid(),
-                    effective_uid()
-                ),
-                device,
-                inode,
-            )
-        } else {
-            (
-                "disarmed",
-                "-".to_owned(),
-                "-".to_owned(),
-                "-".to_owned(),
-                0,
-                0,
-            )
-        };
+    let (
+        state,
+        container_id,
+        scope,
+        control_group,
+        registration_device,
+        registration_inode,
+        registration_size,
+        registration_modified_seconds,
+        registration_modified_nanoseconds,
+        registration_changed_seconds,
+        registration_changed_nanoseconds,
+        device,
+        inode,
+    ) = if let Some(target) = targets.target() {
+        let registration = targets.registration_generation().ok_or_else(|| {
+            "armed target is missing its retained registration generation".to_owned()
+        })?;
+        let scope = target
+            .scope_name()
+            .map_err(|error| format!("read armed scope identity: {error}"))?;
+        let container_id = scope
+            .strip_prefix("docker-")
+            .and_then(|value| value.strip_suffix(".scope"))
+            .ok_or_else(|| "armed scope is not an exact Docker scope".to_owned())?;
+        if container_id.len() != 64
+            || !container_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("armed scope contains an invalid container identity".to_owned());
+        }
+        let (device, inode) = target
+            .generation_identity()
+            .map_err(|error| format!("read armed cgroup generation: {error}"))?;
+        (
+            "armed",
+            container_id.to_owned(),
+            scope.to_owned(),
+            format!(
+                "/user.slice/user-{}.slice/user@{}.service/app.slice/{scope}",
+                effective_uid(),
+                effective_uid()
+            ),
+            registration.device,
+            registration.inode,
+            registration.size,
+            registration.modified_seconds,
+            registration.modified_nanoseconds,
+            registration.changed_seconds,
+            registration.changed_nanoseconds,
+            device,
+            inode,
+        )
+    } else {
+        (
+            "disarmed",
+            "-".to_owned(),
+            "-".to_owned(),
+            "-".to_owned(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
 
-    let status_path = status_dir.join("guardian-status.v1");
-    let temporary_path = status_dir.join(format!(".guardian-status.v1.tmp.{}", std::process::id()));
+    let status_path = status_dir.join("guardian-status.v2");
+    let temporary_path = status_dir.join(format!(".guardian-status.v2.tmp.{}", std::process::id()));
     match fs::remove_file(&temporary_path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -435,16 +479,44 @@ fn publish_guardian_status(config: &Config, targets: &TargetRegistrationSet) -> 
                 temporary_path.display()
             )
         })?;
-    let write_result = writeln!(temporary, "version=1")
+    let write_result = writeln!(temporary, "version=2")
         .and_then(|()| writeln!(temporary, "state={state}"))
         .and_then(|()| writeln!(temporary, "label={}", targets.active_label()))
         .and_then(|()| writeln!(temporary, "registration_file={registration_file}"))
+        .and_then(|()| writeln!(temporary, "registration_device={registration_device}"))
+        .and_then(|()| writeln!(temporary, "registration_inode={registration_inode}"))
+        .and_then(|()| writeln!(temporary, "registration_size={registration_size}"))
+        .and_then(|()| {
+            writeln!(
+                temporary,
+                "registration_modified_seconds={registration_modified_seconds}"
+            )
+        })
+        .and_then(|()| {
+            writeln!(
+                temporary,
+                "registration_modified_nanoseconds={registration_modified_nanoseconds}"
+            )
+        })
+        .and_then(|()| {
+            writeln!(
+                temporary,
+                "registration_changed_seconds={registration_changed_seconds}"
+            )
+        })
+        .and_then(|()| {
+            writeln!(
+                temporary,
+                "registration_changed_nanoseconds={registration_changed_nanoseconds}"
+            )
+        })
         .and_then(|()| writeln!(temporary, "container_id={container_id}"))
         .and_then(|()| writeln!(temporary, "scope={scope}"))
         .and_then(|()| writeln!(temporary, "control_group={control_group}"))
         .and_then(|()| writeln!(temporary, "cgroup_device={device}"))
         .and_then(|()| writeln!(temporary, "cgroup_inode={inode}"))
         .and_then(|()| writeln!(temporary, "guardian_pid={}", std::process::id()))
+        .and_then(|()| writeln!(temporary, "guardian_invocation_id={guardian_invocation_id}"))
         .and_then(|()| temporary.sync_all());
     if let Err(error) = write_result {
         let _ = fs::remove_file(&temporary_path);
@@ -453,7 +525,10 @@ fn publish_guardian_status(config: &Config, targets: &TargetRegistrationSet) -> 
     fs::rename(&temporary_path, &status_path).map_err(|error| {
         let _ = fs::remove_file(&temporary_path);
         format!("publish guardian status {}: {error}", status_path.display())
-    })
+    })?;
+    File::open(&status_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync status directory {}: {error}", status_dir.display()))
 }
 
 fn enforce_expected_target_identity(

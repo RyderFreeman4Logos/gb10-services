@@ -5,7 +5,7 @@
 
 use gb10_memory_guardian_core::{
     effective_uid, AttemptOutcome, CgroupTarget, EmergencyController, GuardianError, RefreshStatus,
-    RegistrationManager,
+    RegistrationGeneration, RegistrationManager,
 };
 use serde::Deserialize;
 use std::env;
@@ -334,6 +334,10 @@ impl TargetRegistrationSet {
 
     pub fn target(&self) -> Option<&CgroupTarget> {
         self.active.target()
+    }
+
+    pub fn registration_generation(&self) -> Option<RegistrationGeneration> {
+        self.active.generation_identity()
     }
 
     pub fn disarm(&mut self) {

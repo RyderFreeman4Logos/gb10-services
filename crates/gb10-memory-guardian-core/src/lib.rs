@@ -209,7 +209,8 @@ mod emergency;
 pub use emergency::{
     kill_direct, parse_registration, target_state_requires_disarm, AttemptOutcome, CgroupTarget,
     EmergencyController, GuardianError, GuardianOperation, KillError, RefreshStatus, Registration,
-    RegistrationError, RegistrationManager, TargetState, REGISTRATION_VERSION,
+    RegistrationError, RegistrationGeneration, RegistrationManager, TargetState,
+    REGISTRATION_VERSION,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

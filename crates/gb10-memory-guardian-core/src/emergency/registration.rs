@@ -121,17 +121,17 @@ fn control_group_matches(control_group: &[u8], scope: &[u8], uid: u32) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileGeneration {
-    device: u64,
-    inode: u64,
-    size: i64,
-    modified_seconds: i64,
-    modified_nanoseconds: i64,
-    changed_seconds: i64,
-    changed_nanoseconds: i64,
+pub struct RegistrationGeneration {
+    pub device: u64,
+    pub inode: u64,
+    pub size: i64,
+    pub modified_seconds: i64,
+    pub modified_nanoseconds: i64,
+    pub changed_seconds: i64,
+    pub changed_nanoseconds: i64,
 }
 
-impl FileGeneration {
+impl RegistrationGeneration {
     fn from_stat(stat: &libc::stat) -> Self {
         Self {
             device: stat.st_dev,
@@ -162,7 +162,7 @@ pub struct RegistrationManager {
     prepared: Option<PreparedAuthority>,
     preparation_error: Option<GuardianError>,
     uid: u32,
-    generation: Option<FileGeneration>,
+    generation: Option<RegistrationGeneration>,
     pub(crate) target: Option<CgroupTarget>,
     buffer: [u8; REGISTRATION_LIMIT],
 }
@@ -186,6 +186,10 @@ impl RegistrationManager {
 
     pub fn target(&self) -> Option<&CgroupTarget> {
         self.target.as_ref()
+    }
+
+    pub fn generation_identity(&self) -> Option<RegistrationGeneration> {
+        self.generation
     }
 
     pub fn clear(&mut self) {
@@ -220,7 +224,7 @@ impl RegistrationManager {
             self.clear();
             return Err(GuardianError::InvalidRegistrationMetadata);
         }
-        let generation = FileGeneration::from_stat(&stat);
+        let generation = RegistrationGeneration::from_stat(&stat);
 
         if self.generation == Some(generation) {
             if let Some(target) = self.target.as_ref() {
@@ -259,7 +263,7 @@ impl RegistrationManager {
             GuardianOperation::ConfirmRegistration,
         )?;
         if !registration_metadata_valid(&confirming_stat, self.uid)
-            || FileGeneration::from_stat(&confirming_stat) != generation
+            || RegistrationGeneration::from_stat(&confirming_stat) != generation
         {
             return Err(GuardianError::ChangedDuringRefresh);
         }
