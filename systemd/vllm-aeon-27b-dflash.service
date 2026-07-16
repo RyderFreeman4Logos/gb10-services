@@ -62,6 +62,8 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
   -v /home/obj/scripts/aeon_hang_guard.py:/opt/hang_guard/aeon_hang_guard.py:ro \
   -v /home/obj/scripts/aeon_vllm_wrapper.py:/opt/hang_guard/aeon_vllm_wrapper.py:ro \
   -e HF_HUB_OFFLINE=1 \
+  -e MAX_JOBS=1 \
+  -e CMAKE_BUILD_PARALLEL_LEVEL=1 \
   -e PYTHONPATH=/opt/hang_guard \
   -e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768 \
   -e AEON_THINKING_BUDGET_GUARD=0 \
