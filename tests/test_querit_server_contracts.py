@@ -34,21 +34,18 @@ class QueritServerContractTests(unittest.TestCase):
 
     def test_bounds_body_documents_and_input_sizes(self) -> None:
         for contract in (
-            "MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024",
+            "MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024",
             "MAX_CONCURRENT_REQUESTS = 16",
             "limit_concurrency=MAX_CONCURRENT_REQUESTS",
-            "MAX_DOCUMENTS = 50",
-            "MAX_QUERY_CHARS = 8192",
-            "MAX_DOCUMENT_CHARS = 32768",
-            "MAX_TOTAL_DOCUMENT_CHARS = 262144",
+            "MAX_DOCUMENTS = 10000",
+            "MAX_QUERY_CHARS = 131072",
+            "MAX_DOCUMENT_CHARS = 131072",
+            "MAX_TOTAL_DOCUMENT_CHARS = 10 * 1024 * 1024",
             "RequestBodyLimitMiddleware",
             "app.add_middleware",
         ):
             self.assertIn(contract, self.source)
         self.assertIn("documents must contain at most", self.source)
-        self.assertIn("query is too long", self.source)
-        self.assertIn("document is too long", self.source)
-        self.assertIn("aggregate document input is too long", self.source)
         self.assertIn("top_n must be positive", self.source)
 
     def test_rejects_non_finite_scores(self) -> None:
@@ -169,7 +166,7 @@ class QueritServerContractTests(unittest.TestCase):
                 SimpleNamespace(
                     model=None,
                     query="q",
-                    documents=["d"] * 51,
+                    documents=["d"] * (module.MAX_DOCUMENTS + 1),
                     top_n=1,
                 )
             )

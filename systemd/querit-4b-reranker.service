@@ -33,6 +33,7 @@ ExecStart=/usr/bin/docker run --rm --name querit-4b-reranker \
   -v /home/obj/.local/bin/querit_score_contract.py:/opt/querit/querit_score_contract.py:ro \
   -e HF_HUB_OFFLINE=1 \
   -e TRANSFORMERS_OFFLINE=1 \
+  -e PYTHONPATH=/opt/querit \
   --memory 18g \
   --memory-swap 18g \
   --memory-swappiness 0 \
@@ -41,7 +42,7 @@ ExecStart=/usr/bin/docker run --rm --name querit-4b-reranker \
   ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c \
   /opt/querit/querit_openai_rerank_server.py \
   --model /models/querit-repo/snapshots/7b796de30ad8dc772d6c46c75659c1341283a665 \
-  --host 0.0.0.0 --port 8000 --max-model-len 40960 --max-batch 8 --dtype bfloat16 \
+  --host 0.0.0.0 --port 8000 --max-model-len 32768 --max-batch 8 --dtype bfloat16 \
   --served-model-name qwen3-reranker-8b Qwen/Qwen3-Reranker-8B Querit/Querit-4B
 # Docker's initial cap protects the gap before the generated scope is found.
 ExecStartPost=/bin/bash -c 'for i in $(seq 1 120); do curl -fsS --max-time 3 http://100.105.4.92:18013/v1/models >/dev/null 2>&1 && exit 0; sleep 2; done; echo "querit models not ready after 4min"; exit 1'

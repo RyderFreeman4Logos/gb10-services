@@ -24,7 +24,7 @@
       "api_token": "no-key-required",
       "api_base_url": "http://gb10:18009/v1/rerank",
       "top_n": 50,
-      "candidate_multiplier": 5,
+      "candidate_multiplier": 20,
       "timeout_secs": 540
     }
   },
