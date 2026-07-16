@@ -1,8 +1,11 @@
+# ── Baseline (clean start 2026-07-16, emb+rr+text co-resident) ──
+# GPU: 17.6G  RSS: 1.4G  Startup: 46s  MemAvail after all 3: 26.6G
+# Config: Semaphore(2), max-model-len 32768, --memory 18g
+# ─────────────────────────────────────────────────────────────────
 [Unit]
 Description=Querit-4B transformers rerank server (raw :18013; Qwen3 reranker aliases)
-# lifecycle-independent from text: guardian recovery must not change reranker state.
 After=network.target
-Conflicts=vllm-qwen3-reranker-8b.service
+Conflicts=vllm-reranker.service vllm-qwen3-reranker-8b.service
 StartLimitIntervalSec=600
 StartLimitBurst=3
 
@@ -34,20 +37,19 @@ ExecStart=/usr/bin/docker run --rm --name querit-4b-reranker \
   -v /home/obj/.local/bin/querit_score_contract.py:/opt/querit/querit_score_contract.py:ro \
   -e HF_HUB_OFFLINE=1 \
   -e TRANSFORMERS_OFFLINE=1 \
+  -e PYTHONPATH=/opt/querit \
   --memory 18g \
   --memory-swap 18g \
   --memory-swappiness 0 \
   --oom-score-adj 500 \
   --entrypoint python3 \
-  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c \
+  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55 \
   /opt/querit/querit_openai_rerank_server.py \
   --model /models/querit-repo/snapshots/7b796de30ad8dc772d6c46c75659c1341283a665 \
-  --host 0.0.0.0 --port 8000 --max-model-len 40960 --max-batch 8 --dtype bfloat16 \
+  --host 0.0.0.0 --port 8000 --max-model-len 32768 --max-batch 8 --dtype bfloat16 \
   --served-model-name qwen3-reranker-8b Qwen/Qwen3-Reranker-8B Querit/Querit-4B
 # Docker's initial cap protects the gap before the generated scope is found.
-ExecStartPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh querit-4b-reranker 18
-# A unit is not ready until its public metadata endpoint answers.
-ExecStartPost=/bin/bash -c 'for i in $(seq 1 120); do curl -fsS --max-time 3 http://100.105.4.92:18013/v1/models >/dev/null 2>&1 && exit 0; sleep 2; done; echo "querit models not ready after 10min"; exit 1'
+ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh rerank http://100.105.4.92:18013 qwen3-reranker-8b --deadline 300
 ExecStop=/usr/bin/timeout --signal=TERM --kill-after=5 30 /usr/bin/docker stop --time 20 querit-4b-reranker
 StandardOutput=journal
 StandardError=journal

@@ -25,7 +25,7 @@ graph TD
 
 ### The 5 Core Services
 1. **vllm-aeon-27b-dflash.service**
-   Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside the pinned AEON v0.24 GB10 Docker image for long-context processing up to 256k tokens, with FP8 KV cache and DFlash `TRITON_ATTN` enabled.
+   Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside the pinned AEON v0.25 GB10 Docker image for long-context processing up to 256k tokens, with FP8 KV cache and DFlash `TRITON_ATTN` enabled.
 2. **vllm-embedding.service**
    Serves BF16 `Qwen/Qwen3-Embedding-8B` with its full 4,096-dimensional output. This is the reliability-critical baseline service. The tracked source profile contracts for 32,768 tokens, 4,800 MiB explicit KV, and a 20 GiB no-swap hard cap while preserving 8,192 batched tokens, 64 sequences, aliases, and quality semantics. Its raw backend listens only on port `18012`; clients should use `llm-guard-proxy` on port `18009` or the guard-owned legacy listener `18002` with model `qwen3-embedding-8b`.
 3. **querit-4b-reranker.service**
@@ -89,8 +89,8 @@ The Bash swap observer remains enabled only for alerts and evidence.
 The reference host runs all three model containers from this pinned image digest:
 
 ```text
-ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0
-digest: sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c
+ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-14-v0.25.0
+digest: sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55
 ```
 
 Capacity contracts and evidence:

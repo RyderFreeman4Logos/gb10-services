@@ -54,14 +54,18 @@ Send = Callable[[Message], Awaitable[None]]
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 
 LOG = logging.getLogger("querit_rerank")
-INFERENCE_LOCK = threading.Lock()
+MAX_CONCURRENT_INFERENCE = 2
+INFERENCE_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_INFERENCE)
 
-MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
+MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
 MAX_CONCURRENT_REQUESTS = 16
-MAX_DOCUMENTS = 50
-MAX_QUERY_CHARS = 8192
-MAX_DOCUMENT_CHARS = 32768
-MAX_TOTAL_DOCUMENT_CHARS = 262144
+# DeepInfra-compatible: no artificial document/query limits.
+# The model's max-model-len (32768) is the natural ceiling —
+# transformers will reject token sequences exceeding it.
+MAX_DOCUMENTS = 10000
+MAX_QUERY_CHARS = 131072
+MAX_DOCUMENT_CHARS = 131072
+MAX_TOTAL_DOCUMENT_CHARS = 10 * 1024 * 1024
 MAX_CHECKPOINT_INDEX_BYTES = 16 * 1024 * 1024
 
 DEFAULT_ALIASES = [
@@ -306,7 +310,7 @@ def rerank(req: RerankRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="top_n is too large")
 
     try:
-        with INFERENCE_LOCK:
+        with INFERENCE_SEMAPHORE:
             scores = score_pairs(req.query, req.documents)
         if len(scores) != len(req.documents):
             raise RuntimeError("model returned an unexpected score count")
@@ -344,10 +348,9 @@ def _resolve_local_dir(model_path: str) -> str:
 
 
 def _read_bounded_regular_file(path: Path, maximum_bytes: int) -> bytes:
-    flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
+    # Resolve symlinks first — HF cache stores files as symlinks to blobs/.
+    resolved = os.path.realpath(path)
+    descriptor = os.open(resolved, os.O_RDONLY | os.O_CLOEXEC)
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):

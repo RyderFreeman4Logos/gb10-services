@@ -547,7 +547,7 @@ if config != {"schema_version": 1, "target": {"label": "aeon-text", "registratio
 text = text_path.read_text()
 for contract in (
     "Environment=GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1",
-    "Restart=on-failure", "--cgroup-parent app.slice",
+    "Restart=always", "--cgroup-parent app.slice",
 ):
     if contract not in text:
         raise SystemExit(f"reviewed text unit is missing contract: {contract}")

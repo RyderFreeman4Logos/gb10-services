@@ -1,0 +1,32 @@
+{
+  "embedding": {
+    "provider": "openai-compatible",
+    "model": "Qwen/Qwen3-Embedding-8B",
+    "api_token": "no-key-required",
+    "api_base_url": "http://gb10:18009/v1",
+    "dimensions": 4096
+  },
+  "index": {
+    "min_code_block_length": 8,
+    "enable_reranker": true,
+    "hybrid": {
+      "enable_bm25": true,
+      "bm25_top_k": 300,
+      "vector_top_k": 300,
+      "rrf_k": 60.0,
+      "rrf_top_k": 300,
+      "short_code_threshold": 30,
+      "short_code_penalty": 0.0
+    },
+    "reranker": {
+      "enabled": true,
+      "model": "Qwen/Qwen3-Reranker-8B",
+      "api_token": "no-key-required",
+      "api_base_url": "http://gb10:18009/v1/rerank",
+      "top_n": 50,
+      "candidate_multiplier": 20,
+      "timeout_secs": 540
+    }
+  },
+  "installed_hooks": {}
+}

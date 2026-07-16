@@ -12,7 +12,10 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 UNIT = ROOT / "systemd" / "vllm-embedding.service"
-IMAGE = "ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0"
+IMAGE = (
+    "ghcr.io/aeon-7/aeon-vllm-ultimate@"
+    "sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55"
+)
 MODELS = ("qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B")
 CONTAINER_ID = "a" * 64
 CURRENT_INVOCATION = "2" * 32

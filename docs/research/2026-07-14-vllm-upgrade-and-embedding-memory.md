@@ -4,7 +4,7 @@
 - **Last updated:** 2026-07-14T12:43:15-07:00
 - **Question:** Can the reliability-critical `Qwen/Qwen3-Embedding-8B` service safely move from a 40,960-token / 5,820 MiB KV / 24 GiB container profile to a 32,768-token / 4,800 MiB KV / 20 GiB source contract, and should the service move to raw vLLM v0.25.x now?
 - **Scope:** Source analysis, bounded live activation on GB10, API smoke tests, and read-only memory attribution. The pinned model image was not upgraded.
-- **Decision status:** Commit the smaller embedding source profile and the live-verified AEON text profile with 15 GiB explicit KV while preserving `max-model-len=262144`. Keep the pinned v0.24.0 image for now while preparing a qualified v0.25.x route. This is a deferral, not a decision to never upgrade.
+- **Decision status:** Commit the smaller embedding source profile and the live-verified AEON text profile with 15 GiB explicit KV while preserving `max-model-len=262144`. Keep the pinned v0.24.0 image for now (historical decision; superseded by the deployed v0.25.0 image) while preparing a qualified v0.25.x route. This is a deferral, not a decision to never upgrade.
 
 An existing ignored draft contains a longer incident chronology. This tracked note intentionally preserves only the aggregate non-secret facts needed for the service decision; the historical draft was not modified.
 
@@ -23,7 +23,7 @@ At the start of this research, `systemd/vllm-embedding.service` specified:
 - post-start cgroup enforcement at `24G`;
 - the existing highest-priority embedding OOM intent and no quantization.
 
-The recorded validated baseline is 5,820 MiB for 41,376 KV tokens. That startup result applies to the currently pinned vLLM v0.24.0 image. It is the basis for projection, not proof of a future 4,800 MiB startup.
+The recorded validated baseline is 5,820 MiB for 41,376 KV tokens. That startup result applies to the currently pinned vLLM v0.24.0 image (now superseded by v0.25.0). It is the basis for projection, not proof of a future 4,800 MiB startup.
 
 ### Aggregate live evidence captured before this source-only change
 

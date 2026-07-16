@@ -1,5 +1,10 @@
+# ── Baseline (clean start 2026-07-16, emb+rr+text co-resident) ──
+# GPU: 41.4G  RSS: 6.5G  Startup: 1070s (~18min, FlashInfer JIT serial)
+# Config: util=0.45 AUTO KV, batch=4096, MAX_JOBS=1, FP8 KV
+# MemAvail after all 3: 26.6G  (GPU total 79.3G of 121.6G)
+# ─────────────────────────────────────────────────────────────────
 [Unit]
-Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.25.0, seqs=16, batch=4096, util=0.49, kv-mem=15360M pin, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
+Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.25.0, seqs=16, batch=4096, util=0.45, AUTO KV, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
 # Independent of embedding/reranker so text can restart alone (no HTTP poll).
 After=network.target
 Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
@@ -24,16 +29,24 @@ OOMScoreAdjust=800
 # The first live all-three 3300s window ended with ~31.6GiB MemAvailable,
 # zero threshold events, and zero cgroup OOM kills.
 # Auto-KV at util=0.6 grew to ~46G and left only ~10G MemAvailable — too fat.
-# AEON-recommended DFlash shape: max-num-seqs 16 + FULL_DECODE_ONLY.
-# max-num-batched-tokens kept at 4096 (not 16384) so co-resident independent
-# restarts fit UMA peak with emb+rr already resident; 16384 still OOMs mid-start.
-# Keep kv-cache-memory-bytes 15360M for ~80G three-service budget (not auto ~46G).
-# util=0.49 so free-memory checks still pass with emb+rr already resident.
+# AEON-recommended DFlash shape: seqs=16, batch=8192, util=0.6, FULL_DECODE_ONLY.
+# NO --kv-cache-memory-bytes: AEON confirmed pinning KV bypasses UMA guard
+# (#46932). determine_available_memory early-returns on explicit bytes,
+# skipping memory_profiling() + profile_cudagraph_memory() — the only paths
+# patched by the UMA free-memory + cudagraph headroom check. AUTO sizing
+# lets these clamps bound the pool based on actual free memory.
+# batch=4096: reduces profile-run compile/cudagraph peak shape to fit co-resident
+# emb+rr without stopping them. Steady-state decode unaffected (governed by seqs);
+# only cold long-prompt prefill TTFT increases via more chunked-prefill iterations.
+# Prefix-cache/KV-cache hit rate is unaffected (lives inside the pool, not batch-sized).
+# util=0.6 is AEON's DFlash-safe GB10 target (0.88 hard ceiling).
+# Restart via gb10_restart_text_safe.sh (stops rr first, never emb).
 MemoryMax=256M
 MemorySwapMax=0
-# Recover from real vLLM/container crashes such as EngineDeadError exits.
-# Manual `systemctl --user stop` remains a clean stop and is not restarted.
-Restart=on-failure
+# Recover from any stop cause (crash, OOM kill, guardian cgroup.kill).
+# Manual `systemctl --user stop` is NOT restarted because systemd treats
+# an explicit stop as a clean deactivation, not a failure.
+Restart=always
 RestartSec=30
 TimeoutStartSec=2400
 TimeoutStopSec=60
@@ -52,10 +65,14 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
   -v /home/obj/scripts/aeon_hang_guard.py:/opt/hang_guard/aeon_hang_guard.py:ro \
   -v /home/obj/scripts/aeon_vllm_wrapper.py:/opt/hang_guard/aeon_vllm_wrapper.py:ro \
   -e HF_HUB_OFFLINE=1 \
+  -e MAX_JOBS=1 \
+  -e CMAKE_BUILD_PARALLEL_LEVEL=1 \
   -e PYTHONPATH=/opt/hang_guard \
   -e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768 \
   -e AEON_THINKING_BUDGET_GUARD=0 \
   --memory-swappiness 0 \
+  --memory 128g \
+  --memory-swap 128g \
   --oom-score-adj 800 \
   --entrypoint python3 \
   ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55 \
@@ -73,8 +90,7 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
     --max-num-partial-prefills 1 \
     --max-long-partial-prefills 1 \
     --enable-prefix-caching \
-    --gpu-memory-utilization 0.49 \
-    --kv-cache-memory-bytes 15360M \
+    --gpu-memory-utilization 0.45 \
     --enable-chunked-prefill \
     --scheduler-reserve-full-isl \
     --compilation-config "{\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_num_of_warmups\":0,\"cache_dir\":\"/var/cache/vllm/aeon-qwen36-v025\"}" \
@@ -91,7 +107,7 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
 # Publish guardian registration + soft cgroup label (69G policy; UMA not policed by cgroup).
 ExecStartPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh --publish-registration vllm-aeon-27b-dflash-n12 69
 # Raw :18010 readiness (defaults target Guard :18009).
-ExecStartPost=/home/obj/.local/bin/aeon_chat_ready.py --url http://100.105.4.92:18010/v1/chat/completions --models-url http://100.105.4.92:18010/v1/models --deadline-seconds 2200 --timeout-seconds 30 --long-timeout-seconds 120 --interval-seconds 5
+ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh chat http://100.105.4.92:18010 aeon-ultimate --deadline 2200
 ExecStop=/usr/bin/timeout --signal=TERM --kill-after=5 30 /usr/bin/docker stop --time 20 vllm-aeon-27b-dflash-n12
 ExecStopPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh --cleanup-registration
 StandardOutput=journal
