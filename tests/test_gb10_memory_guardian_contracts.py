@@ -329,7 +329,9 @@ class MemoryGuardianContractTests(unittest.TestCase):
         text_unit_section = text.split("[Service]", 1)[0]
         self.assertNotIn("Requires=vllm-embedding.service", text_unit_section)
         self.assertNotIn("Wants=vllm-embedding.service", text_unit_section)
-        self.assertIn("After=network.target vllm-embedding.service", text_unit_section)
+        # Text must not wait on embedding so independent restart is possible.
+        self.assertIn("After=network.target", text_unit_section)
+        self.assertNotIn("After=network.target vllm-embedding.service", text_unit_section)
         self.assertNotIn("gb10-memory-guardian.service", text_unit_section)
         self.assertIn("--cgroup-parent app.slice", text)
         self.assertIn(

@@ -34,9 +34,19 @@ def _live_receipt() -> dict[str, Any]:
 
 
 _RECEIPT = _live_receipt()
-IMAGE_DIGEST = _RECEIPT["aeon_container"]["configured_image"].rsplit("@", 1)[1]
+# Production AEON text image digest (v0.25.0, 2026-07-14). Live receipt still records the
+# 15 GiB KV capacity proof from the prior v0.24 run; KV budget stays 15360 MiB.
+IMAGE_DIGEST = (
+    "sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55"
+)
+# Querit still pins the prior offline transformers runtime image until a separate upgrade.
+QUERIT_IMAGE_DIGEST = (
+    "sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c"
+)
 MODEL_SNAPSHOT = "7b796de30ad8dc772d6c46c75659c1341283a665"
 SHORT_GENERATION_REQUEST_TOKENS = 8_192
+# AEON DFlash GB10 ceiling (author guidance + freeze mitigation).
+AEON_MAX_NUM_SEQS = 16
 AEON_CONTEXT_TOKENS = _RECEIPT["aeon_container"]["effective_contract"]["max_model_len"]
 AEON_KV_BUDGET_MIB = _RECEIPT["aeon_container"]["effective_contract"]["kv_cache_memory_mib"]
 MAX_AEON_KV_MIB_WITH_CURRENT_HEADROOM_EVIDENCE = AEON_KV_BUDGET_MIB
@@ -52,16 +62,17 @@ def _aeon_contract(unit: str) -> dict[str, int]:
             f"expected exactly one ExecStart, found {len(exec_starts)}"
         )
     argv = exec_starts[0]
-    image = (
-        "ghcr.io/aeon-7/aeon-vllm-ultimate@"
-        "sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c"
-    )
+    image = f"ghcr.io/aeon-7/aeon-vllm-ultimate@{IMAGE_DIGEST}"
     host_argv, container_argv = _split_docker_run_argv(argv, image)
+    # Docker --memory does not police UMA; unit must not hard-cap the container that way.
+    for banned in ("--memory", "--memory-swap"):
+        if any(tok == banned or tok.startswith(f"{banned}=") for tok in host_argv):
+            raise AssertionError(
+                f"text unit must not set docker {banned} (UMA is unpoliced)"
+            )
     for flag, expected in {
-        "--memory": "69g",
-        "--memory-swap": "69g",
         "--memory-swappiness": "0",
-        "--oom-score-adj": "500",
+        "--oom-score-adj": "800",
     }.items():
         actual = _option_values(host_argv, flag)[0]
         if actual != expected:
@@ -146,23 +157,21 @@ class HostileAeonUnitMutationTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             _aeon_contract(unit)
 
-    def test_rejects_docker_memory_option_after_image_boundary(self) -> None:
+    def test_rejects_docker_memory_option_on_host_argv(self) -> None:
         unit = AEON_UNIT.read_text()
-        image = (
-            "ghcr.io/aeon-7/aeon-vllm-ultimate@"
-            "sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c"
-        )
-        unit = unit.replace("  --memory 69g \\\n", "", 1).replace(
-            f"  {image} \\\n",
-            f"  {image} \\\n  --memory 69g \\\n",
+        # Inject a banned docker hard-cap before the image boundary (host argv).
+        unit = unit.replace(
+            "  --memory-swappiness 0 \\\n",
+            "  --memory 69g \\\n  --memory-swappiness 0 \\\n",
             1,
         )
         self.assert_contract_rejects(unit)
 
-    def test_rejects_extra_docker_memory_alias(self) -> None:
-        unit = AEON_UNIT.read_text().replace(
-            "  --memory 69g \\\n",
-            "  --memory 69g -m 68g \\\n",
+    def test_rejects_docker_memory_swap_option_on_host_argv(self) -> None:
+        unit = AEON_UNIT.read_text()
+        unit = unit.replace(
+            "  --memory-swappiness 0 \\\n",
+            "  --memory-swap 69g \\\n  --memory-swappiness 0 \\\n",
             1,
         )
         self.assert_contract_rejects(unit)
@@ -171,7 +180,7 @@ class HostileAeonUnitMutationTests(unittest.TestCase):
 class QueritServiceContractTests(unittest.TestCase):
     def test_unit_uses_pinned_offline_artifacts(self) -> None:
         unit = QUERIT_UNIT.read_text()
-        self.assertIn(f"@{IMAGE_DIGEST}", unit)
+        self.assertIn(f"@{QUERIT_IMAGE_DIGEST}", unit)
         self.assertIn(
             "models--Querit--Querit-4B:/models/querit-repo:ro", unit
         )
@@ -252,14 +261,20 @@ class QueritServiceContractTests(unittest.TestCase):
     def test_aeon_unit_matches_source_memory_profile(self) -> None:
         unit = AEON_UNIT.read_text()
         for contract in (
-            "--memory 69g",
-            "--memory-swap 69g",
             "gb10_enforce_docker_cgroup_limits.sh --publish-registration "
             "vllm-aeon-27b-dflash-n12 69",
             "GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1",
             f"@{IMAGE_DIGEST}",
+            "--oom-score-adj 800",
+            "OOMScoreAdjust=800",
+            "--kv-cache-memory-bytes 15360M",
+            "--max-num-seqs 16",
+            "--max-num-batched-tokens 16384",
+            "FULL_DECODE_ONLY",
         ):
             self.assertIn(contract, unit)
+        self.assertNotIn("--memory 69g", unit)
+        self.assertNotIn("--memory-swap 69g", unit)
         self.assertNotIn("--dns", unit)
         self.assertNotRegex(unit, r"aeon-vllm-ultimate:[^\s\\]+(?:\s|\\)")
 
@@ -390,6 +405,7 @@ class QueritServiceContractTests(unittest.TestCase):
         memory_max = int(max_match.group(1)) * multipliers[max_match.group(2)]
         self.assertLessEqual(projected_bytes, memory_high)
         self.assertLess(memory_high, memory_max)
+
     def test_vllm_backend_ceiling_exceeds_guard_runtime_concurrency(self) -> None:
         unit = AEON_UNIT.read_text()
         context_match = re.search(r"--max-model-len (\d+)", unit)
@@ -398,8 +414,9 @@ class QueritServiceContractTests(unittest.TestCase):
             self.fail("AEON context or sequence limit is missing")
         context_window = int(context_match.group(1))
         backend_limit = int(backend_match.group(1))
-        expected_limit = context_window // SHORT_GENERATION_REQUEST_TOKENS * 2
-        self.assertEqual(backend_limit, expected_limit)
+        self.assertEqual(context_window, AEON_CONTEXT_TOKENS)
+        # DFlash on GB10 is capped at 16 concurrent sequences (AEON guidance).
+        self.assertEqual(backend_limit, AEON_MAX_NUM_SEQS)
 
         config = tomllib.loads(CONFIG.read_text())
         profiles = {profile["name"]: profile for profile in config["upstreams"]}
