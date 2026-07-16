@@ -338,35 +338,22 @@ required for these proxy-only queue/concurrency changes.
 
 ## Troubleshooting & Recovery
 
-### 0. v0.25 FlashInfer JIT Cache (CRITICAL)
+### 0. v0.25 FlashInfer JIT Compilation
 
 The v0.25 image (`sha256:18c09e6b...`) uses FlashInfer 0.6.13 which requires JIT
-compilation of 30+ CUTLASS FP4 GEMM kernels on first startup. These are compiled
-via ninja (parallel by default), and the nvcc/cc1plus subprocesses can exhaust
-unified memory → kernel OOM killer → `ninja: build stopped: subcommand failed`
-→ `RuntimeError: Engine core initialization failed` (exit 1, NOT 137).
+compilation of 30+ CUTLASS FP4 GEMM kernels on first startup. Without `MAX_JOBS=1`,
+ninja compiles in parallel → multiple nvcc/cc1plus procs exhaust UMA → kernel OOM
+→ `ninja: build stopped` → `RuntimeError` exit 1.
 
 **This is the #1 cause of text startup failures on v0.25.**
 
-The text unit mounts two persistent host volumes to cache compiled kernels:
-```text
-/home/obj/.cache/flashinfer-025           → /root/.cache/flashinfer
-/home/obj/.cache/vllm-flashinfer-autotune-025 → /root/.cache/vllm/flashinfer_autotune_cache
-```
+The text unit sets `MAX_JOBS=1` + `CMAKE_BUILD_PARALLEL_LEVEL=1` to serialize
+compilation. Peak memory stays ~7G above floor — well clear of the guardian's
+2G kill threshold. JIT cache is NOT persisted (ephemeral `--rm` container);
+recompilation adds ~2 min to every cold start but eliminates deployment complexity.
 
-Environment `MAX_JOBS=1` + `CMAKE_BUILD_PARALLEL_LEVEL=1` serialize compilation
-to reduce peak memory. After a successful seed (~8 min), subsequent restarts
-read from cache and skip JIT entirely (~2 min startup).
-
-**If FlashInfer cache is missing or corrupted (cold start):**
-1. Stop guardian: `systemctl --user stop gb10-memory-guardian`
-2. Stop text: `systemctl --user stop vllm-aeon-27b-dflash`
-3. Start text alone: `systemctl --user start vllm-aeon-27b-dflash`
-4. Wait for `/v1/models` 200 (up to 10 min with `MAX_JOBS=1`)
-5. Start rr: `systemctl --user start querit-4b-reranker`
-6. Start guardian: `systemctl --user start gb10-memory-guardian`
-
-See `docs/deployment/v025-flashinfer-jit-investigation.md` for the full root-cause analysis.
+Guardian can stay running during text startup — it only kills at MemAvail < 2G,
+and serialized compilation never drops that low.
 
 ### 1. CUDA Hang or Service Crash
 If `vllm-aeon-27b-dflash.service` hangs or refuses to respond:
