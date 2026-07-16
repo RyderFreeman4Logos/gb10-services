@@ -1,6 +1,6 @@
 # ── Baseline (clean start 2026-07-16, emb+rr+text co-resident) ──
 # GPU: 41.4G  RSS: 6.5G  Startup: 1070s (~18min, FlashInfer JIT serial)
-# Config: util=0.45 AUTO KV, batch=4096, MAX_JOBS=1, FP8 KV
+# Config: util=0.37 AUTO KV, batch=4096, MAX_JOBS=1, FP8 KV
 # MemAvail after all 3: 26.6G  (GPU total 79.3G of 121.6G)
 # ─────────────────────────────────────────────────────────────────
 [Unit]
@@ -90,7 +90,7 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
     --max-num-partial-prefills 1 \
     --max-long-partial-prefills 1 \
     --enable-prefix-caching \
-    --gpu-memory-utilization 0.45 \
+    --gpu-memory-utilization 0.37 \
     --enable-chunked-prefill \
     --scheduler-reserve-full-isl \
     --compilation-config "{\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_num_of_warmups\":0,\"cache_dir\":\"/var/cache/vllm/aeon-qwen36-v025\"}" \
