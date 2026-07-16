@@ -1,0 +1,41 @@
+{
+  "test_config": {
+    "cloud_base_url": "https://api.deepinfra.com/v1/openai",
+    "cloud_model": "Qwen/Qwen3-Embedding-8B",
+    "local_base_url": "http://gb10:18012/v1",
+    "local_model": "qwen3-embedding-8b",
+    "num_docs": 500,
+    "num_queries": 100,
+    "embedding_dim": 4096,
+    "seed": 42
+  },
+  "cosine_similarity_local_vs_cloud": {
+    "mean": 0.999892,
+    "median": 0.999895,
+    "p5": 0.99984,
+    "min": 0.999734,
+    "verdict": "PASS"
+  },
+  "retrieval_rank_correlation": {
+    "spearman_mean": 0.999627,
+    "spearman_median": 0.999647,
+    "spearman_p5": 0.99948,
+    "spearman_min": 0.999218,
+    "recall_at_5_mean": 0.948,
+    "recall_at_10_mean": 0.964,
+    "verdict": "PASS"
+  },
+  "embedding_norm": {
+    "cloud_mean": 1.0,
+    "local_mean": 1.0,
+    "abs_diff_mean": 0.0,
+    "abs_diff_median": 0.0,
+    "abs_diff_max": 0.0
+  },
+  "cost": {
+    "estimated_tokens": 74070,
+    "cloud_cost_usd": 0.0007,
+    "cloud_time_seconds": 128.1,
+    "local_time_seconds": 110.4
+  }
+}
