@@ -17,7 +17,7 @@ MemoryMax=256M
 MemorySwapMax=0
 # Prefer keeping reranker over text under host OOM (text uses 800).
 OOMScoreAdjust=500
-Restart=yes
+Restart=always
 RestartSec=15
 TimeoutStartSec=1800
 TimeoutStopSec=60
