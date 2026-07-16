@@ -1,5 +1,5 @@
 [Unit]
-Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.25.0, seqs=16, batch=8192, util=0.6, AUTO KV, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
+Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.25.0, seqs=16, batch=4096, util=0.6, AUTO KV, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
 # Independent of embedding/reranker so text can restart alone (no HTTP poll).
 After=network.target
 Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
@@ -30,7 +30,10 @@ OOMScoreAdjust=800
 # skipping memory_profiling() + profile_cudagraph_memory() — the only paths
 # patched by the UMA free-memory + cudagraph headroom check. AUTO sizing
 # lets these clamps bound the pool based on actual free memory.
-# batch=8192 (not 16384): extra conservatism on peak compile shape.
+# batch=4096: reduces profile-run compile/cudagraph peak shape to fit co-resident
+# emb+rr without stopping them. Steady-state decode unaffected (governed by seqs);
+# only cold long-prompt prefill TTFT increases via more chunked-prefill iterations.
+# Prefix-cache/KV-cache hit rate is unaffected (lives inside the pool, not batch-sized).
 # util=0.6 is AEON's DFlash-safe GB10 target (0.88 hard ceiling).
 # Restart via gb10_restart_text_safe.sh (stops rr first, never emb).
 MemoryMax=256M
@@ -74,7 +77,7 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
     --mamba-cache-dtype float32 \
     --max-model-len 262144 \
     --max-num-seqs 16 \
-    --max-num-batched-tokens 8192 \
+    --max-num-batched-tokens 4096 \
     --max-num-partial-prefills 1 \
     --max-long-partial-prefills 1 \
     --enable-prefix-caching \

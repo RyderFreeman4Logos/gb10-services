@@ -286,7 +286,7 @@ class QueritServiceContractTests(unittest.TestCase):
             "--oom-score-adj 800",
             "OOMScoreAdjust=800",
             "--max-num-seqs 16",
-            "--max-num-batched-tokens 8192",
+            "--max-num-batched-tokens 4096",
             "--gpu-memory-utilization 0.60",
             "FULL_DECODE_ONLY",
         ):
