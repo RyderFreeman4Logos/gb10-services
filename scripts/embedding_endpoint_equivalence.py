@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
 """
-Cloud vs Local embedding equivalence test.
+Cloud vs Local embedding endpoint equivalence test.
 
 Compares embeddings from a cloud API (DeepInfra) and a local vLLM endpoint
-for the same model (Qwen3-Embedding-8B). Produces a detailed report on whether
-the two endpoints are production-equivalent (no quality gap, not requiring
-byte-identical output).
+for the same model. Produces a detailed report on whether the two endpoints
+are production-equivalent (no quality gap, not requiring byte-identical output).
+
+Supports two corpus sources:
+  1. Built-in JSONL datasets (STS22/STS17) committed under data/embedding-equivalence/
+  2. Custom JSONL file with {"sentence1": ..., "sentence2": ..., "score": ...} per line
 
 Usage:
-    # Set DEEPINFRA_KEY env var first
+    # Real datasets (default — covers English and Chinese)
     DEEPINFRA_KEY=xxx python3 scripts/embedding_endpoint_equivalence.py \
         --cloud-base-url https://api.deepinfra.com/v1/openai \
         --cloud-model Qwen/Qwen3-Embedding-8B \
         --local-base-url http://gb10:18012/v1 \
-        --local-model qwen3-embedding-8b \
-        --num-docs 500 \
-        --num-queries 100
+        --local-model qwen3-embedding-8b
+
+    # English only
+    DEEPINFRA_KEY=xxx python3 scripts/embedding_endpoint_equivalence.py \
+        --cloud-base-url ... --cloud-model ... \
+        --local-base-url ... --local-model ... \
+        --lang en
+
+    # Custom dataset
+    DEEPINFRA_KEY=xxx python3 scripts/embedding_endpoint_equivalence.py \
+        ... --corpus my_data.jsonl
 
 Metrics produced:
     1. Per-text cosine similarity (local vs cloud embedding of same text)
@@ -23,151 +34,75 @@ Metrics produced:
     3. Recall@5 and Recall@10 agreement
     4. Embedding norm comparison
     5. Cost report
-
-The test corpus is generated synthetically to cover:
-    - Short phrases (1-10 tokens)
-    - Medium sentences (10-50 tokens)
-    - Long paragraphs (50-200 tokens)
-    - Code snippets
-    - Multilingual text (Chinese, English, mixed)
-    - Technical/domain-specific text
 """
 
 import argparse
+import glob
 import json
 import math
 import os
-import random
 import sys
 import time
 import urllib.request
 import urllib.error
+from pathlib import Path
 from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# Synthetic corpus generation
+# Corpus loading
 # ---------------------------------------------------------------------------
 
-TOPICS = [
-    "machine learning", "distributed systems", "quantum computing",
-    "climate change", "ancient history", "software engineering",
-    "molecular biology", "game theory", "cryptography", "linguistics",
-    "astrophysics", "neural networks", "database optimization", "container orchestration",
-    "natural language processing", "computer vision", "reinforcement learning",
-    "blockchain consensus", "edge computing", "data privacy",
-]
+SCRIPT_DIR = Path(__file__).resolve().parent
+DATA_DIR = SCRIPT_DIR.parent / "data" / "embedding-equivalence"
 
-CODE_SNIPPETS = [
-    "def fibonacci(n): return n if n <= 1 else fibonacci(n-1) + fibonacci(n-2)",
-    "SELECT u.name, COUNT(o.id) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name",
-    "import numpy as np; matrix = np.random.randn(100, 100); eigenvalues = np.linalg.eigvals(matrix)",
-    "async fn fetch_data(url: &str) -> Result<String, Box<dyn std::error::Error>> { /* ... */ }",
-    "docker run --rm -v $(pwd):/data python:3.12 python /data/script.py --input data.csv",
-    "kubectl apply -f deployment.yaml && kubectl rollout status deployment/api-server",
-    "const pipe = (fns) => (x) => fns.reduce((v, f) => f(v), x);",
-    "git rebase -i HEAD~3  # squash the last three commits into one",
-]
-
-MULTILINGUAL = [
-    "机器学习是人工智能的一个分支，它使计算机系统能够从数据中学习并做出决策。",
-    "分布式系统是由多个独立计算机组成的系统，这些计算机通过消息传递进行通信。",
-    "The quick brown fox jumps over the lazy dog. 这只敏捷的棕色狐狸跳过了那只懒狗。",
-    "量子计算机利用量子比特进行计算，能够解决经典计算机难以处理的问题。",
-    "容器编排是自动化部署、扩展和管理容器化应用程序的过程。",
-    "密码学研究如何在存在 adversaries 的情况下保护信息安全。",
-    "深度学习使用多层神经网络从大量数据中提取层次化的特征表示。",
-    "边缘计算将数据处理从中心数据中心移到靠近数据源的设备上。",
-]
-
-SENTENCE_TEMPLATES = [
-    "The fundamental principle of {topic} involves understanding complex interactions between multiple components.",
-    "Recent advances in {topic} have demonstrated significant improvements in efficiency and accuracy.",
-    "A critical challenge in {topic} is balancing theoretical elegance with practical implementation constraints.",
-    "Researchers studying {topic} often employ empirical methods to validate theoretical predictions.",
-    "The history of {topic} spans several decades, with key breakthroughs occurring in recent years.",
-    "Industry adoption of {topic} technologies has accelerated due to decreasing computational costs.",
-    "Future directions in {topic} include integration with emerging paradigms and cross-disciplinary applications.",
-    "Open problems in {topic} continue to motivate active research across academic and industrial labs.",
-]
-
-PARAGRAPH_TEMPLATES = [
-    "{topic} represents a convergence of theoretical foundations and practical engineering. "
-    "The core methodology relies on iterative refinement, where initial approximations are "
-    "progressively improved through feedback mechanisms. This approach has proven effective "
-    "across diverse domains, from scientific computing to consumer applications. However, "
-    "scaling these methods to production environments introduces unique challenges related "
-    "to resource allocation, fault tolerance, and maintainability.",
-
-    "In the context of {topic}, several key metrics are used to evaluate performance. "
-    "These include throughput, latency, accuracy, and resource utilization. Modern systems "
-    "must balance these competing objectives, often employing multi-objective optimization "
-    "techniques. The tradeoff space is vast, and optimal configurations depend heavily on "
-    "the specific workload characteristics and deployment environment. Recent work has "
-    "explored automated tuning approaches using reinforcement learning and Bayesian optimization.",
-]
+# Built-in datasets and their language codes
+DATASET_FILES = {
+    "en": ["sts22-en.jsonl", "sts17-en-en.jsonl"],
+    "zh": ["sts22-zh.jsonl"],
+    "zh-en": ["sts22-zh-en.jsonl"],
+}
 
 
-def generate_corpus(num_docs: int, num_queries: int) -> tuple[list[str], list[str]]:
-    """Generate a synthetic corpus of documents and queries."""
-    rng = random.Random(42)  # deterministic
-    docs: list[str] = []
-    queries: list[str] = []
+def load_corpus_from_jsonl(path: str) -> list[str]:
+    """Load texts from a JSONL file with sentence1/sentence2 fields."""
+    texts: list[str] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            for key in ("sentence1", "sentence2"):
+                val = row.get(key)
+                if val:
+                    texts.append(val)
+    return texts
 
-    # Mix of content types
-    total = num_docs
-    n_code = max(1, total // 8)
-    n_multi = max(1, total // 8)
-    n_short = max(1, total // 6)
-    n_medium = max(1, total // 3)
-    n_long = total - n_code - n_multi - n_short - n_medium
 
-    # Code snippets
-    for _ in range(n_code):
-        docs.append(rng.choice(CODE_SNIPPETS))
+def load_builtin_corpus(langs: list[str]) -> tuple[list[str], dict[str, int]]:
+    """Load texts from built-in JSONL datasets for the given languages."""
+    texts: list[str] = []
+    source_counts: dict[str, int] = {}
 
-    # Multilingual
-    for _ in range(n_multi):
-        docs.append(rng.choice(MULTILINGUAL))
+    for lang in langs:
+        files = DATASET_FILES.get(lang, [])
+        for fname in files:
+            path = DATA_DIR / fname
+            if not path.exists():
+                print(f"WARNING: dataset file not found: {path}", file=sys.stderr)
+                continue
+            file_texts = load_corpus_from_jsonl(str(path))
+            texts.extend(file_texts)
+            source_counts[f"{lang}/{fname}"] = len(file_texts)
 
-    # Short phrases
-    for _ in range(n_short):
-        topic = rng.choice(TOPICS)
-        words = topic.split()
-        rng.shuffle(words)
-        docs.append(" ".join(words))
+    return texts, source_counts
 
-    # Medium sentences
-    for _ in range(n_medium):
-        template = rng.choice(SENTENCE_TEMPLATES)
-        topic = rng.choice(TOPICS)
-        docs.append(template.format(topic=topic))
 
-    # Long paragraphs
-    for _ in range(n_long):
-        template = rng.choice(PARAGRAPH_TEMPLATES)
-        topic = rng.choice(TOPICS)
-        docs.append(template.format(topic=topic))
-
-    rng.shuffle(docs)
-
-    # Generate queries
-    query_templates = [
-        "What is {topic}?",
-        "How does {topic} work?",
-        "Explain the key concepts of {topic}.",
-        "What are the challenges in {topic}?",
-        "Recent advances in {topic}.",
-        "Applications of {topic} in industry.",
-        "Best practices for {topic}.",
-        "Comparison of approaches in {topic}.",
-    ]
-    for _ in range(num_queries):
-        template = rng.choice(query_templates)
-        topic = rng.choice(TOPICS)
-        queries.append(template.format(topic=topic))
-
-    return docs, queries
+def load_custom_corpus(path: str) -> tuple[list[str], dict[str, int]]:
+    """Load texts from a custom JSONL file."""
+    texts = load_corpus_from_jsonl(path)
+    return texts, {f"custom/{Path(path).name}": len(texts)}
 
 
 # ---------------------------------------------------------------------------
@@ -243,11 +178,9 @@ def rank_documents(query_emb: list[float], doc_embs: list[list[float]]) -> list[
 
 
 def spearman_rank_correlation(ranks_a: list[int], ranks_b: list[int]) -> float:
-    """Spearman's rank correlation coefficient."""
     n = len(ranks_a)
     if n < 2:
         return 1.0
-    # Convert to rank positions
     pos_a = {idx: rank for rank, idx in enumerate(ranks_a)}
     pos_b = {idx: rank for rank, idx in enumerate(ranks_b)}
     d_sq = sum((pos_a[idx] - pos_b[idx]) ** 2 for idx in range(n))
@@ -255,10 +188,18 @@ def spearman_rank_correlation(ranks_a: list[int], ranks_b: list[int]) -> float:
 
 
 def recall_at_k(ranks_a: list[int], ranks_b: list[int], k: int) -> float:
-    """Fraction of top-k items from ranks_a that also appear in top-k of ranks_b."""
     top_a = set(ranks_a[:k])
     top_b = set(ranks_b[:k])
     return len(top_a & top_b) / k
+
+
+def percentile(sorted_list: list[float], p: float) -> float:
+    """Return the p-th percentile (0-100) from a sorted list."""
+    if not sorted_list:
+        return 0.0
+    idx = int(len(sorted_list) * p / 100.0)
+    idx = min(idx, len(sorted_list) - 1)
+    return sorted_list[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -274,10 +215,13 @@ def main():
                         help="Environment variable name for cloud API key")
     parser.add_argument("--local-base-url", required=True)
     parser.add_argument("--local-model", required=True)
-    parser.add_argument("--num-docs", type=int, default=500)
-    parser.add_argument("--num-queries", type=int, default=100)
+    parser.add_argument("--lang", default="en,zh,zh-en",
+                        help="Comma-separated language codes for built-in datasets (en, zh, zh-en)")
+    parser.add_argument("--corpus", default=None,
+                        help="Custom JSONL corpus file (overrides --lang)")
+    parser.add_argument("--num-queries", type=int, default=100,
+                        help="Number of synthetic queries for retrieval ranking test")
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", default=None, help="Output JSON report path")
     args = parser.parse_args()
 
@@ -286,9 +230,56 @@ def main():
         print(f"ERROR: {args.cloud_api_key_env} not set", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Generating corpus: {args.num_docs} docs, {args.num_queries} queries...",
-          file=sys.stderr)
-    docs, queries = generate_corpus(args.num_docs, args.num_queries)
+    # Load corpus
+    if args.corpus:
+        print(f"Loading custom corpus: {args.corpus}", file=sys.stderr)
+        corpus_texts, sources = load_custom_corpus(args.corpus)
+    else:
+        langs = [l.strip() for l in args.lang.split(",")]
+        print(f"Loading built-in datasets for languages: {langs}", file=sys.stderr)
+        corpus_texts, sources = load_builtin_corpus(langs)
+
+    if not corpus_texts:
+        print("ERROR: no corpus texts loaded", file=sys.stderr)
+        sys.exit(1)
+
+    # Deduplicate
+    seen = set()
+    docs = []
+    for t in corpus_texts:
+        if t not in seen:
+            seen.add(t)
+            docs.append(t)
+
+    print(f"Loaded {len(docs)} unique documents from:", file=sys.stderr)
+    for src, count in sources.items():
+        print(f"  {src}: {count} texts", file=sys.stderr)
+
+    # Generate queries (for retrieval ranking test)
+    query_topics = [
+        "technology", "health", "politics", "science", "sports",
+        "business", "culture", "environment", "education", "security",
+        "人工智能", "气候变化", "经济发展", "公共卫生", "教育改革",
+        "量子计算", "数据隐私", "清洁能源", "国际贸易", "太空探索",
+    ]
+    query_templates = [
+        "What are the latest developments in {topic}?",
+        "Explain the key concepts of {topic}.",
+        "What are the challenges in {topic}?",
+        "Recent news about {topic}.",
+        "Applications of {topic} in industry.",
+        "{topic}的最新进展是什么？",
+        "解释{topic}的关键概念。",
+        "{topic}面临哪些挑战？",
+    ]
+    import random
+    rng = random.Random(42)
+    queries = []
+    for _ in range(args.num_queries):
+        template = rng.choice(query_templates)
+        topic = rng.choice(query_topics)
+        queries.append(template.format(topic=topic))
+
     all_texts = docs + queries
 
     # Fetch cloud embeddings
@@ -328,11 +319,13 @@ def main():
         cloud_norms.append(embedding_norm(cloud_embs[i]))
         local_norms.append(embedding_norm(local_embs[i]))
 
-    cos_sims.sort()
+    cos_sims_sorted = sorted(cos_sims)
     cos_mean = sum(cos_sims) / len(cos_sims)
-    cos_median = cos_sims[len(cos_sims) // 2]
-    cos_p5 = cos_sims[int(len(cos_sims) * 0.05)]
-    cos_min = cos_sims[0]
+    cos_median = cos_sims_sorted[len(cos_sims_sorted) // 2]
+    cos_p5 = percentile(cos_sims_sorted, 5)
+    cos_min = cos_sims_sorted[0]
+    # Count outliers below threshold for diagnostics
+    cos_outliers = sum(1 for c in cos_sims if c < 0.998)
 
     # 2. Retrieval rank correlation
     spearman_scores = []
@@ -346,26 +339,25 @@ def main():
         recall5_scores.append(recall_at_k(cloud_rank, local_rank, min(5, len(docs))))
         recall10_scores.append(recall_at_k(cloud_rank, local_rank, min(10, len(docs))))
 
-    spearman_scores.sort()
+    spearman_sorted = sorted(spearman_scores)
     sp_mean = sum(spearman_scores) / len(spearman_scores)
-    sp_median = spearman_scores[len(spearman_scores) // 2]
-    sp_p5 = spearman_scores[int(len(spearman_scores) * 0.05)]
-    sp_min = spearman_scores[0]
+    sp_median = spearman_sorted[len(spearman_sorted) // 2]
+    sp_p5 = percentile(spearman_sorted, 5)
+    sp_min = spearman_sorted[0]
 
     r5_mean = sum(recall5_scores) / len(recall5_scores)
     r10_mean = sum(recall10_scores) / len(recall10_scores)
 
     # 3. Norm comparison
-    norm_diffs = [abs(cn - ln) for cn, ln in zip(cloud_norms, local_norms)]
-    norm_diffs.sort()
+    norm_diffs = sorted(abs(cn - ln) for cn, ln in zip(cloud_norms, local_norms))
     norm_diff_mean = sum(norm_diffs) / len(norm_diffs)
     norm_diff_median = norm_diffs[len(norm_diffs) // 2]
     norm_diff_max = norm_diffs[-1]
 
-    # 4. Token estimate (rough: ~1.3 chars per token)
+    # 4. Token estimate
     total_chars = sum(len(t) for t in all_texts)
     est_tokens = int(total_chars / 1.3)
-    cloud_cost = est_tokens / 1_000_000 * 0.01  # $0.01/M tokens
+    cloud_cost = est_tokens / 1_000_000 * 0.01
 
     # ---- Report ----
     report = {
@@ -377,14 +369,16 @@ def main():
             "num_docs": len(docs),
             "num_queries": len(queries),
             "embedding_dim": len(cloud_embs[0]) if cloud_embs else 0,
-            "seed": args.seed,
+            "languages": args.lang if not args.corpus else "custom",
+            "corpus_sources": sources,
         },
         "cosine_similarity_local_vs_cloud": {
             "mean": round(cos_mean, 6),
             "median": round(cos_median, 6),
             "p5": round(cos_p5, 6),
             "min": round(cos_min, 6),
-            "verdict": "PASS" if cos_min > 0.998 else ("WARN" if cos_min > 0.995 else "FAIL"),
+            "outliers_below_threshold": cos_outliers,
+            "verdict": "PASS" if cos_min > 0.998 else ("WARN" if cos_p5 > 0.998 else "FAIL"),
         },
         "retrieval_rank_correlation": {
             "spearman_mean": round(sp_mean, 6),
@@ -415,6 +409,7 @@ def main():
     print("EMBEDDING EQUIVALENCE REPORT")
     print("=" * 60)
     print(f"\nDocuments: {len(docs)} | Queries: {len(queries)} | Dim: {len(cloud_embs[0])}")
+    print(f"Languages: {args.lang if not args.corpus else 'custom'}")
     print(f"\n1. Cosine Similarity (same text, local vs cloud):")
     print(f"   mean={cos_mean:.6f} median={cos_median:.6f} p5={cos_p5:.6f} min={cos_min:.6f}")
     print(f"   Verdict: {report['cosine_similarity_local_vs_cloud']['verdict']}")
@@ -433,10 +428,9 @@ def main():
 
     if args.output:
         with open(args.output, "w") as f:
-            json.dump(report, f, indent=2)
+            json.dump(report, f, indent=2, ensure_ascii=False)
         print(f"\nFull report saved to {args.output}")
 
-    # Exit code: PASS only if both metrics pass
     if (report["cosine_similarity_local_vs_cloud"]["verdict"] == "PASS"
             and report["retrieval_rank_correlation"]["verdict"] == "PASS"):
         sys.exit(0)
