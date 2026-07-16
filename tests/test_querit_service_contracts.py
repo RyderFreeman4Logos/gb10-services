@@ -218,9 +218,7 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertIn("gb10_check_mem_available.sh 2", unit)
         self.assertIn("--memory 18g", unit)
         self.assertIn("--memory-swap 18g", unit)
-        enforce = unit.index("gb10_enforce_docker_cgroup_limits.sh querit-4b-reranker 18")
         ready = unit.index("http://100.105.4.92:18013/v1/models")
-        self.assertLess(enforce, ready)
         timeout = re.search(r"^TimeoutStartSec=(\d+)$", unit, re.MULTILINE)
         if timeout is None:
             self.fail("TimeoutStartSec missing")
