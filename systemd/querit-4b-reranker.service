@@ -1,3 +1,7 @@
+# ── Baseline (clean start 2026-07-16, emb+rr+text co-resident) ──
+# GPU: 17.6G  RSS: 1.4G  Startup: 46s  MemAvail after all 3: 26.6G
+# Config: Semaphore(2), max-model-len 32768, --memory 18g
+# ─────────────────────────────────────────────────────────────────
 [Unit]
 Description=Querit-4B transformers rerank server (raw :18013; Qwen3 reranker aliases)
 After=network.target

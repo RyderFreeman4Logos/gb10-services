@@ -1,3 +1,7 @@
+# ── Baseline (clean start 2026-07-16, emb+rr+text co-resident) ──
+# GPU: 20.3G  RSS: 3.0G  Startup: 104s  MemAvail after all 3: 26.6G
+# Config: util=0.15, pin KV 4800M, enforce-eager, max-model-len 32768
+# ─────────────────────────────────────────────────────────────────
 [Unit]
 Description=vLLM Qwen3-Embedding-8B (AEON v0.25 GB10 image, raw backend port 18012, behind llm-guard-proxy listeners 18009/18002/18005, reliability-first, 32k contract, 64 seq)
 After=network.target

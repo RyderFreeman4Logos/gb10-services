@@ -1,3 +1,8 @@
+# ── Baseline (clean start 2026-07-16, emb+rr+text co-resident) ──
+# GPU: 41.4G  RSS: 6.5G  Startup: 1070s (~18min, FlashInfer JIT serial)
+# Config: util=0.45 AUTO KV, batch=4096, MAX_JOBS=1, FP8 KV
+# MemAvail after all 3: 26.6G  (GPU total 79.3G of 121.6G)
+# ─────────────────────────────────────────────────────────────────
 [Unit]
 Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.25.0, seqs=16, batch=4096, util=0.45, AUTO KV, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
 # Independent of embedding/reranker so text can restart alone (no HTTP poll).
