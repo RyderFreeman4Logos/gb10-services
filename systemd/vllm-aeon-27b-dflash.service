@@ -1,8 +1,8 @@
 # ── Baseline (clean start 2026-07-16, emb+rr+text co-resident) ──
-# GPU: 41.3G  RSS: 6.6G  Startup: 1050s (~18min, FlashInfer JIT serial)
+# GPU: 39.52G  RSS: 6.50G  Startup: 1034s (~17.2min, FlashInfer JIT serial)
 # Config: util=0.355 AUTO KV, batch=4096, MAX_JOBS=1, FP8 KV
-# KV capacity: 318295 tokens (> one 262144-token context)
-# MemAvail after all 3: 36.8G  (cold-ready GPU total 69.4G of 121.6G)
+# KV capacity: 286962 tokens (24818 / 9.47% above one 262144-token context)
+# MemAvail after all 3: 39.75G  (cold-ready GPU total 67.89G of 121.6G)
 # ─────────────────────────────────────────────────────────────────
 [Unit]
 Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.25.0, seqs=16, batch=4096, util=0.355, AUTO KV, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
