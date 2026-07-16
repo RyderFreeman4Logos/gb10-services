@@ -39,9 +39,9 @@ _RECEIPT = _live_receipt()
 IMAGE_DIGEST = (
     "sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55"
 )
-# Querit still pins the prior offline transformers runtime image until a separate upgrade.
+# Querit pins the deployed v0.25.0 offline transformers runtime image.
 QUERIT_IMAGE_DIGEST = (
-    "sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c"
+    "sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55"
 )
 MODEL_SNAPSHOT = "7b796de30ad8dc772d6c46c75659c1341283a665"
 SHORT_GENERATION_REQUEST_TOKENS = 8_192

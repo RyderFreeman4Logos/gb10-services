@@ -43,7 +43,7 @@ ExecStart=/usr/bin/docker run --rm --name querit-4b-reranker \
   --memory-swappiness 0 \
   --oom-score-adj 500 \
   --entrypoint python3 \
-  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c \
+  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55 \
   /opt/querit/querit_openai_rerank_server.py \
   --model /models/querit-repo/snapshots/7b796de30ad8dc772d6c46c75659c1341283a665 \
   --host 0.0.0.0 --port 8000 --max-model-len 32768 --max-batch 8 --dtype bfloat16 \

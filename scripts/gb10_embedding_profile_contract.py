@@ -19,7 +19,10 @@ __all__ = [
     "validate_unit_text",
 ]
 
-EXPECTED_IMAGE = "ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0"
+EXPECTED_IMAGE = (
+    "ghcr.io/aeon-7/aeon-vllm-ultimate@"
+    "sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55"
+)
 EXPECTED_CONTAINER = "vllm-embedding"
 EXPECTED_MODELS = ("qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B")
 EXPECTED_UNIT_SHA256 = "824437af3faa3bf60aec16b3730bdbc4c5914f161202034a1ebb3e1cb145be57"
