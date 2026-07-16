@@ -9,6 +9,17 @@ generation_queue_retry_after_secs = 10
 max_control_plane_in_flight_requests = 128
 max_request_body_bytes = 4194304
 
+[guardian]
+enabled = true
+target_label = "aeon-text"
+mem_threshold_gib = 5
+kill_action = "cgroup-kill"
+poll_interval_secs = 3
+registration_file = "text-cgroup.v1"
+reserve_mib = 64
+retry_interval_secs = 5
+cgroup_root = "/sys/fs/cgroup"
+
 [[listeners]]
 name = "embedding-legacy"
 bind_host = "100.105.4.92"

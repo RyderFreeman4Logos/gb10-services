@@ -156,7 +156,7 @@ class VerifierFixture:
         (self.proc / "303" / "cgroup").write_text(
             f"0::/app.slice/docker-{CONTAINER_ID}.scope\n"
         )
-        (docker_cgroup / "memory.max").write_text(str(20 * 1024**3) + "\n")
+        (docker_cgroup / "memory.max").write_text(str(128 * 1024**3) + "\n")
         (docker_cgroup / "memory.swap.max").write_text("0\n")
         (docker_cgroup / "memory.swap.current").write_text("0\n")
         (docker_cgroup / "memory.events").write_text(
@@ -169,10 +169,10 @@ class VerifierFixture:
         effective = " ".join(argv)
         pre = "/usr/bin/docker rm -f vllm-embedding"
         post = (
-            "/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh "
-            "vllm-embedding 20"
+            "/home/obj/.local/bin/gb10_service_ready.sh embedding "
+            "http://100.105.4.92:18012 qwen3-embedding-8b --deadline 300"
         )
-        stop = "/usr/bin/docker stop vllm-embedding"
+        stop = "/usr/bin/docker stop --time 20 vllm-embedding"
         rows = {
             "Id": "vllm-embedding.service",
             "LoadState": "loaded",
@@ -191,7 +191,7 @@ class VerifierFixture:
                 f"{{ path=/usr/bin/docker ; argv[]={pre} ; ignore_errors=yes ; }}"
             ),
             "ExecStartPost": (
-                f"{{ path=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh ; "
+                f"{{ path=/home/obj/.local/bin/gb10_service_ready.sh ; "
                 f"argv[]={post} ; ignore_errors=no ; }}"
             ),
             "ExecStop": (
@@ -221,8 +221,8 @@ class VerifierFixture:
                 "Cmd": container_argv,
             },
             "HostConfig": {
-                "Memory": 20 * 1024**3,
-                "MemorySwap": 20 * 1024**3,
+                "Memory": 128 * 1024**3,
+                "MemorySwap": 128 * 1024**3,
                 "MemorySwappiness": 0,
                 "OomScoreAdj": 0,
                 "AutoRemove": True,

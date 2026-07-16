@@ -66,7 +66,7 @@ class StrictUnitParserTests(unittest.TestCase):
         canonical = UNIT.read_text()
         mutations = {
             "host short memory alias": canonical.replace(
-                "  --memory 20g \\\n", "  --memory 20g -m 24g \\\n", 1
+                "  --memory 128g \\\n", "  --memory 128g -m 24g \\\n", 1
             ),
             "host flag after image": canonical.replace(
                 "  /usr/local/bin/vllm serve",
@@ -79,7 +79,9 @@ class StrictUnitParserTests(unittest.TestCase):
                 1,
             ),
             "unexpected model option": canonical.replace(
-                "    --enforce-eager", "    --truncate-dim 256 \\\n    --enforce-eager", 1
+                "    --gpu-memory-utilization 0.15 --enforce-eager",
+                "    --gpu-memory-utilization 0.15 \\\n    --truncate-dim 256 \\\n    --enforce-eager",
+                1,
             ),
             "neighbor lifecycle": canonical
             + "\nExecStartPost=/usr/bin/systemctl --user restart "

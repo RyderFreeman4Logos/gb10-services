@@ -380,12 +380,12 @@ class HostileEmbeddingUnitMutationTests(unittest.TestCase):
         )
         self.assert_contract_rejects(f"{unit}\n{readiness}\n")
 
-    def test_rejects_cgroup_post_start_helper(self) -> None:
+    def test_rejects_guardian_registration_from_embedding(self) -> None:
         unit = EMBEDDING_UNIT.read_text()
         unit = re.sub(
             r"(?m)^ExecStartPost=.*$",
             "ExecStartPost=/home/obj/.local/bin/"
-            "gb10_enforce_docker_cgroup_limits.sh vllm-embedding 20",
+            "llm_guard_proxy_publish_cgroup_registration.sh",
             unit,
             count=1,
         )

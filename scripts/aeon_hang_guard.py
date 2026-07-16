@@ -5,7 +5,7 @@ Prevents CUDA graph replay hangs by periodically forcing eager execution
 (every HANG_GUARD_FLUSH_INTERVAL steps), breaking any accumulating CUDA
 graph state corruption on Blackwell sm_121.
 
-Detection/restart is handled by the external aeon_healthcheck.sh systemd timer.
+Process failures converge through the vLLM systemd service's restart policy.
 
 Env vars:
   HANG_GUARD_FLUSH_INTERVAL  - steps between forced eager execution (default: 5000)

@@ -21,7 +21,6 @@ QUERIT_UNIT = ROOT / "systemd" / "querit-4b-reranker.service"
 AEON_UNIT = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
 GUARD_UNIT = ROOT / "systemd" / "llm-guard-proxy.service"
 LEGACY_UNIT = ROOT / "systemd" / "vllm-qwen3-reranker-8b.service"
-CGROUP_HELPER = ROOT / "scripts" / "gb10_enforce_docker_cgroup_limits.sh"
 MEMORY_GATE = ROOT / "scripts" / "gb10_check_mem_available.sh"
 CONFIG = ROOT / "config" / "llm-guard-proxy" / "config.toml"
 README = ROOT / "README.md"
@@ -225,21 +224,7 @@ class QueritServiceContractTests(unittest.TestCase):
         if deadline_match is None:
             self.fail("gb10_service_ready.sh must specify --deadline")
         readiness_deadline = int(deadline_match.group(1))
-        helper = CGROUP_HELPER.read_text()
-        helper_wait = re.search(r"GB10_CGROUP_WAIT_SECONDS:-([0-9]+)", helper)
-        docker_timeout = re.search(r"GB10_DOCKER_TIMEOUT_SECONDS:-([0-9]+)", helper)
-        systemctl_timeout = re.search(
-            r"GB10_SYSTEMCTL_TIMEOUT_SECONDS:-([0-9]+)", helper
-        )
-        if helper_wait is None or docker_timeout is None or systemctl_timeout is None:
-            self.fail("cgroup helper timeout defaults missing")
-        worst_case_seconds = (
-            readiness_deadline
-            + int(helper_wait.group(1))
-            + int(docker_timeout.group(1))
-            + int(systemctl_timeout.group(1))
-        )
-        self.assertGreaterEqual(int(timeout.group(1)), worst_case_seconds + 60)
+        self.assertGreaterEqual(int(timeout.group(1)), readiness_deadline + 60)
 
     def test_guard_orders_after_backends_without_owning_lifecycle(self) -> None:
         unit = GUARD_UNIT.read_text()
@@ -261,15 +246,14 @@ class QueritServiceContractTests(unittest.TestCase):
     def test_aeon_unit_matches_source_memory_profile(self) -> None:
         unit = AEON_UNIT.read_text()
         for contract in (
-            "gb10_enforce_docker_cgroup_limits.sh --publish-registration "
-            "vllm-aeon-27b-dflash-n12 69",
+            "llm_guard_proxy_publish_cgroup_registration.sh",
             "GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1",
             f"@{IMAGE_DIGEST}",
             "--oom-score-adj 800",
             "OOMScoreAdjust=800",
             "--max-num-seqs 16",
             "--max-num-batched-tokens 4096",
-            "--gpu-memory-utilization 0.45",
+            "--gpu-memory-utilization 0.355",
             "FULL_DECODE_ONLY",
         ):
             self.assertIn(contract, unit)
@@ -281,13 +265,15 @@ class QueritServiceContractTests(unittest.TestCase):
     def test_aeon_text_uma_safe_profile(self) -> None:
         contract = _aeon_contract(AEON_UNIT.read_text())
         self.assertEqual(contract["model_len"], AEON_CONTEXT_TOKENS)
-        self.assertAlmostEqual(contract["util"], 0.45)
+        self.assertAlmostEqual(contract["util"], 0.355)
         _assert_aeon_headroom_evidence(contract)
 
     def test_aeon_unit_documents_current_headroom_evidence(self) -> None:
         unit = AEON_UNIT.read_text()
-        description = unit.splitlines()[1]
-        self.assertIn("util=0.45", description)
+        description = next(
+            line for line in unit.splitlines() if line.startswith("Description=")
+        )
+        self.assertIn("util=0.355", description)
         self.assertIn("AUTO KV", description)
         self.assertIn("bypasses UMA", unit)
         self.assertIn("~31.6GiB MemAvailable", unit)
@@ -295,7 +281,7 @@ class QueritServiceContractTests(unittest.TestCase):
 
     def test_aeon_headroom_contract_rejects_excessive_utilization(self) -> None:
         unit = AEON_UNIT.read_text().replace(
-            "--gpu-memory-utilization 0.45",
+            "--gpu-memory-utilization 0.355",
             "--gpu-memory-utilization 0.80",
             1,
         )
@@ -306,13 +292,6 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertTrue(LEGACY_UNIT.exists())
         self.assertIn("WantedBy=default.target", LEGACY_UNIT.read_text())
 
-    def test_cgroup_helper_validates_cap_and_sets_memory_and_swap(self) -> None:
-        helper = CGROUP_HELPER.read_text()
-        self.assertRegex(helper, r"expected_gib.*=~.*\^\[1-9\]\[0-9\]\*\$")
-        self.assertIn('"MemoryMax=${expected_gib}G"', helper)
-        self.assertIn("MemorySwapMax=0", helper)
-        self.assertIn("/usr/bin/timeout", helper)
-        self.assertNotIn("$(/usr/bin/docker inspect", helper)
 
     def test_memory_gate_exact_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:

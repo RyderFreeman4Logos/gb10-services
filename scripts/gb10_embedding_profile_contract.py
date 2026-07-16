@@ -25,7 +25,7 @@ EXPECTED_IMAGE = (
 )
 EXPECTED_CONTAINER = "vllm-embedding"
 EXPECTED_MODELS = ("qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B")
-EXPECTED_UNIT_SHA256 = "824437af3faa3bf60aec16b3730bdbc4c5914f161202034a1ebb3e1cb145be57"
+EXPECTED_UNIT_SHA256 = "e231589a375a5f26f97559dd6909959c10729e5ecea61a325128e7b3bc49c1ac"
 EXPECTED_HOST_ARGV = [
     "/usr/bin/docker",
     "run",
@@ -36,22 +36,18 @@ EXPECTED_HOST_ARGV = [
     "all",
     "--ipc",
     "host",
-    "--dns",
-    "8.8.8.8",
-    "--dns",
-    "1.1.1.1",
     "-p",
     "100.105.4.92:18012:8000",
     "-v",
     "/home/obj/.cache/huggingface:/root/.cache/huggingface",
     "-e",
     "HF_HUB_OFFLINE=1",
-    "--memory",
-    "20g",
-    "--memory-swap",
-    "20g",
     "--memory-swappiness",
     "0",
+    "--memory",
+    "128g",
+    "--memory-swap",
+    "128g",
     "--oom-score-adj",
     "0",
     "--entrypoint",
@@ -79,16 +75,21 @@ EXPECTED_CONTAINER_ARGV = [
     "64",
     "--kv-cache-memory-bytes",
     "4800M",
+    "--gpu-memory-utilization",
+    "0.15",
     "--enforce-eager",
 ]
 EXPECTED_EXEC_START = [*EXPECTED_HOST_ARGV, EXPECTED_IMAGE, *EXPECTED_CONTAINER_ARGV]
 EXPECTED_EXEC_START_PRE = ["-/usr/bin/docker", "rm", "-f", EXPECTED_CONTAINER]
 EXPECTED_EXEC_START_POST = [
-    "/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh",
-    EXPECTED_CONTAINER,
-    "20",
+    "/home/obj/.local/bin/gb10_service_ready.sh",
+    "embedding",
+    "http://100.105.4.92:18012",
+    "qwen3-embedding-8b",
+    "--deadline",
+    "300",
 ]
-EXPECTED_EXEC_STOP = ["/usr/bin/docker", "stop", EXPECTED_CONTAINER]
+EXPECTED_EXEC_STOP = ["/usr/bin/docker", "stop", "--time", "20", EXPECTED_CONTAINER]
 _MAX_UNIT_BYTES = 64 * 1024
 _MAX_UNIT_LINES = 512
 _MAX_TOKENS = 256

@@ -1,5 +1,5 @@
 [Unit]
-Description=vLLM Qwen3-Reranker-8B (AEON v0.25 GB10 image, BF16, 40k ctx, pooling reranker, util=0.22, raw backend port 18013, behind llm-guard-proxy listeners 18009/18003/18005, 64 seq, post-start swap enforcement)
+Description=vLLM Qwen3-Reranker-8B (AEON v0.25 GB10 image, BF16, 40k ctx, pooling reranker, util=0.22, raw backend port 18013, behind llm-guard-proxy listeners 18009/18003/18005, 64 seq)
 # lifecycle-independent from text: guardian recovery must not change reranker state.
 After=network.target
 Conflicts=querit-4b-reranker.service vllm-qwen35-hauhau.service
@@ -42,10 +42,7 @@ ExecStart=/usr/bin/docker run --rm --name vllm-qwen3-reranker-8b \
     --chat-template /vllm-workspace/examples/pooling/score/template/qwen3_reranker.jinja \
     --hf-overrides '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}' \
     --trust-remote-code
-# Rootless Docker can accept --memory-swap while leaving memory.swap.max=max.
-# Enforce the generated docker scope directly. This disabled 24G fallback is not
-# part of the ordinary 69+20+18=107GiB AEON+embedding+Querit source profile.
-ExecStartPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh vllm-qwen3-reranker-8b 24
+# This disabled 24G fallback is outside the ordinary AEON+embedding+Querit profile.
 ExecStop=/usr/bin/docker stop vllm-qwen3-reranker-8b
 StandardOutput=journal
 StandardError=journal

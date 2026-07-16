@@ -1,10 +1,11 @@
 # ── Baseline (clean start 2026-07-16, emb+rr+text co-resident) ──
-# GPU: 41.4G  RSS: 6.5G  Startup: 1070s (~18min, FlashInfer JIT serial)
-# Config: util=0.37 AUTO KV, batch=4096, MAX_JOBS=1, FP8 KV
-# MemAvail after all 3: 26.6G  (GPU total 79.3G of 121.6G)
+# GPU: 41.3G  RSS: 6.6G  Startup: 1050s (~18min, FlashInfer JIT serial)
+# Config: util=0.355 AUTO KV, batch=4096, MAX_JOBS=1, FP8 KV
+# KV capacity: 318295 tokens (> one 262144-token context)
+# MemAvail after all 3: 36.8G  (cold-ready GPU total 69.4G of 121.6G)
 # ─────────────────────────────────────────────────────────────────
 [Unit]
-Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.25.0, seqs=16, batch=4096, util=0.45, AUTO KV, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
+Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.25.0, seqs=16, batch=4096, util=0.355, AUTO KV, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
 # Independent of embedding/reranker so text can restart alone (no HTTP poll).
 After=network.target
 Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
@@ -20,8 +21,7 @@ Environment=GB10_CONTAINER_CIDFILE=%t/gb10-memory-guardian/aeon-text.cid
 Environment=AEON_URL=http://100.105.4.92:18010
 # Prefer killing text before reranker under host OOM (reranker uses 500).
 OOMScoreAdjust=800
-# Wrapper only. No Docker --memory: UMA/cudaMalloc is not charged to cgroup.
-# Docker/systemd caps are safety labels via --publish-registration 69, not physical NVML/UMA ceilings.
+# Wrapper only. The container's 128G cap is not a physical NVML/UMA ceiling.
 # Memory budget (3-service ~80G+ class): weights~22G + pinned KV 15G + graphs~0.5G
 # + emb~20G + rr~18G ≈ 75G engine-side policy, not a cgroup guarantee.
 # 2026-07-14: 15GiB KV verified 269589 tokens (1.028 full contexts).
@@ -53,8 +53,8 @@ TimeoutStopSec=60
 
 ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-memory-guardian
 ExecStartPre=/usr/bin/install -d -m 0700 /home/obj/.cache/vllm-compile/aeon-qwen36-v025-18c09e
-ExecStartPre=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh --cleanup-registration
 ExecStartPre=-/usr/bin/docker rm -f vllm-aeon-27b-dflash-n12 vllm-aeon-27b-dflash vllm-aeon-27b
+ExecStartPre=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1 %t/gb10-memory-guardian/aeon-text.cid
 ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.cid --name vllm-aeon-27b-dflash-n12 \
   --cgroup-parent app.slice \
   --gpus all --ipc host \
@@ -90,7 +90,7 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
     --max-num-partial-prefills 1 \
     --max-long-partial-prefills 1 \
     --enable-prefix-caching \
-    --gpu-memory-utilization 0.37 \
+    --gpu-memory-utilization 0.355 \
     --enable-chunked-prefill \
     --scheduler-reserve-full-isl \
     --compilation-config "{\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_num_of_warmups\":0,\"cache_dir\":\"/var/cache/vllm/aeon-qwen36-v025\"}" \
@@ -104,12 +104,12 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
     --override-generation-config "{\"temperature\":0.6,\"top_p\":0.95,\"top_k\":20}" \
     --trust-remote-code
 # Multimodal retained: no --language-model-only
-# Publish guardian registration + soft cgroup label (69G policy; UMA not policed by cgroup).
-ExecStartPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh --publish-registration vllm-aeon-27b-dflash-n12 69
+# Publish the exact Docker cgroup for llm-guard-proxy's integrated guardian.
+ExecStartPost=/home/obj/.local/bin/llm_guard_proxy_publish_cgroup_registration.sh
 # Raw :18010 readiness (defaults target Guard :18009).
 ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh chat http://100.105.4.92:18010 aeon-ultimate --deadline 2200
 ExecStop=/usr/bin/timeout --signal=TERM --kill-after=5 30 /usr/bin/docker stop --time 20 vllm-aeon-27b-dflash-n12
-ExecStopPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh --cleanup-registration
+ExecStopPost=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1 %t/gb10-memory-guardian/aeon-text.cid
 StandardOutput=journal
 StandardError=journal
 

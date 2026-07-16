@@ -232,7 +232,6 @@ verify_aeon_profile() {
     fi
 }
 
-run_systemctl is-active --quiet gb10-swap-guard.service
 run_systemctl is-active --quiet "$GUARD_UNIT"
 require_memory_headroom
 

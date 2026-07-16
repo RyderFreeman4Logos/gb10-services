@@ -101,18 +101,15 @@ Run these commands sequentially to deploy the stack from this repository:
 ```bash
 # Ensure target folders exist
 mkdir -p /home/obj/scripts /home/obj/.local/bin /home/obj/.config/llm-guard-proxy /home/obj/log
-install -d -m 0700 /home/obj/.config/gb10-memory-guardian
 
 # Copy all scripts
 cp scripts/aeon_vllm_wrapper.py /home/obj/scripts/
 cp scripts/aeon_hang_guard.py /home/obj/scripts/
-cp scripts/aeon_healthcheck.sh /home/obj/scripts/
 cp scripts/aeon_chat_ready.py /home/obj/.local/bin/
 cp scripts/gb10_check_mem_available.sh /home/obj/.local/bin/
 cp scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/
+cp scripts/llm_guard_proxy_publish_cgroup_registration.sh /home/obj/.local/bin/
 cp scripts/sysmon.sh /home/obj/.local/bin/
-cp scripts/gb10-swap-guard.sh /home/obj/.local/bin/
-cp scripts/gb10_stack_recovery.sh /home/obj/.local/bin/
 
 # Make executable
 chmod +x /home/obj/scripts/*.sh /home/obj/.local/bin/*
@@ -122,8 +119,7 @@ chmod +x /home/obj/scripts/*.sh /home/obj/.local/bin/*
 ```bash
 # Copy llm-guard-proxy config
 cp config/llm-guard-proxy/config.toml /home/obj/.config/llm-guard-proxy/config.toml
-# The guardian transaction below owns its owner-only config, binary, helpers,
-# text/reranker units, private backups, rollback, reload, and activation canaries.
+# This same config owns the integrated guardian policy.
 ```
 
 ### 3. Build llm-guard-proxy
@@ -143,23 +139,20 @@ If the running guard process still points at a deleted old inode after a
 standalone rebuild, the script restarts only `llm-guard-proxy.service` and
 smokes `/health`; it does not restart any vLLM backend.
 
-### 4. Build and install the memory guardian
-```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --locked
-cargo build --release --locked -p gb10-memory-guardian
-```
+### 4. Verify the integrated guardian profile
+
+The proxy config must enable only `aeon-text` with `mem_threshold_gib = 5`,
+`kill_action = "cgroup-kill"`, `poll_interval_secs = 3`, and
+`registration_file = "text-cgroup.v1"`. The guardian is built into the proxy;
+there is no separate guardian binary or service to install.
 
 ### 5. Systemd User Services Installation
 ```bash
 # Create user-level systemd directory if missing
 mkdir -p /home/obj/.config/systemd/user/
 
-# Install only units outside the guardian/text/reranker transaction.
-install -m 0644 systemd/aeon-healthcheck.service systemd/aeon-healthcheck.timer \
-  systemd/gb10-swap-guard.service systemd/gb10-stack-recovery.service \
-  systemd/llm-guard-proxy.service \
+# Install tracked services.
+install -m 0644 systemd/llm-guard-proxy.service \
   systemd/sysmon.service systemd/vllm-embedding.service \
   /home/obj/.config/systemd/user/
 
@@ -169,57 +162,29 @@ systemctl --user daemon-reload
 
 ### 6. Enable and Start Services
 ```bash
-# Start auxiliary services first
 systemctl --user enable --now sysmon.service
-systemctl --user enable --now gb10-swap-guard.service
-systemctl --user enable --now aeon-healthcheck.timer
 
-# Complete any separately approved model-service maintenance before opening the
-# guardian transaction. The deployer never changes these lifecycles.
+# Start model services and the proxy independently.
 systemctl --user enable --now vllm-embedding.service
 systemctl --user enable --now vllm-aeon-27b-dflash.service
 systemctl --user disable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now querit-4b-reranker.service
 systemctl --user enable --now llm-guard-proxy.service
-
-# Install and immediately activate the complete fail-closed guardian bundle.
-# Do not insert model lifecycle, copy, receipt removal, reload, or standalone
-# canary commands between these transaction phases.
-export GB10_BENCHMARK_EXCLUDED=YES
-scripts/gb10_deploy_memory_guardian.sh install
-scripts/gb10_deploy_memory_guardian.sh activate
 ```
 
-Memory recovery is source-first and text-only. The deployer atomically publishes
-an owner-only manifest that binds source and installed hashes/modes plus exact
-prior artifact and parent-directory bytes, modes, and absences. Install leaves
-the guardian disabled in phase `installed`; activation runs bounded disposable
-and the read-only configured-target identity check for `aeon-text` /
-`text-cgroup.v1`,
-starts the guardian unenabled, and
-enables it only after both pass. Every failure or signal restores the complete
-prior generation before a bounded `daemon-reload`; `rollback_failed` state is
-retained for idempotent recovery and can never be activated. Never replace this
-transaction with loose copy, removal, reload, canary, or guardian lifecycle
-fragments.
+Memory recovery is integrated, source-first, and text-only. The text unit's
+post-start publisher validates the immutable Docker CID and exact rootless
+`app.slice` scope, then atomically publishes owner-only `text-cgroup.v1`.
+`llm-guard-proxy` periodically replaces its pre-opened descriptors when that
+registration changes. It releases its touched reserve and writes directly to
+`cgroup.kill` below 5 GiB `MemAvailable`; no Docker/systemd subprocess is needed
+on the emergency path.
 
-The text unit uses `app.slice` and `Restart=on-failure`. It has no
+The text unit uses `app.slice` and `Restart=always`. It has no
 `Requires=`/`Wants=` edge to embedding. Both rerankers have no `Requires=`,
 `BindsTo=`, `PartOf=`, or text-readiness gate, while Guard has ordering only.
-The Rust guardian is the Tier 1 automatic recovery actor: its allocation-free
-text `cgroup.kill` path remains the first response to critical memory pressure.
-`gb10-stack-recovery.service` is the separate Tier 2 fail-closed oneshot for a
-bounded grace-check failure or failed text restart. It acquires a nonblocking
-runtime lock, permits one attempt per boot, snapshots all three model units,
-stops text, reranker, and embedding, proves their prior PIDs and cgroups are
-gone, and requires at least 40 GiB `MemAvailable` before restoring embedding,
-reranker, then text with raw `/v1/models` readiness gates. It is installed but
-not enabled as an ordinary boot service; only the reviewed escalation trigger
-or an explicitly approved operator action should start it. A failed stop,
-release check, start, or readiness gate does not retry the cycle.
-`gb10-swap-guard.service` remains observer-only and must never stop, kill, or
-restart a model. The guardian deployer itself never changes text, embedding,
-reranker, proxy, or Tier 2 coordinator lifecycle.
+Embedding and reranker are never guardian targets. `sysmon.service` remains
+observer-only and must never stop, kill, or restart a model.
 
 For updates on an already-running GB10, the embedding 32K profile is a
 source-first **single-unit** transaction. Never use the general stack installation
@@ -273,7 +238,7 @@ systemctl --user list-units --type=service --state=running
 
 # Check detailed status of core services
 systemctl --user status vllm-embedding vllm-aeon-27b-dflash querit-4b-reranker \
-  llm-guard-proxy gb10-memory-guardian gb10-swap-guard sysmon
+  llm-guard-proxy sysmon
 ```
 
 ### Retrieve System Resource Log (sysmon output)
