@@ -326,6 +326,11 @@ class MemoryGuardianContractTests(unittest.TestCase):
 
     def test_text_is_the_only_registered_automatic_target(self) -> None:
         text = TEXT_UNIT.read_text()
+        active_text = "\n".join(
+            line
+            for line in text.splitlines()
+            if not line.lstrip().startswith(("#", ";"))
+        )
         text_unit_section = text.split("[Service]", 1)[0]
         self.assertNotIn("Requires=vllm-embedding.service", text_unit_section)
         self.assertNotIn("Wants=vllm-embedding.service", text_unit_section)
@@ -338,40 +343,103 @@ class MemoryGuardianContractTests(unittest.TestCase):
             "GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1",
             text,
         )
-        self.assertRegex(text, r"(?m)^Restart=on-failure$")
-
-        for protected in (
-            EMBEDDING_UNIT.read_text(),
-            QUERIT_UNIT.read_text(),
-            LEGACY_RERANKER_UNIT.read_text(),
+        self.assertIn(
+            "(v0.25.0, seqs=16, batch=16384, util=0.6, AUTO KV,",
+            text,
+        )
+        for option in (
+            "--max-num-seqs 16",
+            "--max-num-batched-tokens 16384",
+            "--gpu-memory-utilization 0.60",
         ):
+            self.assertIn(f"    {option} \\", active_text)
+        self.assertNotIn("--kv-cache-memory-bytes", active_text)
+        self.assertIn(
+            "ExecStartPost=/home/obj/.local/bin/"
+            "gb10_enforce_docker_cgroup_limits.sh --publish-registration "
+            "vllm-aeon-27b-dflash-n12 69",
+            active_text,
+        )
+        self.assertEqual(active_text.count("--publish-registration"), 1)
+        self.assertRegex(text, r"(?m)^Restart=always$")
+
+        protected_units = {
+            EMBEDDING_UNIT.name: EMBEDDING_UNIT.read_text(),
+            QUERIT_UNIT.name: QUERIT_UNIT.read_text(),
+            LEGACY_RERANKER_UNIT.name: LEGACY_RERANKER_UNIT.read_text(),
+        }
+        for name, protected in protected_units.items():
+            active_protected = "\n".join(
+                line
+                for line in protected.splitlines()
+                if not line.lstrip().startswith(("#", ";"))
+            )
             self.assertNotIn("GB10_CGROUP_REGISTRATION_PATH", protected)
             self.assertNotIn("text-cgroup.v1", protected)
+            self.assertNotIn(
+                "--publish-registration",
+                active_protected,
+                f"{name} must not publish a guardian registration",
+            )
 
-    def test_rerankers_and_guard_do_not_own_text_lifecycle(self) -> None:
-        for path in (QUERIT_UNIT, LEGACY_RERANKER_UNIT):
-            unit = path.read_text()
-            unit_section = unit.split("[Service]", 1)[0]
-            for relationship in (
-                "Requires=",
-                "BindsTo=",
-                "PartOf=",
-                "PropagatesStopTo=",
-                "StopPropagatedFrom=",
-            ):
-                self.assertNotRegex(
-                    unit_section,
-                    rf"(?m)^{relationship}.*vllm-aeon-27b-dflash\.service",
-                )
-            self.assertNotIn("http://100.105.4.92:18010", unit)
-            self.assertIn("lifecycle-independent", unit)
+        active_embedding = "\n".join(
+            line
+            for line in protected_units[EMBEDDING_UNIT.name].splitlines()
+            if not line.lstrip().startswith(("#", ";"))
+        )
+        self.assertNotIn("gb10_enforce_docker_cgroup_limits.sh", active_embedding)
+
+        publish_registration_callers = []
+        for path in sorted((ROOT / "systemd").glob("*.service")):
+            active_unit = "\n".join(
+                line
+                for line in path.read_text().splitlines()
+                if not line.lstrip().startswith(("#", ";"))
+            )
+            if "--publish-registration" in active_unit:
+                publish_registration_callers.append(path.name)
+        self.assertEqual(publish_registration_callers, [TEXT_UNIT.name])
+
+    def test_reranker_follows_text_lifecycle_and_legacy_does_not(self) -> None:
+        # Querit follows text (Requires+After) for UMA-safe restart.
+        querit = QUERIT_UNIT.read_text()
+        querit_section = querit.split("[Service]", 1)[0]
+        self.assertIn(
+            "Requires=vllm-aeon-27b-dflash.service", querit_section
+        )
+        self.assertIn(
+            "After=network.target vllm-aeon-27b-dflash.service", querit_section
+        )
+        # No BindsTo/PartOf — Requires is sufficient for lifecycle coupling.
+        for relationship in ("BindsTo=", "PartOf=", "PropagatesStopTo="):
+            self.assertNotRegex(
+                querit_section,
+                rf"(?m)^{relationship}.*vllm-aeon-27b-dflash\\.service",
+            )
+        self.assertNotIn("http://100.105.4.92:18010", querit)
+
+        # Legacy reranker must not couple to text.
+        legacy = LEGACY_RERANKER_UNIT.read_text()
+        legacy_section = legacy.split("[Service]", 1)[0]
+        for relationship in (
+            "Requires=",
+            "BindsTo=",
+            "PartOf=",
+            "PropagatesStopTo=",
+        ):
+            self.assertNotRegex(
+                legacy_section,
+                rf"(?m)^{relationship}.*vllm-aeon-27b-dflash\\.service",
+            )
+
+        # Text must not point back at reranker.
         text_unit_section = TEXT_UNIT.read_text().split("[Service]", 1)[0]
         for relationship in ("Conflicts=", "PropagatesStopTo="):
             for line in text_unit_section.splitlines():
                 if line.startswith(relationship):
                     self.assertNotIn("querit-4b-reranker.service", line)
                     self.assertNotIn("vllm-qwen3-reranker-8b.service", line)
-        self.assertIn("Conflicts=vllm-qwen3-reranker-8b.service", QUERIT_UNIT.read_text())
+        self.assertIn("Conflicts=vllm-qwen3-reranker-8b.service", querit)
         self.assertIn("querit-4b-reranker.service", LEGACY_RERANKER_UNIT.read_text())
         self.assertNotIn("gb10-memory-guardian.service", QUERIT_UNIT.read_text())
 

@@ -408,8 +408,10 @@ class ExactCleanupTriStateTests(unittest.TestCase):
         self.assertEqual((self.cgroup / "cgroup.kill").read_text(), "")
 
 class CapOnlyEnforcementTests(unittest.TestCase):
+    # Embedding no longer uses cgroup enforce — it uses --enforce-eager (stable
+    # memory) and a readiness poll instead (v0.25 image starts too slowly for
+    # the cap-only docker inspect race).
     CALLERS = (
-        (EMBEDDING_UNIT, "vllm-embedding", 20),
         (QUERIT_UNIT, "querit-4b-reranker", 18),
         (LEGACY_RERANKER_UNIT, "vllm-qwen3-reranker-8b", 24),
     )

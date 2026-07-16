@@ -1,8 +1,8 @@
 [Unit]
-Description=vLLM Qwen3-Embedding-8B (AEON v0.24 GB10 image, raw backend port 18012, behind llm-guard-proxy listeners 18009/18002/18005, reliability-first, 32k contract, 64 seq, post-start swap enforcement)
+Description=vLLM Qwen3-Embedding-8B (AEON v0.25 GB10 image, raw backend port 18012, behind llm-guard-proxy listeners 18009/18002/18005, reliability-first, 32k contract, 64 seq)
 After=network.target
 StartLimitIntervalSec=600
-StartLimitBurst=3
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -24,16 +24,14 @@ TimeoutStopSec=60
 
 ExecStartPre=-/usr/bin/docker rm -f vllm-embedding
 ExecStart=/usr/bin/docker run --rm --name vllm-embedding \
-  --gpus all --ipc host --dns 8.8.8.8 --dns 1.1.1.1 \
+  --gpus all --ipc host \
   -p 100.105.4.92:18012:8000 \
   -v /home/obj/.cache/huggingface:/root/.cache/huggingface \
   -e HF_HUB_OFFLINE=1 \
-  --memory 20g \
-  --memory-swap 20g \
   --memory-swappiness 0 \
   --oom-score-adj 0 \
   --entrypoint python3 \
-  ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0 \
+  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55 \
   /usr/local/bin/vllm serve Qwen/Qwen3-Embedding-8B \
     --host 0.0.0.0 --port 8000 \
     --served-model-name qwen3-embedding-8b Qwen/Qwen3-Embedding-8B \
@@ -43,13 +41,13 @@ ExecStart=/usr/bin/docker run --rm --name vllm-embedding \
     --max-num-batched-tokens 8192 \
     --max-num-seqs 64 \
     --kv-cache-memory-bytes 4800M \
-    --enforce-eager
-# Rootless Docker can accept --memory-swap while leaving memory.swap.max=max.
-# Enforce the generated docker scope directly. The 20G value is a hard ceiling,
-# not reserved memory; the smaller 4800M KV budget creates the expected UMA gain.
-# Target ordinary caps are 69+20+18=107GiB, about 14.6GiB below a 121.6GiB host.
-ExecStartPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh vllm-embedding 20
-ExecStop=/usr/bin/docker stop vllm-embedding
+    --gpu-memory-utilization 0.60 --enforce-eager
+# No docker --memory and no cgroup enforce: embedding uses --enforce-eager
+# (stable memory, no cudagraph capture peak). The v0.25 image starts slower
+# than v0.24, so cap-only cgroup enforce races with container registration.
+# Readiness is verified by polling the public metadata endpoint instead.
+ExecStartPost=/bin/bash -c 'for i in $(seq 1 120); do curl -fsS --max-time 3 http://100.105.4.92:18012/v1/models >/dev/null 2>&1 && exit 0; sleep 2; done; echo "embedding models not ready after 4min"; exit 1'
+ExecStop=/usr/bin/docker stop --time 20 vllm-embedding
 StandardOutput=journal
 StandardError=journal
 

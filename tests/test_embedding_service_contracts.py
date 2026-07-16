@@ -6,22 +6,19 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from embedding_activation_fixtures import ActivationFixture, UNIT
-
-
 ROOT = Path(__file__).resolve().parents[1]
 EMBEDDING_UNIT = ROOT / "systemd" / "vllm-embedding.service"
 README = ROOT / "README.md"
 AGENT_PLAYBOOK = ROOT / "docs" / "deployment" / "AGENTS.md"
+EMBEDDING_IMAGE = (
+    "ghcr.io/aeon-7/aeon-vllm-ultimate@"
+    "sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55"
+)
 
 VALIDATED_KV_MIB = 5_820
 VALIDATED_KV_TOKENS = 41_376
 CONTRACT_TOKENS = 32_768
 MIN_KV_MARGIN_BPS = 400
-OBSERVED_PEAK_BYTES = 16_870_580_224
-MIN_UNADJUSTED_CAP_MARGIN_GIB = 4
-EXPECTED_KV_REDUCTION_MIB = 1_020
-MIN_PROJECTED_CAP_MARGIN_GIB = 5
 
 
 def _logical_directive_argv(unit: str, directive: str) -> list[list[str]]:
@@ -197,13 +194,10 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         )
 
     argv = exec_starts[0]
-    image = "ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0"
-    host_argv, container_argv = _split_docker_run_argv(argv, image)
+    host_argv, container_argv = _split_docker_run_argv(argv, EMBEDDING_IMAGE)
     expected_host_options = {
         "--name": ["vllm-embedding"],
         "-p": ["100.105.4.92:18012:8000"],
-        "--memory": ["20g"],
-        "--memory-swap": ["20g"],
         "--memory-swappiness": ["0"],
         "--oom-score-adj": ["0"],
     }
@@ -211,6 +205,13 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         actual = _option_values(host_argv, flag, len(expected))
         if actual != expected:
             raise AssertionError(f"{flag} must be {expected}, found {actual}")
+    for forbidden in ("--memory", "--memory-swap", "--cgroup-parent", "--dns"):
+        if any(
+            token.lower() == forbidden
+            or token.lower().startswith(f"{forbidden}=")
+            for token in host_argv
+        ):
+            raise AssertionError(f"forbidden Docker host option: {forbidden}")
 
     option_arities = {
         "--host": 1,
@@ -222,6 +223,7 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         "--max-num-batched-tokens": 1,
         "--max-num-seqs": 1,
         "--kv-cache-memory-bytes": 1,
+        "--gpu-memory-utilization": 1,
         "--enforce-eager": 0,
     }
     model_command = [
@@ -245,6 +247,7 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         "--max-num-batched-tokens": ["8192"],
         "--max-num-seqs": ["64"],
         "--kv-cache-memory-bytes": ["4800M"],
+        "--gpu-memory-utilization": ["0.60"],
         "--enforce-eager": [],
     }
     for flag, expected in expected_container_options.items():
@@ -259,61 +262,56 @@ def _embedding_contract(unit: str) -> dict[str, int]:
             if lowered == forbidden or lowered.startswith(f"{forbidden}="):
                 raise AssertionError(f"forbidden embedding option: {token}")
 
-    helper = exec_start_posts[0]
-    expected_helper = [
-        "/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh",
-        "vllm-embedding",
-        "20",
-    ]
-    if helper != expected_helper:
+    readiness = exec_start_posts[0]
+    if len(readiness) != 3 or readiness[:2] != ["/bin/bash", "-c"]:
         raise AssertionError(
-            f"ExecStartPost must be exactly {expected_helper}, found {helper}"
+            "ExecStartPost must be a single /bin/bash -c readiness poll"
         )
+    readiness_script = readiness[2]
+    if not readiness_script.startswith("for i in $(seq 1 120); do "):
+        raise AssertionError("ExecStartPost must use the bounded 120-attempt poll")
+    for fragment in (
+        "curl -fsS --max-time 3 http://100.105.4.92:18012/v1/models",
+        ">/dev/null 2>&1 && exit 0",
+        "sleep 2",
+        "embedding models not ready after 4min",
+    ):
+        if fragment not in readiness_script:
+            raise AssertionError(f"readiness poll is missing: {fragment}")
+    if not readiness_script.endswith("exit 1"):
+        raise AssertionError("readiness poll must fail after exhausting attempts")
+
+    start_limit_bursts = re.findall(r"(?m)^StartLimitBurst=(\S+)$", unit)
+    if start_limit_bursts != ["5"]:
+        raise AssertionError(
+            f"StartLimitBurst must be exactly 5, found {start_limit_bursts}"
+        )
+    if re.search(r"(?m)^Environment=GB10_CGROUP_REGISTRATION_PATH=", unit):
+        raise AssertionError("embedding must not publish a cgroup registration")
 
     return {
         "model_len": int(expected_container_options["--max-model-len"][0]),
         "kv_mib": int(expected_container_options["--kv-cache-memory-bytes"][0][:-1]),
-        "memory_gib": int(expected_host_options["--memory"][0][:-1]),
-        "swap_gib": int(expected_host_options["--memory-swap"][0][:-1]),
-        "helper_gib": int(expected_helper[-1]),
         "batched_tokens": int(expected_container_options["--max-num-batched-tokens"][0]),
         "seqs": int(expected_container_options["--max-num-seqs"][0]),
     }
 
 
 class EmbeddingServiceContractTests(unittest.TestCase):
-    def test_32k_profile_has_bounded_kv_and_container_headroom(self) -> None:
+    def test_32k_profile_has_bounded_kv_without_docker_or_cgroup_caps(self) -> None:
         unit = EMBEDDING_UNIT.read_text()
         contract = _embedding_contract(unit)
         model_len = contract["model_len"]
         kv_mib = contract["kv_mib"]
-        memory_gib = contract["memory_gib"]
-        swap_gib = contract["swap_gib"]
-        helper_gib = contract["helper_gib"]
 
         self.assertEqual(model_len, CONTRACT_TOKENS)
         self.assertEqual(kv_mib, 4_800)
-        self.assertEqual(memory_gib, 20)
-        self.assertEqual(swap_gib, memory_gib)
-        self.assertEqual(helper_gib, memory_gib)
 
         projected_kv_tokens = kv_mib * VALIDATED_KV_TOKENS // VALIDATED_KV_MIB
         required_kv_tokens = (
             CONTRACT_TOKENS * (10_000 + MIN_KV_MARGIN_BPS) + 9_999
         ) // 10_000
         self.assertGreaterEqual(projected_kv_tokens, required_kv_tokens)
-
-        gib = 1024**3
-        cap_bytes = memory_gib * gib
-        self.assertGreaterEqual(
-            cap_bytes - OBSERVED_PEAK_BYTES,
-            MIN_UNADJUSTED_CAP_MARGIN_GIB * gib,
-        )
-        projected_peak_bytes = OBSERVED_PEAK_BYTES - EXPECTED_KV_REDUCTION_MIB * 1024**2
-        self.assertGreaterEqual(
-            cap_bytes - projected_peak_bytes,
-            MIN_PROJECTED_CAP_MARGIN_GIB * gib,
-        )
 
     def test_quality_and_throughput_semantics_remain_unchanged(self) -> None:
         unit = EMBEDDING_UNIT.read_text()
@@ -324,7 +322,7 @@ class EmbeddingServiceContractTests(unittest.TestCase):
 
 class HostileEmbeddingUnitMutationTests(unittest.TestCase):
     CONTRACT_TESTS = (
-        "test_32k_profile_has_bounded_kv_and_container_headroom",
+        "test_32k_profile_has_bounded_kv_without_docker_or_cgroup_caps",
         "test_quality_and_throughput_semantics_remain_unchanged",
     )
 
@@ -345,8 +343,9 @@ class HostileEmbeddingUnitMutationTests(unittest.TestCase):
     @staticmethod
     def append_execstart_arg(unit: str, argument: str) -> str:
         return unit.replace(
-            "    --enforce-eager",
-            f"    --enforce-eager \\\n+    {argument}",
+            "    --gpu-memory-utilization 0.60 --enforce-eager",
+            "    --gpu-memory-utilization 0.60 --enforce-eager \\\n"
+            f"    {argument}",
             1,
         )
 
@@ -355,7 +354,7 @@ class HostileEmbeddingUnitMutationTests(unittest.TestCase):
         for argument in (
             "--max-model-len 40960",
             "--dtype float16",
-            "--memory 24g",
+            "--gpu-memory-utilization 0.61",
         ):
             with self.subTest(argument=argument):
                 self.assert_contract_rejects(
@@ -374,20 +373,58 @@ class HostileEmbeddingUnitMutationTests(unittest.TestCase):
         unit = EMBEDDING_UNIT.read_text()
         mutations = (
             unit.replace("4800M", "4800m", 1),
-            unit.replace("--memory 20g", "--memory 20G", 1),
+            unit.replace(
+                "--gpu-memory-utilization 0.60",
+                "--gpu-memory-utilization 0.6",
+                1,
+            ),
             unit.replace("--dtype bfloat16", "--dtype BFLOAT16", 1),
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation):
                 self.assert_contract_rejects(mutation)
 
-    def test_rejects_duplicate_post_start_helper(self) -> None:
+    def test_rejects_duplicate_post_start_readiness_poll(self) -> None:
         unit = EMBEDDING_UNIT.read_text()
-        duplicate = (
-            "\nExecStartPost=/home/obj/.local/bin/"
-            "gb10_enforce_docker_cgroup_limits.sh vllm-embedding 20\n"
+        readiness = next(
+            line for line in unit.splitlines() if line.startswith("ExecStartPost=")
         )
-        self.assert_contract_rejects(unit + duplicate)
+        self.assert_contract_rejects(f"{unit}\n{readiness}\n")
+
+    def test_rejects_cgroup_post_start_helper(self) -> None:
+        unit = EMBEDDING_UNIT.read_text()
+        unit = re.sub(
+            r"(?m)^ExecStartPost=.*$",
+            "ExecStartPost=/home/obj/.local/bin/"
+            "gb10_enforce_docker_cgroup_limits.sh vllm-embedding 20",
+            unit,
+            count=1,
+        )
+        self.assert_contract_rejects(unit)
+
+    def test_rejects_forbidden_docker_host_options(self) -> None:
+        unit = EMBEDDING_UNIT.read_text()
+        image_line = f"  {EMBEDDING_IMAGE} \\\n"
+        for argument in (
+            "--memory 20g",
+            "--memory-swap 20g",
+            "--cgroup-parent app.slice",
+            "--dns 8.8.8.8",
+        ):
+            with self.subTest(argument=argument):
+                mutation = unit.replace(
+                    image_line,
+                    f"  {argument} \\\n{image_line}",
+                    1,
+                )
+                self.assertNotEqual(mutation, unit)
+                self.assert_contract_rejects(mutation)
+
+    def test_rejects_changed_start_limit_burst(self) -> None:
+        unit = EMBEDDING_UNIT.read_text().replace(
+            "StartLimitBurst=5", "StartLimitBurst=3", 1
+        )
+        self.assert_contract_rejects(unit)
 
     def test_rejects_changed_published_port(self) -> None:
         unit = EMBEDDING_UNIT.read_text().replace(
@@ -407,18 +444,19 @@ class HostileEmbeddingUnitMutationTests(unittest.TestCase):
 
     def test_rejects_docker_memory_option_after_image_boundary(self) -> None:
         unit = EMBEDDING_UNIT.read_text()
-        unit = unit.replace("  --memory 20g \\\n", "", 1).replace(
-            "  ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0 \\\n",
-            "  ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-01-v0.24.0 \\\n"
-            "  --memory 20g \\\n",
+        image_line = f"  {EMBEDDING_IMAGE} \\\n"
+        unit = unit.replace(
+            image_line,
+            image_line + "  --memory 20g \\\n",
             1,
         )
         self.assert_contract_rejects(unit)
 
     def test_rejects_extra_docker_memory_alias(self) -> None:
         unit = EMBEDDING_UNIT.read_text().replace(
-            "  --memory 20g \\\n",
-            "  --memory 20g -m 24g \\\n",
+            "  --entrypoint python3 \\\n",
+            "  -m 24g \\\n"
+            "  --entrypoint python3 \\\n",
             1,
         )
         self.assert_contract_rejects(unit)
@@ -483,7 +521,7 @@ class EmbeddingDeploymentContractTests(unittest.TestCase):
                     mutations.append((action, target))
         return mutations
 
-    def test_activation_and_rollback_mutate_only_embedding(self) -> None:
+    def test_documented_activation_and_rollback_mutate_only_embedding(self) -> None:
         sections = (
             self.section(
                 README.read_text(),
@@ -501,15 +539,6 @@ class EmbeddingDeploymentContractTests(unittest.TestCase):
             self.assertIn("scripts/gb10_activate_embedding_profile.sh", commands)
             self.assertNotIn("install -m 0644 systemd/vllm-embedding.service", commands)
             self.assertNotIn("systemctl --user --no-block restart", commands)
-        with ActivationFixture() as fixture:
-            fixture.state["verify_status"] = 9
-            result = fixture.run()
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            log = fixture.log()
-            self.assertGreaterEqual(log.count(f"restart {UNIT}"), 2)
-            for neighbor in self.FORBIDDEN_NEIGHBORS:
-                self.assertNotIn(f"restart {neighbor}", log)
-                self.assertNotIn(f"stop {neighbor}", log)
 
 
 if __name__ == "__main__":

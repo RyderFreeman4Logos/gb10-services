@@ -1,7 +1,9 @@
 [Unit]
 Description=Querit-4B transformers rerank server (raw :18013; Qwen3 reranker aliases)
-# lifecycle-independent from text: guardian recovery must not change reranker state.
-After=network.target
+# Follows text lifecycle so text restart frees UMA peak for torch.compile.
+# Embedding is never touched by this dependency.
+After=network.target vllm-aeon-27b-dflash.service
+Requires=vllm-aeon-27b-dflash.service
 Conflicts=vllm-qwen3-reranker-8b.service
 StartLimitIntervalSec=600
 StartLimitBurst=3

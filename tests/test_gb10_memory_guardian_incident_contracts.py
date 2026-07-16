@@ -67,9 +67,9 @@ class DeploymentTransactionTests(unittest.TestCase):
             "systemd/vllm-aeon-27b-dflash.service": (
                 "[Unit]\n[Service]\n"
                 "Environment=GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1\n"
-                "Restart=on-failure\nExecStart=/usr/bin/docker run --cgroup-parent app.slice image\n"
+                "Restart=always\nExecStart=/usr/bin/docker run --cgroup-parent app.slice image\n"
             ),
-            "systemd/querit-4b-reranker.service": "[Unit]\n# lifecycle-independent\n[Service]\n",
+            "systemd/querit-4b-reranker.service": "[Unit]\n# Follows text\n[Service]\n",
             "systemd/vllm-qwen3-reranker-8b.service": "[Unit]\n# lifecycle-independent\n[Service]\n",
         }
         for relative, contents in sources.items():
