@@ -344,12 +344,12 @@ class MemoryGuardianContractTests(unittest.TestCase):
             text,
         )
         self.assertIn(
-            "(v0.25.0, seqs=16, batch=16384, util=0.6, AUTO KV,",
+            "(v0.25.0, seqs=16, batch=4096, util=0.6, AUTO KV,",
             text,
         )
         for option in (
             "--max-num-seqs 16",
-            "--max-num-batched-tokens 16384",
+            "--max-num-batched-tokens 4096",
             "--gpu-memory-utilization 0.60",
         ):
             self.assertIn(f"    {option} \\", active_text)
@@ -400,16 +400,11 @@ class MemoryGuardianContractTests(unittest.TestCase):
                 publish_registration_callers.append(path.name)
         self.assertEqual(publish_registration_callers, [TEXT_UNIT.name])
 
-    def test_reranker_follows_text_lifecycle_and_legacy_does_not(self) -> None:
-        # Querit follows text (Requires+After) for UMA-safe restart.
+    def test_reranker_is_independent_of_text_lifecycle(self) -> None:
         querit = QUERIT_UNIT.read_text()
         querit_section = querit.split("[Service]", 1)[0]
-        self.assertIn(
-            "Requires=vllm-aeon-27b-dflash.service", querit_section
-        )
-        self.assertIn(
-            "After=network.target vllm-aeon-27b-dflash.service", querit_section
-        )
+        self.assertNotIn("Requires=vllm-aeon-27b-dflash.service", querit_section)
+        self.assertNotIn("After=vllm-aeon-27b-dflash.service", querit_section)
         # No BindsTo/PartOf — Requires is sufficient for lifecycle coupling.
         for relationship in ("BindsTo=", "PartOf=", "PropagatesStopTo="):
             self.assertNotRegex(
@@ -439,7 +434,7 @@ class MemoryGuardianContractTests(unittest.TestCase):
                 if line.startswith(relationship):
                     self.assertNotIn("querit-4b-reranker.service", line)
                     self.assertNotIn("vllm-qwen3-reranker-8b.service", line)
-        self.assertIn("Conflicts=vllm-qwen3-reranker-8b.service", querit)
+        self.assertIn("vllm-qwen3-reranker-8b.service", querit)
         self.assertIn("querit-4b-reranker.service", LEGACY_RERANKER_UNIT.read_text())
         self.assertNotIn("gb10-memory-guardian.service", QUERIT_UNIT.read_text())
 

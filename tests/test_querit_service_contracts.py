@@ -209,21 +209,11 @@ class QueritServiceContractTests(unittest.TestCase):
     def test_unit_follows_text_lifecycle_for_uma_safe_restart(self) -> None:
         unit = QUERIT_UNIT.read_text()
         unit_section = unit.split("[Service]", 1)[0]
-        # Reranker follows text so text restart frees UMA peak.
-        self.assertIn(
-            "After=network.target vllm-aeon-27b-dflash.service", unit_section
-        )
-        self.assertIn(
-            "Requires=vllm-aeon-27b-dflash.service", unit_section
-        )
-        # Still no BindsTo/PartOf — we don't want stop propagation from text crash
-        # to be stronger than Requires already provides.
-        for relationship in ("BindsTo=", "PartOf="):
-            self.assertNotRegex(
-                unit_section,
-                rf"(?m)^{relationship}.*vllm-aeon-27b-dflash\\.service",
-            )
-        self.assertIn("Conflicts=vllm-qwen3-reranker-8b.service", unit)
+        # Reranker is independent of text lifecycle so it doesn't stop during
+        # text restart (user cannot accept rr downtime).
+        self.assertNotIn("Requires=vllm-aeon-27b-dflash.service", unit_section)
+        self.assertNotIn("After=vllm-aeon-27b-dflash.service", unit_section)
+        self.assertIn("Conflicts=vllm-reranker.service", unit)
         self.assertNotIn("http://100.105.4.92:18010", unit)
         self.assertIn("gb10_check_mem_available.sh 2", unit)
         self.assertIn("--memory 18g", unit)

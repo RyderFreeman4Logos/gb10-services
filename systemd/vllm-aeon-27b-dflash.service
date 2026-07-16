@@ -57,6 +57,8 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
   -v /home/obj/.cache/huggingface/hub/models--AEON-7--Qwen3.6-27B-AEON-Ultimate-Uncensored-Multimodal-NVFP4-MTP-XS:/models/aeon-cache:ro \
   -v /home/obj/.cache/huggingface/hub/models--z-lab--Qwen3.6-27B-DFlash:/models/dflash-cache:ro \
   -v /home/obj/.cache/vllm-compile/aeon-qwen36-v025-18c09e:/var/cache/vllm/aeon-qwen36-v025 \
+  -v /home/obj/.cache/flashinfer-025:/root/.cache/flashinfer \
+  -v /home/obj/.cache/vllm-flashinfer-autotune-025:/root/.cache/vllm/flashinfer_autotune_cache \
   -v /home/obj/scripts/aeon_hang_guard.py:/opt/hang_guard/aeon_hang_guard.py:ro \
   -v /home/obj/scripts/aeon_vllm_wrapper.py:/opt/hang_guard/aeon_vllm_wrapper.py:ro \
   -e HF_HUB_OFFLINE=1 \
