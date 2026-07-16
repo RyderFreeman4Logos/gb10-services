@@ -222,6 +222,7 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         "--max-model-len": 1,
         "--max-num-batched-tokens": 1,
         "--max-num-seqs": 1,
+        "--kv-cache-memory-bytes": 1,
         "--gpu-memory-utilization": 1,
         "--enforce-eager": 0,
     }
@@ -245,6 +246,7 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         "--max-model-len": ["32768"],
         "--max-num-batched-tokens": ["8192"],
         "--max-num-seqs": ["64"],
+        "--kv-cache-memory-bytes": ["4800M"],
         "--gpu-memory-utilization": ["0.15"],
         "--enforce-eager": [],
     }
@@ -252,13 +254,6 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         actual = parsed_options[flag]
         if actual != expected:
             raise AssertionError(f"{flag} must be {expected}, found {actual}")
-
-    # AUTO KV: --kv-cache-memory-bytes must NOT be present (pinning bypasses
-    # UMA memory profiling, same rationale as the text service).
-    if "--kv-cache-memory-bytes" in parsed_options:
-        raise AssertionError(
-            "embedding must not pin --kv-cache-memory-bytes (use AUTO KV with util)"
-        )
 
     forbidden_options = ("--quantization", "--kv-cache-dtype", "--truncate-dim")
     for token in container_argv:
@@ -290,22 +285,27 @@ def _embedding_contract(unit: str) -> dict[str, int]:
 
     return {
         "model_len": int(expected_container_options["--max-model-len"][0]),
+        "kv_mib": int(expected_container_options["--kv-cache-memory-bytes"][0][:-1]),
         "batched_tokens": int(expected_container_options["--max-num-batched-tokens"][0]),
         "seqs": int(expected_container_options["--max-num-seqs"][0]),
     }
 
 
 class EmbeddingServiceContractTests(unittest.TestCase):
-    def test_32k_profile_uses_auto_kv_with_low_utilization(self) -> None:
+    def test_32k_profile_has_bounded_kv_for_coresident_stability(self) -> None:
         unit = EMBEDDING_UNIT.read_text()
         contract = _embedding_contract(unit)
         model_len = contract["model_len"]
+        kv_mib = contract["kv_mib"]
 
         self.assertEqual(model_len, CONTRACT_TOKENS)
-        # AUTO KV: no pin. vLLM sizes the pool from util * free GPU memory.
-        # util=0.08 gives ~10G on a 121G UMA device — enough for embedding
-        # weights (~4G) plus a healthy KV pool for 32k token batches.
-        # The key invariant: --enforce-eager keeps memory flat (no cudagraph peak).
+        self.assertEqual(kv_mib, 4_800)
+
+        projected_kv_tokens = kv_mib * VALIDATED_KV_TOKENS // VALIDATED_KV_MIB
+        required_kv_tokens = (
+            CONTRACT_TOKENS * (10_000 + MIN_KV_MARGIN_BPS) + 9_999
+        ) // 10_000
+        self.assertGreaterEqual(projected_kv_tokens, required_kv_tokens)
 
     def test_quality_and_throughput_semantics_remain_unchanged(self) -> None:
         unit = EMBEDDING_UNIT.read_text()
@@ -316,7 +316,7 @@ class EmbeddingServiceContractTests(unittest.TestCase):
 
 class HostileEmbeddingUnitMutationTests(unittest.TestCase):
     CONTRACT_TESTS = (
-        "test_32k_profile_uses_auto_kv_with_low_utilization",
+        "test_32k_profile_has_bounded_kv_for_coresident_stability",
         "test_quality_and_throughput_semantics_remain_unchanged",
     )
 
