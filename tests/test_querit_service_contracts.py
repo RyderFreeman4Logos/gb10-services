@@ -226,13 +226,18 @@ class QueritServiceContractTests(unittest.TestCase):
         readiness_deadline = int(deadline_match.group(1))
         self.assertGreaterEqual(int(timeout.group(1)), readiness_deadline + 60)
 
-    def test_guard_orders_after_backends_without_owning_lifecycle(self) -> None:
+    def test_guard_starts_independently_to_protect_backend_startup(self) -> None:
         unit = GUARD_UNIT.read_text()
         unit_section = unit.split("[Service]", 1)[0]
-        self.assertIn("querit-4b-reranker.service", unit_section)
-        self.assertNotIn("vllm-qwen3-reranker-8b.service", unit_section)
+        for backend in (
+            "vllm-aeon-27b-dflash.service",
+            "vllm-embedding.service",
+            "querit-4b-reranker.service",
+            "vllm-qwen3-reranker-8b.service",
+        ):
+            self.assertNotIn(backend, unit_section)
         self.assertNotRegex(unit_section, r"(?m)^Wants=.*vllm-")
-        self.assertIn("Ordering only", unit_section)
+        self.assertIn("protects backend startup", unit_section)
         for setting in (
             "MemoryHigh=1792M",
             "MemoryMax=2G",

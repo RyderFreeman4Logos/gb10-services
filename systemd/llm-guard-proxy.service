@@ -1,7 +1,7 @@
 [Unit]
 Description=llm-guard-proxy guard wrapper for GB10 model upstreams
-After=network.target vllm-embedding.service vllm-aeon-27b-dflash.service querit-4b-reranker.service
-# Ordering only: Guard does not own backend lifecycle or participate in text recovery.
+After=network.target
+# Start independently so the integrated guardian protects backend startup.
 
 [Service]
 Type=simple
