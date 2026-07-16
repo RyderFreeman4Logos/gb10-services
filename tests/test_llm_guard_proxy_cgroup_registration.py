@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PUBLISHER = ROOT / "scripts" / "llm_guard_proxy_publish_cgroup_registration.sh"
 CONFIG = ROOT / "config" / "llm-guard-proxy" / "config.toml"
 TEXT_UNIT = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
+PROXY_UNIT = ROOT / "systemd" / "llm-guard-proxy.service"
 
 
 class IntegratedGuardianRegistrationTests(unittest.TestCase):
@@ -35,6 +36,12 @@ class IntegratedGuardianRegistrationTests(unittest.TestCase):
         unit = TEXT_UNIT.read_text()
         self.assertIn(PUBLISHER.name, unit)
         self.assertNotIn("gb10_enforce_docker_cgroup_limits", unit)
+        proxy_unit = PROXY_UNIT.read_text()
+        self.assertIn(
+            "--guardian-runtime-dir %t/gb10-memory-guardian", proxy_unit
+        )
+        self.assertIn("ReadWritePaths=", proxy_unit)
+        self.assertIn("/sys/fs/cgroup", proxy_unit)
         for path in (
             ROOT / "systemd" / "gb10-memory-guardian.service",
             ROOT / "systemd" / "gb10-stack-recovery.service",

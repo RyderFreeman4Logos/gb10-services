@@ -11,7 +11,9 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadOnlyPaths=/home/obj/.config/llm-guard-proxy /home/obj/.local/bin/llm-guard-proxy
-ReadWritePaths=/home/obj/.local/state /home/obj/.local/state/llm-guard-proxy
+# The integrated guardian must retain a writable cgroup.kill descriptor for the
+# dynamically generated text Docker scope. Registration state itself lives in %t.
+ReadWritePaths=/home/obj/.local/state /home/obj/.local/state/llm-guard-proxy /sys/fs/cgroup
 CacheDirectory=llm-guard-proxy-evidence
 CacheDirectoryMode=0700
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
@@ -26,7 +28,7 @@ OOMScoreAdjust=-200
 ExecStartPre=/usr/bin/test -r /home/obj/.config/llm-guard-proxy/config.toml
 ExecStartPre=/usr/bin/mkdir -p /home/obj/.local/state/llm-guard-proxy
 
-ExecStart=/home/obj/.local/bin/llm-guard-proxy --config /home/obj/.config/llm-guard-proxy/config.toml
+ExecStart=/home/obj/.local/bin/llm-guard-proxy --config /home/obj/.config/llm-guard-proxy/config.toml --guardian-runtime-dir %t/gb10-memory-guardian
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
