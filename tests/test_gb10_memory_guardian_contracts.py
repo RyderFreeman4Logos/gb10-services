@@ -344,13 +344,13 @@ class MemoryGuardianContractTests(unittest.TestCase):
             text,
         )
         self.assertIn(
-            "(v0.25.0, seqs=16, batch=4096, util=0.6, AUTO KV,",
+            "(v0.25.0, seqs=16, batch=4096, util=0.45, AUTO KV,",
             text,
         )
         for option in (
             "--max-num-seqs 16",
             "--max-num-batched-tokens 4096",
-            "--gpu-memory-utilization 0.60",
+            "--gpu-memory-utilization 0.45",
         ):
             self.assertIn(f"    {option} \\", active_text)
         self.assertNotIn("--kv-cache-memory-bytes", active_text)

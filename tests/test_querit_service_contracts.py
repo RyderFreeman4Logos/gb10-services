@@ -102,7 +102,7 @@ def _aeon_contract(unit: str) -> dict[str, int | float]:
 
 
 def _assert_aeon_headroom_evidence(contract: dict[str, int | float]) -> None:
-    if contract["util"] > 0.65:
+    if contract["util"] > 0.55:
         raise AssertionError(
             "gpu-memory-utilization above 0.65 requires updated UMA headroom evidence"
         )
@@ -275,7 +275,7 @@ class QueritServiceContractTests(unittest.TestCase):
             "OOMScoreAdjust=800",
             "--max-num-seqs 16",
             "--max-num-batched-tokens 4096",
-            "--gpu-memory-utilization 0.60",
+            "--gpu-memory-utilization 0.45",
             "FULL_DECODE_ONLY",
         ):
             self.assertIn(contract, unit)
@@ -287,13 +287,13 @@ class QueritServiceContractTests(unittest.TestCase):
     def test_aeon_text_uma_safe_profile(self) -> None:
         contract = _aeon_contract(AEON_UNIT.read_text())
         self.assertEqual(contract["model_len"], AEON_CONTEXT_TOKENS)
-        self.assertAlmostEqual(contract["util"], 0.60)
+        self.assertAlmostEqual(contract["util"], 0.45)
         _assert_aeon_headroom_evidence(contract)
 
     def test_aeon_unit_documents_current_headroom_evidence(self) -> None:
         unit = AEON_UNIT.read_text()
         description = unit.splitlines()[1]
-        self.assertIn("util=0.6", description)
+        self.assertIn("util=0.45", description)
         self.assertIn("AUTO KV", description)
         self.assertIn("bypasses UMA", unit)
         self.assertIn("~31.6GiB MemAvailable", unit)
@@ -301,7 +301,7 @@ class QueritServiceContractTests(unittest.TestCase):
 
     def test_aeon_headroom_contract_rejects_excessive_utilization(self) -> None:
         unit = AEON_UNIT.read_text().replace(
-            "--gpu-memory-utilization 0.60",
+            "--gpu-memory-utilization 0.45",
             "--gpu-memory-utilization 0.80",
             1,
         )

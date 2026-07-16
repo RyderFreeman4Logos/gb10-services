@@ -347,10 +347,9 @@ def _resolve_local_dir(model_path: str) -> str:
 
 
 def _read_bounded_regular_file(path: Path, maximum_bytes: int) -> bytes:
-    flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
+    # Resolve symlinks first — HF cache stores files as symlinks to blobs/.
+    resolved = os.path.realpath(path)
+    descriptor = os.open(resolved, os.O_RDONLY | os.O_CLOEXEC)
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
