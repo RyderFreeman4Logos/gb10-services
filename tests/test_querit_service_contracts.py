@@ -269,7 +269,7 @@ class QueritServiceContractTests(unittest.TestCase):
             "OOMScoreAdjust=800",
             "--kv-cache-memory-bytes 15360M",
             "--max-num-seqs 16",
-            "--max-num-batched-tokens 16384",
+            "--max-num-batched-tokens 4096",
             "FULL_DECODE_ONLY",
         ):
             self.assertIn(contract, unit)
