@@ -26,10 +26,15 @@ class QueritServerContractTests(unittest.TestCase):
         self.source = SERVER.read_text()
         ast.parse(self.source)
 
-    def test_bounds_backend_admission_and_serializes_gpu_inference(self) -> None:
-        self.assertIn("INFERENCE_LOCK = threading.Lock()", self.source)
-        self.assertIn("with INFERENCE_LOCK:", self.source)
-        self.assertNotIn("INFERENCE_LOCK.acquire(blocking=False)", self.source)
+    def test_bounds_backend_admission_and_parallel_gpu_inference(self) -> None:
+        self.assertIn("MAX_CONCURRENT_INFERENCE = 2", self.source)
+        self.assertIn(
+            "INFERENCE_SEMAPHORE = threading.BoundedSemaphore("
+            "MAX_CONCURRENT_INFERENCE)",
+            self.source,
+        )
+        self.assertIn("with INFERENCE_SEMAPHORE:", self.source)
+        self.assertNotIn("INFERENCE_SEMAPHORE.acquire(blocking=False)", self.source)
         self.assertNotIn("rerank inference busy", self.source)
 
     def test_bounds_body_documents_and_input_sizes(self) -> None:
@@ -180,57 +185,65 @@ class QueritServerContractTests(unittest.TestCase):
         self.assertEqual(non_finite.exception.status_code, 500)
         self.assertEqual(non_finite.exception.detail, "rerank inference failed")
 
-    def test_busy_inference_waits_without_gpu_overlap(self) -> None:
+    def test_inference_allows_two_in_flight_and_bounds_third(self) -> None:
         module = self.load_with_fake_dependencies()
         first_entered = threading.Event()
         first_release = threading.Event()
         second_entered = threading.Event()
-        call_lock = threading.Lock()
-        call_count = 0
+        second_release = threading.Event()
+        third_entered = threading.Event()
         errors: list[BaseException] = []
         results: list[Any] = []
 
-        def fake_score(_query, _documents):
-            nonlocal call_count
-            with call_lock:
-                call_count += 1
-                current = call_count
-            if current == 1:
+        def fake_score(query, _documents):
+            if query == "first":
                 first_entered.set()
                 if not first_release.wait(timeout=1):
                     raise RuntimeError("test inference release timed out")
-            else:
+            elif query == "second":
                 second_entered.set()
+                if not second_release.wait(timeout=1):
+                    raise RuntimeError("test inference release timed out")
+            else:
+                third_entered.set()
             return [1.0]
 
         setattr(module, "score_pairs", fake_score)
 
-        def request() -> None:
+        def request(query: str) -> None:
             try:
                 results.append(
                     module.rerank(
                         SimpleNamespace(
-                            model=None, query="q", documents=["d"], top_n=1
+                            model=None, query=query, documents=["d"], top_n=1
                         )
                     )
                 )
             except BaseException as exc:  # pragma: no cover - surfaced below
                 errors.append(exc)
 
-        first = threading.Thread(target=request)
-        second = threading.Thread(target=request)
+        first = threading.Thread(target=request, args=("first",))
+        second = threading.Thread(target=request, args=("second",))
+        third = threading.Thread(target=request, args=("third",))
         first.start()
         self.assertTrue(first_entered.wait(timeout=1))
         second.start()
-        self.assertFalse(second_entered.wait(timeout=0.05))
+        second_ran_in_parallel = second_entered.wait(timeout=0.1)
+        third.start()
+        third_exceeded_bound = third_entered.wait(timeout=0.05)
         first_release.set()
+        second_release.set()
         first.join(timeout=1)
         second.join(timeout=1)
+        third.join(timeout=1)
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
-        self.assertTrue(second_entered.is_set())
+        self.assertFalse(third.is_alive())
+        self.assertTrue(second_ran_in_parallel)
+        self.assertFalse(third_exceeded_bound)
+        self.assertTrue(third_entered.is_set())
         self.assertEqual(errors, [])
-        self.assertEqual(len(results), 2)
+        self.assertEqual(len(results), 3)
 
 
 if __name__ == "__main__":

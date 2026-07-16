@@ -54,7 +54,8 @@ Send = Callable[[Message], Awaitable[None]]
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 
 LOG = logging.getLogger("querit_rerank")
-INFERENCE_LOCK = threading.Lock()
+MAX_CONCURRENT_INFERENCE = 2
+INFERENCE_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_INFERENCE)
 
 MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
 MAX_CONCURRENT_REQUESTS = 16
@@ -309,7 +310,7 @@ def rerank(req: RerankRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="top_n is too large")
 
     try:
-        with INFERENCE_LOCK:
+        with INFERENCE_SEMAPHORE:
             scores = score_pairs(req.query, req.documents)
         if len(scores) != len(req.documents):
             raise RuntimeError("model returned an unexpected score count")
