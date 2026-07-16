@@ -48,6 +48,18 @@ done
   echo "guardian identity directory is missing or unsafe: $identity_dir" >&2
   exit 1
 }
+cidfile_deadline=$((SECONDS + wait_seconds))
+while [[ ! -f "$container_cidfile" ]]; do
+  [[ ! -e "$container_cidfile" && ! -L "$container_cidfile" ]] || {
+    echo "immutable launch CID is unsafe: $container_cidfile" >&2
+    exit 1
+  }
+  (( SECONDS < cidfile_deadline )) || {
+    echo "immutable launch CID was not published in time: $container_cidfile" >&2
+    exit 1
+  }
+  sleep 1
+done
 [[ -f "$container_cidfile" && ! -L "$container_cidfile" ]] || {
   echo "immutable launch CID is missing or unsafe: $container_cidfile" >&2
   exit 1

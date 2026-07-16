@@ -4,6 +4,7 @@ import os
 import stat
 import subprocess
 import tempfile
+import time
 import tomllib
 import unittest
 from pathlib import Path
@@ -119,6 +120,27 @@ class IntegratedGuardianRegistrationTests(unittest.TestCase):
         self.assertNotIn("set-property", source)
         self.assertNotIn("MemoryMax", source)
         self.assertNotIn("MemorySwapMax", source)
+
+    def test_waits_for_docker_to_publish_the_immutable_cidfile(self) -> None:
+        temporary, env, registration, _systemctl = self.fixture()
+        self.addCleanup(temporary.cleanup)
+        cidfile = Path(env["GB10_CONTAINER_CIDFILE"])
+        cid = cidfile.read_text()
+        cidfile.unlink()
+
+        process = subprocess.Popen(
+            [str(PUBLISHER)],
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        time.sleep(0.1)
+        cidfile.write_text(cid)
+        stdout, stderr = process.communicate(timeout=10)
+
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.assertTrue(registration.is_file())
 
     def test_rejects_a_systemd_control_group_outside_the_exact_docker_scope(self) -> None:
         temporary, env, registration, systemctl = self.fixture()
