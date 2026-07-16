@@ -665,8 +665,8 @@ PY
   validate_text_registration "$registration_path"
 
   require_running_unit "$target_unit"
-  [[ "$UNIT_RESTART" == "on-failure" ]] || {
-    echo "text target must use Restart=on-failure" >&2
+  [[ "$UNIT_RESTART" == "always" ]] || {
+    echo "text target must use Restart=always" >&2
     exit 1
   }
   local expected_environment="GB10_CGROUP_REGISTRATION_PATH=$registration_path"
