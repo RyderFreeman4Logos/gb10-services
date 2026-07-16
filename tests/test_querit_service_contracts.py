@@ -81,30 +81,22 @@ def _aeon_contract(unit: str) -> dict[str, int | float]:
     model_len = _option_values(container_argv, "--max-model-len")[0]
     if not model_len.isdecimal():
         raise AssertionError(f"invalid --max-model-len value: {model_len}")
-    # AEON guidance: do NOT pin --kv-cache-memory-bytes (bypasses UMA guard).
-    kv_flag_present = True
-    try:
-        _option_values(container_argv, "--kv-cache-memory-bytes")
-    except AssertionError as e:
-        if "expected exactly one" in str(e):
-            kv_flag_present = False
-        else:
-            raise
-    if kv_flag_present:
-        raise AssertionError(
-            "text unit must not pin --kv-cache-memory-bytes (bypasses UMA guard)"
-        )
+    kv_budget = _option_values(container_argv, "--kv-cache-memory-bytes")[0]
+    kv_match = re.fullmatch(r"([1-9][0-9]*)M", kv_budget)
+    if kv_match is None:
+        raise AssertionError(f"invalid --kv-cache-memory-bytes value: {kv_budget}")
     util = _option_values(container_argv, "--gpu-memory-utilization")[0]
     return {
         "model_len": int(model_len),
+        "kv_mib": int(kv_match.group(1)),
         "util": float(util),
     }
 
 
 def _assert_aeon_headroom_evidence(contract: dict[str, int | float]) -> None:
-    if contract.get("util", 0) > 0.65:
+    if contract["kv_mib"] > MAX_AEON_KV_MIB_WITH_CURRENT_HEADROOM_EVIDENCE:
         raise AssertionError(
-            "gpu-memory-utilization above 0.65 requires updated UMA headroom evidence"
+            "raising text KV above 15 GiB requires updated UMA headroom evidence"
         )
 
 
@@ -285,42 +277,36 @@ class QueritServiceContractTests(unittest.TestCase):
             f"@{IMAGE_DIGEST}",
             "--oom-score-adj 800",
             "OOMScoreAdjust=800",
+            "--kv-cache-memory-bytes 15360M",
             "--max-num-seqs 16",
-            "--max-num-batched-tokens 16384",
-            "--gpu-memory-utilization 0.60",
+            "--max-num-batched-tokens 8192",
+            "--gpu-memory-utilization 0.49",
             "FULL_DECODE_ONLY",
         ):
             self.assertIn(contract, unit)
         self.assertNotIn("--memory 69g", unit)
         self.assertNotIn("--memory-swap 69g", unit)
-        # The docker run argv must not contain --kv-cache-memory-bytes.
-        # (Comments mentioning it are fine.)
-        exec_start = _logical_directive_argv(unit, "ExecStart")[0]
-        _, container_argv = _split_docker_run_argv(exec_start, f"ghcr.io/aeon-7/aeon-vllm-ultimate@{IMAGE_DIGEST}")
-        self.assertNotIn("--kv-cache-memory-bytes", container_argv)
         self.assertNotIn("--dns", unit)
         self.assertNotRegex(unit, r"aeon-vllm-ultimate:[^\s\\]+(?:\s|\\)")
 
     def test_aeon_text_uma_safe_profile(self) -> None:
         contract = _aeon_contract(AEON_UNIT.read_text())
         self.assertEqual(contract["model_len"], AEON_CONTEXT_TOKENS)
-        self.assertAlmostEqual(contract["util"], 0.60)
+        self.assertEqual(contract["kv_mib"], AEON_KV_BUDGET_MIB)
         _assert_aeon_headroom_evidence(contract)
 
     def test_aeon_unit_documents_current_headroom_evidence(self) -> None:
         unit = AEON_UNIT.read_text()
         description = unit.splitlines()[1]
-        self.assertIn("util=0.6", description)
-        self.assertIn("AUTO KV", description)
-        self.assertIn("bypasses", unit)
-        self.assertIn("UMA", unit)
+        self.assertIn("kv-mem=15360M", description)
+        self.assertIn("batch=8192", description)
         self.assertIn("~31.6GiB MemAvailable", unit)
         self.assertNotIn("36GiB KV keeps ~2.47", unit)
 
-    def test_aeon_headroom_contract_rejects_excessive_utilization(self) -> None:
+    def test_aeon_headroom_contract_rejects_kv_above_15_gib(self) -> None:
         unit = AEON_UNIT.read_text().replace(
-            "--gpu-memory-utilization 0.60",
-            "--gpu-memory-utilization 0.80",
+            "--kv-cache-memory-bytes 15360M",
+            "--kv-cache-memory-bytes 15361M",
             1,
         )
         with self.assertRaisesRegex(AssertionError, "updated UMA headroom evidence"):

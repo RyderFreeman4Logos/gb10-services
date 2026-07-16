@@ -1,5 +1,5 @@
 [Unit]
-Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.25.0, seqs=16, batch=16384, util=0.6, AUTO KV, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
+Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.25.0, seqs=16, batch=8192, util=0.49, kv-mem=15360M pin, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
 # Independent of embedding/reranker so text can restart alone (no HTTP poll).
 After=network.target
 Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
@@ -24,11 +24,12 @@ OOMScoreAdjust=800
 # The first live all-three 3300s window ended with ~31.6GiB MemAvailable,
 # zero threshold events, and zero cgroup OOM kills.
 # Auto-KV at util=0.6 grew to ~46G and left only ~10G MemAvailable — too fat.
-# AEON-recommended DFlash shape: seqs=16, batch=16384, util=0.6, FULL_DECODE_ONLY.
-# No explicit --kv-cache-memory-bytes: AEON confirmed that pinning KV bypasses
-# the UMA memory_profiling guard (#46932), causing cudaMalloc to grow unbounded.
-# Auto sizing lets determine_available_memory run the full profile path.
-# Restart must go through gb10_restart_text_safe.sh (stops rr first, never emb).
+# AEON-recommended DFlash shape: seqs=16, batch=8192, FULL_DECODE_ONLY.
+# batch=8192 (not 16384): compile/cudagraph capture peak was too high with 16384,
+# causing 137 even with rr stopped. 8192 reduces the profile-run max token shape 4x.
+# kv-cache-memory-bytes 15360M pinned: AUTO KV at util=0.6 grew to ~46G, also too fat.
+# util=0.49 so free-memory checks pass with emb already resident (0.6 fails).
+# Restart via gb10_restart_text_safe.sh (stops rr first, never emb).
 MemoryMax=256M
 MemorySwapMax=0
 # Recover from any stop cause (crash, OOM kill, guardian cgroup.kill).
@@ -70,11 +71,12 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
     --mamba-cache-dtype float32 \
     --max-model-len 262144 \
     --max-num-seqs 16 \
-    --max-num-batched-tokens 16384 \
+    --max-num-batched-tokens 8192 \
     --max-num-partial-prefills 1 \
     --max-long-partial-prefills 1 \
     --enable-prefix-caching \
-    --gpu-memory-utilization 0.60 \
+    --gpu-memory-utilization 0.49 \
+    --kv-cache-memory-bytes 15360M \
     --enable-chunked-prefill \
     --scheduler-reserve-full-isl \
     --compilation-config "{\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_num_of_warmups\":0,\"cache_dir\":\"/var/cache/vllm/aeon-qwen36-v025\"}" \
