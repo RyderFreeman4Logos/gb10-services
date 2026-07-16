@@ -66,6 +66,8 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
   -e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768 \
   -e AEON_THINKING_BUDGET_GUARD=0 \
   --memory-swappiness 0 \
+  --memory 128g \
+  --memory-swap 128g \
   --oom-score-adj 800 \
   --entrypoint python3 \
   ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55 \

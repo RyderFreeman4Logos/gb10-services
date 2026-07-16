@@ -205,7 +205,7 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         actual = _option_values(host_argv, flag, len(expected))
         if actual != expected:
             raise AssertionError(f"{flag} must be {expected}, found {actual}")
-    for forbidden in ("--memory", "--memory-swap", "--cgroup-parent", "--dns"):
+    for forbidden in ("--cgroup-parent", "--dns"):
         if any(
             token.lower() == forbidden
             or token.lower().startswith(f"{forbidden}=")
@@ -400,8 +400,6 @@ class HostileEmbeddingUnitMutationTests(unittest.TestCase):
         unit = EMBEDDING_UNIT.read_text()
         image_line = f"  {EMBEDDING_IMAGE} \\\n"
         for argument in (
-            "--memory 20g",
-            "--memory-swap 20g",
             "--cgroup-parent app.slice",
             "--dns 8.8.8.8",
         ):

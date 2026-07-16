@@ -64,12 +64,20 @@ def _aeon_contract(unit: str) -> dict[str, int | float]:
     argv = exec_starts[0]
     image = f"ghcr.io/aeon-7/aeon-vllm-ultimate@{IMAGE_DIGEST}"
     host_argv, container_argv = _split_docker_run_argv(argv, image)
-    # Docker --memory does not police UMA; unit must not hard-cap the container that way.
-    for banned in ("--memory", "--memory-swap"):
-        if any(tok == banned or tok.startswith(f"{banned}=") for tok in host_argv):
-            raise AssertionError(
-                f"text unit must not set docker {banned} (UMA is unpoliced)"
-            )
+    # Docker --memory-swap == --memory disables swap (swap=0).
+    # Without --memory, Docker creates no memory cgroup and
+    # --memory-swappiness 0 is silently ignored by the kernel.
+    # The cap is a high safety label, not a physical UMA ceiling.
+    memory_values = _option_values(host_argv, "--memory")
+    swap_values = _option_values(host_argv, "--memory-swap")
+    if not memory_values:
+        raise AssertionError("text unit must set --memory for swappiness enforcement")
+    if not swap_values:
+        raise AssertionError("text unit must set --memory-swap (== --memory) for swap=0")
+    if swap_values[0] != memory_values[0]:
+        raise AssertionError(
+            f"--memory-swap must equal --memory (swap=0): {swap_values[0]} != {memory_values[0]}"
+        )
     for flag, expected in {
         "--memory-swappiness": "0",
         "--oom-score-adj": "800",
@@ -167,21 +175,12 @@ class HostileAeonUnitMutationTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             _aeon_contract(unit)
 
-    def test_rejects_docker_memory_option_on_host_argv(self) -> None:
-        unit = AEON_UNIT.read_text()
-        # Inject a banned docker hard-cap before the image boundary (host argv).
-        unit = unit.replace(
-            "  --memory-swappiness 0 \\\n",
-            "  --memory 69g \\\n  --memory-swappiness 0 \\\n",
-            1,
-        )
-        self.assert_contract_rejects(unit)
-
-    def test_rejects_docker_memory_swap_option_on_host_argv(self) -> None:
+    def test_rejects_mismatched_memory_swap(self) -> None:
+        """--memory-swap != --memory allows swap and must be rejected."""
         unit = AEON_UNIT.read_text()
         unit = unit.replace(
-            "  --memory-swappiness 0 \\\n",
-            "  --memory-swap 69g \\\n  --memory-swappiness 0 \\\n",
+            "--memory-swap 128g",
+            "--memory-swap 256g",
             1,
         )
         self.assert_contract_rejects(unit)
@@ -275,7 +274,7 @@ class QueritServiceContractTests(unittest.TestCase):
         ):
             self.assertIn(contract, unit)
         self.assertNotIn("--memory 69g", unit)
-        self.assertNotIn("--memory-swap 69g", unit)
+        # --memory-swap == --memory is valid (swap=0). 69g is the old cap.
         self.assertNotIn("--dns", unit)
         self.assertNotRegex(unit, r"aeon-vllm-ultimate:[^\s\\]+(?:\s|\\)")
 
