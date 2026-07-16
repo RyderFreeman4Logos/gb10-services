@@ -13,7 +13,8 @@ Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
 Environment=HF_HUB_OFFLINE=1
 Environment=GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1
 Environment=GB10_CONTAINER_CIDFILE=%t/gb10-memory-guardian/aeon-text.cid
-OOMScoreAdjust=500
+# Prefer killing text before reranker under host OOM (reranker uses 500).
+OOMScoreAdjust=800
 # Wrapper/docker-CLI only. Real AEON memory hard-cap is docker --memory 69g plus
 # ExecStartPost MemoryMax=69G / MemorySwapMax=0 on docker-*.scope.
 # 2026-07-14: 15GiB KV verified 269589 tokens (1.028 full contexts).
@@ -48,7 +49,7 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
   --memory 69g \
   --memory-swap 69g \
   --memory-swappiness 0 \
-  --oom-score-adj 500 \
+  --oom-score-adj 800 \
   --entrypoint python3 \
   ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c \
   /opt/hang_guard/aeon_vllm_wrapper.py serve \

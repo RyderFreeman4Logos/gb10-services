@@ -15,8 +15,10 @@ Environment=TRANSFORMERS_OFFLINE=1
 # Wrapper/docker-CLI only. The generated docker scope is capped separately.
 MemoryMax=256M
 MemorySwapMax=0
-OOMScoreAdjust=800
-Restart=no
+# Prefer keeping reranker over text under host OOM (text uses 800).
+OOMScoreAdjust=500
+Restart=yes
+RestartSec=15
 TimeoutStartSec=1800
 TimeoutStopSec=60
 
@@ -35,7 +37,7 @@ ExecStart=/usr/bin/docker run --rm --name querit-4b-reranker \
   --memory 18g \
   --memory-swap 18g \
   --memory-swappiness 0 \
-  --oom-score-adj 800 \
+  --oom-score-adj 500 \
   --entrypoint python3 \
   ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:f6d453d0b4a7ef90eefee486f4ff769cc2e1bb1e206df16d70370da09c02203c \
   /opt/querit/querit_openai_rerank_server.py \
