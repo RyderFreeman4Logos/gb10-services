@@ -81,22 +81,30 @@ def _aeon_contract(unit: str) -> dict[str, int | float]:
     model_len = _option_values(container_argv, "--max-model-len")[0]
     if not model_len.isdecimal():
         raise AssertionError(f"invalid --max-model-len value: {model_len}")
-    kv_budget = _option_values(container_argv, "--kv-cache-memory-bytes")[0]
-    kv_match = re.fullmatch(r"([1-9][0-9]*)M", kv_budget)
-    if kv_match is None:
-        raise AssertionError(f"invalid --kv-cache-memory-bytes value: {kv_budget}")
-    util = _option_values(container_argv, "--gpu-memory-utilization")[0]
+    # AEON guidance: do NOT pin --kv-cache-memory-bytes (bypasses UMA guard).
+    kv_flag_present = True
+    try:
+        _option_values(container_argv, "--kv-cache-memory-bytes")
+    except AssertionError as e:
+        if "expected exactly one" in str(e):
+            kv_flag_present = False
+        else:
+            raise
+    if kv_flag_present:
+        raise AssertionError(
+            "text unit must not pin --kv-cache-memory-bytes (bypasses UMA guard)"
+        )
+    util = float(_option_values(container_argv, "--gpu-memory-utilization")[0])
     return {
         "model_len": int(model_len),
-        "kv_mib": int(kv_match.group(1)),
-        "util": float(util),
+        "util": util,
     }
 
 
 def _assert_aeon_headroom_evidence(contract: dict[str, int | float]) -> None:
-    if contract["kv_mib"] > MAX_AEON_KV_MIB_WITH_CURRENT_HEADROOM_EVIDENCE:
+    if contract["util"] > 0.65:
         raise AssertionError(
-            "raising text KV above 15 GiB requires updated UMA headroom evidence"
+            "gpu-memory-utilization above 0.65 requires updated UMA headroom evidence"
         )
 
 
@@ -277,10 +285,9 @@ class QueritServiceContractTests(unittest.TestCase):
             f"@{IMAGE_DIGEST}",
             "--oom-score-adj 800",
             "OOMScoreAdjust=800",
-            "--kv-cache-memory-bytes 15360M",
             "--max-num-seqs 16",
             "--max-num-batched-tokens 8192",
-            "--gpu-memory-utilization 0.49",
+            "--gpu-memory-utilization 0.60",
             "FULL_DECODE_ONLY",
         ):
             self.assertIn(contract, unit)
@@ -292,21 +299,22 @@ class QueritServiceContractTests(unittest.TestCase):
     def test_aeon_text_uma_safe_profile(self) -> None:
         contract = _aeon_contract(AEON_UNIT.read_text())
         self.assertEqual(contract["model_len"], AEON_CONTEXT_TOKENS)
-        self.assertEqual(contract["kv_mib"], AEON_KV_BUDGET_MIB)
+        self.assertAlmostEqual(contract["util"], 0.60)
         _assert_aeon_headroom_evidence(contract)
 
     def test_aeon_unit_documents_current_headroom_evidence(self) -> None:
         unit = AEON_UNIT.read_text()
         description = unit.splitlines()[1]
-        self.assertIn("kv-mem=15360M", description)
-        self.assertIn("batch=8192", description)
+        self.assertIn("util=0.6", description)
+        self.assertIn("AUTO KV", description)
+        self.assertIn("bypasses UMA", unit)
         self.assertIn("~31.6GiB MemAvailable", unit)
         self.assertNotIn("36GiB KV keeps ~2.47", unit)
 
-    def test_aeon_headroom_contract_rejects_kv_above_15_gib(self) -> None:
+    def test_aeon_headroom_contract_rejects_excessive_utilization(self) -> None:
         unit = AEON_UNIT.read_text().replace(
-            "--kv-cache-memory-bytes 15360M",
-            "--kv-cache-memory-bytes 15361M",
+            "--gpu-memory-utilization 0.60",
+            "--gpu-memory-utilization 0.80",
             1,
         )
         with self.assertRaisesRegex(AssertionError, "updated UMA headroom evidence"):
