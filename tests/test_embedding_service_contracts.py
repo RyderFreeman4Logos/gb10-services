@@ -263,23 +263,17 @@ def _embedding_contract(unit: str) -> dict[str, int]:
                 raise AssertionError(f"forbidden embedding option: {token}")
 
     readiness = exec_start_posts[0]
-    if len(readiness) != 3 or readiness[:2] != ["/bin/bash", "-c"]:
+    if not readiness or not readiness[0].endswith("gb10_service_ready.sh"):
         raise AssertionError(
-            "ExecStartPost must be a single /bin/bash -c readiness poll"
+            "ExecStartPost must use gb10_service_ready.sh"
         )
-    readiness_script = readiness[2]
-    if not readiness_script.startswith("for i in $(seq 1 120); do "):
-        raise AssertionError("ExecStartPost must use the bounded 120-attempt poll")
-    for fragment in (
-        "curl -fsS --max-time 3 http://100.105.4.92:18012/v1/models",
-        ">/dev/null 2>&1 && exit 0",
-        "sleep 2",
-        "embedding models not ready after 4min",
-    ):
-        if fragment not in readiness_script:
-            raise AssertionError(f"readiness poll is missing: {fragment}")
-    if not readiness_script.endswith("exit 1"):
-        raise AssertionError("readiness poll must fail after exhausting attempts")
+    readiness_args = readiness[1:]
+    if "embedding" not in readiness_args:
+        raise AssertionError("readiness script must check embedding kind")
+    if not any("18012" in a for a in readiness_args):
+        raise AssertionError("readiness script must target port 18012")
+    if not any("qwen3-embedding-8b" in a for a in readiness_args):
+        raise AssertionError("readiness script must use qwen3-embedding-8b")
 
     start_limit_bursts = re.findall(r"(?m)^StartLimitBurst=(\S+)$", unit)
     if start_limit_bursts != ["5"]:

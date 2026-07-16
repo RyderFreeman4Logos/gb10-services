@@ -218,19 +218,14 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertIn("gb10_check_mem_available.sh 2", unit)
         self.assertIn("--memory 18g", unit)
         self.assertIn("--memory-swap 18g", unit)
-        ready = unit.index("http://100.105.4.92:18013/v1/models")
+        ready = unit.index("gb10_service_ready.sh rerank")
         timeout = re.search(r"^TimeoutStartSec=(\d+)$", unit, re.MULTILINE)
         if timeout is None:
             self.fail("TimeoutStartSec missing")
-        readiness_loops = re.findall(
-            r"seq 1 (\d+).*?--max-time (\d+).*?sleep (\d+); done",
-            unit,
-        )
-        self.assertEqual(len(readiness_loops), 1)
-        readiness_budget = sum(
-            int(attempts) * (int(curl_timeout) + int(sleep_seconds))
-            for attempts, curl_timeout, sleep_seconds in readiness_loops
-        )
+        deadline_match = re.search(r"--deadline (\d+)", unit)
+        if deadline_match is None:
+            self.fail("gb10_service_ready.sh must specify --deadline")
+        readiness_deadline = int(deadline_match.group(1))
         helper = CGROUP_HELPER.read_text()
         helper_wait = re.search(r"GB10_CGROUP_WAIT_SECONDS:-([0-9]+)", helper)
         docker_timeout = re.search(r"GB10_DOCKER_TIMEOUT_SECONDS:-([0-9]+)", helper)
@@ -240,7 +235,7 @@ class QueritServiceContractTests(unittest.TestCase):
         if helper_wait is None or docker_timeout is None or systemctl_timeout is None:
             self.fail("cgroup helper timeout defaults missing")
         worst_case_seconds = (
-            readiness_budget
+            readiness_deadline
             + int(helper_wait.group(1))
             + int(docker_timeout.group(1))
             + int(systemctl_timeout.group(1))
