@@ -1,0 +1,128 @@
+from __future__ import annotations
+
+import importlib
+import json
+import math
+import sys
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+adapter = importlib.import_module("querit_deepinfra_adapter")
+
+
+def _public_request() -> bytes:
+    return json.dumps(
+        {
+            "documents": ["d1", "d2", "d3"],
+            "instruction": "rank faithfully",
+            "queries": ["q1", "q2", "q3"],
+            "service_tier": "priority",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+
+def _backend_response(scores: list[float]) -> bytes:
+    return json.dumps(
+        {
+            "id": "score-request-test",
+            "object": "list",
+            "created": 1,
+            "model": "Querit/Querit-4B",
+            "data": [
+                {"index": index, "object": "score", "score": score}
+                for index, score in enumerate(scores)
+            ],
+            "usage": {"prompt_tokens": 123, "total_tokens": 123},
+        },
+        allow_nan=True,
+        separators=(",", ":"),
+    ).encode()
+
+
+class QueritDeepinfraAdapterTests(unittest.TestCase):
+    def test_exact_public_request_maps_to_vllm_score_and_back(self) -> None:
+        request = adapter.parse_public_request(_public_request())
+        self.assertEqual(
+            adapter.backend_request_bytes(request),
+            json.dumps(
+                {
+                    "documents": ["d1", "d2", "d3"],
+                    "instruction": "rank faithfully",
+                    "model": "Querit/Querit-4B",
+                    "queries": ["q1", "q2", "q3"],
+                    "use_activation": True,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode(),
+        )
+        response = json.loads(
+            adapter.public_response_bytes(
+                adapter.parse_backend_response(_backend_response([-1.0, 0.0, 1.0]), 3)
+            )
+        )
+        self.assertEqual(response["scores"], [0.0, 0.5, 1.0])
+        self.assertEqual(response["input_tokens"], 123)
+        self.assertEqual(response["request_id"], "score-request-test")
+
+    def test_public_path_and_version_query_are_exact(self) -> None:
+        self.assertTrue(
+            adapter.valid_public_target(
+                "/v1/inference/Qwen/Qwen3-Reranker-8B",
+                "version=5fa94080caafeaa45a15d11f969d7978e087a3db",
+            )
+        )
+        for path, query in (
+            ("/v1/score", ""),
+            ("/v1/inference/Qwen/Qwen3-Reranker-8B", ""),
+            ("/v1/inference/Qwen/Qwen3-Reranker-8B", "version=stale"),
+            (
+                "/v1/inference/Qwen/Qwen3-Reranker-8B",
+                "version=5fa94080caafeaa45a15d11f969d7978e087a3db&extra=1",
+            ),
+        ):
+            with self.subTest(path=path, query=query):
+                self.assertFalse(adapter.valid_public_target(path, query))
+
+    def test_request_and_backend_response_fail_closed_on_schema_or_domain_drift(
+        self,
+    ) -> None:
+        public = json.loads(_public_request())
+        invalid_requests = []
+        for mutation in (
+            lambda row: row["documents"].pop(),
+            lambda row: row.update({"extra": True}),
+            lambda row: row.update({"queries": ["", "q2", "q3"]}),
+        ):
+            changed = json.loads(json.dumps(public))
+            mutation(changed)
+            invalid_requests.append(json.dumps(changed).encode())
+        invalid_requests.append(json.dumps(public, indent=2, sort_keys=True).encode())
+        for body in invalid_requests:
+            with self.subTest(body=body), self.assertRaises(adapter.AdapterError):
+                adapter.parse_public_request(body)
+
+        invalid_backend = (
+            _backend_response([-1.000001, 0.0, 1.0]),
+            _backend_response([-1.0, 0.0, 1.000001]),
+            _backend_response([math.nan, 0.0, 1.0]),
+            _backend_response([0.0, 1.0]),
+            _backend_response([0.0, 0.5, 1.0]).replace(b'"index":1', b'"index":0'),
+            _backend_response([0.0, 0.5, 1.0]).replace(
+                b'"prompt_tokens":123', b'"prompt_tokens":true'
+            ),
+        )
+        for body in invalid_backend:
+            with self.subTest(body=body), self.assertRaises(adapter.AdapterError):
+                adapter.parse_backend_response(body, 3)
+
+
+if __name__ == "__main__":
+    unittest.main()
