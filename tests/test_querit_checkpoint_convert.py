@@ -285,6 +285,7 @@ class SnapshotConversionTests(unittest.TestCase):
                     {
                         "architectures": ["MLQwen3Model"],
                         "hidden_size": 2560,
+                        "max_position_embeddings": 40960,
                         "num_labels": 2,
                     }
                 )

@@ -123,7 +123,9 @@ The original adapter document assumed v0.24.0. All references updated to v0.25.0
    `gb10_querit_canary_*.py` entry points. Do not enable either unit.
 2. Run `gb10_querit_canary_lifecycle.py activate`. The activator alone may
    start the loopback vLLM backend and the public adapter.
-3. Verify the public DeepInfra path and native `/v1/score` warmup evidence.
+3. Require the public DeepInfra probe, a native 32,768-token `/score` peak
+   allocation, and a 16-pair chunked-prefill probe. Reject any unit/container/PID
+   identity change, OOM event, or insufficient post-warm host headroom.
 4. Run the cache-safe endpoint equivalence experiment on pinned public data.
 5. Run `gb10_querit_canary_lifecycle.py deactivate` to stop adapter then
    backend and restore any text state paused by the transaction.
@@ -133,11 +135,11 @@ Install the reviewed files without starting a service:
 ```bash
 install -d -m 0755 /home/obj/.local/lib/gb10 /home/obj/.local/bin
 install -m 0644 scripts/querit_deepinfra_adapter.py \
-  scripts/querit_canary_lifecycle.py scripts/querit_vllm_artifact.py \
+  scripts/querit_canary_lifecycle.py scripts/querit_canary_runtime.py \
+  scripts/querit_canary_transaction.py scripts/querit_vllm_artifact.py \
   scripts/reranker_equivalence_wire.py /home/obj/.local/lib/gb10/
 install -m 0755 scripts/gb10_querit_canary_lifecycle.py \
-  scripts/gb10_querit_canary_preflight.py \
-  scripts/gb10_querit_canary_ready.py /home/obj/.local/bin/
+  scripts/gb10_querit_canary_preflight.py /home/obj/.local/bin/
 install -m 0644 systemd/vllm-querit-4b-canary.service \
   systemd/vllm-querit-4b-canary-backend.service \
   /home/obj/.config/systemd/user/

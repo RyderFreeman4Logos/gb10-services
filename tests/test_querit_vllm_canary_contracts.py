@@ -207,6 +207,11 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
         self.assertNotIn("docker run", unit)
         self.assertIn("Requires=vllm-querit-4b-canary-backend.service", unit)
         self.assertIn("After=vllm-querit-4b-canary-backend.service", unit)
+        self.assertEqual(
+            _logical_directive_argv(unit, "ExecStartPost"),
+            [],
+            "peak readiness must run after systemctl reports an active adapter",
+        )
 
     def test_canary_is_memory_bounded_fail_closed_and_lifecycle_isolated(self) -> None:
         unit = BACKEND_UNIT.read_text()

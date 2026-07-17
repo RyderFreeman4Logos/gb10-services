@@ -16,6 +16,10 @@ SOURCE_REVISION = "7b796de30ad8dc772d6c46c75659c1341283a665"
 TRANSFORM = "querit-tanh-scalar-head-v1"
 MAX_FILES = 4096
 MAX_FILE_BYTES = 32 * 1024 * 1024 * 1024
+MAX_METADATA_BYTES = 1024 * 1024
+EXPECTED_TEMPLATE_SHA256 = (
+    "048e14c0ed521d08717dd31b89990e4bf7ac12366c9ae338f2a2cc5d5d7b301d"
+)
 
 
 class ArtifactError(RuntimeError):
@@ -91,6 +95,79 @@ def _hash_regular(path: Path) -> tuple[int, str]:
         os.close(descriptor)
 
 
+def _read_json_object(path: Path, label: str) -> dict[str, object]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_size < 0
+                or before.st_size > MAX_METADATA_BYTES
+            ):
+                raise ArtifactError(f"{label} is not a bounded regular file")
+            raw = os.read(descriptor, MAX_METADATA_BYTES + 1)
+            after = os.fstat(descriptor)
+            stable_before = (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_nlink,
+                before.st_uid,
+                before.st_gid,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            stable_after = (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_nlink,
+                after.st_uid,
+                after.st_gid,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if stable_before != stable_after or len(raw) != before.st_size:
+                raise ArtifactError(f"{label} changed while it was read")
+        finally:
+            os.close(descriptor)
+        decoded = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ArtifactError(f"{label} is not valid JSON") from exc
+    if not isinstance(decoded, dict):
+        raise ArtifactError(f"{label} must be a JSON object")
+    return decoded
+
+
+def _verify_semantics(root: Path) -> None:
+    config = _read_json_object(root / "config.json", "converted config")
+    expected = {
+        "architectures": ["Qwen3ForSequenceClassification"],
+        "head_dtype": "model",
+        "hidden_size": 2560,
+        "num_labels": 1,
+        "sbert_ce_default_activation_function": (
+            "torch.nn.modules.activation.Tanh"
+        ),
+    }
+    for key, value in expected.items():
+        if config.get(key) != value:
+            raise ArtifactError(f"converted config {key} is incompatible")
+    context = config.get("max_position_embeddings")
+    if isinstance(context, bool) or not isinstance(context, int) or context < 32768:
+        raise ArtifactError("converted config does not attest 32,768-token context")
+    if "problem_type" in config:
+        raise ArtifactError("converted config must not override the scoring problem type")
+    _size, template_sha256 = _hash_regular(root / "querit-rerank.jinja")
+    if template_sha256 != EXPECTED_TEMPLATE_SHA256:
+        raise ArtifactError("converted artifact score template is not the pinned template")
+
+
 def _inventory(root: Path) -> list[dict[str, object]]:
     try:
         root_metadata = root.lstat()
@@ -128,6 +205,7 @@ def _inventory(root: Path) -> list[dict[str, object]]:
         str(name).endswith(".safetensors") for name in names
     ):
         raise ArtifactError("converted artifact is missing required model files")
+    _verify_semantics(root)
     return files
 
 

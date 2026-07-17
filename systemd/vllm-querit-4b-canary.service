@@ -18,7 +18,6 @@ OOMScoreAdjust=500
 
 ExecCondition=/home/obj/.local/bin/gb10_querit_canary_preflight.py
 ExecStart=/usr/bin/python3 /home/obj/.local/lib/gb10/querit_deepinfra_adapter.py --listen-host 100.105.4.92 --listen-port 18014 --backend-url http://127.0.0.1:18015
-ExecStartPost=/home/obj/.local/bin/gb10_querit_canary_ready.py
 
 StandardOutput=journal
 StandardError=journal
