@@ -18,8 +18,9 @@ LEFTHOOK = shutil.which("lefthook")
 
 
 class HookFixture:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, lefthook: str | None = LEFTHOOK) -> None:
         self.root = root
+        self.lefthook = lefthook
         self.git_env = os.environ.copy()
         local_env_vars = subprocess.check_output(
             ["git", "rev-parse", "--local-env-vars"],
@@ -90,6 +91,37 @@ class HookFixture:
             'exit "${FAKE_MALICIOUS_EXIT:-0}"\n'
         )
         malicious.chmod(0o755)
+        self._stage_lefthook_node()
+
+    def _stage_lefthook_node(self) -> None:
+        if self.lefthook is None:
+            return
+        try:
+            with Path(self.lefthook).open("rb") as executable:
+                shebang = executable.readline(256).rstrip(b"\r\n")
+        except OSError as error:
+            raise RuntimeError(
+                f"unable to inspect selected Lefthook executable: {self.lefthook}"
+            ) from error
+        if shebang != b"#!/usr/bin/env node":
+            return
+
+        node = shutil.which("node", path=self.git_env.get("PATH"))
+        if node is None:
+            raise RuntimeError(
+                f"selected Lefthook executable requires node: {self.lefthook}"
+            )
+        node_path = Path(node).resolve()
+        if not node_path.is_file() or not os.access(node_path, os.X_OK):
+            raise RuntimeError(
+                f"resolved node is not executable for Lefthook: {node_path}"
+            )
+        try:
+            self.bin.joinpath("node").symlink_to(node_path)
+        except OSError as error:
+            raise RuntimeError(
+                f"unable to stage node for Lefthook: {node_path}"
+            ) from error
 
     def git_run(self, *args: str, from_root: bool = True) -> None:
         subprocess.run(
@@ -168,7 +200,7 @@ class HookFixture:
     def run_topology(
         self, updates: str, **environment: str
     ) -> subprocess.CompletedProcess[str]:
-        if LEFTHOOK is None:
+        if self.lefthook is None:
             raise RuntimeError("lefthook is required for the hook topology contract")
         shutil.copy2(ROOT / "lefthook.yml", self.root / "lefthook.yml")
         env = self.git_env.copy()
@@ -182,7 +214,7 @@ class HookFixture:
         )
         return subprocess.run(
             [
-                LEFTHOOK,
+                self.lefthook,
                 "run",
                 "pre-push",
                 "--command",
@@ -235,6 +267,58 @@ class PrePushHookTests(unittest.TestCase):
             self.assertNotEqual(malformed.returncode, 0)
             self.assertIn("malformed", malformed.stdout + malformed.stderr)
             self.assertEqual(len(fixture.csa_log.read_text().splitlines()), 1)
+
+    @unittest.skipIf(LEFTHOOK is None, "lefthook is not installed")
+    def test_lefthook_node_shebang_routes_updates_through_the_review_gate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            lefthook_script = root / "npm-lefthook"
+            lefthook_script.write_text(
+                "#!/usr/bin/env node\n"
+                "const { spawnSync } = require('node:child_process');\n"
+                "const result = spawnSync(process.env.FAKE_LEFTHOOK_BINARY, "
+                "process.argv.slice(2), { stdio: 'inherit' });\n"
+                "if (result.error) { console.error(result.error.message); process.exit(127); }\n"
+                "process.exit(result.status === null ? 1 : result.status);\n"
+            )
+            lefthook_script.chmod(0o755)
+            fixture = HookFixture(root, str(lefthook_script))
+            update = fixture.update(
+                "refs/heads/feat/test",
+                fixture.head,
+                "refs/heads/feat/test",
+                ZERO,
+            )
+
+            result = fixture.run_topology(
+                update, FAKE_LEFTHOOK_BINARY=str(LEFTHOOK)
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(len(fixture.receipts()), 1)
+            self.assertEqual(
+                fixture.csa_log.read_text().splitlines(),
+                [f"review --check-verdict --range {fixture.first}..{fixture.head}"],
+            )
+            malformed = fixture.run_topology(
+                "malformed\\n", FAKE_LEFTHOOK_BINARY=str(LEFTHOOK)
+            )
+            self.assertNotEqual(malformed.returncode, 0)
+            self.assertIn("malformed", malformed.stdout + malformed.stderr)
+            self.assertEqual(len(fixture.csa_log.read_text().splitlines()), 1)
+
+    def test_lefthook_node_shebang_fails_loudly_without_node(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            lefthook_script = root / "npm-lefthook"
+            lefthook_script.write_text("#!/usr/bin/env node\n")
+            lefthook_script.chmod(0o755)
+
+            with mock.patch("test_pre_push_hooks.shutil.which", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "requires node"):
+                    HookFixture(root, str(lefthook_script))
 
     def test_private_btrfs_style_receipt_directory_is_accepted(self) -> None:
         fixture_parent = ROOT / "target" / "pre-push-hook-tests"
