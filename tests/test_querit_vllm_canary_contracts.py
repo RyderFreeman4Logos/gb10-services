@@ -89,9 +89,7 @@ def _backend_contract(unit: str) -> None:
     if len(starts) != 1:
         raise AssertionError(f"expected one ExecStart, found {len(starts)}")
     if len(start_posts) != 1:
-        raise AssertionError(
-            f"expected one ExecStartPost, found {len(start_posts)}"
-        )
+        raise AssertionError(f"expected one ExecStartPost, found {len(start_posts)}")
 
     host, container = _split_at_image(starts[0])
     expected_host = [
@@ -106,6 +104,8 @@ def _backend_contract(unit: str) -> None:
         "host",
         "-p",
         "127.0.0.1:18015:8000",
+        "-p",
+        "100.105.4.92:18015:8000",
         "-v",
         f"{MODEL_DIR}:{MODEL_DIR}:ro",
         "-e",
@@ -133,6 +133,7 @@ def _backend_contract(unit: str) -> None:
         "--runner": 1,
         "--dtype": 1,
         "--max-model-len": 1,
+        "--gpu-memory-utilization": 1,
         "--kv-cache-memory-bytes": 1,
         "--max-num-batched-tokens": 1,
         "--max-num-seqs": 1,
@@ -159,6 +160,7 @@ def _backend_contract(unit: str) -> None:
         "--runner": ["pooling"],
         "--dtype": ["bfloat16"],
         "--max-model-len": ["32768"],
+        "--gpu-memory-utilization": ["0.22"],
         "--kv-cache-memory-bytes": ["4800M"],
         "--max-num-batched-tokens": ["4096"],
         "--max-num-seqs": ["16"],
@@ -212,6 +214,30 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
             [],
             "peak readiness must run after systemctl reports an active adapter",
         )
+
+    def test_raw_canary_publishes_loopback_and_tailnet_once_without_wildcard(
+        self,
+    ) -> None:
+        backend = BACKEND_UNIT.read_text()
+        host, _container = _split_at_image(
+            _logical_directive_argv(backend, "ExecStart")[0]
+        )
+        publishes = [
+            host[index + 1] for index, token in enumerate(host) if token == "-p"
+        ]
+        self.assertEqual(
+            publishes,
+            [
+                "127.0.0.1:18015:8000",
+                "100.105.4.92:18015:8000",
+            ],
+        )
+        self.assertEqual(len(publishes), len(set(publishes)))
+        for binding in publishes:
+            address, host_port, container_port = binding.rsplit(":", 2)
+            self.assertIn(address, {"127.0.0.1", "100.105.4.92"})
+            self.assertEqual(host_port, "18015")
+            self.assertEqual(container_port, "8000")
 
     def test_canary_is_memory_bounded_fail_closed_and_lifecycle_isolated(self) -> None:
         unit = BACKEND_UNIT.read_text()
@@ -275,7 +301,9 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
         self.assertNotIn("100.105.4.92:18014:8000", production)
         self.assertIn("querit_openai_rerank_server.py", production)
 
-    def test_research_note_records_adapter_and_transactional_operator_contract(self) -> None:
+    def test_research_note_records_adapter_and_transactional_operator_contract(
+        self,
+    ) -> None:
         note = RESEARCH_NOTE.read_text()
         self.assertIn(
             "### DeepInfra wire compatibility adapter",
@@ -292,6 +320,14 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
             "20 GiB",
             "stop then start",
             "No production cutover",
+            "127.0.0.1:18015",
+            "100.105.4.92:18015",
+            "without a wildcard bind",
+            "--gpu-memory-utilization 0.22",
+            "8,043,564,036",
+            "8,043,558,914",
+            "-5,122",
+            "scripts/querit_replay_trust.py",
         ):
             self.assertIn(required, note)
 

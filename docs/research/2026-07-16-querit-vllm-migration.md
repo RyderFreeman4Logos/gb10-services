@@ -55,6 +55,12 @@ Config:
 - Set `head_dtype: "model"` for BF16 head behavior (vLLM defaults pooling heads to FP32)
 - Do NOT set `problem_type` to regression or single-label classification
 - Must rewrite the second safetensors shard (remove `head.*`, add `score.*`)
+- The converter attests the source snapshot against the pinned source ledger before
+  writing. It changes `metadata.total_size` exactly from `8,043,564,036` to
+  `8,043,558,914` bytes (delta `-5,122`), then seals source/output ledgers and
+  hashes in `querit-vllm-artifact-manifest.json`. The validator rejects stale
+  totals, missing `score.*` keys, retained `head.*` keys, and any tensor that is
+  not consumed exactly once by the index.
 - Synthetic test: max rewrite error ~7.3e-5
 
 ### Prompt template
@@ -77,9 +83,12 @@ This is an improvement, not a regression. The new contract should be named `quer
 ### DeepInfra wire compatibility adapter
 
 vLLM 0.25 exposes native `/v1/score`, but that endpoint is not the public
-DeepInfra contract. The raw vLLM backend is therefore loopback-only on port
-18015. A separately tested adapter owns public canary port 18014 and accepts
-only the version-pinned target
+DeepInfra contract. The raw backend retains its loopback publish at
+`127.0.0.1:18015` for the local adapter and additionally publishes the same
+container port at `100.105.4.92:18015` for direct Tailnet CodeSeek
+`/v1/rerank` access, without a wildcard bind. A separately tested adapter
+continues to own the DeepInfra-native canary port `100.105.4.92:18014` and
+accepts only the version-pinned target
 `/v1/inference/Qwen/Qwen3-Reranker-8B?version=5fa94080caafeaa45a15d11f969d7978e087a3db`.
 It requires canonical equal-length `queries[]` and `documents[]`, sends the
 corresponding positional request to `/v1/score`, validates every response
@@ -123,14 +132,17 @@ parameters.
 2. Rewrite `model-00002-of-00002.safetensors`: `head.*` → `score.*` (Tanh conversion)
 3. Update `config.json`: architectures, num_labels, head_dtype, activation
 4. Update `model.safetensors.index.json` weight_map
-5. Install verified Jinja template as `querit-rerank.jinja`
-6. Generate and verify `querit-vllm-artifact-manifest.json`
+5. Update `metadata.total_size` from `8,043,564,036` to `8,043,558,914`
+   (exact delta `-5,122`)
+6. Install verified Jinja template as `querit-rerank.jinja`
+7. Generate and verify `querit-vllm-artifact-manifest.json`, including its
+   pinned source ledger and output ledger hashes
 
 ### Phase 2: Smoke test (temporary port)
 1. Install the two tracked canary units, adapter, lifecycle modules, and two
    `gb10_querit_canary_*.py` entry points. Do not enable either unit.
 2. Run `gb10_querit_canary_lifecycle.py activate`. The activator alone may
-   start the loopback vLLM backend and the public adapter.
+   start the dual-published raw vLLM backend and the DeepInfra-native adapter.
 3. Require the public DeepInfra probe, a native 32,768-token `/score` peak
    allocation, and a 16-pair chunked-prefill probe. Reject any unit/container/PID
    identity change, OOM event, or insufficient post-warm host headroom.
@@ -145,6 +157,7 @@ install -d -m 0755 /home/obj/.local/lib/gb10 /home/obj/.local/bin
 install -m 0644 scripts/querit_deepinfra_adapter.py \
   scripts/querit_canary_lifecycle.py scripts/querit_canary_runtime.py \
   scripts/querit_canary_transaction.py scripts/querit_vllm_artifact.py \
+  scripts/querit_replay_trust.py \
   scripts/reranker_equivalence_wire.py /home/obj/.local/lib/gb10/
 install -m 0755 scripts/gb10_querit_canary_lifecycle.py \
   scripts/gb10_querit_canary_preflight.py /home/obj/.local/bin/
@@ -176,6 +189,7 @@ vllm serve /home/obj/models/querit-4b-vllm \
   --runner pooling \
   --dtype bfloat16 \
   --max-model-len 32768 \
+  --gpu-memory-utilization 0.22 \
   --kv-cache-memory-bytes 4800M \
   --max-num-batched-tokens 4096 \
   --max-num-seqs 16 \
@@ -187,8 +201,14 @@ vllm serve /home/obj/models/querit-4b-vllm \
   --chat-template /home/obj/models/querit-4b-vllm/querit-rerank.jinja
 ```
 
-The tracked backend publishes container port 8000 only to loopback port 18015;
-the adapter publishes the exact DeepInfra-native API on Tailscale port 18014.
+The tracked backend publishes container port 8000 exactly once to each of
+`127.0.0.1:18015` and `100.105.4.92:18015`, both targeting container port
+8000, without a wildcard bind. The loopback publish remains the adapter's
+backend path; the Tailnet publish is direct native `/v1/rerank` access. The
+adapter publishes the exact DeepInfra-native API only on Tailscale port 18014.
 Docker bounds the backend to 18 GiB memory and swap with swappiness 0; both
-systemd and the container use OOM score adjustment 500. `Restart=no` and the
+systemd and the container use OOM score adjustment 500. The canary explicitly
+sets `--gpu-memory-utilization 0.22`; it never relies on vLLM 0.25.1's `0.92`
+default, while retaining the explicit `--kv-cache-memory-bytes 4800M` profile.
+`Restart=no` and the
 transaction-authorized `ExecCondition` prevent retry loops or ad-hoc starts.

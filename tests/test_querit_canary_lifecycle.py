@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import struct
 import sys
 import tempfile
 import unittest
@@ -16,6 +17,48 @@ sys.path.insert(0, str(ROOT / "scripts"))
 lifecycle = importlib.import_module("querit_canary_lifecycle")
 runtime = importlib.import_module("querit_canary_runtime")
 artifact = importlib.import_module("querit_vllm_artifact")
+
+
+def _safetensors_stub(*names: str) -> bytes:
+    header = {
+        name: {
+            "data_offsets": [index, index + 1],
+            "dtype": "BF16",
+            "shape": [1],
+        }
+        for index, name in enumerate(names)
+    }
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    return struct.pack("<Q", len(encoded)) + encoded + b"\0" * len(names)
+
+
+def _write_converted_artifact(root: Path) -> None:
+    config = {
+        "architectures": ["Qwen3ForSequenceClassification"],
+        "head_dtype": "model",
+        "hidden_size": 2560,
+        "max_position_embeddings": 32768,
+        "num_labels": 1,
+        "sbert_ce_default_activation_function": "torch.nn.modules.activation.Tanh",
+    }
+    index = {
+        "metadata": {"total_size": 8_043_558_914},
+        "weight_map": {
+            "model.weight": "model-00001-of-00002.safetensors",
+            "score.bias": "model-00002-of-00002.safetensors",
+            "score.weight": "model-00002-of-00002.safetensors",
+        },
+    }
+    (root / "config.json").write_text(json.dumps(config))
+    (root / "model.safetensors.index.json").write_text(json.dumps(index))
+    (root / "model-00001-of-00002.safetensors").write_bytes(
+        _safetensors_stub("model.weight")
+    )
+    (root / "model-00002-of-00002.safetensors").write_bytes(
+        _safetensors_stub("score.bias", "score.weight")
+    )
+    template = ROOT / "config" / "querit" / "querit-rerank.jinja"
+    (root / "querit-rerank.jinja").write_bytes(template.read_bytes())
 
 
 class FakeHost:
@@ -78,31 +121,7 @@ class ArtifactManifestTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
-            for name, payload in (
-                (
-                    "config.json",
-                    json.dumps(
-                        {
-                            "architectures": ["Qwen3ForSequenceClassification"],
-                            "head_dtype": "model",
-                            "hidden_size": 2560,
-                            "max_position_embeddings": 40960,
-                            "num_labels": 1,
-                            "sbert_ce_default_activation_function": (
-                                "torch.nn.modules.activation.Tanh"
-                            ),
-                        }
-                    ).encode(),
-                ),
-                ("model.safetensors.index.json", b"{}\n"),
-                ("model-00001-of-00002.safetensors", b"weights-1"),
-                ("model-00002-of-00002.safetensors", b"weights-2"),
-                (
-                    "querit-rerank.jinja",
-                    (ROOT / "config" / "querit" / "querit-rerank.jinja").read_bytes(),
-                ),
-            ):
-                (root / name).write_bytes(payload)
+            _write_converted_artifact(root)
             manifest = artifact.write_manifest(root)
             verified = artifact.verify_manifest(root)
             self.assertEqual(verified, manifest)
@@ -111,6 +130,20 @@ class ArtifactManifestTests(unittest.TestCase):
                 "7b796de30ad8dc772d6c46c75659c1341283a665",
             )
             self.assertEqual(verified["transform"], "querit-tanh-scalar-head-v1")
+            self.assertEqual(
+                verified["source_ledger_sha256"], artifact.SOURCE_LEDGER_SHA256
+            )
+            self.assertEqual(
+                verified["source_tree_sha256"], artifact.SOURCE_TREE_SHA256
+            )
+            self.assertEqual(
+                verified["total_size"],
+                {
+                    "delta": -5_122,
+                    "output": 8_043_558_914,
+                    "source": 8_043_564_036,
+                },
+            )
 
             target = root / "model-00002-of-00002.safetensors"
             target.write_bytes(b"mutated")
@@ -124,10 +157,7 @@ class ArtifactManifestTests(unittest.TestCase):
     def test_manifest_semantically_attests_32k_config_and_exact_template(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
-            (root / "model.safetensors.index.json").write_text("{}\n")
-            (root / "model.safetensors").write_bytes(b"weights")
-            template = ROOT / "config" / "querit" / "querit-rerank.jinja"
-            (root / "querit-rerank.jinja").write_bytes(template.read_bytes())
+            _write_converted_artifact(root)
             valid_config = {
                 "architectures": ["Qwen3ForSequenceClassification"],
                 "head_dtype": "model",
@@ -149,15 +179,83 @@ class ArtifactManifestTests(unittest.TestCase):
                 changed = dict(valid_config)
                 mutation(changed)
                 (root / "config.json").write_text(json.dumps(changed))
-                with self.subTest(changed=changed), self.assertRaises(
-                    artifact.ArtifactError
+                with (
+                    self.subTest(changed=changed),
+                    self.assertRaises(artifact.ArtifactError),
                 ):
                     artifact.write_manifest(root)
 
             (root / "config.json").write_text(json.dumps(valid_config))
+            template = ROOT / "config" / "querit" / "querit-rerank.jinja"
             (root / "querit-rerank.jinja").write_bytes(template.read_bytes() + b"\n")
             with self.assertRaises(artifact.ArtifactError):
                 artifact.write_manifest(root)
+
+    def test_manifest_rejects_total_size_index_and_tensor_consumption_drift(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            _write_converted_artifact(root)
+            index_path = root / "model.safetensors.index.json"
+            valid_index = json.loads(index_path.read_text())
+
+            cases = {
+                "wrong total size": lambda row: row["metadata"].update(
+                    {"total_size": 8_043_564_036}
+                ),
+                "obsolete head": lambda row: row["weight_map"].update(
+                    {"head.weight": "model-00002-of-00002.safetensors"}
+                ),
+                "missing scalar": lambda row: row["weight_map"].pop("score.bias"),
+            }
+            for label, mutate in cases.items():
+                changed = json.loads(json.dumps(valid_index))
+                mutate(changed)
+                index_path.write_text(json.dumps(changed))
+                with (
+                    self.subTest(label=label),
+                    self.assertRaises(artifact.ArtifactError),
+                ):
+                    artifact.write_manifest(root)
+
+            index_path.write_text(json.dumps(valid_index))
+            (root / "model-00002-of-00002.safetensors").write_bytes(
+                _safetensors_stub("score.bias", "score.weight", "orphan.weight")
+            )
+            with self.assertRaisesRegex(
+                artifact.ArtifactError, "consumed exactly once"
+            ):
+                artifact.write_manifest(root)
+
+            _write_converted_artifact(root)
+            (root / "unexpected.safetensors").write_bytes(
+                _safetensors_stub("unexpected.weight")
+            )
+            with self.assertRaisesRegex(artifact.ArtifactError, "shard set"):
+                artifact.write_manifest(root)
+
+    def test_manifest_rejects_a_tampered_source_or_output_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            _write_converted_artifact(root)
+            artifact.write_manifest(root)
+            manifest_path = root / artifact.MANIFEST_NAME
+            manifest = json.loads(manifest_path.read_text())
+
+            for field, value in (
+                ("source_ledger", []),
+                ("source_ledger_sha256", "0" * 64),
+                ("output_tree_sha256", "0" * 64),
+            ):
+                changed = dict(manifest)
+                changed[field] = value
+                manifest_path.write_text(artifact._json_bytes(changed).decode())
+                with (
+                    self.subTest(field=field),
+                    self.assertRaises(artifact.ArtifactError),
+                ):
+                    artifact.verify_manifest(root)
 
 
 class CanaryLifecycleTests(unittest.TestCase):
@@ -306,7 +404,10 @@ class CanaryLifecycleTests(unittest.TestCase):
     def test_deactivation_failure_and_signal_restore_original_instead_of_canary(
         self,
     ) -> None:
-        for failure in (RuntimeError("stop failed"), lifecycle.LifecycleCancelled("SIGTERM")):
+        for failure in (
+            RuntimeError("stop failed"),
+            lifecycle.LifecycleCancelled("SIGTERM"),
+        ):
             with (
                 self.subTest(failure=type(failure).__name__),
                 tempfile.TemporaryDirectory() as raw_tmp,
@@ -323,7 +424,9 @@ class CanaryLifecycleTests(unittest.TestCase):
                 self.assertFalse(host.states[lifecycle.BACKEND_UNIT].active)
                 self.assertFalse(
                     any(
-                        command == "start" and unit in {
+                        command == "start"
+                        and unit
+                        in {
                             lifecycle.ADAPTER_UNIT,
                             lifecycle.BACKEND_UNIT,
                         }
@@ -515,7 +618,9 @@ class CanaryLifecycleTests(unittest.TestCase):
             ),
             mock.patch.object(host, "memory_available_gib", return_value=4),
         ):
-            with self.assertRaisesRegex(lifecycle.LifecycleError, "changed during warmup"):
+            with self.assertRaisesRegex(
+                lifecycle.LifecycleError, "changed during warmup"
+            ):
                 host.warm()
 
 

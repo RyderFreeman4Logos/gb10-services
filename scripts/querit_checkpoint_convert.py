@@ -54,6 +54,16 @@ def rewrite_weight_index(
     """Replace Querit's head keys in a safetensors index without other changes."""
 
     replacements = {"head.weight": "score.weight", "head.bias": "score.bias"}
+    metadata = index.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise ValueError("weight index has no mapping-valued metadata")
+    total_size = metadata.get("total_size")
+    if (
+        isinstance(total_size, bool)
+        or not isinstance(total_size, int)
+        or total_size != querit_vllm_artifact.SOURCE_TOTAL_SIZE
+    ):
+        raise ValueError("weight index total_size is not the pinned source size")
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, Mapping):
         raise ValueError("weight index has no mapping-valued weight_map")
@@ -63,13 +73,14 @@ def rewrite_weight_index(
         if key not in weight_map:
             raise ValueError(f"missing {key} in weight index")
         if weight_map[key] != shard_name:
-            raise ValueError(
-                f"{key} shard must be {shard_name}, got {weight_map[key]}"
-            )
+            raise ValueError(f"{key} shard must be {shard_name}, got {weight_map[key]}")
     converted_map = {
         replacements.get(key, key): value for key, value in weight_map.items()
     }
     converted = dict(index)
+    converted_metadata = dict(metadata)
+    converted_metadata["total_size"] = querit_vllm_artifact.OUTPUT_TOTAL_SIZE
+    converted["metadata"] = converted_metadata
     converted["weight_map"] = converted_map
     return converted
 
@@ -116,7 +127,9 @@ def _load_safetensors(path: Path) -> tuple[dict[str, Any], dict[str, str] | None
     try:
         from safetensors import safe_open
     except ImportError as error:
-        raise RuntimeError("safetensors is required for checkpoint conversion") from error
+        raise RuntimeError(
+            "safetensors is required for checkpoint conversion"
+        ) from error
 
     with safe_open(str(path), framework="pt", device="cpu") as handle:
         state = {key: handle.get_tensor(key) for key in handle.keys()}
@@ -130,7 +143,9 @@ def _save_safetensors(
     try:
         from safetensors.torch import save_file
     except ImportError as error:
-        raise RuntimeError("safetensors is required for checkpoint conversion") from error
+        raise RuntimeError(
+            "safetensors is required for checkpoint conversion"
+        ) from error
 
     save_file(tensors, str(path), metadata=metadata)
 
@@ -197,6 +212,7 @@ def convert_snapshot(
 
     source_template = Path(template_path).expanduser().resolve(strict=True)
     template_bytes = source_template.read_bytes()
+    source_tree_sha256 = querit_vllm_artifact.attest_source_snapshot(snapshot)
     index = rewrite_weight_index(_load_json_object(index_path))
     config = rewrite_config(_load_json_object(config_path))
 
@@ -206,7 +222,9 @@ def convert_snapshot(
         try:
             import torch
         except ImportError as error:
-            raise RuntimeError("PyTorch is required for BF16 checkpoint conversion") from error
+            raise RuntimeError(
+                "PyTorch is required for BF16 checkpoint conversion"
+            ) from error
         bfloat16_dtype = torch.bfloat16
     state, metadata = loader(shard_path)
     converted_state = rewrite_head_state(state, bfloat16_dtype=bfloat16_dtype)
@@ -236,7 +254,7 @@ def convert_snapshot(
 
     score_weight = converted_state["score.weight"]
     score_bias = converted_state["score.bias"]
-    querit_vllm_artifact.write_manifest(snapshot)
+    querit_vllm_artifact.write_manifest(snapshot, source_tree_sha256=source_tree_sha256)
     return {
         "snapshot": str(snapshot),
         "shard": SHARD_NAME,

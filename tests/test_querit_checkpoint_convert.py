@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +23,7 @@ except ModuleNotFoundError:
 
 BFLOAT16 = object()
 TEMPLATE_PATH = ROOT / "config" / "querit" / "querit-rerank.jinja"
-EXPECTED_TEMPLATE = '''{%- set q = (
+EXPECTED_TEMPLATE = """{%- set q = (
     messages
     | selectattr("role", "eq", "query")
     | first
@@ -46,7 +48,20 @@ EXPECTED_TEMPLATE = '''{%- set q = (
     ~ "<|im_end|>\\n"
     ~ "<|im_start|>assistant\\n"
 -}}
-'''
+"""
+
+
+def _safetensors_stub(*names: str) -> bytes:
+    header = {
+        name: {
+            "data_offsets": [index, index + 1],
+            "dtype": "BF16",
+            "shape": [1],
+        }
+        for index, name in enumerate(names)
+    }
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    return struct.pack("<Q", len(encoded)) + encoded + b"\0" * len(names)
 
 
 class FakeTensor:
@@ -127,9 +142,7 @@ class HeadRewriteTests(unittest.TestCase):
 
     def test_arithmetic_must_retain_bfloat16_output(self) -> None:
         state = {
-            "head.weight": PromotingFakeTensor(
-                [[2.0] * 2560, [10.0] * 2560]
-            ),
+            "head.weight": PromotingFakeTensor([[2.0] * 2560, [10.0] * 2560]),
             "head.bias": PromotingFakeTensor([4.0, 12.0]),
         }
 
@@ -201,9 +214,11 @@ class MetadataRewriteTests(unittest.TestCase):
         self.assertNotIn("problem_type", converted)
         self.assertNotIn("head_dtype", source)
 
-    def test_weight_index_replaces_only_head_keys_and_preserves_metadata(self) -> None:
+    def test_weight_index_replaces_head_keys_and_pins_total_size_transition(
+        self,
+    ) -> None:
         source = {
-            "metadata": {"total_size": 123456},
+            "metadata": {"total_size": 8_043_564_036},
             "weight_map": {
                 "model.embed_tokens.weight": "model-00001-of-00002.safetensors",
                 "head.bias": "model-00002-of-00002.safetensors",
@@ -217,7 +232,14 @@ class MetadataRewriteTests(unittest.TestCase):
             source, shard_name="model-00002-of-00002.safetensors"
         )
 
-        self.assertEqual(converted["metadata"], source["metadata"])
+        self.assertEqual(
+            converted["metadata"]["total_size"],
+            8_043_558_914,
+        )
+        self.assertEqual(
+            converted["metadata"]["total_size"] - source["metadata"]["total_size"],
+            -5_122,
+        )
         self.assertEqual(
             list(converted["weight_map"]),
             [
@@ -233,6 +255,18 @@ class MetadataRewriteTests(unittest.TestCase):
         )
         self.assertNotIn("head.weight", converted["weight_map"])
         self.assertIn("head.weight", source["weight_map"])
+
+    def test_weight_index_rejects_a_non_pinned_total_size(self) -> None:
+        with self.assertRaisesRegex(ValueError, "total_size"):
+            converter.rewrite_weight_index(  # type: ignore[union-attr]
+                {
+                    "metadata": {"total_size": 123456},
+                    "weight_map": {
+                        "head.weight": "model-00002-of-00002.safetensors",
+                        "head.bias": "model-00002-of-00002.safetensors",
+                    },
+                }
+            )
 
     def test_weight_index_rejects_wrong_shard_or_existing_score_keys(self) -> None:
         cases = {
@@ -250,7 +284,10 @@ class MetadataRewriteTests(unittest.TestCase):
             with self.subTest(label=label):
                 with self.assertRaisesRegex(ValueError, label):
                     converter.rewrite_weight_index(  # type: ignore[union-attr]
-                        {"weight_map": weight_map},
+                        {
+                            "metadata": {"total_size": 8_043_564_036},
+                            "weight_map": weight_map,
+                        },
                         shard_name="model-00002-of-00002.safetensors",
                     )
 
@@ -267,15 +304,21 @@ class SnapshotConversionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_tmp:
             snapshot = Path(raw_tmp)
             shard = snapshot / "model-00002-of-00002.safetensors"
-            shard.write_bytes(b"original-shard")
+            (snapshot / "model-00001-of-00002.safetensors").write_bytes(
+                _safetensors_stub("model.weight")
+            )
+            shard.write_bytes(
+                _safetensors_stub("head.weight", "head.bias", "model.norm.weight")
+            )
             (snapshot / "model.safetensors.index.json").write_text(
                 json.dumps(
                     {
-                        "metadata": {"total_size": 123456},
+                        "metadata": {"total_size": 8_043_564_036},
                         "weight_map": {
                             "model.weight": "model-00001-of-00002.safetensors",
                             "head.weight": shard.name,
                             "head.bias": shard.name,
+                            "model.norm.weight": shard.name,
                         },
                     }
                 )
@@ -307,17 +350,24 @@ class SnapshotConversionTests(unittest.TestCase):
                 metadata: dict[str, str] | None,
             ) -> None:
                 calls.append(("save", tensors, path, metadata))
-                path.write_bytes(b"converted-shard")
+                path.write_bytes(
+                    _safetensors_stub("model.norm.weight", "score.weight", "score.bias")
+                )
 
-            result = converter.convert_snapshot(  # type: ignore[union-attr]
-                snapshot,
-                template_path=TEMPLATE_PATH,
-                load_shard=load_shard,
-                save_shard=save_shard,
-                bfloat16_dtype=BFLOAT16,
-            )
+            with mock.patch.object(
+                converter.querit_vllm_artifact,
+                "attest_source_snapshot",
+                return_value=converter.querit_vllm_artifact.SOURCE_TREE_SHA256,
+            ) as attest_source:
+                result = converter.convert_snapshot(  # type: ignore[union-attr]
+                    snapshot,
+                    template_path=TEMPLATE_PATH,
+                    load_shard=load_shard,
+                    save_shard=save_shard,
+                    bfloat16_dtype=BFLOAT16,
+                )
+            attest_source.assert_called_once_with(snapshot)
 
-            self.assertEqual(shard.read_bytes(), b"converted-shard")
             self.assertEqual(calls[0], ("load", shard))
             self.assertEqual(calls[1][0], "save")
             self.assertNotEqual(calls[1][2], shard)
@@ -329,8 +379,11 @@ class SnapshotConversionTests(unittest.TestCase):
             index = json.loads((snapshot / "model.safetensors.index.json").read_text())
             self.assertEqual(index["weight_map"]["score.weight"], shard.name)
             self.assertNotIn("head.weight", index["weight_map"])
+            self.assertEqual(index["metadata"]["total_size"], 8_043_558_914)
             config = json.loads((snapshot / "config.json").read_text())
-            self.assertEqual(config["architectures"], ["Qwen3ForSequenceClassification"])
+            self.assertEqual(
+                config["architectures"], ["Qwen3ForSequenceClassification"]
+            )
             self.assertEqual(config["num_labels"], 1)
             self.assertEqual(config["head_dtype"], "model")
             self.assertNotIn("problem_type", config)
@@ -347,7 +400,6 @@ class SnapshotConversionTests(unittest.TestCase):
 
             verified = querit_vllm_artifact.verify_manifest(snapshot)
             self.assertEqual(verified["source_revision"], converter.SOURCE_REVISION)
-
 
 
 if __name__ == "__main__":
