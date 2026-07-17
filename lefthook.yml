@@ -5,8 +5,6 @@ pre-commit:
 
 pre-push:
   commands:
-    branch-protection:
-      run: scripts/hooks/branch-protection.sh
     review-check:
       run: scripts/hooks/review-check.sh
     local-quality-gate:

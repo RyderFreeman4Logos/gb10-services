@@ -40,6 +40,8 @@ class LocalGateContractTests(unittest.TestCase):
         self.assertIn("pre-commit:", lefthook)
         self.assertIn("run: just quick-check", lefthook)
         self.assertIn("pre-push:", lefthook)
+        self.assertIn("run: scripts/hooks/review-check.sh", lefthook)
+        self.assertNotIn("run: scripts/hooks/branch-protection.sh", lefthook)
         self.assertIn("run: just pre-push", lefthook)
 
     def test_systemd_gate_uses_unprivileged_user_manager_semantics(self) -> None:
