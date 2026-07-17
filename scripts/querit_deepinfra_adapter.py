@@ -17,6 +17,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PUBLIC_PATH = "/v1/inference/Qwen/Qwen3-Reranker-8B"
 PUBLIC_VERSION = "5fa94080caafeaa45a15d11f969d7978e087a3db"
 BACKEND_MODEL = "Querit/Querit-4B"
+DEFAULT_INSTRUCTION = (
+    "Given a web search query, retrieve relevant passages that answer the query"
+)
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 # Two float32 ULPs at 1.0 cover serialization noise only. Admitted boundary
@@ -111,12 +114,11 @@ def parse_public_request(body: bytes) -> PublicRequest:
 def backend_request_bytes(request: PublicRequest) -> bytes:
     payload: dict[str, object] = {
         "documents": list(request.documents),
+        "instruction": request.instruction or DEFAULT_INSTRUCTION,
         "model": BACKEND_MODEL,
         "queries": list(request.queries),
         "use_activation": True,
     }
-    if request.instruction is not None:
-        payload["instruction"] = request.instruction
     return _json_bytes(payload)
 
 
@@ -155,19 +157,27 @@ def parse_backend_response(body: bytes, expected_count: int) -> BackendResponse:
         transformed.append((score + 1.0) / 2.0)
     usage = payload["usage"]
     if not isinstance(usage, dict) or set(usage) != {
+        "completion_tokens",
         "prompt_tokens",
+        "prompt_tokens_details",
         "total_tokens",
     }:
         raise AdapterError("vLLM usage fields are not exact")
+    completion_tokens = usage["completion_tokens"]
     prompt_tokens = usage["prompt_tokens"]
+    prompt_tokens_details = usage["prompt_tokens_details"]
     total_tokens = usage["total_tokens"]
     if (
-        isinstance(prompt_tokens, bool)
+        isinstance(completion_tokens, bool)
+        or not isinstance(completion_tokens, int)
+        or completion_tokens != 0
+        or isinstance(prompt_tokens, bool)
         or not isinstance(prompt_tokens, int)
         or prompt_tokens < 0
+        or prompt_tokens_details is not None
         or isinstance(total_tokens, bool)
         or not isinstance(total_tokens, int)
-        or total_tokens < prompt_tokens
+        or total_tokens != prompt_tokens
     ):
         raise AdapterError("vLLM token usage is invalid")
     return BackendResponse(tuple(transformed), prompt_tokens, request_id)

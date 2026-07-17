@@ -31,12 +31,16 @@ EXPECTED_TEMPLATE = '''{%- set q = (
     | selectattr("role", "eq", "document")
     | first
 ).content -%}
+{%- set instruction = instruction
+    if instruction is defined and instruction is not none
+    else "Given a web search query, retrieve relevant passages that answer the query"
+-%}
 {{- "<|im_start|>system\\n"
     ~ "Judge whether the Document meets the requirements based on the Query "
     ~ "and the Instruct provided. Note that the answer can only be \\"yes\\" or \\"no\\"."
     ~ "<|im_end|>\\n"
     ~ "<|im_start|>user\\n"
-    ~ "<Instruct>: Given a web search query, retrieve relevant passages that answer the query\\n"
+    ~ "<Instruct>: " ~ instruction ~ "\\n"
     ~ "<Query>: " ~ q ~ "\\n"
     ~ "<Document>: " ~ d
     ~ "<|im_end|>\\n"

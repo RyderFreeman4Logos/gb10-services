@@ -39,7 +39,12 @@ def _backend_response(scores: list[float]) -> bytes:
                 {"index": index, "object": "score", "score": score}
                 for index, score in enumerate(scores)
             ],
-            "usage": {"prompt_tokens": 123, "total_tokens": 123},
+            "usage": {
+                "prompt_tokens": 123,
+                "total_tokens": 123,
+                "completion_tokens": 0,
+                "prompt_tokens_details": None,
+            },
         },
         allow_nan=True,
         separators=(",", ":"),
@@ -71,6 +76,33 @@ class QueritDeepinfraAdapterTests(unittest.TestCase):
         self.assertEqual(response["scores"], [0.0, 0.5, 1.0])
         self.assertEqual(response["input_tokens"], 123)
         self.assertEqual(response["request_id"], "score-request-test")
+
+    def test_default_and_custom_instruction_reach_the_tracked_chat_template(self) -> None:
+        request = adapter.parse_public_request(
+            json.dumps(
+                {"documents": ["document"], "queries": ["query"]},
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        )
+        default_backend = json.loads(adapter.backend_request_bytes(request))
+        self.assertEqual(default_backend["instruction"], adapter.DEFAULT_INSTRUCTION)
+
+        custom = adapter.parse_public_request(_public_request())
+        custom_backend = json.loads(adapter.backend_request_bytes(custom))
+        self.assertEqual(custom_backend["instruction"], "rank faithfully")
+
+        template = (ROOT / "config" / "querit" / "querit-rerank.jinja").read_text()
+        self.assertIn('~ "<Instruct>: " ~ instruction ~ "\\n"', template)
+        self.assertNotIn(
+            "<Instruct>: Given a web search query, retrieve relevant passages that answer the query\\n",
+            template,
+        )
+
+    def test_real_vllm_025_score_response_usage_shape_is_accepted(self) -> None:
+        response = adapter.parse_backend_response(_backend_response([0.25]), 1)
+        self.assertEqual(response.input_tokens, 123)
+        self.assertEqual(response.scores, (0.625,))
 
     def test_public_path_and_version_query_are_exact(self) -> None:
         self.assertTrue(
@@ -117,6 +149,18 @@ class QueritDeepinfraAdapterTests(unittest.TestCase):
             _backend_response([0.0, 0.5, 1.0]).replace(b'"index":1', b'"index":0'),
             _backend_response([0.0, 0.5, 1.0]).replace(
                 b'"prompt_tokens":123', b'"prompt_tokens":true'
+            ),
+            _backend_response([0.0, 0.5, 1.0]).replace(
+                b',"completion_tokens":0,"prompt_tokens_details":null', b""
+            ),
+            _backend_response([0.0, 0.5, 1.0]).replace(
+                b'"completion_tokens":0', b'"completion_tokens":1'
+            ),
+            _backend_response([0.0, 0.5, 1.0]).replace(
+                b'"prompt_tokens_details":null', b'"prompt_tokens_details":{}'
+            ),
+            _backend_response([0.0, 0.5, 1.0]).replace(
+                b'"total_tokens":123', b'"total_tokens":124'
             ),
         )
         for body in invalid_backend:
