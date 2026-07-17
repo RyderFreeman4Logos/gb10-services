@@ -82,6 +82,7 @@ class FakeHost:
             lifecycle.GUARD_UNIT: lifecycle.ServiceState(True, "guard-before"),
         }
         self.stop_failures: dict[str, BaseException] = {}
+        self.unit_file_states = {lifecycle.TEXT_UNIT: "disabled"}
 
     def verify_artifact(self) -> str:
         self.verify_calls += 1
@@ -92,6 +93,9 @@ class FakeHost:
 
     def service_state(self, unit: str) -> lifecycle.ServiceState:
         return self.states[unit]
+
+    def unit_file_state(self, unit: str) -> str:
+        return self.unit_file_states.get(unit, "disabled")
 
     def start(self, unit: str) -> None:
         self.commands.append(("start", unit))
@@ -358,6 +362,67 @@ class CanaryLifecycleTests(unittest.TestCase):
             lifecycle.activate(host, Path(raw_tmp) / "state.json")
             self.assertNotIn(("stop", lifecycle.TEXT_UNIT), host.commands)
             self.assertTrue(host.states[lifecycle.TEXT_UNIT].active)
+
+    def test_explicit_pause_stops_active_text_at_high_headroom_and_restores_it(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            state = Path(raw_tmp) / "state.json"
+            host = FakeHost(memory=[24, 24])
+            lifecycle.activate(host, state, pause_text=True)
+
+            record = json.loads(state.read_text())
+            self.assertTrue(record["text_pause_requested"])
+            self.assertTrue(record["text_paused"])
+            self.assertEqual(host.commands[0], ("stop", lifecycle.TEXT_UNIT))
+
+            lifecycle.deactivate(host, state)
+            self.assertEqual(host.commands[-1], ("start", lifecycle.TEXT_UNIT))
+
+    def test_explicit_pause_leaves_inactive_text_unowned_and_inactive(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            state = Path(raw_tmp) / "state.json"
+            host = FakeHost(memory=[24])
+            host.states[lifecycle.TEXT_UNIT] = lifecycle.ServiceState(False, "")
+
+            lifecycle.activate(host, state, pause_text=True)
+            record = json.loads(state.read_text())
+            self.assertTrue(record["text_pause_requested"])
+            self.assertFalse(record["text_paused"])
+            lifecycle.deactivate(host, state)
+
+            self.assertNotIn(("stop", lifecycle.TEXT_UNIT), host.commands)
+            self.assertNotIn(("start", lifecycle.TEXT_UNIT), host.commands)
+
+    def test_explicit_pause_restores_text_after_activation_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            state = Path(raw_tmp) / "state.json"
+            host = FakeHost(memory=[24, 24], warm_error=RuntimeError("warm failed"))
+            with self.assertRaisesRegex(RuntimeError, "warm failed"):
+                lifecycle.activate(host, state, pause_text=True)
+
+            self.assertEqual(
+                host.commands[-3:],
+                [
+                    ("stop", lifecycle.ADAPTER_UNIT),
+                    ("stop", lifecycle.BACKEND_UNIT),
+                    ("start", lifecycle.TEXT_UNIT),
+                ],
+            )
+            self.assertTrue(host.states[lifecycle.TEXT_UNIT].active)
+            self.assertFalse(state.exists())
+
+    def test_explicit_pause_rejects_persistent_or_runtime_mask_before_mutation(self) -> None:
+        for mask in ("masked", "masked-runtime"):
+            with self.subTest(mask=mask), tempfile.TemporaryDirectory() as raw_tmp:
+                state = Path(raw_tmp) / "state.json"
+                host = FakeHost(memory=[24])
+                host.unit_file_states[lifecycle.TEXT_UNIT] = mask
+
+                with self.assertRaisesRegex(lifecycle.LifecycleError, "masked"):
+                    lifecycle.activate(host, state, pause_text=True)
+                self.assertFalse(state.exists())
+                self.assertEqual(host.commands, [])
 
     def test_readiness_failure_and_signal_both_restore_text_and_stop_canary(
         self,

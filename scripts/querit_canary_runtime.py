@@ -194,6 +194,20 @@ class SystemHost:
             container_pids=container_pids,
         )
 
+    def unit_file_state(self, unit: str) -> str:
+        """Return the exact systemd unit-file state used for mask admission.
+
+        The lifecycle only needs this before it takes ownership of stopping text.
+        Keeping the query here makes the policy use the same fixed systemctl binary
+        as all other lifecycle operations.
+        """
+
+        completed = self._systemctl("show", unit, "--property=UnitFileState")
+        key, separator, value = completed.stdout.strip().partition("=")
+        if key != "UnitFileState" or not separator or not value:
+            raise LifecycleError(f"systemd UnitFileState is invalid for {unit}")
+        return value
+
     @staticmethod
     def _cgroup_pids(control_group: str) -> tuple[int, ...]:
         if not control_group.startswith("/") or ".." in Path(control_group).parts:

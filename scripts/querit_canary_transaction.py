@@ -29,6 +29,8 @@ class Host(Protocol):
 
     def service_state(self, unit: str) -> ServiceState: ...
 
+    def unit_file_state(self, unit: str) -> str: ...
+
     def start(self, unit: str) -> None: ...
 
     def stop(self, unit: str) -> None: ...
@@ -141,6 +143,7 @@ def _new_record(
         "schema": "querit-canary-state-v2",
         "text_before": text.record(),
         "text_paused": False,
+        "text_pause_requested": False,
     }
 
 
@@ -169,6 +172,24 @@ def _retry_restore(
     return f"{label}: {type(last_error).__name__}: {last_error}"
 
 
+def _quiescent(state: ServiceState) -> bool:
+    return (
+        not state.active
+        and state.main_pid == 0
+        and not state.unit_pids
+        and not state.container_id
+        and state.container_pid == 0
+        and not state.container_cgroup
+        and not state.container_pids
+    )
+
+
+def _require_unmasked_text(host: Host) -> None:
+    state = host.unit_file_state(TEXT_UNIT)
+    if state in {"masked", "masked-runtime"}:
+        raise LifecycleError("text service is masked and cannot be transactionally restored")
+
+
 def _restore_original(
     host: Host, state_path: Path, record: dict[str, object]
 ) -> BaseException | None:
@@ -192,24 +213,13 @@ def _restore_original(
     try:
         _write_state(state_path, record)
 
-        def quiescent(state: ServiceState) -> bool:
-            return (
-                not state.active
-                and state.main_pid == 0
-                and not state.unit_pids
-                and not state.container_id
-                and state.container_pid == 0
-                and not state.container_cgroup
-                and not state.container_pids
-            )
-
         def stop_to_snapshot(unit: str, expected: ServiceState) -> None:
             if expected.active:
                 raise LifecycleError(f"{unit} was unexpectedly active before activation")
-            if not quiescent(host.service_state(unit)):
+            if not _quiescent(host.service_state(unit)):
                 host.stop(unit)
             stopped = host.service_state(unit)
-            if not quiescent(stopped):
+            if not _quiescent(stopped):
                 raise LifecycleError(f"{unit} retains unit/container/PID residue")
             record[f"{unit}_restored"] = stopped.record()
 
@@ -230,24 +240,19 @@ def _restore_original(
 
         def restore_text() -> None:
             observed = host.service_state(TEXT_UNIT)
-            if text_before.active:
+            if text_paused:
+                if not text_before.active:
+                    raise LifecycleError("inactive text service cannot be pause-owned")
                 if not observed.active:
                     host.start(TEXT_UNIT)
                 restored = host.service_state(TEXT_UNIT)
                 if not restored.active:
                     raise LifecycleError("text service did not return to active state")
-                if not text_paused and restored != text_before:
-                    raise LifecycleError("untouched text service identity changed")
                 record["text_restored"] = restored.record()
             else:
-                if not quiescent(observed):
-                    if observed.active:
-                        host.stop(TEXT_UNIT)
-                    if not quiescent(host.service_state(TEXT_UNIT)):
-                        raise LifecycleError(
-                            "text service did not return to a quiescent inactive state"
-                        )
-                record["text_restored"] = host.service_state(TEXT_UNIT).record()
+                if observed != text_before:
+                    raise LifecycleError("untouched text service identity changed")
+                record["text_restored"] = observed.record()
 
         error = _retry_restore("text restore", restore_text, failures)
         if error:
@@ -279,7 +284,7 @@ def _recover_stale_transaction(host: Host, state_path: Path) -> None:
         raise restore_error
 
 
-def activate(host: Host, state_path: Path) -> None:
+def activate(host: Host, state_path: Path, *, pause_text: bool = False) -> None:
     if state_path.exists():
         _recover_stale_transaction(host, state_path)
     artifact_sha256 = host.verify_artifact()
@@ -299,14 +304,22 @@ def activate(host: Host, state_path: Path) -> None:
         adapter=adapter_before,
     )
     try:
+        if pause_text:
+            _require_unmasked_text(host)
+            record["text_pause_requested"] = True
         _write_state(state_path, record)
         available = host.memory_available_gib()
-        if available < MINIMUM_HEADROOM_GIB and text_before.active:
+        should_pause_text = text_before.active and (
+            pause_text or available < MINIMUM_HEADROOM_GIB
+        )
+        if should_pause_text:
+            if not pause_text:
+                _require_unmasked_text(host)
             record["text_paused"] = True
             _write_state(state_path, record)
             host.stop(TEXT_UNIT)
-            if host.service_state(TEXT_UNIT).active:
-                raise LifecycleError("text service did not stop for canary headroom")
+            if not _quiescent(host.service_state(TEXT_UNIT)):
+                raise LifecycleError("text service did not fully quiesce for canary")
             available = host.memory_available_gib()
         if available < MINIMUM_HEADROOM_GIB:
             raise LifecycleError(

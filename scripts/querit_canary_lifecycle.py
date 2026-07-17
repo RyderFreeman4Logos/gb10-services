@@ -114,6 +114,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("action", choices=("activate", "deactivate", "preflight"))
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--model-root", type=Path, default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--pause-text",
+        action="store_true",
+        help="transactionally pause an active text unit before canary activation",
+    )
     return parser.parse_args(argv)
 
 
@@ -130,8 +135,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         previous_handlers[selected] = signal.signal(selected, _signal_handler)
     try:
         if args.action == "activate":
-            activate(host, state_path)
+            activate(host, state_path, pause_text=args.pause_text)
         else:
+            if args.pause_text:
+                raise LifecycleError("--pause-text is valid only with activate")
             deactivate(host, state_path)
     finally:
         for selected, handler in previous_handlers.items():
