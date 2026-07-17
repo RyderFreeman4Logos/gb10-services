@@ -104,6 +104,21 @@ class QueritDeepinfraAdapterTests(unittest.TestCase):
         self.assertEqual(response.input_tokens, 123)
         self.assertEqual(response.scores, (0.625,))
 
+    def test_internal_tanh_domain_never_clamps_outside_evidence(self) -> None:
+        for score in (
+            math.nextafter(-1.0, -math.inf),
+            -1.0 - 2.0**-23,
+            1.0 + 2.0**-23,
+            math.nextafter(1.0, math.inf),
+        ):
+            with self.subTest(score=score), self.assertRaises(adapter.AdapterError):
+                adapter.parse_backend_response(_backend_response([score]), 1)
+
+        self.assertEqual(
+            adapter.parse_backend_response(_backend_response([-1.0, 1.0]), 2).scores,
+            (0.0, 1.0),
+        )
+
     def test_public_path_and_version_query_are_exact(self) -> None:
         self.assertTrue(
             adapter.valid_public_target(

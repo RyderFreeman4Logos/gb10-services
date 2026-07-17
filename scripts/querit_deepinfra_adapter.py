@@ -22,9 +22,6 @@ DEFAULT_INSTRUCTION = (
 )
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
-# Two float32 ULPs at 1.0 cover serialization noise only. Admitted boundary
-# values are clamped before the declared tanh [-1, 1] -> public [0, 1] map.
-RAW_SCORE_EPSILON = 2.0**-22
 
 
 class AdapterError(RuntimeError):
@@ -151,9 +148,8 @@ def parse_backend_response(body: bytes, expected_count: int) -> BackendResponse:
         ):
             raise AdapterError("vLLM raw scores must be finite numbers")
         score = float(value)
-        if not -1.0 - RAW_SCORE_EPSILON <= score <= 1.0 + RAW_SCORE_EPSILON:
+        if not -1.0 <= score <= 1.0:
             raise AdapterError("vLLM raw scores must be in the tanh [-1, 1] domain")
-        score = min(1.0, max(-1.0, score))
         transformed.append((score + 1.0) / 2.0)
     usage = payload["usage"]
     if not isinstance(usage, dict) or set(usage) != {

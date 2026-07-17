@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import os
 import sys
 import tempfile
@@ -496,6 +497,25 @@ class CostAndResponseTests(unittest.TestCase):
                 self.assertRaises(reranker.ResponseValidationError),
             ):
                 reranker.validate_response(body, 2)
+
+    def test_public_score_domain_rejects_every_representable_outside_value(
+        self,
+    ) -> None:
+        for score in (
+            math.nextafter(0.0, -math.inf),
+            -(2.0**-23),
+            1.0 + 2.0**-23,
+            math.nextafter(1.0, math.inf),
+        ):
+            with self.subTest(score=score), self.assertRaises(
+                reranker.ResponseValidationError
+            ):
+                reranker.validate_response(_response([score]), 1)
+
+        self.assertEqual(
+            reranker.validate_response(_response([0.0, 1.0]), 2).scores,
+            (0.0, 1.0),
+        )
 
 
 class MetricsTests(unittest.TestCase):

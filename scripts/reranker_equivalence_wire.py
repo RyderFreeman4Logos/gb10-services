@@ -23,9 +23,6 @@ PUBLIC_API_MODEL = "Qwen/Qwen3-Reranker-8B"
 LOCAL_MODEL_REVISION = "7b796de30ad8dc772d6c46c75659c1341283a665"
 PUBLIC_SCORE_MIN = 0.0
 PUBLIC_SCORE_MAX = 1.0
-# Two float32 ULPs at 1.0. Values admitted only by this serialization tolerance
-# are clamped to the documented public [0, 1] domain before use.
-PUBLIC_SCORE_EPSILON = 2.0**-22
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 ALLOWED_RESPONSE_HEADERS = frozenset(
     {
@@ -646,15 +643,11 @@ def validate_response(body: bytes, expected_count: int) -> ValidatedResponse:
         ):
             raise ResponseValidationError("response scores must be finite numbers")
         score = float(value)
-        if not (
-            PUBLIC_SCORE_MIN - PUBLIC_SCORE_EPSILON
-            <= score
-            <= PUBLIC_SCORE_MAX + PUBLIC_SCORE_EPSILON
-        ):
+        if not PUBLIC_SCORE_MIN <= score <= PUBLIC_SCORE_MAX:
             raise ResponseValidationError(
                 "response scores must be in public [0, 1] domain"
             )
-        scores.append(min(PUBLIC_SCORE_MAX, max(PUBLIC_SCORE_MIN, score)))
+        scores.append(score)
     input_tokens = payload["input_tokens"]
     if (
         isinstance(input_tokens, bool)
@@ -792,7 +785,6 @@ __all__ = [
     "EvidenceResponse",
     "HttpResult",
     "LOCAL_ENDPOINT",
-    "PUBLIC_SCORE_EPSILON",
     "RequestIdentity",
     "ResponseValidationError",
     "ValidatedResponse",
