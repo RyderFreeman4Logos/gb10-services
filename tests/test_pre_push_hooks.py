@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,50 +17,42 @@ ZERO = "0" * 40
 class HookFixture:
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.git_env = os.environ.copy()
+        local_env_vars = subprocess.check_output(
+            ["git", "rev-parse", "--local-env-vars"],
+            env=self.git_env,
+            text=True,
+        ).splitlines()
+        for name in local_env_vars:
+            self.git_env.pop(name, None)
+
         self.hooks = root / "scripts" / "hooks"
         self.hooks.mkdir(parents=True)
         for name in ("branch-protection.sh", "review-check.sh"):
             shutil.copy2(ROOT / "scripts" / "hooks" / name, self.hooks / name)
-        subprocess.run(["git", "init", "-q", "-b", "feat/test"], cwd=root, check=True)
-        subprocess.run(
-            ["git", "config", "user.email", "test@example.invalid"],
-            cwd=root,
-            check=True,
-        )
-        subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+        self.git_run("init", "-q", "-b", "feat/test")
+        self.git_run("config", "user.email", "test@example.invalid")
+        self.git_run("config", "user.name", "Test")
         (root / "tracked.txt").write_text("one\n")
-        subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
-        subprocess.run(["git", "commit", "-qm", "first"], cwd=root, check=True)
+        self.git_run("add", "tracked.txt")
+        self.git_run("commit", "-qm", "first")
         self.first = self.git("rev-parse", "HEAD")
-        subprocess.run(["git", "branch", "main"], cwd=root, check=True)
+        self.git_run("branch", "main")
         (root / "tracked.txt").write_text("two\n")
-        subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
-        subprocess.run(["git", "commit", "-qm", "second"], cwd=root, check=True)
+        self.git_run("add", "tracked.txt")
+        self.git_run("commit", "-qm", "second")
         self.head = self.git("rev-parse", "HEAD")
         self.first_tree = self.git("rev-parse", f"{self.first}^{{tree}}")
         self.head_tree = self.git("rev-parse", f"{self.head}^{{tree}}")
 
         self.remote = root / "remote.git"
-        subprocess.run(["git", "init", "--bare", "-q", self.remote], check=True)
-        subprocess.run(
-            ["git", "remote", "add", "origin", str(self.remote)],
-            cwd=root,
-            check=True,
-        )
-        subprocess.run(
-            ["git", "update-ref", "refs/remotes/origin/main", self.first],
-            cwd=root,
-            check=True,
-        )
-        subprocess.run(
-            [
-                "git",
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/main",
-            ],
-            cwd=root,
-            check=True,
+        self.git_run("init", "--bare", "-q", str(self.remote), from_root=False)
+        self.git_run("remote", "add", "origin", str(self.remote))
+        self.git_run("update-ref", "refs/remotes/origin/main", self.first)
+        self.git_run(
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
         )
 
         self.csa_log = root / "trusted-csa.log"
@@ -95,8 +88,18 @@ class HookFixture:
         )
         malicious.chmod(0o755)
 
+    def git_run(self, *args: str, from_root: bool = True) -> None:
+        subprocess.run(
+            ["git", *args],
+            cwd=self.root if from_root else None,
+            env=self.git_env,
+            check=True,
+        )
+
     def git(self, *args: str) -> str:
-        return subprocess.check_output(["git", *args], cwd=self.root, text=True).strip()
+        return subprocess.check_output(
+            ["git", *args], cwd=self.root, env=self.git_env, text=True
+        ).strip()
 
     def update(
         self,
@@ -114,7 +117,7 @@ class HookFixture:
         arguments: tuple[str, ...] | None = None,
         **environment: str,
     ) -> subprocess.CompletedProcess[str]:
-        env = os.environ.copy()
+        env = self.git_env.copy()
         env.update(
             {
                 "FAKE_CSA_LOG": str(self.csa_log),
@@ -141,20 +144,113 @@ class HookFixture:
         )
 
     def force_commit(self) -> str:
-        subprocess.run(
-            ["git", "checkout", "-qb", "force-side", self.first],
-            cwd=self.root,
-            check=True,
-        )
+        self.git_run("checkout", "-qb", "force-side", self.first)
         (self.root / "tracked.txt").write_text("force side\n")
-        subprocess.run(["git", "add", "tracked.txt"], cwd=self.root, check=True)
-        subprocess.run(["git", "commit", "-qm", "force side"], cwd=self.root, check=True)
+        self.git_run("add", "tracked.txt")
+        self.git_run("commit", "-qm", "force side")
         side = self.git("rev-parse", "HEAD")
-        subprocess.run(["git", "checkout", "-q", "feat/test"], cwd=self.root, check=True)
+        self.git_run("checkout", "-q", "feat/test")
         return side
 
 
 class PrePushHookTests(unittest.TestCase):
+    def test_fixture_ignores_ambient_git_local_environment(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as raw_outer,
+            tempfile.TemporaryDirectory() as raw_fixture,
+        ):
+            outer = Path(raw_outer)
+            fixture_root = Path(raw_fixture)
+            clean_env = os.environ.copy()
+            local_env_vars = subprocess.check_output(
+                ["git", "rev-parse", "--local-env-vars"],
+                env=clean_env,
+                text=True,
+            ).splitlines()
+            for name in local_env_vars:
+                clean_env.pop(name, None)
+
+            def outer_git(*args: str) -> str:
+                return subprocess.check_output(
+                    ["git", *args], cwd=outer, env=clean_env, text=True
+                ).strip()
+
+            subprocess.run(
+                ["git", "init", "-q", "-b", "ambient"],
+                cwd=outer,
+                env=clean_env,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Outer"],
+                cwd=outer,
+                env=clean_env,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "outer@example.invalid"],
+                cwd=outer,
+                env=clean_env,
+                check=True,
+            )
+            (outer / "outer.txt").write_text("outer\n")
+            subprocess.run(
+                ["git", "add", "outer.txt"], cwd=outer, env=clean_env, check=True
+            )
+            subprocess.run(
+                ["git", "commit", "-qm", "outer"],
+                cwd=outer,
+                env=clean_env,
+                check=True,
+            )
+
+            def outer_state() -> dict[str, str]:
+                git_dir = outer / ".git"
+                return {
+                    "head": outer_git("rev-parse", "HEAD"),
+                    "head_ref": outer_git("symbolic-ref", "HEAD"),
+                    "refs": outer_git(
+                        "for-each-ref", "--format=%(refname) %(objectname)"
+                    ),
+                    "index": hashlib.sha256(
+                        git_dir.joinpath("index").read_bytes()
+                    ).hexdigest(),
+                    "config": hashlib.sha256(
+                        git_dir.joinpath("config").read_bytes()
+                    ).hexdigest(),
+                    "core.bare": outer_git("config", "--local", "--get", "core.bare"),
+                    "user.name": outer_git("config", "--local", "--get", "user.name"),
+                    "user.email": outer_git(
+                        "config", "--local", "--get", "user.email"
+                    ),
+                }
+
+            before = outer_state()
+            ambient_env = clean_env.copy()
+            ambient_env.update(
+                {
+                    "GIT_COMMON_DIR": str(outer / ".git"),
+                    "GIT_CONFIG": str(outer / ".git" / "config"),
+                    "GIT_DIR": str(outer / ".git"),
+                    "GIT_INDEX_FILE": str(outer / ".git" / "index"),
+                    "GIT_OBJECT_DIRECTORY": str(outer / ".git" / "objects"),
+                    "GIT_WORK_TREE": str(fixture_root),
+                }
+            )
+            construction_error: subprocess.CalledProcessError | None = None
+            fixture_git_dir = ""
+            with mock.patch.dict(os.environ, ambient_env, clear=True):
+                try:
+                    fixture = HookFixture(fixture_root)
+                    fixture_git_dir = fixture.git("rev-parse", "--absolute-git-dir")
+                except subprocess.CalledProcessError as error:
+                    construction_error = error
+
+            self.assertEqual(outer_state(), before)
+            self.assertIsNone(construction_error)
+            self.assertEqual(fixture_git_dir, str(fixture_root / ".git"))
+            self.assertTrue((fixture_root / ".git").is_dir())
+
     def test_new_branch_receipt_binds_remote_update_range_and_trees(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             fixture = HookFixture(Path(raw_tmp))
@@ -196,9 +292,7 @@ class PrePushHookTests(unittest.TestCase):
     def test_multiple_refs_are_canonical_and_altered_order_is_equivalent(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             fixture = HookFixture(Path(raw_tmp))
-            subprocess.run(
-                ["git", "tag", "v-test", fixture.head], cwd=fixture.root, check=True
-            )
+            fixture.git_run("tag", "v-test", fixture.head)
             branch = fixture.update(
                 "refs/heads/feat/test",
                 fixture.head,
@@ -223,11 +317,7 @@ class PrePushHookTests(unittest.TestCase):
     def test_unprotected_delete_is_attested_but_protected_delete_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             fixture = HookFixture(Path(raw_tmp))
-            subprocess.run(
-                ["git", "update-ref", "refs/remotes/origin/old", fixture.first],
-                cwd=fixture.root,
-                check=True,
-            )
+            fixture.git_run("update-ref", "refs/remotes/origin/old", fixture.first)
             deletion = fixture.update("(delete)", ZERO, "refs/heads/old", fixture.first)
 
             allowed = fixture.run(deletion)
@@ -246,11 +336,7 @@ class PrePushHookTests(unittest.TestCase):
             fixture = HookFixture(Path(raw_tmp))
             side = fixture.force_commit()
             side_tree = fixture.git("rev-parse", f"{side}^{{tree}}")
-            subprocess.run(
-                ["git", "update-ref", "refs/remotes/origin/force", fixture.head],
-                cwd=fixture.root,
-                check=True,
-            )
+            fixture.git_run("update-ref", "refs/remotes/origin/force", fixture.head)
             update = fixture.update(
                 "refs/heads/force-side", side, "refs/heads/force", fixture.head
             )
@@ -269,15 +355,10 @@ class PrePushHookTests(unittest.TestCase):
     def test_existing_branch_fast_forward_uses_the_remote_tracking_base(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             fixture = HookFixture(Path(raw_tmp))
-            subprocess.run(
-                [
-                    "git",
-                    "update-ref",
-                    "refs/remotes/origin/feat/test",
-                    fixture.first,
-                ],
-                cwd=fixture.root,
-                check=True,
+            fixture.git_run(
+                "update-ref",
+                "refs/remotes/origin/feat/test",
+                fixture.first,
             )
             update = fixture.update(
                 "refs/heads/feat/test",
@@ -297,10 +378,8 @@ class PrePushHookTests(unittest.TestCase):
     def test_empty_transition_and_same_tree_commit_fail_before_review(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             fixture = HookFixture(Path(raw_tmp))
-            subprocess.run(
-                ["git", "update-ref", "refs/remotes/origin/feat/test", fixture.head],
-                cwd=fixture.root,
-                check=True,
+            fixture.git_run(
+                "update-ref", "refs/remotes/origin/feat/test", fixture.head
             )
             same_sha = fixture.update(
                 "refs/heads/feat/test",
@@ -308,24 +387,15 @@ class PrePushHookTests(unittest.TestCase):
                 "refs/heads/feat/test",
                 fixture.head,
             )
-            metadata = subprocess.check_output(
-                [
-                    "git",
-                    "commit-tree",
-                    fixture.head_tree,
-                    "-p",
-                    fixture.head,
-                    "-m",
-                    "metadata only",
-                ],
-                cwd=fixture.root,
-                text=True,
-            ).strip()
-            subprocess.run(
-                ["git", "update-ref", "refs/heads/metadata", metadata],
-                cwd=fixture.root,
-                check=True,
+            metadata = fixture.git(
+                "commit-tree",
+                fixture.head_tree,
+                "-p",
+                fixture.head,
+                "-m",
+                "metadata only",
             )
+            fixture.git_run("update-ref", "refs/heads/metadata", metadata)
             same_tree = fixture.update(
                 "refs/heads/metadata",
                 metadata,
@@ -357,20 +427,13 @@ class PrePushHookTests(unittest.TestCase):
                     result = fixture.run(update, **environment)
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("changed while", result.stderr)
-                    subprocess.run(
-                        ["git", "update-ref", "refs/heads/feat/test", fixture.head],
-                        cwd=fixture.root,
-                        check=True,
+                    fixture.git_run(
+                        "update-ref", "refs/heads/feat/test", fixture.head
                     )
-                    subprocess.run(
-                        [
-                            "git",
-                            "update-ref",
-                            "refs/remotes/origin/main",
-                            fixture.first,
-                        ],
-                        cwd=fixture.root,
-                        check=True,
+                    fixture.git_run(
+                        "update-ref",
+                        "refs/remotes/origin/main",
+                        fixture.first,
                     )
 
     def test_stale_or_tampered_receipt_never_authorizes_a_push(self) -> None:
