@@ -150,23 +150,70 @@ parameters.
 5. Run `gb10_querit_canary_lifecycle.py deactivate` to stop adapter then
    backend and restore any text state paused by the transaction.
 
-Install the reviewed files without starting a service:
+### Source-closed canary deployment transaction
+
+Do not copy files, unmask units, reload systemd, publish the artifact, or start
+either canary unit by hand. The operator-facing owner is
+`scripts/gb10_querit_canary_deploy.py`; it is the only path that can remove the
+runtime masks it created. It makes a private exact-HEAD bundle whose manifest
+binds each tracked source path to its explicit target path, mode, size, and
+SHA-256. The bundle includes the lifecycle/runtime/transaction/artifact and
+adapter/equivalence modules, both wrappers and units,
+`gb10_service_ready.sh`, the converter, and the pinned Jinja template.
+Its explicit library mapping includes `scripts/querit_replay_trust.py` alongside
+`scripts/querit_vllm_artifact.py`, `scripts/querit_checkpoint_convert.py`, and
+`config/querit/querit-rerank.jinja`; no target is inferred from an executable
+bit or a directory convention.
+
+Run from a clean repository root. `SNAPSHOT` is a pinned source snapshot that
+may be read but is never changed; the owner creates an owner-only disposable
+copy, runs the committed converter and validator on that copy, and atomically
+publishes it at `/home/obj/models/querit-4b-vllm`.
 
 ```bash
-install -d -m 0755 /home/obj/.local/lib/gb10 /home/obj/.local/bin
-install -m 0644 scripts/querit_deepinfra_adapter.py \
-  scripts/querit_canary_lifecycle.py scripts/querit_canary_runtime.py \
-  scripts/querit_canary_transaction.py scripts/querit_vllm_artifact.py \
-  scripts/querit_replay_trust.py \
-  scripts/reranker_equivalence_wire.py /home/obj/.local/lib/gb10/
-install -m 0755 scripts/gb10_querit_canary_lifecycle.py \
-  scripts/gb10_querit_canary_preflight.py /home/obj/.local/bin/
-install -m 0644 systemd/vllm-querit-4b-canary.service \
-  systemd/vllm-querit-4b-canary-backend.service \
-  /home/obj/.config/systemd/user/
-rm -f /home/obj/.local/bin/gb10_querit_canary_ready.py
-systemctl --user daemon-reload
+SNAPSHOT=/path/to/pinned/Querit-4B-snapshot
+
+# Read-only source/host attestation, durable prestate receipt, then owner mask.
+python3 scripts/gb10_querit_canary_deploy.py prepare --source-root "$PWD"
+
+# Re-attest immediately before mutation; convert, publish, install, reload, and
+# verify exact loaded unit bytes. Both candidate units remain disabled.
+python3 scripts/gb10_querit_canary_deploy.py install \
+  --source-root "$PWD" --source-snapshot "$SNAPSHOT"
+
+# The explicit experiment mode durably owns an active text pause. It never
+# restarts or kills text; canonical lifecycle activation starts backend then adapter.
+python3 scripts/gb10_querit_canary_deploy.py activate \
+  --source-root "$PWD" --pause-text
+
+# Stop adapter then backend through the canonical lifecycle, restore text only
+# if this transaction paused it, restore artifact/files/masks, and reload.
+python3 scripts/gb10_querit_canary_deploy.py deactivate --source-root "$PWD"
 ```
+
+`deploy --source-snapshot "$SNAPSHOT" --pause-text` performs the same three
+phases as one command. `deactivate` and `rollback` are equivalent recovery
+actions for a non-active partial receipt. A subsequent `prepare`/`deploy`
+recovers a non-active receipt before it performs new work; an `active` receipt
+requires the explicit `deactivate` command.
+
+Before its first file, artifact, mask, daemon-reload, or lifecycle mutation,
+the owner re-attests the clean source/bundle identity; exact target prestate;
+text and immutable-neighbor service identities; candidate units, masks,
+FragmentPath and drop-ins; listeners 18014/18015; candidate containers; sealed
+artifact prestate; and memory/swap/PSI admission facts. Persistent masks,
+foreign runtime masks, enabled candidate units, loaded-byte/path/drop-in drift,
+or pre-existing candidate listeners/containers fail closed. Rollback stops only
+the candidate through the lifecycle, proves candidate PIDs/listeners/containers
+are absent, then restores the recorded artifact, files, runtime-mask prestate,
+and systemd generation. A partial or failed rollback keeps an owner-only state
+file and receipt for recovery; it never touches embedding, legacy Querit on
+18013, the qwen reranker, Proxy, or guardian.
+
+The former manual `install`/`daemon-reload` sequence is superseded by the
+source-closed owner above. It deliberately cannot be used as a recovery
+shortcut because it lacks the deployment receipt, artifact backup, and owned
+runtime-mask record.
 
 ### Phase 3: Production cutover
 1. Stop current transformers RR
