@@ -100,9 +100,11 @@ backend starts. The tracked lifecycle transaction verifies the converted
 artifact manifest and snapshots embedding, both current/legacy reranker units,
 Guard, and text. If headroom is low it may stop text only, then remeasures. It
 starts the backend and adapter with `stop then start` operations only, warms the
-public wire endpoint, and restores text plus canary pre-state after every
-failure or termination signal. It never stops embedding, either production
-reranker, or Guard, and the canary is never enrolled in the guardian.
+public wire endpoint plus native peak-context and batching paths, then checks
+OOM counters, headroom, and unit/container/PID identity. It restores text plus
+canary pre-state after every failure or termination signal. It never stops
+embedding, either production reranker, or Guard, and the canary is never
+enrolled in the guardian.
 
 ### v0.24 → v0.25 note
 
@@ -119,7 +121,7 @@ The original adapter document assumed v0.24.0. All references updated to v0.25.0
 6. Generate and verify `querit-vllm-artifact-manifest.json`
 
 ### Phase 2: Smoke test (temporary port)
-1. Install the two tracked canary units, adapter, lifecycle modules, and three
+1. Install the two tracked canary units, adapter, lifecycle modules, and two
    `gb10_querit_canary_*.py` entry points. Do not enable either unit.
 2. Run `gb10_querit_canary_lifecycle.py activate`. The activator alone may
    start the loopback vLLM backend and the public adapter.
@@ -143,6 +145,7 @@ install -m 0755 scripts/gb10_querit_canary_lifecycle.py \
 install -m 0644 systemd/vllm-querit-4b-canary.service \
   systemd/vllm-querit-4b-canary-backend.service \
   /home/obj/.config/systemd/user/
+rm -f /home/obj/.local/bin/gb10_querit_canary_ready.py
 systemctl --user daemon-reload
 ```
 
