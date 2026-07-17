@@ -1,7 +1,7 @@
 # Querit vLLM Migration — Research and Implementation Plan
 
 **Date:** 2026-07-16
-**Status:** Research complete, implementation starting
+**Status:** Source-controlled canary ready; live probing pending
 
 ## Background
 
@@ -9,7 +9,7 @@ The current Querit reranker runs as a Python transformers server (`querit_openai
 
 ### First principle
 
-GB10 local Querit-4B and cloud DeepInfra Qwen3-Reranker-8B must be transparently interchangeable. Developers program against `qwen3-reranker-8b` API. The guard-proxy adapter does mathematical conversion so score semantics are identical. Local and cloud endpoints differ only in quality (Querit-4B tested slightly better; cloud may have quantization), not API surface. This pairs with #172 (upstream failover, merged) for automatic local↔cloud switching.
+GB10 local Querit-4B and cloud DeepInfra Qwen3-Reranker-8B must ultimately be transparently interchangeable. Developers program against the public DeepInfra contract for `Qwen/Qwen3-Reranker-8B`. Native vLLM scoring availability is necessary but is not, by itself, evidence of wire compatibility. This pairs with #172 (upstream failover, merged) for eventual automatic local↔cloud switching.
 
 ## Research Findings
 
@@ -71,9 +71,15 @@ Jinja template verified byte-exact match to `render_current_prompt()`:
 
 This is an improvement, not a regression. The new contract should be named `querit-prompt-last-real-v1`.
 
-### No guard-proxy adapter needed
+### Native scoring support
 
-vLLM natively provides `/v1/rerank`. With Tanh conversion, scores are in `[-1, 1]` matching the current API. Guard-proxy just routes to the vLLM endpoint instead of the transformers server.
+vLLM provides native `/v1/rerank` and `/v1/score` endpoints. With Tanh conversion, the expected model score domain is `[-1, 1]`. The temporary unit exposes these endpoints for a parent-run live canary; this source change does not assert public wire compatibility or authorize a route change.
+
+### Live-probe blocker: DeepInfra wire compatibility
+
+The canonical public endpoint is `/v1/inference/Qwen/Qwen3-Reranker-8B`: it takes equal-length `queries[]` and `documents[]` arrays and returns `scores[]`, `input_tokens`, and optional request metadata. Repository evidence currently establishes only vLLM's native `/v1/rerank` and `/v1/score` behavior. It does not establish that the raw vLLM server accepts the DeepInfra batch body or emits its response schema.
+
+The parent must live-probe the canary's native endpoints and either prove an exact compatibility path or add a separately tested adapter before directing `reranker_endpoint_equivalence.py` at port 18014. No production cutover, guard route change, or retirement of the Transformers service is permitted on source evidence alone.
 
 ### Memory budget
 
@@ -94,9 +100,10 @@ The original adapter document assumed v0.24.0. All references updated to v0.25.0
 5. Install verified Jinja template as `querit-rerank.jinja`
 
 ### Phase 2: Smoke test (temporary port)
-1. Start vLLM with conservative 32K profile on port 18014
+1. Install and start `vllm-querit-4b-canary.service` with its conservative 32K profile on host port 18014
 2. Verify `/v1/models`, `/v1/score`, `/v1/rerank`
-3. Compare scores against transformers server (max_batch=1) on mixed samples
+3. Prove or adapt the canonical DeepInfra wire contract before endpoint equivalence testing
+4. Compare scores against transformers server (max_batch=1) on pinned public data
 
 ### Phase 3: Production cutover
 1. Stop current transformers RR
@@ -112,10 +119,10 @@ The original adapter document assumed v0.24.0. All references updated to v0.25.0
 ## Recommended vLLM config
 
 ```bash
-vllm serve /models/querit-4b-vllm \
+vllm serve /home/obj/models/querit-4b-vllm \
   --host 0.0.0.0 \
-  --port 18013 \
-  --served-model-name qwen3-reranker-8b \
+  --port 8000 \
+  --served-model-name qwen3-reranker-8b Qwen/Qwen3-Reranker-8B Querit/Querit-4B \
   --runner pooling \
   --dtype bfloat16 \
   --max-model-len 32768 \
@@ -127,5 +134,7 @@ vllm serve /models/querit-4b-vllm \
   --max-long-partial-prefills 1 \
   --long-prefill-token-threshold 8192 \
   --enforce-eager \
-  --chat-template /models/querit-4b-vllm/querit-rerank.jinja
+  --chat-template /home/obj/models/querit-4b-vllm/querit-rerank.jinja
 ```
+
+The tracked canary publishes container port 8000 as host port 18014. It has no lifecycle dependency or conflict with embedding or production reranking, removes and stops only its own container, and is not a recovery target. Docker bounds it to 18 GiB memory and swap with swappiness 0; both systemd and the container use OOM score adjustment 500.

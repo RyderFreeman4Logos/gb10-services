@@ -1,0 +1,61 @@
+# Temporary source-controlled canary. Production Transformers reranking remains
+# on :18013 until the live validation gates in the migration note pass.
+[Unit]
+Description=Temporary Querit-4B vLLM pooling canary (AEON v0.25, raw port 18014)
+After=network.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+
+# Wrapper/docker-CLI only. Docker bounds the canary container separately.
+MemoryMax=256M
+MemorySwapMax=0
+OOMScoreAdjust=500
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=1800
+TimeoutStopSec=60
+
+ExecStartPre=/home/obj/.local/bin/gb10_check_mem_available.sh 2
+ExecStartPre=-/usr/bin/docker rm -f vllm-querit-4b-canary
+ExecStart=/usr/bin/docker run --rm --name vllm-querit-4b-canary \
+  --cgroup-parent app.slice \
+  --gpus all --ipc host \
+  -p 100.105.4.92:18014:8000 \
+  -v /home/obj/models/querit-4b-vllm:/home/obj/models/querit-4b-vllm:ro \
+  -e HF_HUB_OFFLINE=1 \
+  -e TRANSFORMERS_OFFLINE=1 \
+  --memory 18g \
+  --memory-swap 18g \
+  --memory-swappiness 0 \
+  --oom-score-adj 500 \
+  --entrypoint python3 \
+  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55 \
+  /usr/local/bin/vllm serve /home/obj/models/querit-4b-vllm \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --served-model-name qwen3-reranker-8b Qwen/Qwen3-Reranker-8B Querit/Querit-4B \
+    --runner pooling \
+    --dtype bfloat16 \
+    --max-model-len 32768 \
+    --kv-cache-memory-bytes 4800M \
+    --max-num-batched-tokens 4096 \
+    --max-num-seqs 16 \
+    --enable-chunked-prefill \
+    --max-num-partial-prefills 1 \
+    --max-long-partial-prefills 1 \
+    --long-prefill-token-threshold 8192 \
+    --enforce-eager \
+    --chat-template /home/obj/models/querit-4b-vllm/querit-rerank.jinja
+ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh rerank http://100.105.4.92:18014 qwen3-reranker-8b --deadline 300
+ExecStop=/usr/bin/timeout --signal=TERM --kill-after=5 30 /usr/bin/docker stop --time 20 vllm-querit-4b-canary
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
