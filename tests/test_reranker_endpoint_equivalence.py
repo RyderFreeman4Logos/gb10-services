@@ -1,25 +1,22 @@
 from __future__ import annotations
 
+import importlib
 import json
-import math
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import reranker_endpoint_equivalence as reranker
+reranker = importlib.import_module("reranker_endpoint_equivalence")
 
 
-CORPUS = (
-    ROOT
-    / "data"
-    / "reranker-equivalence"
-    / "miracl-reranking-en-zh-dev.jsonl"
-)
+CORPUS = ROOT / "data" / "reranker-equivalence" / "miracl-reranking-en-zh-dev.jsonl"
 METADATA = ROOT / "data" / "reranker-equivalence" / "metadata.json"
 
 SOURCE_SHA256 = {
@@ -74,7 +71,100 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     )
 
 
-class CloudEvidenceCacheTests(unittest.TestCase):
+class EndpointEvidenceCacheTests(unittest.TestCase):
+    def test_request_identity_has_golden_bytes_and_binds_every_paid_dimension(
+        self,
+    ) -> None:
+        body = reranker.canonical_payload(["q"], ["d"])
+        identity = reranker.request_identity(body, reranker.CLOUD_ENDPOINT)
+
+        self.assertEqual(
+            identity.canonical_bytes(),
+            (
+                b'{"body_sha256":"f12cae033231437c589a0172f374f6c82442a50638339da9'
+                b'042bfd09a45b3560","instruction":null,"method":"POST","model":"Qwen/'
+                b'Qwen3-Reranker-8B","path_and_query":"/v1/inference/Qwen/Qwen3-Reranker-8B'
+                b'?version=5fa94080caafeaa45a15d11f969d7978e087a3db","provider":"deepinfra"'
+                b',"provider_model_version":"5fa94080caafeaa45a15d11f969d7978e087a3db"'
+                b',"request_body":"{\\"documents\\":[\\"d\\"],\\"queries\\":[\\"q\\"]}"'
+                b',"runner_transform":"gb10-reranker-equivalence-v2+deepinfra-native-v1"'
+                b',"schema":"reranker-request-identity-v2","service_tier":null}'
+            ),
+        )
+        self.assertEqual(
+            reranker.canonical_request_hash(identity),
+            "b5fb011fedb315e44a30c38e483b15165af2ab5e50b2431b13385f64db376f43",
+        )
+
+        variants = [
+            reranker.request_identity(body, reranker.LOCAL_ENDPOINT),
+            reranker.request_identity(
+                reranker.canonical_payload(["q"], ["d"], instruction="rank"),
+                reranker.CLOUD_ENDPOINT,
+            ),
+            reranker.request_identity(
+                reranker.canonical_payload(["q"], ["d"], service_tier="priority"),
+                reranker.CLOUD_ENDPOINT,
+            ),
+            reranker.request_identity(
+                body,
+                reranker.EndpointSpec(
+                    provider="deepinfra",
+                    model="Qwen/Qwen3-Reranker-8B",
+                    provider_model_version="different-immutable-version",
+                    runner_transform="gb10-reranker-equivalence-v2+deepinfra-native-v1",
+                ),
+            ),
+            reranker.request_identity(
+                body,
+                reranker.EndpointSpec(
+                    provider="deepinfra",
+                    model="Qwen/Qwen3-Reranker-8B",
+                    provider_model_version=reranker.DEEPINFRA_MODEL_VERSION,
+                    runner_transform="different-runner-transform",
+                ),
+            ),
+        ]
+        self.assertEqual(
+            len(
+                {
+                    reranker.canonical_request_hash(identity),
+                    *map(reranker.canonical_request_hash, variants),
+                }
+            ),
+            1 + len(variants),
+        )
+
+    def test_cloud_and_local_share_exact_target_and_body_but_not_cache_identity(
+        self,
+    ) -> None:
+        body = reranker.canonical_payload(
+            ["q"], ["d"], instruction="rank", service_tier="priority"
+        )
+        cloud = reranker.request_identity(body, reranker.CLOUD_ENDPOINT)
+        local = reranker.request_identity(body, reranker.LOCAL_ENDPOINT)
+        self.assertEqual(cloud.path_and_query, local.path_and_query)
+        self.assertEqual(cloud.request_body, local.request_body)
+        self.assertEqual(
+            cloud.path_and_query,
+            "/v1/inference/Qwen/Qwen3-Reranker-8B"
+            "?version=5fa94080caafeaa45a15d11f969d7978e087a3db",
+        )
+        self.assertEqual(
+            reranker.endpoint_url("https://api.deepinfra.com", cloud),
+            "https://api.deepinfra.com" + cloud.path_and_query,
+        )
+        self.assertEqual(
+            reranker.endpoint_url("http://100.105.4.92:18014", local),
+            "http://100.105.4.92:18014" + local.path_and_query,
+        )
+        with self.assertRaises(ValueError):
+            reranker.endpoint_url("https://api.deepinfra.com?version=stale", cloud)
+        self.assertNotEqual(
+            reranker.canonical_request_hash(cloud),
+            reranker.canonical_request_hash(local),
+        )
+
     def test_cache_hit_prevents_network_and_http_errors_are_cached(self) -> None:
         calls = 0
 
@@ -91,17 +181,18 @@ class CloudEvidenceCacheTests(unittest.TestCase):
             )
 
         with tempfile.TemporaryDirectory() as raw_tmp:
-            cache = reranker.CloudEvidenceCache(Path(raw_tmp), transport=transport)
             body = reranker.canonical_payload(["q"], ["d"])
+            identity = reranker.request_identity(body, reranker.CLOUD_ENDPOINT)
+            cache = reranker.EndpointEvidenceCache(Path(raw_tmp), transport=transport)
             first = cache.fetch(
-                body,
+                identity,
                 base_url="https://api.deepinfra.com",
                 api_key="secret-key",
                 timeout=1,
             )
             second = cache.fetch(
-                body,
-                base_url="https://not-the-cache-key.invalid",
+                identity,
+                base_url="https://api.deepinfra.com",
                 api_key="different-secret",
                 timeout=1,
             )
@@ -116,7 +207,8 @@ class CloudEvidenceCacheTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
             body = reranker.canonical_payload(["q"], ["d"])
-            request_hash = reranker.canonical_request_hash(body)
+            identity = reranker.request_identity(body, reranker.CLOUD_ENDPOINT)
+            request_hash = reranker.canonical_request_hash(identity)
 
             def transport(
                 _url: str,
@@ -134,16 +226,16 @@ class CloudEvidenceCacheTests(unittest.TestCase):
                 observed = True
                 return reranker.HttpResult(200, {}, _response([0.5]), 3)
 
-            cache = reranker.CloudEvidenceCache(root, transport=transport)
+            cache = reranker.EndpointEvidenceCache(root, transport=transport)
             cache.fetch(
-                body,
+                identity,
                 base_url="https://api.deepinfra.com",
                 api_key="secret-key",
                 timeout=1,
             )
             self.assertTrue(observed)
 
-    def test_cache_only_needs_neither_cloud_secret_nor_send_cost_override(self) -> None:
+    def test_offline_reader_needs_no_transport_base_url_or_secret(self) -> None:
         calls = 0
 
         def transport(
@@ -154,28 +246,43 @@ class CloudEvidenceCacheTests(unittest.TestCase):
             return reranker.HttpResult(200, {}, _response([0.5]), 2)
 
         with tempfile.TemporaryDirectory() as raw_tmp:
-            cache = reranker.CloudEvidenceCache(Path(raw_tmp), transport=transport)
+            cache = reranker.EndpointEvidenceCache(Path(raw_tmp), transport=transport)
             body = reranker.canonical_payload(["q"], ["d"])
+            identity = reranker.request_identity(body, reranker.CLOUD_ENDPOINT)
             cache.fetch(
-                body,
+                identity,
                 base_url="https://api.deepinfra.com",
                 api_key="initial-paid-request-secret",
                 timeout=1,
             )
 
-            cached = reranker.fetch_cloud_batches(
-                [body],
-                cache=cache,
-                base_url="https://api.deepinfra.com",
-                api_key="",
-                timeout=1,
-                estimated_tokens=1_000_001,
-                max_estimated_tokens=1_000_000,
-                max_cost_usd=0.05,
-                cache_only=True,
-            )
+            offline = reranker.EndpointEvidenceCache(Path(raw_tmp))
+            cached = reranker.load_cached_batches([identity], cache=offline)
             self.assertEqual(calls, 1)
             self.assertEqual(cached[0].scores, (0.5,))
+
+    def test_offline_reader_fails_on_missing_incomplete_or_ambiguous_local_cache(
+        self,
+    ) -> None:
+        body = reranker.canonical_payload(["q"], ["d"])
+        identity = reranker.request_identity(body, reranker.LOCAL_ENDPOINT)
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            cache = reranker.EndpointEvidenceCache(root)
+            with self.assertRaises(reranker.CacheMissError):
+                cache.load(identity)
+
+            request_dir = root / reranker.canonical_request_hash(identity)
+            request_dir.mkdir()
+            (request_dir / "request.json").write_bytes(
+                reranker.request_ledger_bytes(identity)
+            )
+            with self.assertRaises(reranker.CacheStateError):
+                cache.load(identity)
+
+            (request_dir / "ambiguous-1.json").write_text("{}\n")
+            with self.assertRaises(reranker.CacheStateError):
+                cache.load(identity)
 
     def test_ambiguous_transport_is_recorded_once_and_never_resent(self) -> None:
         calls = 0
@@ -189,23 +296,24 @@ class CloudEvidenceCacheTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
-            cache = reranker.CloudEvidenceCache(root, transport=ambiguous)
             body = reranker.canonical_payload(["q"], ["d"])
+            identity = reranker.request_identity(body, reranker.CLOUD_ENDPOINT)
+            cache = reranker.EndpointEvidenceCache(root, transport=ambiguous)
             with self.assertRaises(reranker.AmbiguousTransportError):
                 cache.fetch(
-                    body,
+                    identity,
                     base_url="https://api.deepinfra.com",
                     api_key="secret-key",
                     timeout=1,
                 )
             with self.assertRaises(reranker.CacheStateError):
                 cache.fetch(
-                    body,
+                    identity,
                     base_url="https://api.deepinfra.com",
                     api_key="secret-key",
                     timeout=1,
                 )
-            request_dir = root / reranker.canonical_request_hash(body)
+            request_dir = root / reranker.canonical_request_hash(identity)
             self.assertEqual(calls, 1)
             self.assertEqual(len(list(request_dir.glob("ambiguous-*.json"))), 1)
             self.assertFalse((request_dir / "response.json").exists())
@@ -231,9 +339,11 @@ class CloudEvidenceCacheTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
-            cache = reranker.CloudEvidenceCache(root, transport=transport)
+            body = reranker.canonical_payload(["q"], ["d"])
+            identity = reranker.request_identity(body, reranker.CLOUD_ENDPOINT)
+            cache = reranker.EndpointEvidenceCache(root, transport=transport)
             cache.fetch(
-                reranker.canonical_payload(["q"], ["d"]),
+                identity,
                 base_url="https://api.deepinfra.com",
                 api_key=secret,
                 timeout=1,
@@ -248,19 +358,90 @@ class CloudEvidenceCacheTests(unittest.TestCase):
             self.assertNotIn(b"x-api-key", lowered)
             self.assertIn(b"x-request-id", lowered)
 
-            leaking = reranker.CloudEvidenceCache(
+            leaking = reranker.EndpointEvidenceCache(
                 root / "leaking",
                 transport=lambda *_args: reranker.HttpResult(
                     200, {}, _response([0.1]) + secret.encode(), 1
                 ),
             )
+            leaking_identity = reranker.request_identity(
+                reranker.canonical_payload(["q2"], ["d2"]),
+                reranker.CLOUD_ENDPOINT,
+            )
             with self.assertRaises(reranker.EvidenceError):
                 leaking.fetch(
-                    reranker.canonical_payload(["q2"], ["d2"]),
+                    leaking_identity,
                     base_url="https://api.deepinfra.com",
                     api_key=secret,
                     timeout=1,
                 )
+
+
+class OfflineMainTests(unittest.TestCase):
+    def test_cache_only_main_reads_both_caches_without_env_dns_socket_or_transport(
+        self,
+    ) -> None:
+        row = _valid_row()
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            corpus = root / "corpus.jsonl"
+            report = root / "report.json"
+            _write_jsonl(corpus, [row])
+            groups = reranker.load_corpus(corpus)
+            payloads = reranker.build_batches(groups, 128)
+            cache = reranker.EndpointEvidenceCache(
+                root / "cache",
+                transport=lambda *_args: reranker.HttpResult(
+                    200, {}, _response([0.5] * 10), 1
+                ),
+            )
+            for endpoint, base_url, key in (
+                (reranker.CLOUD_ENDPOINT, "https://api.deepinfra.com", "cloud-key"),
+                (reranker.LOCAL_ENDPOINT, "http://127.0.0.1:18014", ""),
+            ):
+                for payload in payloads:
+                    cache.fetch(
+                        reranker.request_identity(payload, endpoint),
+                        base_url=base_url,
+                        api_key=key,
+                        timeout=1,
+                    )
+
+            class NoEnvironment(dict[str, str]):
+                def get(self, *_args: object, **_kwargs: object) -> str:
+                    raise AssertionError("cache-only read an environment variable")
+
+            with (
+                mock.patch.object(os, "environ", NoEnvironment()),
+                mock.patch(
+                    "socket.getaddrinfo", side_effect=AssertionError("DNS attempted")
+                ),
+                mock.patch(
+                    "socket.socket", side_effect=AssertionError("socket attempted")
+                ),
+                mock.patch.object(
+                    reranker,
+                    "_urllib_transport",
+                    side_effect=AssertionError("transport attempted"),
+                ),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "reranker_endpoint_equivalence.py",
+                        "--cache-only",
+                        "--corpus",
+                        str(corpus),
+                        "--cache-root",
+                        str(root / "cache"),
+                        "--output-json",
+                        str(report),
+                    ],
+                ),
+            ):
+                exit_code = reranker.main()
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(json.loads(report.read_text())["pairs"], 10)
 
 
 class CostAndResponseTests(unittest.TestCase):
@@ -275,7 +456,7 @@ class CostAndResponseTests(unittest.TestCase):
             return reranker.HttpResult(200, {}, _response([0.1]), 1)
 
         with tempfile.TemporaryDirectory() as raw_tmp:
-            cache = reranker.CloudEvidenceCache(Path(raw_tmp), transport=transport)
+            cache = reranker.EndpointEvidenceCache(Path(raw_tmp), transport=transport)
             with self.assertRaises(reranker.CostCapError):
                 reranker.fetch_cloud_batches(
                     [reranker.canonical_payload(["q"], ["d"])],
@@ -291,9 +472,11 @@ class CostAndResponseTests(unittest.TestCase):
             self.assertEqual(calls, 0)
             self.assertEqual(list(Path(raw_tmp).iterdir()), [])
 
-    def test_response_schema_cardinality_and_finite_scores_are_strict(self) -> None:
-        valid = reranker.validate_response(_response([0.1, -0.2]), 2)
-        self.assertEqual(valid.scores, (0.1, -0.2))
+    def test_response_schema_cardinality_finiteness_and_public_domain_are_strict(
+        self,
+    ) -> None:
+        valid = reranker.validate_response(_response([0.1, 0.8]), 2)
+        self.assertEqual(valid.scores, (0.1, 0.8))
         self.assertEqual(valid.input_tokens, 17)
 
         invalid = (
@@ -304,10 +487,13 @@ class CostAndResponseTests(unittest.TestCase):
             b'{"scores":[true],"input_tokens":1}',
             b'{"scores":[NaN],"input_tokens":1}',
             b'{"scores":[Infinity],"input_tokens":1}',
+            b'{"scores":[-0.000001,0.5],"input_tokens":1}',
+            b'{"scores":[0.5,1.000001],"input_tokens":1}',
         )
         for body in invalid:
-            with self.subTest(body=body), self.assertRaises(
-                reranker.ResponseValidationError
+            with (
+                self.subTest(body=body),
+                self.assertRaises(reranker.ResponseValidationError),
             ):
                 reranker.validate_response(body, 2)
 
@@ -368,18 +554,24 @@ class CorpusTests(unittest.TestCase):
         groups = reranker.load_corpus(CORPUS)
         self.assertEqual(len(groups), 200)
         self.assertEqual(
-            {language: sum(g.source_language == language for g in groups)
-             for language in ("en", "zh")},
+            {
+                language: sum(g.source_language == language for g in groups)
+                for language in ("en", "zh")
+            },
             {"en": 100, "zh": 100},
         )
         self.assertTrue(all(len(group.candidates) == 10 for group in groups))
         self.assertTrue(
-            all(any(candidate.relevance > 0 for candidate in group.candidates)
-                for group in groups)
+            all(
+                any(candidate.relevance > 0 for candidate in group.candidates)
+                for group in groups
+            )
         )
         self.assertTrue(
-            all(any(candidate.relevance == 0 for candidate in group.candidates)
-                for group in groups)
+            all(
+                any(candidate.relevance == 0 for candidate in group.candidates)
+                for group in groups
+            )
         )
 
         metadata = json.loads(METADATA.read_text())
@@ -392,7 +584,9 @@ class CorpusTests(unittest.TestCase):
         self.assertEqual(metadata["groups_per_language"], 100)
         self.assertEqual(metadata["candidates_per_group"], 10)
         sources = {row["path"]: row for row in metadata["source_files"]}
-        self.assertEqual({path: row["sha256"] for path, row in sources.items()}, SOURCE_SHA256)
+        self.assertEqual(
+            {path: row["sha256"] for path, row in sources.items()}, SOURCE_SHA256
+        )
         for path, row in sources.items():
             self.assertIn(metadata["revision"], row["url"])
             self.assertIn(path, row["url"])
