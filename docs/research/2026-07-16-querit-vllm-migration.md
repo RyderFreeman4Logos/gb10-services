@@ -259,3 +259,70 @@ sets `--gpu-memory-utilization 0.22`; it never relies on vLLM 0.25.1's `0.92`
 default, while retaining the explicit `--kv-cache-memory-bytes 4800M` profile.
 `Restart=no` and the
 transaction-authorized `ExecCondition` prevent retry loops or ad-hoc starts.
+
+## Direct legacy/canary equivalence harness
+
+`scripts/querit_legacy_canary_equivalence.py` is the sealed, direct comparison
+for the production legacy Querit native API and the separately deployed canary
+adapter. It uses only the committed MIRACL development subset
+`data/reranker-equivalence/miracl-reranking-en-zh-dev.jsonl` (200 groups,
+2,000 pairs, SHA-256
+`2dd35e5a0ce1357ec8c6daaa4893809c220309058e858d62b0c9f1d8c68b954d`) and
+the canonical plan artifact
+`data/reranker-equivalence/querit-legacy-canary-equivalence-plan-v2.json`
+(SHA-256 `18b2ed43c7ce352de048165c5f9497d8f583b2c894b2e8ddaa08f0e49c049e92`).
+It is neither CodeSeek testing nor a cloud or paid-endpoint comparison.
+
+First inspect the completely offline schedule. This performs no DNS, socket,
+or credential initialization:
+
+```bash
+python3 scripts/querit_legacy_canary_equivalence.py --dry-run
+```
+
+An operator may then run the planned endpoint-specific experiment with explicit
+placeholder URLs and an owner-only receipt location:
+
+```bash
+python3 scripts/querit_legacy_canary_equivalence.py \
+  --legacy-url 'http://<legacy-host>:18013' \
+  --candidate-url 'http://<canary-host>:18014' \
+  --output "$HOME/.local/state/querit-equivalence/receipt.json"
+```
+
+The legacy request is native `POST /v1/rerank` with one query, ten ordered
+documents, and `top_n=10`; sorted legacy results are reconstructed by original
+document index. The candidate request is the adapter’s pinned
+DeepInfra-compatible model/version path, with the query repeated ten times and
+the same documents paired positionally. It deliberately omits `instruction`
+and `service_tier`. Neither request uses Authorization handling. The sealed
+schedule has no retries: the main native-contract run is 200 groups per
+endpoint, while each warm concurrency of 1/2/4/8 has exactly 40 calibration
+groups per endpoint. Cold first-score and excluded warmup attempts are reported
+separately.
+
+The receipt contains only hashes, corpus/schedule counts, aggregate ranking,
+qrels, failure/Wilson, and latency evidence, fixed thresholds, and verdicts.
+It never contains endpoint URLs, hostnames, paths, credentials, headers,
+payloads, request/response bodies, query/document text, case identifiers, or
+per-case hashes. Do not commit generated receipts or raw evidence. The runner
+creates an output parent at mode `0700` and receipt file at mode `0600` through
+an atomic fsync/rename flow.
+
+Its separate verdicts mean: native API availability is each endpoint satisfying
+its own contract; ranking behavior is approximate held-out rank agreement;
+qrels quality is the paired non-inferiority bound; reliability and latency are
+the fixed operational gates; behavioral usability requires all of those except
+latency; and canary operational suitability additionally requires latency.
+`wire_drop_in_compatibility` is permanently
+`NOT_CLAIMED_CONTRACTS_DIFFER`, while `score_interchangeability` is permanently
+`NOT_CLAIMED_EXPECTED_NONIDENTICAL`: legacy physical-last and candidate
+last-real pooling intentionally differ. A `PASS` only supports this isolated,
+endpoint-specific canary experiment; it is not wire replacement, score consumer
+interchangeability, full-MIRACL equivalence, or production-cutover readiness.
+
+Exit code `0` is only a complete canary-operational `PASS`; `2` is a complete
+valid `FAIL`; and `3` denotes `INCONCLUSIVE` or transport/identity failure.
+By explicit operator instruction, deployment and this direct endpoint run occur
+before Tier-4 review; that review still occurs before any push, pull request,
+or merge.
