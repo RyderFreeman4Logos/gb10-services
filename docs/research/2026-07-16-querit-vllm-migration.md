@@ -71,20 +71,38 @@ Jinja template verified byte-exact match to `render_current_prompt()`:
 
 This is an improvement, not a regression. The new contract should be named `querit-prompt-last-real-v1`.
 
-### Native scoring support
+### DeepInfra wire compatibility adapter
 
-vLLM provides native `/v1/rerank` and `/v1/score` endpoints. With Tanh conversion, the expected model score domain is `[-1, 1]`. The temporary unit exposes these endpoints for a parent-run live canary; this source change does not assert public wire compatibility or authorize a route change.
+vLLM 0.25 exposes native `/v1/score`, but that endpoint is not the public
+DeepInfra contract. The raw vLLM backend is therefore loopback-only on port
+18015. A separately tested adapter owns public canary port 18014 and accepts
+only the version-pinned target
+`/v1/inference/Qwen/Qwen3-Reranker-8B?version=5fa94080caafeaa45a15d11f969d7978e087a3db`.
+It requires canonical equal-length `queries[]` and `documents[]`, sends the
+corresponding positional request to `/v1/score`, validates every response
+index and finite Tanh score, transforms `[-1, 1]` to the documented public
+`[0, 1]` domain, and returns `scores[]`, `input_tokens`, and `request_id`.
+Cloud and local experiment requests therefore differ only in base URL and
+authorization; their POST target and body bytes are identical.
 
-### Live-probe blocker: DeepInfra wire compatibility
-
-The canonical public endpoint is `/v1/inference/Qwen/Qwen3-Reranker-8B`: it takes equal-length `queries[]` and `documents[]` arrays and returns `scores[]`, `input_tokens`, and optional request metadata. Repository evidence currently establishes only vLLM's native `/v1/rerank` and `/v1/score` behavior. It does not establish that the raw vLLM server accepts the DeepInfra batch body or emits its response schema.
-
-The parent must live-probe the canary's native endpoints and either prove an exact compatibility path or add a separately tested adapter before directing `reranker_endpoint_equivalence.py` at port 18014. No production cutover, guard route change, or retirement of the Transformers service is permitted on source evidence alone.
+This source contract removes the known wire mismatch. It does not provide live
+model, numerical, or paid-cloud evidence. No production cutover, guard route
+change, or retirement of the Transformers service is permitted on source
+evidence alone.
 
 ### Memory budget
 
 Current: text 41.4G + emb 20.3G + RR 17.6G = 79.3G / 121.6G, MemAvail 26.6G
 vLLM Querit (replacing RR): ~8G weights + 4.8G KV + overhead ≈ 15-18G (same or less)
+
+Canary activation requires **20 GiB** `MemAvailable` before the 18 GiB-bounded
+backend starts. The tracked lifecycle transaction verifies the converted
+artifact manifest and snapshots embedding, both current/legacy reranker units,
+Guard, and text. If headroom is low it may stop text only, then remeasures. It
+starts the backend and adapter with `stop then start` operations only, warms the
+public wire endpoint, and restores text plus canary pre-state after every
+failure or termination signal. It never stops embedding, either production
+reranker, or Guard, and the canary is never enrolled in the guardian.
 
 ### v0.24 → v0.25 note
 
@@ -98,12 +116,33 @@ The original adapter document assumed v0.24.0. All references updated to v0.25.0
 3. Update `config.json`: architectures, num_labels, head_dtype, activation
 4. Update `model.safetensors.index.json` weight_map
 5. Install verified Jinja template as `querit-rerank.jinja`
+6. Generate and verify `querit-vllm-artifact-manifest.json`
 
 ### Phase 2: Smoke test (temporary port)
-1. Install and start `vllm-querit-4b-canary.service` with its conservative 32K profile on host port 18014
-2. Verify `/v1/models`, `/v1/score`, `/v1/rerank`
-3. Prove or adapt the canonical DeepInfra wire contract before endpoint equivalence testing
-4. Compare scores against transformers server (max_batch=1) on pinned public data
+1. Install the two tracked canary units, adapter, lifecycle modules, and three
+   `gb10_querit_canary_*.py` entry points. Do not enable either unit.
+2. Run `gb10_querit_canary_lifecycle.py activate`. The activator alone may
+   start the loopback vLLM backend and the public adapter.
+3. Verify the public DeepInfra path and native `/v1/score` warmup evidence.
+4. Run the cache-safe endpoint equivalence experiment on pinned public data.
+5. Run `gb10_querit_canary_lifecycle.py deactivate` to stop adapter then
+   backend and restore any text state paused by the transaction.
+
+Install the reviewed files without starting a service:
+
+```bash
+install -d -m 0755 /home/obj/.local/lib/gb10 /home/obj/.local/bin
+install -m 0644 scripts/querit_deepinfra_adapter.py \
+  scripts/querit_canary_lifecycle.py scripts/querit_vllm_artifact.py \
+  scripts/reranker_equivalence_wire.py /home/obj/.local/lib/gb10/
+install -m 0755 scripts/gb10_querit_canary_lifecycle.py \
+  scripts/gb10_querit_canary_preflight.py \
+  scripts/gb10_querit_canary_ready.py /home/obj/.local/bin/
+install -m 0644 systemd/vllm-querit-4b-canary.service \
+  systemd/vllm-querit-4b-canary-backend.service \
+  /home/obj/.config/systemd/user/
+systemctl --user daemon-reload
+```
 
 ### Phase 3: Production cutover
 1. Stop current transformers RR
@@ -137,4 +176,8 @@ vllm serve /home/obj/models/querit-4b-vllm \
   --chat-template /home/obj/models/querit-4b-vllm/querit-rerank.jinja
 ```
 
-The tracked canary publishes container port 8000 as host port 18014. It has no lifecycle dependency or conflict with embedding or production reranking, removes and stops only its own container, and is not a recovery target. Docker bounds it to 18 GiB memory and swap with swappiness 0; both systemd and the container use OOM score adjustment 500.
+The tracked backend publishes container port 8000 only to loopback port 18015;
+the adapter publishes the exact DeepInfra-native API on Tailscale port 18014.
+Docker bounds the backend to 18 GiB memory and swap with swappiness 0; both
+systemd and the container use OOM score adjustment 500. `Restart=no` and the
+transaction-authorized `ExecCondition` prevent retry loops or ad-hoc starts.

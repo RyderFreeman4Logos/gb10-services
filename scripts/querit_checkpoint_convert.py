@@ -16,10 +16,13 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import querit_vllm_artifact
+
 SHARD_NAME = "model-00002-of-00002.safetensors"
 INDEX_NAME = "model.safetensors.index.json"
 CONFIG_NAME = "config.json"
 TEMPLATE_NAME = "querit-rerank.jinja"
+SOURCE_REVISION = querit_vllm_artifact.SOURCE_REVISION
 DEFAULT_TEMPLATE_PATH = (
     Path(__file__).resolve().parents[1] / "config" / "querit" / TEMPLATE_NAME
 )
@@ -233,6 +236,7 @@ def convert_snapshot(
 
     score_weight = converted_state["score.weight"]
     score_bias = converted_state["score.bias"]
+    querit_vllm_artifact.write_manifest(snapshot)
     return {
         "snapshot": str(snapshot),
         "shard": SHARD_NAME,
@@ -240,6 +244,7 @@ def convert_snapshot(
         "score_bias_shape": list(score_bias.shape),
         "dtype": str(score_weight.dtype),
         "template": TEMPLATE_NAME,
+        "artifact_manifest": querit_vllm_artifact.MANIFEST_NAME,
     }
 
 

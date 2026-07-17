@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 UNIT_SOURCE = ROOT / "systemd"
 TARGET_ROOT = ROOT / "target"
 EXEC_DIRECTIVES = (
+    "ExecCondition=",
     "ExecStart=",
     "ExecStartPre=",
     "ExecStartPost=",

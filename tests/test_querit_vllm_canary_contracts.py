@@ -6,7 +6,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CANARY_UNIT = ROOT / "systemd" / "vllm-querit-4b-canary.service"
+ADAPTER_UNIT = ROOT / "systemd" / "vllm-querit-4b-canary.service"
+BACKEND_UNIT = ROOT / "systemd" / "vllm-querit-4b-canary-backend.service"
 PRODUCTION_UNIT = ROOT / "systemd" / "querit-4b-reranker.service"
 RESEARCH_NOTE = ROOT / "docs" / "research" / "2026-07-16-querit-vllm-migration.md"
 MODEL_DIR = "/home/obj/models/querit-4b-vllm"
@@ -82,7 +83,7 @@ def _exact_container_options(
     return options
 
 
-def _canary_contract(unit: str) -> None:
+def _backend_contract(unit: str) -> None:
     starts = _logical_directive_argv(unit, "ExecStart")
     start_posts = _logical_directive_argv(unit, "ExecStartPost")
     if len(starts) != 1:
@@ -104,7 +105,7 @@ def _canary_contract(unit: str) -> None:
         "--ipc",
         "host",
         "-p",
-        "100.105.4.92:18014:8000",
+        "127.0.0.1:18015:8000",
         "-v",
         f"{MODEL_DIR}:{MODEL_DIR}:ro",
         "-e",
@@ -174,7 +175,7 @@ def _canary_contract(unit: str) -> None:
     if start_posts[0] != [
         "/home/obj/.local/bin/gb10_service_ready.sh",
         "rerank",
-        "http://100.105.4.92:18014",
+        "http://127.0.0.1:18015",
         "qwen3-reranker-8b",
         "--deadline",
         "300",
@@ -184,10 +185,31 @@ def _canary_contract(unit: str) -> None:
 
 class QueritVllmCanaryContractTests(unittest.TestCase):
     def test_launch_profile_is_exact_and_digest_pinned(self) -> None:
-        _canary_contract(CANARY_UNIT.read_text())
+        _backend_contract(BACKEND_UNIT.read_text())
 
-    def test_canary_is_memory_bounded_and_lifecycle_isolated(self) -> None:
-        unit = CANARY_UNIT.read_text()
+    def test_public_18014_is_the_deepinfra_adapter_not_raw_vllm(self) -> None:
+        unit = ADAPTER_UNIT.read_text()
+        starts = _logical_directive_argv(unit, "ExecStart")
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(
+            starts[0],
+            [
+                "/usr/bin/python3",
+                "/home/obj/.local/lib/gb10/querit_deepinfra_adapter.py",
+                "--listen-host",
+                "100.105.4.92",
+                "--listen-port",
+                "18014",
+                "--backend-url",
+                "http://127.0.0.1:18015",
+            ],
+        )
+        self.assertNotIn("docker run", unit)
+        self.assertIn("Requires=vllm-querit-4b-canary-backend.service", unit)
+        self.assertIn("After=vllm-querit-4b-canary-backend.service", unit)
+
+    def test_canary_is_memory_bounded_fail_closed_and_lifecycle_isolated(self) -> None:
+        unit = BACKEND_UNIT.read_text()
         self.assertIn("MemoryMax=256M", unit)
         self.assertIn("MemorySwapMax=0", unit)
         self.assertIn("OOMScoreAdjust=500", unit)
@@ -195,12 +217,15 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
         self.assertIn("Environment=HF_HUB_OFFLINE=1", unit)
         self.assertIn("Environment=TRANSFORMERS_OFFLINE=1", unit)
 
+        self.assertIn("Restart=no", unit)
+        self.assertNotIn("Restart=on-failure", unit)
+        self.assertEqual(
+            _logical_directive_argv(unit, "ExecCondition"),
+            [["/home/obj/.local/bin/gb10_querit_canary_preflight.py"]],
+        )
         self.assertEqual(
             _logical_directive_argv(unit, "ExecStartPre"),
-            [
-                ["/home/obj/.local/bin/gb10_check_mem_available.sh", "2"],
-                ["-/usr/bin/docker", "rm", "-f", "vllm-querit-4b-canary"],
-            ],
+            [["-/usr/bin/docker", "rm", "-f", "vllm-querit-4b-canary"]],
         )
         self.assertEqual(
             _logical_directive_argv(unit, "ExecStop"),
@@ -219,14 +244,22 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
             ],
         )
 
-        unit_section = unit.split("[Service]", 1)[0]
+        adapter = ADAPTER_UNIT.read_text()
+        self.assertIn("Restart=no", adapter)
+        self.assertNotIn("Restart=on-failure", adapter)
+        self.assertEqual(
+            _logical_directive_argv(adapter, "ExecCondition"),
+            [["/home/obj/.local/bin/gb10_querit_canary_preflight.py"]],
+        )
+
+        unit_section = unit.split("[Service]", 1)[0] + adapter.split("[Service]", 1)[0]
         for neighbor in (
             "vllm-embedding.service",
             "querit-4b-reranker.service",
             "vllm-qwen3-reranker-8b.service",
         ):
             self.assertNotIn(neighbor, unit_section)
-        lowered = unit.lower()
+        lowered = (unit + adapter).lower()
         self.assertNotIn("guardian", lowered)
         self.assertNotIn("gb10_cgroup_registration", lowered)
         self.assertNotIn("publish_cgroup_registration", lowered)
@@ -237,19 +270,22 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
         self.assertNotIn("100.105.4.92:18014:8000", production)
         self.assertIn("querit_openai_rerank_server.py", production)
 
-    def test_research_note_records_deepinfra_wire_live_probe_blocker(self) -> None:
+    def test_research_note_records_adapter_and_transactional_operator_contract(self) -> None:
         note = RESEARCH_NOTE.read_text()
         self.assertIn(
-            "### Live-probe blocker: DeepInfra wire compatibility",
+            "### DeepInfra wire compatibility adapter",
             note,
         )
         for required in (
-            "/v1/rerank",
             "/v1/score",
             "/v1/inference/Qwen/Qwen3-Reranker-8B",
             "queries[]",
             "scores[]",
             "input_tokens",
+            "gb10_querit_canary_lifecycle.py activate",
+            "gb10_querit_canary_lifecycle.py deactivate",
+            "20 GiB",
+            "stop then start",
             "No production cutover",
         ):
             self.assertIn(required, note)

@@ -334,6 +334,15 @@ class SnapshotConversionTests(unittest.TestCase):
             )
             self.assertEqual(result["snapshot"], str(snapshot.resolve()))
             self.assertEqual(result["score_weight_shape"], [1, 2560])
+            manifest_path = snapshot / "querit-vllm-artifact-manifest.json"
+            self.assertTrue(manifest_path.is_file())
+            self.assertEqual(result["artifact_manifest"], manifest_path.name)
+            sys.path.insert(0, str(ROOT / "scripts"))
+            import querit_vllm_artifact
+
+            verified = querit_vllm_artifact.verify_manifest(snapshot)
+            self.assertEqual(verified["source_revision"], converter.SOURCE_REVISION)
+
 
 
 if __name__ == "__main__":
