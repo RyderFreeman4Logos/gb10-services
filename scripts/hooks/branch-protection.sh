@@ -6,6 +6,8 @@ export LC_ALL=C
 GIT=/usr/bin/git
 SHA256SUM=/usr/bin/sha256sum
 SORT=/usr/bin/sort
+STAT=/usr/bin/stat
+MAX_UPDATES_BYTES=1048576
 
 die() {
   printf 'ERROR: %s\n' "$1" >&2
@@ -36,8 +38,39 @@ fi
 updates_file=$1
 remote_name=$2
 remote_location=$3
-[[ -f "$updates_file" && ! -L "$updates_file" ]] \
+read -r capture_owner capture_mode capture_links capture_size \
+    capture_device capture_inode capture_kind < <(
+  "$STAT" -c '%u %a %h %s %d %i %F' -- "$updates_file" 2>/dev/null
+) || die "captured pre-push updates are missing or unsafe."
+[[ "$capture_owner" == "$(/usr/bin/id -u)" && "$capture_mode" == 600 \
+    && "$capture_links" == 1 && "$capture_kind" == "regular file" \
+    && "$capture_size" -le "$MAX_UPDATES_BYTES" ]] \
   || die "captured pre-push updates are missing or unsafe."
+exec {updates_fd}< "$updates_file" \
+  || die "captured pre-push updates cannot be opened safely."
+read -r opened_owner opened_mode opened_links opened_size \
+    opened_device opened_inode opened_kind < <(
+  "$STAT" -Lc '%u %a %h %s %d %i %F' -- "/proc/self/fd/${updates_fd}"
+)
+read -r current_owner current_mode current_links current_size \
+    current_device current_inode current_kind < <(
+  "$STAT" -c '%u %a %h %s %d %i %F' -- "$updates_file" 2>/dev/null
+) || die "captured pre-push updates path changed while opening."
+[[ "$opened_owner" == "$capture_owner" \
+    && "$opened_mode" == "$capture_mode" \
+    && "$opened_links" == "$capture_links" \
+    && "$opened_size" == "$capture_size" \
+    && "$opened_device" == "$capture_device" \
+    && "$opened_inode" == "$capture_inode" \
+    && "$opened_kind" == "$capture_kind" \
+    && "$current_owner" == "$capture_owner" \
+    && "$current_mode" == "$capture_mode" \
+    && "$current_links" == "$capture_links" \
+    && "$current_size" == "$capture_size" \
+    && "$current_device" == "$capture_device" \
+    && "$current_inode" == "$capture_inode" \
+    && "$current_kind" == "$capture_kind" ]] \
+  || die "captured pre-push updates identity changed while opening."
 [[ "$remote_name" =~ ^[A-Za-z0-9._-]+$ ]] \
   || die "remote name is malformed."
 [[ -n "$remote_location" && "$remote_location" != *$'\n'* ]] \
@@ -58,7 +91,8 @@ printf -v zero_sha '%*s' "$sha_length" ''
 zero_sha=${zero_sha// /0}
 sha_pattern="^[0-9a-f]{${sha_length}}$"
 
-mapfile -t updates < "$updates_file"
+mapfile -t updates <&"$updates_fd"
+exec {updates_fd}<&-
 (( ${#updates[@]} > 0 && ${#updates[@]} <= 1024 )) \
   || die "pre-push update set must contain between 1 and 1024 refs."
 

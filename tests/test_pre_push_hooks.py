@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +14,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ZERO = "0" * 40
+LEFTHOOK = shutil.which("lefthook")
 
 
 class HookFixture:
@@ -28,7 +31,7 @@ class HookFixture:
 
         self.hooks = root / "scripts" / "hooks"
         self.hooks.mkdir(parents=True)
-        for name in ("branch-protection.sh", "review-check.sh"):
+        for name in ("branch-protection.sh", "receipt-store.py", "review-check.sh"):
             shutil.copy2(ROOT / "scripts" / "hooks" / name, self.hooks / name)
         self.git_run("init", "-q", "-b", "feat/test")
         self.git_run("config", "user.email", "test@example.invalid")
@@ -136,11 +139,66 @@ class HookFixture:
             text=True,
             capture_output=True,
             check=False,
+            timeout=15,
+        )
+
+    def run_planner(
+        self, updates_file: Path, *arguments: str
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "/usr/bin/bash",
+                "scripts/hooks/branch-protection.sh",
+                str(updates_file),
+                *arguments,
+            ],
+            cwd=self.root,
+            env=self.git_env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=15,
         )
 
     def receipts(self) -> list[Path]:
         return sorted(
             (self.root / ".git" / "gb10-pre-push-receipts").glob("*.receipt")
+        )
+
+    def run_topology(
+        self, updates: str, **environment: str
+    ) -> subprocess.CompletedProcess[str]:
+        if LEFTHOOK is None:
+            raise RuntimeError("lefthook is required for the hook topology contract")
+        shutil.copy2(ROOT / "lefthook.yml", self.root / "lefthook.yml")
+        env = self.git_env.copy()
+        env.update(
+            {
+                "FAKE_CSA_LOG": str(self.csa_log),
+                "FAKE_MALICIOUS_LOG": str(self.malicious_log),
+                "PATH": f"{self.bin}:/usr/bin:/bin",
+                **environment,
+            }
+        )
+        return subprocess.run(
+            [
+                LEFTHOOK,
+                "run",
+                "pre-push",
+                "--command",
+                "branch-protection",
+                "--command",
+                "review-check",
+                "--no-auto-install",
+                "origin",
+                str(self.remote),
+            ],
+            cwd=self.root,
+            env=env,
+            input=updates,
+            text=True,
+            capture_output=True,
+            check=False,
         )
 
     def force_commit(self) -> str:
@@ -154,6 +212,255 @@ class HookFixture:
 
 
 class PrePushHookTests(unittest.TestCase):
+    @unittest.skipIf(LEFTHOOK is None, "lefthook is not installed")
+    def test_lefthook_routes_updates_only_through_the_review_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            fixture = HookFixture(Path(raw_tmp))
+            update = fixture.update(
+                "refs/heads/feat/test",
+                fixture.head,
+                "refs/heads/feat/test",
+                ZERO,
+            )
+
+            result = fixture.run_topology(update)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(len(fixture.receipts()), 1)
+            self.assertEqual(
+                fixture.csa_log.read_text().splitlines(),
+                [f"review --check-verdict --range {fixture.first}..{fixture.head}"],
+            )
+            malformed = fixture.run_topology("malformed\n")
+            self.assertNotEqual(malformed.returncode, 0)
+            self.assertIn("malformed", malformed.stdout + malformed.stderr)
+            self.assertEqual(len(fixture.csa_log.read_text().splitlines()), 1)
+
+    def test_private_btrfs_style_receipt_directory_is_accepted(self) -> None:
+        fixture_parent = ROOT / "target" / "pre-push-hook-tests"
+        fixture_parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=fixture_parent) as raw_tmp:
+            fixture = HookFixture(Path(raw_tmp))
+            update = fixture.update(
+                "refs/heads/feat/test",
+                fixture.head,
+                "refs/heads/feat/test",
+                ZERO,
+            )
+
+            result = fixture.run(update)
+            receipt_dir = fixture.root / ".git" / "gb10-pre-push-receipts"
+            if receipt_dir.stat().st_nlink != 1:
+                self.skipTest("fixture filesystem does not expose Btrfs-style st_nlink=1")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(fixture.receipts()), 1)
+
+    def test_planner_rejects_missing_arguments_and_unsafe_capture_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            fixture = HookFixture(Path(raw_tmp))
+            update = fixture.update(
+                "refs/heads/feat/test",
+                fixture.head,
+                "refs/heads/feat/test",
+                ZERO,
+            )
+            capture = fixture.root / "updates"
+            capture.write_text(update)
+            capture.chmod(0o600)
+
+            for arguments in ((), ("origin",)):
+                with self.subTest(arguments=arguments):
+                    result = fixture.run_planner(capture, *arguments)
+                    self.assertNotEqual(result.returncode, 0)
+
+            capture.chmod(0o644)
+            unsafe_mode = fixture.run_planner(capture, "origin", str(fixture.remote))
+            self.assertNotEqual(unsafe_mode.returncode, 0)
+
+            capture.chmod(0o600)
+            hard_link = fixture.root / "updates-hard-link"
+            os.link(capture, hard_link)
+            linked = fixture.run_planner(capture, "origin", str(fixture.remote))
+            self.assertNotEqual(linked.returncode, 0)
+
+            hard_link.unlink()
+            arbitrary = fixture.root / "arbitrary-updates"
+            arbitrary.write_text(update)
+            arbitrary.chmod(0o600)
+            capture.unlink()
+            capture.symlink_to(arbitrary)
+            symlinked = fixture.run_planner(capture, "origin", str(fixture.remote))
+            self.assertNotEqual(symlinked.returncode, 0)
+
+            capture.unlink()
+            capture.mkdir(mode=0o700)
+            nonregular = fixture.run_planner(capture, "origin", str(fixture.remote))
+            self.assertNotEqual(nonregular.returncode, 0)
+
+    def test_hostile_receipt_directories_fail_without_touching_targets(self) -> None:
+        def update_for(fixture: HookFixture) -> str:
+            return fixture.update(
+                "refs/heads/feat/test",
+                fixture.head,
+                "refs/heads/feat/test",
+                ZERO,
+            )
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            fixture = HookFixture(Path(raw_tmp))
+            target = fixture.root / "arbitrary-directory"
+            target.mkdir(mode=0o700)
+            sentinel = target / "sentinel"
+            sentinel.write_text("untouched\n")
+            receipt_dir = fixture.root / ".git" / "gb10-pre-push-receipts"
+            receipt_dir.symlink_to(target, target_is_directory=True)
+
+            result = fixture.run(update_for(fixture))
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(sentinel.read_text(), "untouched\n")
+            self.assertFalse(fixture.csa_log.exists())
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            fixture = HookFixture(Path(raw_tmp))
+            receipt_dir = fixture.root / ".git" / "gb10-pre-push-receipts"
+            receipt_dir.write_text("do not truncate\n")
+            receipt_dir.chmod(0o600)
+
+            result = fixture.run(update_for(fixture))
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(receipt_dir.read_text(), "do not truncate\n")
+            self.assertFalse(fixture.csa_log.exists())
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            fixture = HookFixture(Path(raw_tmp))
+            receipt_dir = fixture.root / ".git" / "gb10-pre-push-receipts"
+            receipt_dir.mkdir(mode=0o755)
+            sentinel = receipt_dir / "sentinel"
+            sentinel.write_text("untouched\n")
+
+            result = fixture.run(update_for(fixture))
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(sentinel.read_text(), "untouched\n")
+            self.assertFalse(fixture.csa_log.exists())
+
+    def test_hostile_lock_and_receipt_entries_are_never_trusted(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            fixture = HookFixture(Path(raw_tmp))
+            update = fixture.update(
+                "refs/heads/feat/test",
+                fixture.head,
+                "refs/heads/feat/test",
+                ZERO,
+            )
+            receipt_dir = fixture.root / ".git" / "gb10-pre-push-receipts"
+            receipt_dir.mkdir(mode=0o700)
+            arbitrary = fixture.root / "arbitrary-target"
+            arbitrary.write_text("never read or changed\n")
+            arbitrary.chmod(0o600)
+            (receipt_dir / ".lock").symlink_to(arbitrary)
+
+            hostile_lock = fixture.run(update)
+
+            self.assertNotEqual(hostile_lock.returncode, 0)
+            self.assertEqual(arbitrary.read_text(), "never read or changed\n")
+            self.assertFalse(fixture.csa_log.exists())
+
+            lock_path = receipt_dir / ".lock"
+            lock_path.unlink()
+            lock_path.write_text("")
+            lock_path.chmod(0o600)
+            lock_alias = fixture.root / "lock-hard-link"
+            os.link(lock_path, lock_alias)
+            linked_lock = fixture.run(update)
+            self.assertNotEqual(linked_lock.returncode, 0)
+            self.assertEqual(lock_path.read_text(), "")
+            self.assertFalse(fixture.csa_log.exists())
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            fixture = HookFixture(Path(raw_tmp))
+            update = fixture.update(
+                "refs/heads/feat/test",
+                fixture.head,
+                "refs/heads/feat/test",
+                ZERO,
+            )
+            first = fixture.run(update)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            receipt = fixture.receipts()[0]
+            original = receipt.read_bytes()
+            original_inode = receipt.stat().st_ino
+            calls_before = fixture.csa_log.read_text()
+
+            receipt.chmod(0o644)
+            unsafe_mode = fixture.run(update)
+            self.assertNotEqual(unsafe_mode.returncode, 0)
+            self.assertEqual(receipt.read_bytes(), original)
+            self.assertEqual(receipt.stat().st_ino, original_inode)
+            self.assertEqual(fixture.csa_log.read_text(), calls_before)
+            receipt.chmod(0o600)
+
+            hard_link = fixture.root / "receipt-hard-link"
+            os.link(receipt, hard_link)
+
+            linked = fixture.run(update)
+
+            self.assertNotEqual(linked.returncode, 0)
+            self.assertEqual(receipt.read_bytes(), original)
+            self.assertEqual(receipt.stat().st_ino, original_inode)
+            self.assertEqual(fixture.csa_log.read_text(), calls_before)
+
+            hard_link.unlink()
+            receipt.unlink()
+            arbitrary = fixture.root / "arbitrary-target"
+            arbitrary.write_text("never read or changed\n")
+            arbitrary.chmod(0o600)
+            receipt.symlink_to(arbitrary)
+
+            symlinked = fixture.run(update)
+
+            self.assertNotEqual(symlinked.returncode, 0)
+            self.assertEqual(arbitrary.read_text(), "never read or changed\n")
+            self.assertEqual(fixture.csa_log.read_text(), calls_before)
+
+            receipt.unlink()
+            os.mkfifo(receipt, mode=0o600)
+            nonregular = fixture.run(update)
+            self.assertNotEqual(nonregular.returncode, 0)
+            self.assertEqual(fixture.csa_log.read_text(), calls_before)
+
+    def test_concurrent_publication_creates_one_immutable_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            fixture = HookFixture(Path(raw_tmp))
+            update = fixture.update(
+                "refs/heads/feat/test",
+                fixture.head,
+                "refs/heads/feat/test",
+                ZERO,
+            )
+
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                results = list(executor.map(lambda _: fixture.run(update), range(6)))
+
+            for result in results:
+                self.assertEqual(result.returncode, 0, result.stderr)
+            receipts = fixture.receipts()
+            self.assertEqual(len(receipts), 1)
+            metadata = receipts[0].stat()
+            self.assertTrue(stat.S_ISREG(metadata.st_mode))
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            self.assertEqual(metadata.st_nlink, 1)
+            self.assertEqual(len(fixture.csa_log.read_text().splitlines()), 6)
+            leftovers = [
+                path.name
+                for path in receipts[0].parent.iterdir()
+                if path.name != ".lock" and path != receipts[0]
+            ]
+            self.assertEqual(leftovers, [])
+
     def test_fixture_ignores_ambient_git_local_environment(self) -> None:
         with (
             tempfile.TemporaryDirectory() as raw_outer,
