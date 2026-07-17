@@ -433,8 +433,10 @@ class CloudEvidenceCache:
     ) -> EvidenceResponse:
         """Return cached evidence or send exactly once after a durable ledger commit."""
 
-        if not base_url or not api_key or timeout <= 0:
-            raise ValueError("base URL, API key, and positive timeout are required")
+        if not base_url or timeout <= 0:
+            raise ValueError("base URL and positive timeout are required")
+        if not api_key and not cache_only:
+            raise ValueError("API key is required when cloud network access is allowed")
         request_hash = canonical_request_hash(body)
         request_dir = self.root / request_hash
         if request_dir.exists():
@@ -625,7 +627,8 @@ def fetch_cloud_batches(
 ) -> list[ValidatedResponse]:
     """Enforce the whole-plan cap before reading cache or sending the first request."""
 
-    _enforce_cost_cap(estimated_tokens, max_estimated_tokens, max_cost_usd)
+    if not cache_only:
+        _enforce_cost_cap(estimated_tokens, max_estimated_tokens, max_cost_usd)
     validated: list[ValidatedResponse] = []
     for payload in payloads:
         expected = _payload_cardinality(payload)
@@ -1107,7 +1110,10 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--cache-only",
         action="store_true",
-        help="forbid cloud network calls; the local endpoint is still probed",
+        help=(
+            "forbid cloud network calls and API-key use; send-only cost caps do not "
+            "apply, and the local endpoint is still probed"
+        ),
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output-json", default="-")
@@ -1146,7 +1152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         cloud_key = os.environ.get(args.cloud_api_key_env, "")
-        if not cloud_key:
+        if not cloud_key and not args.cache_only:
             raise EquivalenceError(
                 f"cloud API key environment variable is unset: {args.cloud_api_key_env}"
             )

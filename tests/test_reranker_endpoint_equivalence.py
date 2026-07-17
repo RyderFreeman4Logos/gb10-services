@@ -143,6 +143,40 @@ class CloudEvidenceCacheTests(unittest.TestCase):
             )
             self.assertTrue(observed)
 
+    def test_cache_only_needs_neither_cloud_secret_nor_send_cost_override(self) -> None:
+        calls = 0
+
+        def transport(
+            _url: str, _body: bytes, _headers: dict[str, str], _timeout: float
+        ) -> reranker.HttpResult:
+            nonlocal calls
+            calls += 1
+            return reranker.HttpResult(200, {}, _response([0.5]), 2)
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            cache = reranker.CloudEvidenceCache(Path(raw_tmp), transport=transport)
+            body = reranker.canonical_payload(["q"], ["d"])
+            cache.fetch(
+                body,
+                base_url="https://api.deepinfra.com",
+                api_key="initial-paid-request-secret",
+                timeout=1,
+            )
+
+            cached = reranker.fetch_cloud_batches(
+                [body],
+                cache=cache,
+                base_url="https://api.deepinfra.com",
+                api_key="",
+                timeout=1,
+                estimated_tokens=1_000_001,
+                max_estimated_tokens=1_000_000,
+                max_cost_usd=0.05,
+                cache_only=True,
+            )
+            self.assertEqual(calls, 1)
+            self.assertEqual(cached[0].scores, (0.5,))
+
     def test_ambiguous_transport_is_recorded_once_and_never_resent(self) -> None:
         calls = 0
 

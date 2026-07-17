@@ -40,4 +40,6 @@ fails closed. A paid full-corpus run therefore requires explicit increases to
 both `--max-estimated-input-tokens` and `--max-cloud-cost-usd`; use the dry-run
 output to choose them. `--cache-only` forbids cloud network calls while still
 allowing the configured local endpoint to be evaluated against paid responses
-already present in the evidence cache.
+already present in the evidence cache. It requires no cloud API key and ignores
+the send-only cost caps; every planned request hash must already have complete
+response evidence or the run aborts.
