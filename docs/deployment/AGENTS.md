@@ -18,7 +18,9 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 
 ## Current Reference Runtime
 
-* vLLM image for embedding, AEON chat, and the disabled vLLM reranker fallback: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-14-v0.25.0` (`sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55`).
+* Tracked vLLM source image for embedding, AEON chat, Querit, and the disabled vLLM reranker fallback: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-16-v0.25.1` (`sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d`; runtime `0.25.1+aeon.sm121a.dflash`).
+* Rollback/superseded image retained on GB10: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-14-v0.25.0` (`sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55`).
+* The 0.25.1 AEON build ports the MRv2 `lm_head` sharing fix across DFlash, Eagle, and DSpark, includes vLLM #47888 for torchcodec startup without FFmpeg, and guards the mixed-dtype FlashInfer TP>1 fusion via #48330. AEON calls the DSpark loader fix-covered and TP=2-ready but explicitly leaves TP>1 unvalidated; do not present this source migration as a multi-Spark hardware result.
 * `vllm-embedding.service` tracked source contract: BF16 Qwen3-Embedding-8B with 4,096-dimensional output, `max-model-len=32768`, `max-num-batched-tokens=8192`, `max-num-seqs=64`, `kv-cache-memory-bytes=4800M`, and a 20 GiB no-swap hard cap. The validated 5,820 MiB baseline yielded 41,376 KV tokens; 4,800 MiB projects about 34,124 tokens (4.14% above 32,768) but is not production-verified until a live restart prints at least 32,768 tokens.
 * `vllm-aeon-27b-dflash.service`: DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-batched-tokens=32768`, `kv-cache-memory-bytes=15360M`, verified 269,589 KV tokens.
 * `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
@@ -303,14 +305,14 @@ required for these proxy-only queue/concurrency changes.
 
 ## Troubleshooting & Recovery
 
-### 0. v0.25 FlashInfer JIT Compilation
+### 0. v0.25.1 FlashInfer JIT Compilation
 
-The v0.25 image (`sha256:18c09e6b...`) uses FlashInfer 0.6.13 which requires JIT
+The v0.25.1 image (`sha256:c15e2c4b...`) uses FlashInfer 0.6.13 which requires JIT
 compilation of 30+ CUTLASS FP4 GEMM kernels on first startup. Without `MAX_JOBS=1`,
 ninja compiles in parallel → multiple nvcc/cc1plus procs exhaust UMA → kernel OOM
 → `ninja: build stopped` → `RuntimeError` exit 1.
 
-**This is the #1 cause of text startup failures on v0.25.**
+**This is the #1 cause of text startup failures on v0.25.x.**
 
 The text unit sets `MAX_JOBS=1` + `CMAKE_BUILD_PARALLEL_LEVEL=1` to serialize
 compilation. Peak memory stays ~7G above floor — well clear of the guardian's

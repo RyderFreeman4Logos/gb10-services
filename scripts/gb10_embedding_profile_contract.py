@@ -21,11 +21,11 @@ __all__ = [
 
 EXPECTED_IMAGE = (
     "ghcr.io/aeon-7/aeon-vllm-ultimate@"
-    "sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55"
+    "sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d"
 )
 EXPECTED_CONTAINER = "vllm-embedding"
 EXPECTED_MODELS = ("qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B")
-EXPECTED_UNIT_SHA256 = "e231589a375a5f26f97559dd6909959c10729e5ecea61a325128e7b3bc49c1ac"
+EXPECTED_UNIT_SHA256 = "1e96eedc0308f6de0be3d761cbb9cae09d9154fa54a3ef35b3944a8f591cda4e"
 EXPECTED_HOST_ARGV = [
     "/usr/bin/docker",
     "run",

@@ -3,7 +3,7 @@
 # Config: util=0.15, pin KV 4800M, enforce-eager, max-model-len 32768
 # ─────────────────────────────────────────────────────────────────
 [Unit]
-Description=vLLM Qwen3-Embedding-8B (AEON v0.25 GB10 image, raw backend port 18012, behind llm-guard-proxy listeners 18009/18002/18005, reliability-first, 32k contract, 64 seq)
+Description=vLLM Qwen3-Embedding-8B (AEON v0.25.1 GB10 image, raw backend port 18012, behind llm-guard-proxy listeners 18009/18002/18005, reliability-first, 32k contract, 64 seq)
 After=network.target
 StartLimitIntervalSec=600
 StartLimitBurst=5
@@ -37,7 +37,7 @@ ExecStart=/usr/bin/docker run --rm --name vllm-embedding \
   --memory-swap 128g \
   --oom-score-adj 0 \
   --entrypoint python3 \
-  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55 \
+  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d \
   /usr/local/bin/vllm serve Qwen/Qwen3-Embedding-8B \
     --host 0.0.0.0 --port 8000 \
     --served-model-name qwen3-embedding-8b Qwen/Qwen3-Embedding-8B \
@@ -49,7 +49,7 @@ ExecStart=/usr/bin/docker run --rm --name vllm-embedding \
     --kv-cache-memory-bytes 4800M \
     --gpu-memory-utilization 0.15 --enforce-eager
 # No docker --memory and no cgroup enforce: embedding uses --enforce-eager
-# (stable memory, no cudagraph capture peak). The v0.25 image starts slower
+# (stable memory, no cudagraph capture peak). The v0.25.1 image starts slower
 # than v0.24, so cap-only cgroup enforce races with container registration.
 # Readiness is verified by polling the public metadata endpoint instead.
 ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh embedding http://100.105.4.92:18012 qwen3-embedding-8b --deadline 300

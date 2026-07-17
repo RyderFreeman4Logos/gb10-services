@@ -33,14 +33,14 @@ def _live_receipt() -> dict[str, Any]:
 
 
 _RECEIPT = _live_receipt()
-# Production AEON text image digest (v0.25.0, 2026-07-14). Live receipt still records the
+# Source-selected AEON text image digest (v0.25.1, 2026-07-16). Live receipt still records the
 # 15 GiB KV capacity proof from the prior v0.24 run; KV budget stays 15360 MiB.
 IMAGE_DIGEST = (
-    "sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55"
+    "sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d"
 )
-# Querit pins the deployed v0.25.0 offline transformers runtime image.
+# Querit pins the source-selected v0.25.1 offline transformers runtime image.
 QUERIT_IMAGE_DIGEST = (
-    "sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55"
+    "sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d"
 )
 MODEL_SNAPSHOT = "7b796de30ad8dc772d6c46c75659c1341283a665"
 SHORT_GENERATION_REQUEST_TOKENS = 8_192

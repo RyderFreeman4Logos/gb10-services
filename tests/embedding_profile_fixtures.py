@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 UNIT = ROOT / "systemd" / "vllm-embedding.service"
 IMAGE = (
     "ghcr.io/aeon-7/aeon-vllm-ultimate@"
-    "sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55"
+    "sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d"
 )
 MODELS = ("qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B")
 CONTAINER_ID = "a" * 64

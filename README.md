@@ -79,14 +79,28 @@ before writing directly to a pre-opened `cgroup.kill` descriptor; it does not
 invoke Docker or systemd under pressure. Embedding and reranker remain outside
 the target set. `sysmon.service` remains the observer-only host monitor.
 
-### Reference Production Profile (source updated 2026-07-14)
+### Reference Production Profile (source updated 2026-07-17)
 
-The reference host runs all three model containers from this pinned image digest:
+The tracked source selects this friendly release and immutable repository digest
+for every AEON-backed unit. The running containers remain on their prior image
+until a separately authorized deployment changes them.
 
 ```text
-ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-14-v0.25.0
-digest: sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55
+friendly tag: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-16-v0.25.1
+repository digest: sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d
+rollback/superseded: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-14-v0.25.0 @ sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55
+runtime version: 0.25.1+aeon.sm121a.dflash
 ```
+
+AEON build revision [`afd9b8b7`](https://github.com/AEON-7/vllm-ultimate-dgx-spark/commit/afd9b8b7faa6fbe2ceab13a14638e97dc5ca718f)
+rebases to vLLM 0.25.1 and ports the MRv2 `lm_head` sharing fix to
+DFlash, Eagle, and DSpark. It also includes upstream
+[#47888](https://github.com/vllm-project/vllm/pull/47888), which prevents the
+optional torchcodec import from blocking startup when FFmpeg is absent, and
+[#48330](https://github.com/vllm-project/vllm/pull/48330), which guards the
+mixed-dtype FlashInfer allreduce/RMSNorm/quant fusion for TP>1. Upstream labels
+the DSpark loader fix-covered and TP=2-ready but still says TP>1 is unvalidated;
+this repository does not claim a multi-Spark hardware validation.
 
 Capacity contracts and evidence:
 
