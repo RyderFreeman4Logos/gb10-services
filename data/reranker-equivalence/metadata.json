@@ -1,0 +1,86 @@
+{
+  "candidates_per_group": 10,
+  "citations": [
+    {
+      "doi": "10.1162/tacl_a_00595",
+      "title": "MIRACL: A Multilingual Retrieval Dataset Covering 18 Diverse Languages"
+    },
+    {
+      "doi": "10.48550/arXiv.2502.13595",
+      "title": "MMTEB: Massive Multilingual Text Embedding Benchmark"
+    },
+    {
+      "doi": "10.48550/ARXIV.2210.07316",
+      "title": "MTEB: Massive Text Embedding Benchmark"
+    }
+  ],
+  "corpus_file": "miracl-reranking-en-zh-dev.jsonl",
+  "corpus_sha256": "2dd35e5a0ce1357ec8c6daaa4893809c220309058e858d62b0c9f1d8c68b954d",
+  "dataset": "mteb/MIRACLReranking",
+  "dataset_url": "https://huggingface.co/datasets/mteb/MIRACLReranking/tree/ab6f54eff185a84bc1f6ab96b56bc7df87433228",
+  "groups_per_language": 100,
+  "languages": [
+    "en",
+    "zh"
+  ],
+  "license": "CC-BY-SA-4.0",
+  "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+  "revision": "ab6f54eff185a84bc1f6ab96b56bc7df87433228",
+  "selection": {
+    "candidate_rule": "For each valid query, take the first qrels-positive candidate and the first nine qrels-zero hard negatives from top_ranked, then restore top_ranked order. No text is generated or rewritten.",
+    "query_rule": "Sort valid query groups by SHA-256 of the fixed selection domain, revision, language, and query_id; take the first 100 per language.",
+    "selection_domain": "miracl-reranker-equivalence-v1"
+  },
+  "source_card_url": "https://huggingface.co/datasets/mteb/MIRACLReranking/blob/ab6f54eff185a84bc1f6ab96b56bc7df87433228/README.md",
+  "source_files": [
+    {
+      "path": "en-corpus/dev-00000-of-00001.parquet",
+      "sha256": "cf0679ffc34fd67a14c68554b446618c353e7f0a8c3cb6ce1c31b14f9b765416",
+      "size": 30024859,
+      "url": "https://huggingface.co/datasets/mteb/MIRACLReranking/resolve/ab6f54eff185a84bc1f6ab96b56bc7df87433228/en-corpus/dev-00000-of-00001.parquet?download=true"
+    },
+    {
+      "path": "en-qrels/dev-00000-of-00001.parquet",
+      "sha256": "925bacac253aa59680f308c2779367bc31e8189e569df5519880e623b489c7e4",
+      "size": 500585,
+      "url": "https://huggingface.co/datasets/mteb/MIRACLReranking/resolve/ab6f54eff185a84bc1f6ab96b56bc7df87433228/en-qrels/dev-00000-of-00001.parquet?download=true"
+    },
+    {
+      "path": "en-queries/dev-00000-of-00001.parquet",
+      "sha256": "79265c85080b101de7abd590cc6aecbafa14cf0001fa778f7c2eeac1928c7734",
+      "size": 28887,
+      "url": "https://huggingface.co/datasets/mteb/MIRACLReranking/resolve/ab6f54eff185a84bc1f6ab96b56bc7df87433228/en-queries/dev-00000-of-00001.parquet?download=true"
+    },
+    {
+      "path": "en-top_ranked/dev-00000-of-00001.parquet",
+      "sha256": "f549fd8a3746546f37095083a9ce006f7348e09fab4da2b471b57703cf538c01",
+      "size": 410185,
+      "url": "https://huggingface.co/datasets/mteb/MIRACLReranking/resolve/ab6f54eff185a84bc1f6ab96b56bc7df87433228/en-top_ranked/dev-00000-of-00001.parquet?download=true"
+    },
+    {
+      "path": "zh-corpus/dev-00000-of-00001.parquet",
+      "sha256": "c0fdd6d7b6b7ca30dddc3bb2fe761433fc507c7eb9d99e502985faef5bc8d1a6",
+      "size": 10998069,
+      "url": "https://huggingface.co/datasets/mteb/MIRACLReranking/resolve/ab6f54eff185a84bc1f6ab96b56bc7df87433228/zh-corpus/dev-00000-of-00001.parquet?download=true"
+    },
+    {
+      "path": "zh-qrels/dev-00000-of-00001.parquet",
+      "sha256": "23d7986206a286f23683da48d42771bee8c61cb6e7e3cce8586625bb0f64999f",
+      "size": 249243,
+      "url": "https://huggingface.co/datasets/mteb/MIRACLReranking/resolve/ab6f54eff185a84bc1f6ab96b56bc7df87433228/zh-qrels/dev-00000-of-00001.parquet?download=true"
+    },
+    {
+      "path": "zh-queries/dev-00000-of-00001.parquet",
+      "sha256": "f5c75b9f96531886dc906097d8451f508921c22850076be5820d4f51d8b6b7f2",
+      "size": 12509,
+      "url": "https://huggingface.co/datasets/mteb/MIRACLReranking/resolve/ab6f54eff185a84bc1f6ab96b56bc7df87433228/zh-queries/dev-00000-of-00001.parquet?download=true"
+    },
+    {
+      "path": "zh-top_ranked/dev-00000-of-00001.parquet",
+      "sha256": "023a96094f80d889f8fe026449c3fb528cb276ef8e463da7b4f0335eb8be2ecb",
+      "size": 238646,
+      "url": "https://huggingface.co/datasets/mteb/MIRACLReranking/resolve/ab6f54eff185a84bc1f6ab96b56bc7df87433228/zh-top_ranked/dev-00000-of-00001.parquet?download=true"
+    }
+  ],
+  "split": "dev"
+}
