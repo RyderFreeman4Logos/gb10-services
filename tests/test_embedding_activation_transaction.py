@@ -64,6 +64,10 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 receipt = json.loads(receipt_path.read_text())
                 self.assertEqual(receipt["commit_requires_phase"], "committed")
                 self.assertEqual(receipt["verification"], "passed")
+                self.assertEqual(
+                    receipt["profile"],
+                    "qwen3-embedding-8b-32k-4800M-128GiB",
+                )
                 self.assertNotIn("transaction", receipt)
                 self.assertNotIn("rollback_available", receipt)
                 self.assertEqual(receipt_path.stat().st_mode & 0o777, 0o600)

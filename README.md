@@ -25,7 +25,7 @@ graph TD
 1. **vllm-aeon-27b-dflash.service**
    Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside the pinned AEON v0.25 GB10 Docker image for long-context processing up to 256k tokens, with FP8 KV cache and DFlash `TRITON_ATTN` enabled.
 2. **vllm-embedding.service**
-   Serves BF16 `Qwen/Qwen3-Embedding-8B` with its full 4,096-dimensional output. This is the reliability-critical baseline service. The tracked source profile contracts for 32,768 tokens, 4,800 MiB explicit KV, and a 20 GiB no-swap hard cap while preserving 8,192 batched tokens, 64 sequences, aliases, and quality semantics. Its raw backend listens only on port `18012`; clients should use `llm-guard-proxy` on port `18009` or the guard-owned legacy listener `18002` with model `qwen3-embedding-8b`.
+   Serves BF16 `Qwen/Qwen3-Embedding-8B` with its full 4,096-dimensional output. This is the reliability-critical baseline service. The tracked source profile contracts for 32,768 tokens and 4,800 MiB explicit KV while preserving 8,192 batched tokens, 64 sequences, aliases, and quality semantics. Its equal 128 GiB memory/swap cgroup ceiling disables container swap without imposing the obsolete 20 GiB service budget; this source contract is not a live-activation claim. Its raw backend listens only on port `18012`; clients should use `llm-guard-proxy` on port `18009` or the guard-owned legacy listener `18002` with model `qwen3-embedding-8b`.
 3. **querit-4b-reranker.service**
    Serves the pinned `Querit/Querit-4B` snapshot through a bounded, single-inference Transformers adapter. It keeps the `qwen3-reranker-8b` and `Qwen/Qwen3-Reranker-8B` aliases, a 40,960-token input profile, and an 18 GiB no-swap container cap. Its raw backend listens on `18013`; clients should use `llm-guard-proxy` on `18009` or the restricted listener `18003`. The old `vllm-qwen3-reranker-8b.service` remains tracked only as a disabled rollback artifact.
 4. **llm-guard-proxy.service**
@@ -228,7 +228,9 @@ cp config/llm-guard-proxy/config.toml ~/.config/llm-guard-proxy/config.toml
 ```bash
 mkdir -p ~/.config/systemd/user/
 install -m 0644 systemd/llm-guard-proxy.service \
-  systemd/sysmon.service systemd/vllm-embedding.service \
+  systemd/querit-4b-reranker.service systemd/sysmon.service \
+  systemd/vllm-aeon-27b-dflash.service systemd/vllm-embedding.service \
+  systemd/vllm-qwen3-reranker-8b.service \
   ~/.config/systemd/user/
 ```
 
@@ -255,8 +257,10 @@ Neither the proxy nor text owns embedding/reranker lifecycle.
 
 ### Embedding 32K profile activation and rollback
 
-The tracked 32,768-token / 4,800 MiB KV / 20 GiB profile is source-first and
-must be activated as a **single-unit** transaction. Do not stop or restart text,
+The tracked 32,768-token / 4,800 MiB KV profile is source-first and uses an
+equal 128 GiB memory/swap cgroup ceiling to disable container swap without
+imposing the obsolete 20 GiB service budget. It must be activated as a
+**single-unit** transaction. Do not stop or restart text,
 either reranker, or the proxy, and do not copy/sync unrelated files from this
 branch. The production entry point accepts no arguments or environment path/tool
 overrides:
@@ -273,8 +277,9 @@ only `vllm-embedding.service`, and requires a new `InvocationID`, PID, and
 monotonic start generation. It then invokes the canonical fail-closed verifier;
 the caller cannot substitute a unit, verifier, Docker command, or evidence path.
 
-Commit requires the canonical 32K/4,800M/20GiB unit and effective Docker argv,
-current systemd/cgroup/container generation, all intended engine-process
+Commit requires the canonical `qwen3-embedding-8b-32k-4800M-128GiB` receipt
+profile and exact 128g memory/swap plus zero-swappiness Docker argv, current
+systemd/cgroup/container generation, all intended engine-process
 metrics, startup capacity of at least 32,768 tokens, exact model aliases, and
 finite 4,096-dimensional fixture vectors. The fixture proves only repeat/alias
 cosine stability at `0.99999` and unchanged nearest-neighbor ordering; it does

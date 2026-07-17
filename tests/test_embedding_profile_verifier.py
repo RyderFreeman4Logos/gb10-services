@@ -220,6 +220,10 @@ class CurrentGenerationVerifierTests(unittest.TestCase):
                     (fixture.evidence / "verification.receipt.json").read_text()
                 )
                 self.assertEqual(receipt["verification"], "passed")
+                self.assertEqual(
+                    receipt["profile"],
+                    "qwen3-embedding-8b-32k-4800M-128GiB",
+                )
                 serialized = json.dumps(receipt, sort_keys=True)
                 self.assertNotIn(CURRENT_INVOCATION, serialized)
                 self.assertNotIn(CONTAINER_ID, serialized)

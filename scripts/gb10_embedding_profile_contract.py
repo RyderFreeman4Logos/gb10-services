@@ -14,6 +14,7 @@ __all__ = [
     "EXPECTED_EXEC_START",
     "EXPECTED_IMAGE",
     "EXPECTED_MODELS",
+    "EXPECTED_PROFILE",
     "validate_effective_commands",
     "validate_unit",
     "validate_unit_text",
@@ -25,7 +26,8 @@ EXPECTED_IMAGE = (
 )
 EXPECTED_CONTAINER = "vllm-embedding"
 EXPECTED_MODELS = ("qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B")
-EXPECTED_UNIT_SHA256 = "1e96eedc0308f6de0be3d761cbb9cae09d9154fa54a3ef35b3944a8f591cda4e"
+EXPECTED_PROFILE = "qwen3-embedding-8b-32k-4800M-128GiB"
+EXPECTED_UNIT_SHA256 = "097fce4d4cc6f2226ac5786f77e20491aa63a8481b0ee773c345912185374a76"
 EXPECTED_HOST_ARGV = [
     "/usr/bin/docker",
     "run",

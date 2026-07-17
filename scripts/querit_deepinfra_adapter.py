@@ -22,6 +22,7 @@ DEFAULT_INSTRUCTION = (
 )
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+REQUEST_BODY_TIMEOUT_SECONDS = 5.0
 
 
 class AdapterError(RuntimeError):
@@ -250,7 +251,20 @@ def _handler(backend_url: str, timeout: float) -> type[BaseHTTPRequestHandler]:
             ):
                 self._error(HTTPStatus.BAD_REQUEST, "invalid content metadata")
                 return
-            body = self.rfile.read(length + 1)
+            previous_timeout = self.connection.gettimeout()
+            body_timed_out = False
+            try:
+                self.connection.settimeout(REQUEST_BODY_TIMEOUT_SECONDS)
+                body = self.rfile.read(length)
+            except TimeoutError:
+                body = b""
+                body_timed_out = True
+            finally:
+                self.connection.settimeout(previous_timeout)
+            if body_timed_out:
+                self.close_connection = True
+                self._error(HTTPStatus.REQUEST_TIMEOUT, "request body timed out")
+                return
             if len(body) != length:
                 self._error(HTTPStatus.BAD_REQUEST, "invalid request length")
                 return

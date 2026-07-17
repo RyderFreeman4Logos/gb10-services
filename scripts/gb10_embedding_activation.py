@@ -21,9 +21,9 @@ EXPECTED_IMPORT_AUTHORITY: dict[str, str] = {
     "gb10_embedding_activation_checks.py": "9c4720fff0d7eaf44e19ca6ce018b8a4688bf1ecafbb4ac78de3de6a2f1a84d6",
     "gb10_embedding_activation_config.py": "9a0f87fa66d55c59d755525eb779ed00aa6540375bfbf3855a6e443aef6e093f",
     "gb10_embedding_activation_storage.py": "38f93b566019b8a29b4c84dbe6882b4e55eb9ebcce75288d3d356953a625b339",
-    "gb10_embedding_profile_contract.py": "387a62a227017f433fae6f330b560dc6d26273cecd970d553a48f56d6bc541d9",
+    "gb10_embedding_profile_contract.py": "0672654ffda1f03ca29002c1a1cfdc443b353d019705901d19370c0ef7ac1e24",
     "gb10_embedding_verifier_runtime.py": "599af1c802e1a0d3e942fb0b16cdfd3a66f9e928ab64eabf3fb455ec007df629",
-    "gb10_verify_embedding_profile.py": "a11b1a41b30ce75ace5b673f967b4f62a3aa0527a22f20495a3e47df2399906d",
+    "gb10_verify_embedding_profile.py": "7c53bf4eaf6f956ef1864c4f0aee67bc386c6d49494fc4ab60cfa0dc7f8f7e7e",
 }
 
 
@@ -76,7 +76,10 @@ from gb10_embedding_activation_storage import (  # noqa: E402
     secure_directory as _secure_directory,
     secure_regular as _secure_regular,
 )
-from gb10_embedding_profile_contract import validate_unit_text  # noqa: E402
+from gb10_embedding_profile_contract import (  # noqa: E402
+    EXPECTED_PROFILE,
+    validate_unit_text,
+)
 from gb10_embedding_verifier_runtime import (  # noqa: E402
     command,
     json_file,
@@ -695,7 +698,7 @@ def activate(config: RuntimeConfig) -> int:
                 "vector_dimensions",
                 "verification",
             }
-            or verification["profile"] != "qwen3-embedding-8b-32k-4800M-20GiB"
+            or verification["profile"] != EXPECTED_PROFILE
             or verification["quality_claim"] != "synthetic-baseline-stability-only"
             or verification["unit_sha256"] != manifest["source_sha256"]
             or verification["vector_dimensions"] != 4096
@@ -722,7 +725,7 @@ def activate(config: RuntimeConfig) -> int:
         receipt = {
             "commit_requires_phase": "committed",
             "neighbor_generations_unchanged": True,
-            "profile": "qwen3-embedding-8b-32k-4800M-20GiB",
+            "profile": EXPECTED_PROFILE,
             "source_sha256": manifest["source_sha256"],
             "verification": "passed",
             "unit": UNIT,

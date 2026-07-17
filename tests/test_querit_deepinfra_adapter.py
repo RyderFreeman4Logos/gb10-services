@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import importlib
+import http.client
 import json
 import math
+import socket
 import sys
+import threading
 import unittest
+from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +57,73 @@ def _backend_response(scores: list[float]) -> bytes:
 
 
 class QueritDeepinfraAdapterTests(unittest.TestCase):
+    def test_loopback_exact_content_length_request_completes(self) -> None:
+        handler = adapter._handler("http://unused.invalid/v1/score", 0.5)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_port, timeout=0.5
+        )
+        body = _public_request()
+        try:
+            with patch.object(
+                adapter,
+                "_call_backend",
+                return_value=_backend_response([-1.0, 0.0, 1.0]),
+            ):
+                connection.request(
+                    "POST",
+                    "/v1/inference/Qwen/Qwen3-Reranker-8B"
+                    "?version=5fa94080caafeaa45a15d11f969d7978e087a3db",
+                    body=body,
+                    headers={
+                        "Content-Length": str(len(body)),
+                        "Content-Type": "application/json",
+                    },
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read())
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["scores"], [0.0, 0.5, 1.0])
+        finally:
+            connection.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
+    def test_partial_request_body_times_out_fail_closed(self) -> None:
+        handler = adapter._handler("http://unused.invalid/v1/score", 0.5)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = socket.create_connection(
+            ("127.0.0.1", server.server_port), timeout=1
+        )
+        client.settimeout(0.5)
+        body = _public_request()
+        request = (
+            "POST /v1/inference/Qwen/Qwen3-Reranker-8B"
+            "?version=5fa94080caafeaa45a15d11f969d7978e087a3db HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "\r\n"
+        ).encode() + body[:8]
+        try:
+            with patch.object(
+                adapter, "REQUEST_BODY_TIMEOUT_SECONDS", 0.05, create=True
+            ):
+                client.sendall(request)
+                response = client.recv(4096)
+            self.assertTrue(response.startswith(b"HTTP/1.0 408 "), response)
+            self.assertNotIn(body[:8], response)
+        finally:
+            client.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
     def test_exact_public_request_maps_to_vllm_score_and_back(self) -> None:
         request = adapter.parse_public_request(_public_request())
         self.assertEqual(

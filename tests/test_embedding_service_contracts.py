@@ -198,6 +198,8 @@ def _embedding_contract(unit: str) -> dict[str, int]:
     expected_host_options = {
         "--name": ["vllm-embedding"],
         "-p": ["100.105.4.92:18012:8000"],
+        "--memory": ["128g"],
+        "--memory-swap": ["128g"],
         "--memory-swappiness": ["0"],
         "--oom-score-adj": ["0"],
     }
@@ -292,6 +294,9 @@ def _embedding_contract(unit: str) -> dict[str, int]:
 
 
 class EmbeddingServiceContractTests(unittest.TestCase):
+    def test_host_memory_options_create_equal_no_swap_cgroup_ceiling(self) -> None:
+        _embedding_contract(EMBEDDING_UNIT.read_text())
+
     def test_32k_profile_has_bounded_kv_for_coresident_stability(self) -> None:
         unit = EMBEDDING_UNIT.read_text()
         contract = _embedding_contract(unit)
@@ -458,6 +463,14 @@ class HostileEmbeddingUnitMutationTests(unittest.TestCase):
 
 
 class EmbeddingDeploymentContractTests(unittest.TestCase):
+    FRESH_STACK_UNITS = {
+        "llm-guard-proxy.service",
+        "querit-4b-reranker.service",
+        "sysmon.service",
+        "vllm-aeon-27b-dflash.service",
+        "vllm-embedding.service",
+        "vllm-qwen3-reranker-8b.service",
+    }
     FORBIDDEN_NEIGHBORS = (
         "vllm-aeon-27b-dflash.service",
         "querit-4b-reranker.service",
@@ -507,6 +520,66 @@ class EmbeddingDeploymentContractTests(unittest.TestCase):
                 if target.endswith(".service"):
                     mutations.append((action, target))
         return mutations
+
+    @staticmethod
+    def installed_units_before_reload(text: str, start: str) -> set[str]:
+        start_at = text.find(start)
+        if start_at < 0:
+            raise AssertionError(f"missing install section marker: {start}")
+        reload_at = text.find("systemctl --user daemon-reload", start_at)
+        if reload_at < 0:
+            raise AssertionError("missing daemon-reload after install section")
+        before_reload = text[start_at:reload_at].replace("\\\n", " ")
+        installed: set[str] = set()
+        for raw_line in before_reload.splitlines():
+            line = raw_line.strip()
+            if not line.startswith("install -m 0644 "):
+                continue
+            try:
+                argv = shlex.split(line, comments=True, posix=True)
+            except ValueError as error:
+                raise AssertionError(
+                    f"invalid documented install command: {line}"
+                ) from error
+            for token in argv[3:-1]:
+                if token.startswith("systemd/") and token.endswith(".service"):
+                    installed.add(Path(token).name)
+        return installed
+
+    def test_fresh_stack_install_blocks_stage_every_managed_unit(self) -> None:
+        documents = (
+            (README.read_text(), "### Step 2: Install Systemd Services"),
+            (
+                AGENT_PLAYBOOK.read_text(),
+                "### 5. Systemd User Services Installation",
+            ),
+        )
+        for text, marker in documents:
+            with self.subTest(marker=marker):
+                self.assertEqual(
+                    self.installed_units_before_reload(text, marker),
+                    self.FRESH_STACK_UNITS,
+                )
+
+    def test_current_embedding_memory_contract_has_no_obsolete_cap_claim(self) -> None:
+        stale_claims = (
+            "20 GiB no-swap hard cap",
+            "32,768-token / 4,800 MiB KV / 20 GiB profile",
+            "32K/4,800M/20GiB",
+            "20 GiB no-swap cgroup/container",
+        )
+        for path in (README, AGENT_PLAYBOOK):
+            text = path.read_text()
+            with self.subTest(path=path):
+                self.assertIn("equal 128 GiB memory/swap cgroup ceiling", text)
+                self.assertIn("without imposing the obsolete 20 GiB service budget", text)
+                for stale in stale_claims:
+                    self.assertNotIn(stale, text)
+
+        unit = EMBEDDING_UNIT.read_text()
+        self.assertNotIn("No docker --memory", unit)
+        self.assertIn("Equal --memory 128g and --memory-swap 128g", unit)
+        self.assertIn("disable container swap", unit)
 
     def test_documented_activation_and_rollback_mutate_only_embedding(self) -> None:
         sections = (
