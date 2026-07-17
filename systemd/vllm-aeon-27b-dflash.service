@@ -22,12 +22,14 @@ Environment=AEON_URL=http://100.105.4.92:18010
 # Prefer killing text before reranker under host OOM (reranker uses 500).
 OOMScoreAdjust=800
 # Wrapper only. The container's 128G cap is not a physical NVML/UMA ceiling.
-# Memory budget (3-service ~80G+ class): weights~22G + pinned KV 15G + graphs~0.5G
-# + emb~20G + rr~18G ≈ 75G engine-side policy, not a cgroup guarantee.
-# 2026-07-14: 15GiB KV verified 269589 tokens (1.028 full contexts).
+# Tracked clean-start v0.25.1 reference (not a live-production activation claim):
+# weights~22G + AUTO KV ~16G at util=0.355 + graphs~0.5G
+# + emb~20G + rr~18G ≈ 76.5G engine-side policy, not a cgroup guarantee.
+# Clean-start KV capacity: 286962 tokens (1.094 full 262144-token contexts).
 # It preserves one full 262144-token context, not two concurrent max requests.
-# The first live all-three 3300s window ended with ~31.6GiB MemAvailable,
-# zero threshold events, and zero cgroup OOM kills.
+# The co-resident clean-start baseline left 39.75G MemAvailable after all three.
+# A historical pre-v0.25.1 live all-three 3300s receipt (not this tracked
+# reference) ended at ~31.6GiB MemAvailable with zero threshold events/OOM kills.
 # Auto-KV at util=0.6 grew to ~46G and left only ~10G MemAvailable — too fat.
 # AEON-recommended DFlash shape: seqs=16, batch=8192, util=0.6, FULL_DECODE_ONLY.
 # NO --kv-cache-memory-bytes: AEON confirmed pinning KV bypasses UMA guard
@@ -39,7 +41,7 @@ OOMScoreAdjust=800
 # emb+rr without stopping them. Steady-state decode unaffected (governed by seqs);
 # only cold long-prompt prefill TTFT increases via more chunked-prefill iterations.
 # Prefix-cache/KV-cache hit rate is unaffected (lives inside the pool, not batch-sized).
-# util=0.6 is AEON's DFlash-safe GB10 target (0.88 hard ceiling).
+# util=0.355 is the tracked co-resident target; 0.6 is the too-fat upstream baseline.
 # Restart via gb10_restart_text_safe.sh (stops rr first, never emb).
 MemoryMax=256M
 MemorySwapMax=0

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import shlex
 import unittest
 from pathlib import Path
 
@@ -65,6 +67,73 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                     f"ghcr.io/aeon-7/aeon-vllm-ultimate@{CURRENT_DIGEST}", text
                 )
                 self.assertNotRegex(text, r"aeon-vllm-ultimate:[^\s\\]+")
+
+    def test_aeon_tracked_runtime_profile_matches_deployment_reference(self) -> None:
+        unit = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
+        unit_text = unit.read_text()
+        unit_lines = unit_text.splitlines()
+        start = next(
+            index for index, line in enumerate(unit_lines) if line.startswith("ExecStart=")
+        )
+        command_lines = [unit_lines[start].removeprefix("ExecStart=")]
+        while command_lines[-1].rstrip().endswith("\\"):
+            start += 1
+            self.assertLess(start, len(unit_lines))
+            command_lines.append(unit_lines[start].strip())
+
+        command = " ".join(
+            line.rstrip().removesuffix("\\").rstrip() for line in command_lines
+        )
+        argv = shlex.split(command)
+        serve_index = argv.index("serve")
+        runtime_argv = argv[serve_index + 1 :]
+
+        def option_value(option: str) -> str:
+            self.assertIn(option, runtime_argv)
+            index = runtime_argv.index(option)
+            self.assertLess(index + 1, len(runtime_argv))
+            return runtime_argv[index + 1]
+
+        self.assertEqual(option_value("--max-model-len"), "262144")
+        self.assertEqual(option_value("--max-num-seqs"), "16")
+        self.assertEqual(option_value("--max-num-batched-tokens"), "4096")
+        self.assertEqual(option_value("--gpu-memory-utilization"), "0.355")
+        self.assertEqual(option_value("--kv-cache-dtype"), "fp8_e4m3")
+        self.assertEqual(option_value("--attention-backend"), "TRITON_ATTN")
+        speculative = json.loads(option_value("--speculative-config"))
+        self.assertEqual(speculative["method"], "dflash")
+        self.assertEqual(speculative["num_speculative_tokens"], 10)
+        self.assertNotIn("--kv-cache-memory-bytes", runtime_argv)
+
+        guide = (ROOT / "docs" / "deployment" / "AGENTS.md").read_text()
+        reference_rows = [
+            line
+            for line in guide.splitlines()
+            if line.startswith("* `vllm-aeon-27b-dflash.service`")
+        ]
+        self.assertEqual(len(reference_rows), 1)
+        reference_row = reference_rows[0]
+        for expected in (
+            "tracked clean-start v0.25.1 reference",
+            "DFlash n=10",
+            "kv-cache-dtype=fp8_e4m3",
+            "attention-backend=TRITON_ATTN",
+            "max-model-len=262144",
+            "max-num-seqs=16",
+            "max-num-batched-tokens=4096",
+            "AUTO KV",
+            "gpu-memory-utilization=0.355",
+            "no explicit `kv-cache-memory-bytes`",
+            "286,962 KV tokens",
+            "not a live-production activation claim",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, reference_row)
+        self.assertNotIn("max-num-batched-tokens=32768", reference_row)
+        self.assertNotIn("kv-cache-memory-bytes=15360M", reference_row)
+        self.assertNotIn("269,589 KV tokens", reference_row)
+        self.assertNotIn("pinned KV 15G", unit_text)
+        self.assertNotIn("15GiB KV verified 269589", unit_text)
 
     def test_current_docs_publish_friendly_tag_and_immutable_digest(self) -> None:
         for path in CURRENT_DOCS:
