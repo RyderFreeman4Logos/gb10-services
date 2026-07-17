@@ -40,7 +40,8 @@ class LocalGateContractTests(unittest.TestCase):
         self.assertIn("pre-commit:", lefthook)
         self.assertIn("run: just quick-check", lefthook)
         self.assertIn("pre-push:", lefthook)
-        self.assertIn("run: scripts/hooks/review-check.sh", lefthook)
+        self.assertIn("run: scripts/hooks/review-check.sh {1} {2}", lefthook)
+        self.assertIn("use_stdin: true", lefthook)
         self.assertNotIn("run: scripts/hooks/branch-protection.sh", lefthook)
         self.assertIn("run: just pre-push", lefthook)
 

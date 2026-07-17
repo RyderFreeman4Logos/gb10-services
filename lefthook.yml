@@ -6,6 +6,7 @@ pre-commit:
 pre-push:
   commands:
     review-check:
-      run: scripts/hooks/review-check.sh
+      run: scripts/hooks/review-check.sh {1} {2}
+      use_stdin: true
     local-quality-gate:
       run: just pre-push
