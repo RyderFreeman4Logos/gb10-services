@@ -28,6 +28,7 @@ import querit_vllm_artifact as artifact
 
 
 BUNDLE_SCHEMA = "gb10-querit-canary-bundle-v1"
+PLAN_SCHEMA = "gb10-querit-canary-plan-v1"
 STATE_SCHEMA = "gb10-querit-canary-deployment-v1"
 DEFAULT_STATE = Path("/home/obj/.local/state/gb10-querit-canary-deployment/state.json")
 DEFAULT_ARTIFACT = Path("/home/obj/models/querit-4b-vllm")
@@ -35,6 +36,7 @@ DEFAULT_LIFECYCLE_STATE = Path("/home/obj/.local/state/gb10-querit-canary/state.
 LIB_ROOT = Path("/home/obj/.local/lib/gb10")
 BIN_ROOT = Path("/home/obj/.local/bin")
 UNIT_ROOT = Path("/home/obj/.config/systemd/user")
+RUNTIME_UNIT_ROOT = Path("/run/user/1001/systemd/user")
 CANDIDATE_UNITS = (runtime.BACKEND_UNIT, runtime.ADAPTER_UNIT)
 
 
@@ -50,6 +52,8 @@ class Host(Protocol):
     def runtime_mask(self, unit: str) -> None: ...
 
     def runtime_unmask(self, unit: str) -> None: ...
+
+    def runtime_mask_attestation(self, unit: str) -> dict[str, object] | None: ...
 
     def daemon_reload(self) -> None: ...
 
@@ -122,6 +126,34 @@ class SystemHost:
 
     def runtime_unmask(self, unit: str) -> None:
         self._run(["/usr/bin/systemctl", "--user", "unmask", "--runtime", unit])
+
+    def runtime_mask_attestation(self, unit: str) -> dict[str, object] | None:
+        path = _runtime_mask_path(unit)
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise DeploymentError(f"cannot lstat runtime mask for {unit}") from exc
+        if not stat.S_ISLNK(metadata.st_mode):
+            raise DeploymentError(f"runtime mask is not a symlink for {unit}")
+        try:
+            target = os.readlink(path)
+        except OSError as exc:
+            raise DeploymentError(f"cannot read runtime mask target for {unit}") from exc
+        if target != "/dev/null":
+            raise DeploymentError(f"runtime mask target is not /dev/null for {unit}")
+        return {
+            "scope": "runtime",
+            "path": str(path),
+            "lstat": {
+                "st_dev": metadata.st_dev,
+                "st_ino": metadata.st_ino,
+                "st_mode": metadata.st_mode,
+                "type": "symlink",
+            },
+            "link_target": target,
+        }
 
     def daemon_reload(self) -> None:
         self._run(["/usr/bin/systemctl", "--user", "daemon-reload"])
@@ -511,6 +543,53 @@ def _unit_target(unit: str) -> Path:
     raise AssertionError(f"missing target mapping for {unit}")
 
 
+def _runtime_mask_path(unit: str) -> Path:
+    if unit not in CANDIDATE_UNITS:
+        raise DeploymentError(f"runtime mask is not an expected candidate unit: {unit}")
+    return RUNTIME_UNIT_ROOT / unit
+
+
+def _runtime_mask_evidence(value: object, unit: str) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "scope",
+        "path",
+        "lstat",
+        "link_target",
+    }:
+        raise DeploymentError(f"runtime mask attestation is malformed for {unit}")
+    lstat = value.get("lstat")
+    if (
+        value.get("scope") != "runtime"
+        or value.get("path") != str(_runtime_mask_path(unit))
+        or value.get("link_target") != "/dev/null"
+        or not isinstance(lstat, dict)
+        or set(lstat) != {"st_dev", "st_ino", "st_mode", "type"}
+        or not isinstance(lstat.get("st_dev"), int)
+        or not isinstance(lstat.get("st_ino"), int)
+        or not isinstance(lstat.get("st_mode"), int)
+        or lstat.get("type") != "symlink"
+        or not stat.S_ISLNK(int(lstat["st_mode"]))
+    ):
+        raise DeploymentError(f"runtime mask attestation is not exact for {unit}")
+    return value
+
+
+def _same_runtime_mask_layout(left: object, right: object, unit: str) -> bool:
+    expected = _runtime_mask_evidence(left, unit)
+    observed = _runtime_mask_evidence(right, unit)
+    expected_lstat = expected["lstat"]
+    observed_lstat = observed["lstat"]
+    assert isinstance(expected_lstat, dict)
+    assert isinstance(observed_lstat, dict)
+    return (
+        expected["scope"] == observed["scope"]
+        and expected["path"] == observed["path"]
+        and expected["link_target"] == observed["link_target"]
+        and expected_lstat["st_mode"] == observed_lstat["st_mode"]
+        and expected_lstat["type"] == observed_lstat["type"]
+    )
+
+
 def _quiescent(state: runtime.ServiceState) -> bool:
     return (
         not state.active
@@ -563,12 +642,14 @@ class Deployment:
         source_root: Path,
         artifact_path: Path,
         lifecycle_state: Path = DEFAULT_LIFECYCLE_STATE,
+        accept_runtime_mask_prestate: bool = False,
     ) -> None:
         self.host = host
         self.state_path = state_path.expanduser().resolve(strict=False)
         self.source_root = source_root.expanduser().resolve(strict=True)
         self.artifact_path = artifact_path.expanduser().resolve(strict=False)
         self.lifecycle_state = lifecycle_state.expanduser().resolve(strict=False)
+        self.accept_runtime_mask_prestate = accept_runtime_mask_prestate
 
     def _write(self, record: dict[str, object]) -> None:
         _write_state(self.state_path, record)
@@ -601,6 +682,10 @@ class Deployment:
             "artifact": _artifact_snapshot(self.artifact_path),
             "bundle_sha256": manifest["bundle_sha256"],
             "candidate_containers": containers,
+            "candidate_runtime_masks": {
+                unit: self.host.runtime_mask_attestation(unit)
+                for unit in CANDIDATE_UNITS
+            },
             "candidate_units": units,
             "files": files,
             "listeners": list(self.host.listeners()),
@@ -618,29 +703,40 @@ class Deployment:
         if not isinstance(states, dict):
             raise DeploymentError("candidate service prestate is invalid")
         for unit in CANDIDATE_UNITS:
-            state = runtime.ServiceState.from_record(states.get(unit), unit)
-            if not _quiescent(state):
+            service_state = runtime.ServiceState.from_record(states.get(unit), unit)
+            if not _quiescent(service_state):
                 raise DeploymentError("candidate unit must be fully inactive before deployment")
         units = prestate.get("candidate_units")
         if not isinstance(units, dict):
             raise DeploymentError("candidate unit metadata is invalid")
+        runtime_masks = prestate.get("candidate_runtime_masks")
+        if not isinstance(runtime_masks, dict) or set(runtime_masks) != set(CANDIDATE_UNITS):
+            raise DeploymentError("candidate runtime-mask evidence is invalid")
+        states_by_unit: dict[str, str] = {}
         for unit in CANDIDATE_UNITS:
             info = units.get(unit)
             if not isinstance(info, dict):
                 raise DeploymentError("candidate unit metadata is malformed")
-            state = info.get("UnitFileState")
-            if state == "masked":
+            unit_file_state = info.get("UnitFileState")
+            if unit_file_state == "masked":
                 raise DeploymentError(f"persistent candidate mask blocks deployment: {unit}")
-            if state == "masked-runtime":
-                raise DeploymentError(f"foreign runtime candidate mask blocks deployment: {unit}")
-            if state != "disabled":
+            if unit_file_state not in {"disabled", "masked-runtime"}:
                 raise DeploymentError(f"candidate unit must remain disabled: {unit}")
+            states_by_unit[unit] = unit_file_state
             if info.get("DropInPaths"):
                 raise DeploymentError(f"candidate unit has unexpected drop-ins: {unit}")
             target = _unit_target(unit)
             snapshot = prestate["files"].get(str(target))  # type: ignore[index]
             if not isinstance(snapshot, dict):
                 raise DeploymentError("candidate unit file snapshot is missing")
+            expected_fragment = str(target)
+            if unit_file_state == "masked-runtime":
+                evidence = _runtime_mask_evidence(runtime_masks.get(unit), unit)
+                expected_fragment = str(evidence["path"])
+                if info.get("LoadState") != "masked":
+                    raise DeploymentError(f"candidate runtime mask load state is invalid: {unit}")
+            elif runtime_masks.get(unit) is not None:
+                raise DeploymentError(f"unexpected runtime candidate mask blocks deployment: {unit}")
             if snapshot.get("exists"):
                 expected = next(
                     entry for entry in manifest["files"]  # type: ignore[index]
@@ -649,13 +745,25 @@ class Deployment:
                 if (
                     snapshot.get("sha256") != expected["sha256"]
                     or snapshot.get("mode") != expected["mode"]
-                    or info.get("FragmentPath") != str(target)
+                    or info.get("FragmentPath") != expected_fragment
                 ):
                     raise DeploymentError(
                         f"candidate unit bytes or FragmentPath drifted: {unit}"
                     )
-            elif info.get("FragmentPath"):
+            elif info.get("FragmentPath") != (
+                expected_fragment if unit_file_state == "masked-runtime" else ""
+            ):
                 raise DeploymentError(f"candidate unit loaded from an unexpected path: {unit}")
+        runtime_masked = [
+            unit for unit, state in states_by_unit.items() if state == "masked-runtime"
+        ]
+        if runtime_masked:
+            if set(runtime_masked) != set(CANDIDATE_UNITS):
+                raise DeploymentError("candidate runtime-mask prestate is mixed or incomplete")
+            if not self.accept_runtime_mask_prestate:
+                raise DeploymentError(
+                    f"foreign runtime candidate mask blocks deployment: {runtime_masked[0]}"
+                )
         protected_units = prestate.get("protected_units")
         if not isinstance(protected_units, dict):
             raise DeploymentError("protected unit metadata is invalid")
@@ -682,13 +790,30 @@ class Deployment:
             raise DeploymentError("candidate artifact prestate drifted before installation")
         if prestate.get("listeners") != list(self.host.listeners()):
             raise DeploymentError("candidate listener prestate drifted before installation")
+        candidate_units = prestate.get("candidate_units")
+        runtime_masks = prestate.get("candidate_runtime_masks")
+        if not isinstance(candidate_units, dict) or not isinstance(runtime_masks, dict):
+            raise DeploymentError("candidate unit prestate is malformed")
+        accepted_runtime_masks = all(
+            isinstance(candidate_units.get(unit), dict)
+            and candidate_units[unit].get("UnitFileState") == "masked-runtime"
+            for unit in CANDIDATE_UNITS
+        )
         for unit in CANDIDATE_UNITS:
             info = self.host.unit_info(unit)
-            previous = prestate["candidate_units"].get(unit)  # type: ignore[index]
-            if not isinstance(previous, dict) or any(
-                info.get(field) != previous.get(field)
-                for field in ("FragmentPath", "DropInPaths", "LoadState")
-            ) or info.get("UnitFileState") != "masked-runtime":
+            previous = candidate_units.get(unit)
+            observed_mask = self.host.runtime_mask_attestation(unit)
+            if not isinstance(previous, dict) or observed_mask is None:
+                raise DeploymentError(f"candidate unit metadata drifted before installation: {unit}")
+            _runtime_mask_evidence(observed_mask, unit)
+            if accepted_runtime_masks:
+                expected_mask = runtime_masks.get(unit)
+                if info != previous or observed_mask != expected_mask:
+                    raise DeploymentError(f"candidate unit metadata drifted before installation: {unit}")
+            elif (
+                info.get("DropInPaths") != previous.get("DropInPaths")
+                or info.get("UnitFileState") != "masked-runtime"
+            ):
                 raise DeploymentError(f"candidate unit metadata drifted before installation: {unit}")
         protected = prestate.get("protected_units")
         if not isinstance(protected, dict):
@@ -703,6 +828,32 @@ class Deployment:
             raise DeploymentError("candidate container prestate drifted before installation")
         if prestate.get("admission") != self.host.admission():
             raise DeploymentError("memory/swap/PSI admission facts drifted before installation")
+
+    def plan(self, bundle: Path) -> dict[str, object]:
+        """Return the non-secret mask ownership plan without mutating the host."""
+
+        manifest = verify_bundle(bundle, self.source_root)
+        if self.state_path.exists():
+            raise DeploymentError("existing deployment receipt must be recovered before plan")
+        prestate = self._capture_prestate(manifest)
+        self._validate_prestate(prestate, manifest)
+        candidate_units = prestate["candidate_units"]
+        assert isinstance(candidate_units, dict)
+        accepted_runtime_masks = all(
+            isinstance(candidate_units.get(unit), dict)
+            and candidate_units[unit].get("UnitFileState") == "masked-runtime"
+            for unit in CANDIDATE_UNITS
+        )
+        return {
+            "bundle_sha256": manifest["bundle_sha256"],
+            "candidate_runtime_mask_ownership": {
+                "accepted_prestate": accepted_runtime_masks,
+                "owned_units": list(CANDIDATE_UNITS),
+                "remove_before_activation": list(CANDIDATE_UNITS),
+                "restore_on_rollback": list(CANDIDATE_UNITS),
+            },
+            "schema": PLAN_SCHEMA,
+        }
 
     def _assert_service_identities(self, prestate: Mapping[str, object]) -> None:
         expected = prestate.get("service_states")
@@ -720,22 +871,41 @@ class Deployment:
             raise DeploymentError("existing deployment receipt must be recovered before prepare")
         prestate = self._capture_prestate(manifest)
         self._validate_prestate(prestate, manifest)
+        candidate_units = prestate["candidate_units"]
+        assert isinstance(candidate_units, dict)
+        accepted_runtime_masks = all(
+            isinstance(candidate_units.get(unit), dict)
+            and candidate_units[unit].get("UnitFileState") == "masked-runtime"
+            for unit in CANDIDATE_UNITS
+        )
         record: dict[str, object] = {
             "bundle": str(bundle.expanduser().resolve(strict=True)),
             "lifecycle_deactivated": False,
-            "owned_runtime_masks": [],
-            "runtime_masks_restored": [],
+            "runtime_mask_ownership": {
+                "accepted_prestate": accepted_runtime_masks,
+                "owned_units": list(CANDIDATE_UNITS) if accepted_runtime_masks else [],
+                "removed_units": [],
+                "restored_units": [],
+            },
             "phase": "preparing",
             "prestate": prestate,
             "schema": STATE_SCHEMA,
         }
         self._write(record)
-        for unit in CANDIDATE_UNITS:
-            self.host.runtime_mask(unit)
-            cast_masks = record["owned_runtime_masks"]
-            assert isinstance(cast_masks, list)
-            cast_masks.append(unit)
-            self._write(record)
+        if not accepted_runtime_masks:
+            ownership = record["runtime_mask_ownership"]
+            assert isinstance(ownership, dict)
+            owned = ownership["owned_units"]
+            assert isinstance(owned, list)
+            for unit in CANDIDATE_UNITS:
+                self.host.runtime_mask(unit)
+                if (
+                    self.host.unit_info(unit).get("UnitFileState") != "masked-runtime"
+                    or self.host.runtime_mask_attestation(unit) is None
+                ):
+                    raise DeploymentError(f"owner runtime mask was not created: {unit}")
+                owned.append(unit)
+                self._write(record)
         record["phase"] = "prepared"
         self._write(record)
 
@@ -804,7 +974,7 @@ class Deployment:
         record["files_installed"] = True
         self._write(record)
         self.host.daemon_reload()
-        self._restore_owned_runtime_masks(record)
+        self._remove_owned_runtime_masks(record)
         self.host.daemon_reload()
         self._verify_installed(manifest)
 
@@ -969,65 +1139,191 @@ class Deployment:
             if _candidate_container(self.host, unit) is not None:
                 raise DeploymentError(f"candidate container remains after lifecycle rollback: {unit}")
 
-    def _restore_owned_runtime_masks(self, record: dict[str, object]) -> None:
+    def _runtime_mask_ownership(self, record: Mapping[str, object]) -> dict[str, object]:
         prestate = record.get("prestate")
         if not isinstance(prestate, dict):
             raise DeploymentError("deployment prestate is missing")
         units = prestate.get("candidate_units")
-        if not isinstance(units, dict):
+        runtime_masks = prestate.get("candidate_runtime_masks")
+        ownership = record.get("runtime_mask_ownership")
+        if (
+            not isinstance(units, dict)
+            or not isinstance(runtime_masks, dict)
+            or set(runtime_masks) != set(CANDIDATE_UNITS)
+            or not isinstance(ownership, dict)
+            or set(ownership)
+            != {"accepted_prestate", "owned_units", "removed_units", "restored_units"}
+            or not isinstance(ownership.get("accepted_prestate"), bool)
+        ):
             raise DeploymentError("candidate unit prestate is malformed")
-        owned = record.get("owned_runtime_masks")
-        restored = record.get("runtime_masks_restored")
+        accepted = ownership["accepted_prestate"]
+        expected_accepted = all(
+            isinstance(units.get(unit), dict)
+            and units[unit].get("UnitFileState") == "masked-runtime"
+            for unit in CANDIDATE_UNITS
+        )
+        if accepted != expected_accepted:
+            raise DeploymentError("candidate runtime-mask ownership does not match prestate")
+        owned = ownership["owned_units"]
+        removed = ownership["removed_units"]
+        restored = ownership["restored_units"]
         if (
             not isinstance(owned, list)
+            or not isinstance(removed, list)
             or not isinstance(restored, list)
-            or any(not isinstance(unit, str) for unit in (*owned, *restored))
+            or any(not isinstance(unit, str) for unit in (*owned, *removed, *restored))
             or len(set(owned)) != len(owned)
+            or len(set(removed)) != len(removed)
             or len(set(restored)) != len(restored)
             or not set(owned).issubset(CANDIDATE_UNITS)
+            or not set(removed).issubset(owned)
             or not set(restored).issubset(owned)
+            or (accepted and set(owned) != set(CANDIDATE_UNITS))
         ):
             raise DeploymentError("owned runtime-mask record is invalid")
+        return ownership
+
+    def _assert_runtime_mask_removed(self, unit: str) -> None:
+        if (
+            self.host.unit_info(unit).get("UnitFileState") != "disabled"
+            or self.host.runtime_mask_attestation(unit) is not None
+        ):
+            raise DeploymentError(f"candidate runtime mask did not remove: {unit}")
+        if not _quiescent(self.host.service_state(unit)):
+            raise DeploymentError(f"candidate unit became active after runtime mask removal: {unit}")
+        if self.host.listeners() or _candidate_container(self.host, unit) is not None:
+            raise DeploymentError(f"candidate ownership appeared after runtime mask removal: {unit}")
+
+    def _remove_owned_runtime_masks(self, record: dict[str, object]) -> None:
+        ownership = self._runtime_mask_ownership(record)
+        prestate = record["prestate"]
+        assert isinstance(prestate, dict)
+        units = prestate["candidate_units"]
+        runtime_masks = prestate["candidate_runtime_masks"]
+        assert isinstance(units, dict)
+        assert isinstance(runtime_masks, dict)
+        accepted = ownership["accepted_prestate"]
+        owned = ownership["owned_units"]
+        removed = ownership["removed_units"]
+        assert isinstance(accepted, bool)
+        assert isinstance(owned, list)
+        assert isinstance(removed, list)
         for unit in owned:
             before = units.get(unit)
             if not isinstance(before, dict):
                 raise DeploymentError("candidate unit prestate is malformed")
-            expected = before.get("UnitFileState")
-            if expected != "disabled":
-                raise DeploymentError("candidate mask prestate is invalid")
-            observed = self.host.unit_info(unit).get("UnitFileState")
-            if unit in restored:
-                if observed != expected:
-                    raise DeploymentError(
-                        f"candidate mask prestate drifted after owner restoration: {unit}"
-                    )
+            if unit in removed:
+                self._assert_runtime_mask_removed(unit)
                 continue
-            if observed == expected:
-                restored.append(unit)
-                self._write(record)
-                continue
-            if observed != "masked-runtime":
+            observed_mask = self.host.runtime_mask_attestation(unit)
+            observed_info = self.host.unit_info(unit)
+            if (
+                observed_info.get("UnitFileState") != "masked-runtime"
+                or observed_info.get("FragmentPath") != str(_runtime_mask_path(unit))
+                or observed_info.get("LoadState") != "masked"
+                or observed_info.get("DropInPaths") != before.get("DropInPaths")
+                or observed_mask is None
+            ):
                 raise DeploymentError(
-                    f"owned candidate runtime mask is no longer present: {unit}"
+                    f"candidate mask prestate is invalid: owned runtime mask is absent: {unit}"
                 )
+            _runtime_mask_evidence(observed_mask, unit)
+            if accepted and observed_mask != runtime_masks.get(unit):
+                raise DeploymentError(f"accepted runtime mask identity drifted: {unit}")
             self.host.runtime_unmask(unit)
-            if self.host.unit_info(unit).get("UnitFileState") != expected:
-                raise DeploymentError(f"candidate runtime mask did not restore: {unit}")
-            restored.append(unit)
+            self._assert_runtime_mask_removed(unit)
+            removed.append(unit)
             self._write(record)
+
+    def _restore_owned_runtime_masks(self, record: dict[str, object]) -> bool:
+        ownership = self._runtime_mask_ownership(record)
+        prestate = record["prestate"]
+        assert isinstance(prestate, dict)
+        units = prestate["candidate_units"]
+        runtime_masks = prestate["candidate_runtime_masks"]
+        assert isinstance(units, dict)
+        assert isinstance(runtime_masks, dict)
+        accepted = ownership["accepted_prestate"]
+        owned = ownership["owned_units"]
+        restored = ownership["restored_units"]
+        assert isinstance(accepted, bool)
+        assert isinstance(owned, list)
+        assert isinstance(restored, list)
+        changed = False
+        for unit in owned:
+            before = units.get(unit)
+            if not isinstance(before, dict):
+                raise DeploymentError("candidate unit prestate is malformed")
+            observed_info = self.host.unit_info(unit)
+            observed_mask = self.host.runtime_mask_attestation(unit)
+            if accepted:
+                expected_mask = runtime_masks.get(unit)
+                _runtime_mask_evidence(expected_mask, unit)
+                if observed_info == before and observed_mask == expected_mask:
+                    continue
+                if (
+                    observed_info.get("UnitFileState") != "disabled"
+                    or observed_mask is not None
+                ):
+                    raise DeploymentError(f"candidate mask prestate drifted after owner restoration: {unit}")
+                self.host.runtime_mask(unit)
+                restored_mask = self.host.runtime_mask_attestation(unit)
+                if (
+                    self.host.unit_info(unit) != before
+                    or restored_mask is None
+                    or not _same_runtime_mask_layout(expected_mask, restored_mask, unit)
+                ):
+                    raise DeploymentError(f"candidate runtime mask did not restore: {unit}")
+            else:
+                if observed_info.get("UnitFileState") == "disabled" and observed_mask is None:
+                    continue
+                if (
+                    observed_info.get("UnitFileState") != "masked-runtime"
+                    or observed_mask is None
+                ):
+                    raise DeploymentError(
+                        f"candidate mask prestate is invalid: owned runtime mask is absent: {unit}"
+                    )
+                _runtime_mask_evidence(observed_mask, unit)
+                self.host.runtime_unmask(unit)
+                self._assert_runtime_mask_removed(unit)
+            changed = True
+            if unit not in restored:
+                restored.append(unit)
+            self._write(record)
+        return changed
 
     def _verify_restored_unit_prestate(self, record: Mapping[str, object]) -> None:
         prestate = record.get("prestate")
         if not isinstance(prestate, dict):
             raise DeploymentError("deployment prestate is missing")
         expected = prestate.get("candidate_units")
-        if not isinstance(expected, dict):
+        runtime_masks = prestate.get("candidate_runtime_masks")
+        ownership = self._runtime_mask_ownership(record)
+        if not isinstance(expected, dict) or not isinstance(runtime_masks, dict):
             raise DeploymentError("candidate unit prestate is malformed")
+        restored = ownership["restored_units"]
+        assert isinstance(restored, list)
         for unit in CANDIDATE_UNITS:
             before = expected.get(unit)
             if not isinstance(before, dict) or self.host.unit_info(unit) != before:
                 raise DeploymentError(
                     f"candidate unit metadata did not return to its prestate: {unit}"
+                )
+            expected_mask = runtime_masks.get(unit)
+            observed_mask = self.host.runtime_mask_attestation(unit)
+            if expected_mask is None:
+                if observed_mask is not None:
+                    raise DeploymentError(
+                        f"candidate runtime mask did not return to its prestate: {unit}"
+                    )
+            elif observed_mask is None or (
+                not _same_runtime_mask_layout(expected_mask, observed_mask, unit)
+                if unit in restored
+                else observed_mask != expected_mask
+            ):
+                raise DeploymentError(
+                    f"candidate runtime mask did not return to its prestate: {unit}"
                 )
 
     def rollback(self) -> None:
@@ -1100,7 +1396,10 @@ def _lock(path: Path) -> int:
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "install", "activate", "deactivate", "rollback", "deploy"))
+    parser.add_argument(
+        "action",
+        choices=("plan", "prepare", "install", "activate", "deactivate", "rollback", "deploy"),
+    )
     parser.add_argument("--source-root", type=Path, default=Path.cwd())
     parser.add_argument("--bundle", type=Path)
     parser.add_argument("--bundle-root", type=Path)
@@ -1108,11 +1407,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--artifact", type=Path, default=DEFAULT_ARTIFACT)
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--pause-text", action="store_true")
+    parser.add_argument("--accept-runtime-mask-prestate", action="store_true")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.accept_runtime_mask_prestate and args.action not in {"plan", "prepare", "deploy"}:
+        raise DeploymentError(
+            "--accept-runtime-mask-prestate is valid only with plan, prepare, or deploy"
+        )
     state = args.state.expanduser().resolve(strict=False)
     descriptor = _lock(state.with_suffix(".lock"))
     try:
@@ -1122,6 +1426,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             state,
             source_root=source_root,
             artifact_path=args.artifact,
+            accept_runtime_mask_prestate=args.accept_runtime_mask_prestate,
         )
         if args.action in {"prepare", "deploy"} and state.exists():
             existing = owner._read()
@@ -1132,7 +1437,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         bundle: Path | None = None
         if args.action not in {"deactivate", "rollback"}:
             bundle = args.bundle or build_bundle(source_root, bundle_root)
-        if args.action == "prepare":
+        if args.action == "plan":
+            assert bundle is not None
+            sys.stdout.write(_canonical(owner.plan(bundle)).decode() + "\n")
+        elif args.action == "prepare":
             assert bundle is not None
             owner.prepare(bundle)
         elif args.action == "install":

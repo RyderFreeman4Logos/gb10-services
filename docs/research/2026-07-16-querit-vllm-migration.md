@@ -154,8 +154,9 @@ parameters.
 
 Do not copy files, unmask units, reload systemd, publish the artifact, or start
 either canary unit by hand. The operator-facing owner is
-`scripts/gb10_querit_canary_deploy.py`; it is the only path that can remove the
-runtime masks it created. It makes a private exact-HEAD bundle whose manifest
+`scripts/gb10_querit_canary_deploy.py`; it is the only path that can remove
+its own or explicitly accepted exact candidate runtime masks. It makes a
+private exact-HEAD bundle whose manifest
 binds each tracked source path to its explicit target path, mode, size, and
 SHA-256. The bundle includes the lifecycle/runtime/transaction/artifact and
 adapter/equivalence modules, both wrappers and units,
@@ -175,6 +176,10 @@ SNAPSHOT=/path/to/pinned/Querit-4B-snapshot
 
 # Read-only source/host attestation, durable prestate receipt, then owner mask.
 python3 scripts/gb10_querit_canary_deploy.py prepare --source-root "$PWD"
+
+# Only for the exact two-unit runtime-mask recovery prestate:
+python3 scripts/gb10_querit_canary_deploy.py prepare --source-root "$PWD" \
+  --accept-runtime-mask-prestate
 
 # Re-attest immediately before mutation; convert, publish, install, reload, and
 # verify exact loaded unit bytes. Both candidate units remain disabled.
@@ -202,8 +207,9 @@ the owner re-attests the clean source/bundle identity; exact target prestate;
 text and immutable-neighbor service identities; candidate units, masks,
 FragmentPath and drop-ins; listeners 18014/18015; candidate containers; sealed
 artifact prestate; and memory/swap/PSI admission facts. Persistent masks,
-foreign runtime masks, enabled candidate units, loaded-byte/path/drop-in drift,
-or pre-existing candidate listeners/containers fail closed. Rollback stops only
+runtime masks without the explicit ownership opt-in, enabled candidate units,
+loaded-byte/path/drop-in drift, or pre-existing candidate listeners/containers
+fail closed. Rollback stops only
 the candidate through the lifecycle, proves candidate PIDs/listeners/containers
 are absent, then restores the recorded artifact, files, runtime-mask prestate,
 and systemd generation. A partial or failed rollback keeps an owner-only state

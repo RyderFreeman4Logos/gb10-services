@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import os
 import shutil
 import stat
 import sys
@@ -25,6 +24,10 @@ class FakeHost:
         self.targets = targets
         self.commands: list[tuple[str, str]] = []
         self._masked: set[str] = set()
+        self.runtime_masks: dict[str, dict[str, object] | None] = {
+            unit: None for unit in deployment.CANDIDATE_UNITS
+        }
+        self._mask_inode = 100
         self.listener_lines: tuple[str, ...] = ()
         self.containers: dict[str, dict[str, str] | None] = {
             runtime.CONTAINER_NAMES[unit]: None
@@ -41,6 +44,7 @@ class FakeHost:
             runtime.GUARD_UNIT: runtime.ServiceState(True, "guard-before"),
         }
         self._lifecycle_state = False
+        self._text_was_paused = False
         self._admission = {
             "mem_available_gib": 32,
             "pressure_sha256": "p" * 64,
@@ -76,17 +80,50 @@ class FakeHost:
     def runtime_mask(self, unit: str) -> None:
         self.commands.append(("mask", unit))
         self._masked.add(unit)
+        self._mask_inode += 1
+        self.runtime_masks[unit] = {
+            "scope": "runtime",
+            "path": f"/run/user/1001/systemd/user/{unit}",
+            "lstat": {
+                "st_dev": 1,
+                "st_ino": self._mask_inode,
+                "st_mode": stat.S_IFLNK | 0o777,
+                "type": "symlink",
+            },
+            "link_target": "/dev/null",
+        }
         self.info[unit]["UnitFileState"] = "masked-runtime"
+        self.info[unit]["FragmentPath"] = f"/run/user/1001/systemd/user/{unit}"
+        self.info[unit]["LoadState"] = "masked"
 
     def runtime_unmask(self, unit: str) -> None:
         self.commands.append(("unmask", unit))
         self._masked.discard(unit)
+        self.runtime_masks[unit] = None
         self.info[unit]["UnitFileState"] = "disabled"
+        if deployment._unit_target(unit).exists():
+            self.info[unit]["FragmentPath"] = str(deployment._unit_target(unit))
+            self.info[unit]["LoadState"] = "loaded"
+        else:
+            self.info[unit]["FragmentPath"] = ""
+            self.info[unit]["LoadState"] = "not-found"
+
+    def runtime_mask_attestation(self, unit: str) -> dict[str, object] | None:
+        evidence = self.runtime_masks[unit]
+        if evidence is None:
+            return None
+        return {
+            **evidence,
+            "lstat": dict(evidence["lstat"]),
+        }
 
     def daemon_reload(self) -> None:
         self.commands.append(("daemon-reload", ""))
         for unit in deployment.CANDIDATE_UNITS:
-            if deployment._unit_target(unit).exists():
+            if unit in self._masked:
+                self.info[unit]["FragmentPath"] = f"/run/user/1001/systemd/user/{unit}"
+                self.info[unit]["LoadState"] = "masked"
+            elif deployment._unit_target(unit).exists():
                 self.info[unit]["FragmentPath"] = str(deployment._unit_target(unit))
                 self.info[unit]["LoadState"] = "loaded"
             else:
@@ -112,12 +149,15 @@ class FakeHost:
             self._lifecycle_state = True
             if pause_text:
                 self.states[runtime.TEXT_UNIT] = runtime.ServiceState(False, "")
+                self._text_was_paused = True
             self.states[runtime.BACKEND_UNIT] = runtime.ServiceState(True, "backend-new")
             self.states[runtime.ADAPTER_UNIT] = runtime.ServiceState(True, "adapter-new")
         elif action == "deactivate":
             self.states[runtime.BACKEND_UNIT] = runtime.ServiceState(False, "")
             self.states[runtime.ADAPTER_UNIT] = runtime.ServiceState(False, "")
-            self.states[runtime.TEXT_UNIT] = runtime.ServiceState(True, "text-restored")
+            if self._text_was_paused:
+                self.states[runtime.TEXT_UNIT] = runtime.ServiceState(True, "text-restored")
+                self._text_was_paused = False
             self._lifecycle_state = False
         else:
             raise AssertionError(action)
@@ -211,6 +251,38 @@ class DeploymentTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.raw_tmp.cleanup()
 
+    def _set_exact_runtime_mask_prestate(self) -> None:
+        for unit in deployment.CANDIDATE_UNITS:
+            self.host.runtime_mask(unit)
+        self.host.commands.clear()
+
+    def _runtime_mask_owner(self) -> deployment.Deployment:
+        return deployment.Deployment(
+            self.host,
+            self.state,
+            source_root=self.root,
+            artifact_path=self.artifact,
+            accept_runtime_mask_prestate=True,
+        )
+
+    def _assert_exact_runtime_mask_prestate_restored(self) -> None:
+        self.assertEqual(self.host._masked, set(deployment.CANDIDATE_UNITS))
+        for unit in deployment.CANDIDATE_UNITS:
+            self.assertEqual(self.host.info[unit]["UnitFileState"], "masked-runtime")
+            self.assertEqual(
+                self.host.info[unit]["FragmentPath"],
+                f"/run/user/1001/systemd/user/{unit}",
+            )
+            self.assertEqual(self.host.info[unit]["DropInPaths"], "")
+            self.assertEqual(self.host.info[unit]["LoadState"], "masked")
+            evidence = self.host.runtime_mask_attestation(unit)
+            self.assertIsNotNone(evidence)
+            assert evidence is not None
+            self.assertEqual(evidence["scope"], "runtime")
+            self.assertEqual(evidence["link_target"], "/dev/null")
+        self.assertEqual(self.host.listener_lines, ())
+        self.assertTrue(all(container is None for container in self.host.containers.values()))
+
     def test_exact_mapping_covers_ready_converter_template_and_owner(self) -> None:
         mapping = {str(item["source"]): item for item in PRODUCTION_TARGETS}
         self.assertEqual(mapping["scripts/gb10_service_ready.sh"]["mode"], 0o755)
@@ -253,6 +325,213 @@ class DeploymentTests(unittest.TestCase):
                 for action, _value in self.host.commands
             )
         )
+
+    def test_runtime_mask_prestate_requires_opt_in_and_records_ownership(self) -> None:
+        self._set_exact_runtime_mask_prestate()
+
+        with self.assertRaisesRegex(
+            deployment.DeploymentError, "foreign runtime candidate mask"
+        ):
+            self.owner.prepare(self.bundle)
+        self.assertEqual(self.host.commands, [])
+
+        owner = self._runtime_mask_owner()
+        owner.prepare(self.bundle)
+
+        record = owner._read()
+        self.assertEqual(
+            record["runtime_mask_ownership"],
+            {
+                "accepted_prestate": True,
+                "owned_units": list(deployment.CANDIDATE_UNITS),
+                "removed_units": [],
+                "restored_units": [],
+            },
+        )
+        self.assertEqual(self.host.commands, [])
+
+    def test_plan_declares_runtime_mask_ownership_without_mutation(self) -> None:
+        self._set_exact_runtime_mask_prestate()
+        plan = self._runtime_mask_owner().plan(self.bundle)
+
+        self.assertEqual(plan["schema"], "gb10-querit-canary-plan-v1")
+        self.assertEqual(
+            plan["candidate_runtime_mask_ownership"],
+            {
+                "accepted_prestate": True,
+                "owned_units": list(deployment.CANDIDATE_UNITS),
+                "remove_before_activation": list(deployment.CANDIDATE_UNITS),
+                "restore_on_rollback": list(deployment.CANDIDATE_UNITS),
+            },
+        )
+        self.assertEqual(self.host.commands, [])
+        self.assertFalse(self.state.exists())
+
+    def test_opt_in_rejects_noncanonical_runtime_mask_or_candidate_activity(self) -> None:
+        def persistent() -> None:
+            self.host.info[runtime.BACKEND_UNIT]["UnitFileState"] = "masked"
+
+        def wrong_target() -> None:
+            evidence = self.host.runtime_masks[runtime.BACKEND_UNIT]
+            assert evidence is not None
+            evidence["link_target"] = "/wrong/null"
+
+        def regular_file() -> None:
+            evidence = self.host.runtime_masks[runtime.BACKEND_UNIT]
+            assert evidence is not None
+            lstat = evidence["lstat"]
+            assert isinstance(lstat, dict)
+            lstat["st_mode"] = stat.S_IFREG | 0o600
+            lstat["type"] = "regular"
+
+        def mixed() -> None:
+            self.host.runtime_unmask(runtime.ADAPTER_UNIT)
+            self.host.commands.clear()
+
+        def missing() -> None:
+            self.host.runtime_masks[runtime.BACKEND_UNIT] = None
+
+        def active() -> None:
+            self.host.states[runtime.BACKEND_UNIT] = runtime.ServiceState(True, "foreign")
+
+        def listener() -> None:
+            self.host.listener_lines = ("LISTEN 0 1 100.105.4.92:18014",)
+
+        def container() -> None:
+            self.host.containers[runtime.CONTAINER_NAMES[runtime.BACKEND_UNIT]] = {
+                "id": "a" * 64,
+                "image": "candidate",
+                "config_image": "candidate",
+                "pid": "0",
+                "running": "false",
+            }
+
+        cases = {
+            "persistent": persistent,
+            "wrong target": wrong_target,
+            "regular file": regular_file,
+            "mixed": mixed,
+            "missing": missing,
+            "active": active,
+            "listener": listener,
+            "container": container,
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                self._set_exact_runtime_mask_prestate()
+                mutate()
+                with self.assertRaises(deployment.DeploymentError):
+                    self._runtime_mask_owner().prepare(self.bundle)
+                self.assertEqual(self.host.commands, [])
+                self.assertFalse(self.state.exists())
+
+    def test_system_host_runtime_mask_attestation_requires_exact_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            runtime_root = Path(raw_tmp) / "runtime" / "systemd" / "user"
+            runtime_root.mkdir(parents=True)
+            path = runtime_root / runtime.BACKEND_UNIT
+            path.symlink_to("/dev/null")
+            with mock.patch.object(deployment, "RUNTIME_UNIT_ROOT", runtime_root):
+                host = deployment.SystemHost(model_root=self.artifact)
+                evidence = host.runtime_mask_attestation(runtime.BACKEND_UNIT)
+                self.assertIsNotNone(evidence)
+                assert evidence is not None
+                self.assertEqual(evidence["path"], str(path))
+                self.assertEqual(evidence["link_target"], "/dev/null")
+
+                path.unlink()
+                path.symlink_to("/wrong/null")
+                with self.assertRaisesRegex(deployment.DeploymentError, "target"):
+                    host.runtime_mask_attestation(runtime.BACKEND_UNIT)
+
+                path.unlink()
+                path.write_text("not a symlink")
+                with self.assertRaisesRegex(deployment.DeploymentError, "not a symlink"):
+                    host.runtime_mask_attestation(runtime.BACKEND_UNIT)
+
+    def test_first_runtime_mask_removal_failure_restores_exact_prestate(self) -> None:
+        self._set_exact_runtime_mask_prestate()
+        owner = self._runtime_mask_owner()
+        original_unmask = self.host.runtime_unmask
+        calls = 0
+
+        def fail_after_first(unit: str) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise deployment.DeploymentError("second runtime unmask failed")
+            original_unmask(unit)
+
+        with mock.patch.object(self.host, "runtime_unmask", side_effect=fail_after_first):
+            with self.assertRaisesRegex(deployment.DeploymentError, "second runtime unmask failed"):
+                owner.deploy(self.bundle, self.source_snapshot, pause_text=False)
+
+        self.assertFalse(self.state.exists())
+        self._assert_exact_runtime_mask_prestate_restored()
+
+    def test_post_unmask_prestart_failure_restores_both_runtime_masks(self) -> None:
+        self._set_exact_runtime_mask_prestate()
+        owner = self._runtime_mask_owner()
+        with mock.patch.object(
+            owner,
+            "_verify_installed",
+            side_effect=deployment.DeploymentError("prestart verification failed"),
+        ):
+            with self.assertRaisesRegex(deployment.DeploymentError, "prestart verification failed"):
+                owner.deploy(self.bundle, self.source_snapshot, pause_text=False)
+
+        self.assertFalse(self.state.exists())
+        self._assert_exact_runtime_mask_prestate_restored()
+
+    def test_activate_then_deactivate_restores_masks_without_touching_protected_units(self) -> None:
+        self._set_exact_runtime_mask_prestate()
+        protected_states = {
+            unit: self.host.states[unit]
+            for unit in (*runtime.IMMUTABLE_NEIGHBORS, runtime.TEXT_UNIT)
+        }
+        protected_info = {
+            unit: self.host.unit_info(unit)
+            for unit in (*runtime.IMMUTABLE_NEIGHBORS, runtime.TEXT_UNIT)
+        }
+        owner = self._runtime_mask_owner()
+        owner.prepare(self.bundle)
+        owner.install(self.source_snapshot)
+        owner.activate(pause_text=False)
+        owner.rollback()
+
+        self.assertFalse(self.state.exists())
+        self._assert_exact_runtime_mask_prestate_restored()
+        self.assertEqual(
+            {
+                unit: self.host.states[unit]
+                for unit in (*runtime.IMMUTABLE_NEIGHBORS, runtime.TEXT_UNIT)
+            },
+            protected_states,
+        )
+        self.assertEqual(
+            {
+                unit: self.host.unit_info(unit)
+                for unit in (*runtime.IMMUTABLE_NEIGHBORS, runtime.TEXT_UNIT)
+            },
+            protected_info,
+        )
+
+    def test_activation_failure_after_candidate_ownership_restores_exact_prestate(self) -> None:
+        self._set_exact_runtime_mask_prestate()
+        owner = self._runtime_mask_owner()
+        original_lifecycle = self.host.lifecycle
+
+        def activate_then_fail(action: str, *, pause_text: bool) -> None:
+            original_lifecycle(action, pause_text=pause_text)
+            if action == "activate":
+                raise deployment.DeploymentError("candidate activation failed")
+
+        with mock.patch.object(self.host, "lifecycle", side_effect=activate_then_fail):
+            with self.assertRaisesRegex(deployment.DeploymentError, "candidate activation failed"):
+                owner.deploy(self.bundle, self.source_snapshot, pause_text=False)
+
+        self.assertFalse(self.state.exists())
+        self._assert_exact_runtime_mask_prestate_restored()
 
     def test_persistent_and_foreign_runtime_masks_fail_without_unmasking(self) -> None:
         for mask in ("masked", "masked-runtime"):
