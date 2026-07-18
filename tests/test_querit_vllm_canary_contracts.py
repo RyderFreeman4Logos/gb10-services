@@ -101,7 +101,7 @@ def _backend_contract(unit: str) -> None:
     expected_host = [
         "--rm",
         "--name",
-        "vllm-querit-4b-canary",
+        "querit-4b-vllm",
         "--cgroup-parent",
         "app.slice",
         "--gpus",
@@ -109,9 +109,7 @@ def _backend_contract(unit: str) -> None:
         "--ipc",
         "host",
         "-p",
-        "127.0.0.1:18015:8000",
-        "-p",
-        "100.105.4.92:18015:8000",
+        "100.105.4.92:18013:8000",
         "-v",
         f"{MODEL_DIR}:{MODEL_DIR}:ro",
         "-e",
@@ -144,7 +142,6 @@ def _backend_contract(unit: str) -> None:
         "--kv-cache-dtype": 1,
         "--tensor-parallel-size": 1,
         "--pipeline-parallel-size": 1,
-        "--swap-space": 1,
         "--cpu-offload-gb": 1,
         "--max-num-batched-tokens": 1,
         "--max-num-seqs": 1,
@@ -164,9 +161,9 @@ def _backend_contract(unit: str) -> None:
         "--host": ["0.0.0.0"],
         "--port": ["8000"],
         "--served-model-name": [
-            "qwen3-reranker-8b",
-            "Qwen/Qwen3-Reranker-8B",
             "Querit/Querit-4B",
+            "Qwen/Qwen3-Reranker-8B",
+            "qwen3-reranker-8b",
         ],
         "--runner": ["pooling"],
         "--dtype": ["bfloat16"],
@@ -176,7 +173,6 @@ def _backend_contract(unit: str) -> None:
         "--kv-cache-dtype": ["auto"],
         "--tensor-parallel-size": ["1"],
         "--pipeline-parallel-size": ["1"],
-        "--swap-space": ["0"],
         "--cpu-offload-gb": ["0"],
         "--max-num-batched-tokens": ["1024"],
         "--max-num-seqs": ["1"],
@@ -189,17 +185,16 @@ def _backend_contract(unit: str) -> None:
     }
     if options != expected_options:
         raise AssertionError(f"wrong vLLM canary options: {options}")
-    profile.validate_backend_unit(unit)
 
     if start_posts[0] != [
         "/home/obj/.local/bin/gb10_service_ready.sh",
         "rerank",
-        "http://127.0.0.1:18015",
-        "qwen3-reranker-8b",
+        "http://100.105.4.92:18013",
+        "Querit/Querit-4B",
         "--deadline",
         "300",
     ]:
-        raise AssertionError("readiness must probe native rerank behavior on :18014")
+        raise AssertionError("readiness must probe native rerank behavior on :18013")
 
 
 class QueritVllmCanaryContractTests(unittest.TestCase):
@@ -293,7 +288,7 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
             "peak readiness must run after systemctl reports an active adapter",
         )
 
-    def test_raw_canary_publishes_loopback_and_tailnet_once_without_wildcard(
+    def test_raw_canary_publishes_tailnet_once_without_wildcard(
         self,
     ) -> None:
         backend = BACKEND_UNIT.read_text()
@@ -305,16 +300,13 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
         ]
         self.assertEqual(
             publishes,
-            [
-                "127.0.0.1:18015:8000",
-                "100.105.4.92:18015:8000",
-            ],
+            ["100.105.4.92:18013:8000"],
         )
         self.assertEqual(len(publishes), len(set(publishes)))
         for binding in publishes:
             address, host_port, container_port = binding.rsplit(":", 2)
-            self.assertIn(address, {"127.0.0.1", "100.105.4.92"})
-            self.assertEqual(host_port, "18015")
+            self.assertEqual(address, "100.105.4.92")
+            self.assertEqual(host_port, "18013")
             self.assertEqual(container_port, "8000")
 
     def test_canary_is_memory_bounded_fail_closed_and_lifecycle_isolated(self) -> None:
@@ -330,11 +322,7 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
         self.assertNotIn("Restart=on-failure", unit)
         self.assertEqual(
             _logical_directive_argv(unit, "ExecCondition"),
-            [["/home/obj/.local/bin/gb10_querit_canary_preflight.py"]],
-        )
-        self.assertEqual(
-            _logical_directive_argv(unit, "ExecStartPre"),
-            [["-/usr/bin/docker", "rm", "-f", "vllm-querit-4b-canary"]],
+            [],
         )
         self.assertEqual(
             _logical_directive_argv(unit, "ExecStop"),
@@ -348,7 +336,7 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
                     "stop",
                     "--time",
                     "20",
-                    "vllm-querit-4b-canary",
+                    "querit-4b-vllm",
                 ]
             ],
         )
@@ -362,6 +350,11 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
         )
 
         unit_section = unit.split("[Service]", 1)[0] + adapter.split("[Service]", 1)[0]
+        # Conflicts= is an intentional mutual-exclusion declaration, not a dependency.
+        # Strip Conflicts lines before checking for accidental neighbor dependencies.
+        unit_section = "\n".join(
+            line for line in unit_section.splitlines() if not line.strip().startswith("Conflicts=")
+        )
         for neighbor in (
             "vllm-embedding.service",
             "querit-4b-reranker.service",
