@@ -139,6 +139,15 @@ source mounts, a 12 GiB no-swap cgroup ceiling, and only the disposable copied
 snapshot mounted writable. This avoids mutable host-venv dependencies without
 changing the checkpoint conversion or scoring contract.
 
+The next live install also established a user-systemd detail that the original
+mock did not model: after a persistent unit file appears, `systemctl show`
+reports that unit as loaded/static even while the exact runtime-mask symlink to
+`/dev/null` still exists. Runtime-mask ownership is therefore attested from the
+symlink's no-follow identity and candidate quiescence. Once the owner removes
+that exact symlink, both disabled and static are valid non-enabled states; final
+rollback still has to reproduce the complete original unit metadata and mask
+layout.
+
 The tracked lifecycle transaction verifies the converted artifact manifest and
 snapshots embedding, both current/legacy reranker units, Guard, and text. If
 headroom is low it may stop text only, then remeasures. It starts the backend

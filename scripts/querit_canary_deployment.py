@@ -843,6 +843,28 @@ def _unit_target(unit: str) -> Path:
     raise AssertionError(f"missing target mapping for {unit}")
 
 
+def _quiescent_unmasked_unit_info(info: Mapping[str, str], unit: str) -> bool:
+    if (
+        info.get("UnitFileState") not in {"disabled", "static"}
+        or info.get("DropInPaths")
+    ):
+        return False
+    fragment = info.get("FragmentPath")
+    load_state = info.get("LoadState")
+    return (fragment == str(_unit_target(unit)) and load_state == "loaded") or (
+        not fragment and load_state == "not-found"
+    )
+
+
+def _installed_unit_info(info: Mapping[str, str], unit: str) -> bool:
+    return (
+        info.get("FragmentPath") == str(_unit_target(unit))
+        and not info.get("DropInPaths")
+        and info.get("UnitFileState") in {"disabled", "static"}
+        and info.get("LoadState") == "loaded"
+    )
+
+
 def _runtime_mask_path(unit: str) -> Path:
     if unit not in CANDIDATE_UNITS:
         raise DeploymentError(f"runtime mask is not an expected candidate unit: {unit}")
@@ -1563,11 +1585,7 @@ class Deployment:
                 raise DeploymentError(f"installed file drifted: {target}")
         for unit in CANDIDATE_UNITS:
             info = self.host.unit_info(unit)
-            if (
-                info.get("FragmentPath") != str(_unit_target(unit))
-                or info.get("DropInPaths")
-                or info.get("UnitFileState") != "disabled"
-            ):
+            if not _installed_unit_info(info, unit):
                 raise DeploymentError(f"loaded candidate unit is not the installed disabled unit: {unit}")
 
     def install(self, source_snapshot: Path) -> None:
@@ -1899,7 +1917,7 @@ class Deployment:
 
     def _assert_runtime_mask_removed(self, unit: str) -> None:
         if (
-            self.host.unit_info(unit).get("UnitFileState") != "disabled"
+            not _quiescent_unmasked_unit_info(self.host.unit_info(unit), unit)
             or self.host.runtime_mask_attestation(unit) is not None
         ):
             raise DeploymentError(f"candidate runtime mask did not remove: {unit}")
@@ -1931,12 +1949,14 @@ class Deployment:
                 continue
             observed_mask = self.host.runtime_mask_attestation(unit)
             observed_info = self.host.unit_info(unit)
-            if (
-                observed_info.get("UnitFileState") != "masked-runtime"
-                or observed_info.get("FragmentPath") != str(_runtime_mask_path(unit))
-                or observed_info.get("LoadState") != "masked"
-                or observed_info.get("DropInPaths") != before.get("DropInPaths")
-                or observed_mask is None
+            masked_view = (
+                observed_info.get("UnitFileState") == "masked-runtime"
+                and observed_info.get("FragmentPath") == str(_runtime_mask_path(unit))
+                and observed_info.get("LoadState") == "masked"
+                and observed_info.get("DropInPaths") == before.get("DropInPaths")
+            )
+            if observed_mask is None or not (
+                masked_view or _installed_unit_info(observed_info, unit)
             ):
                 raise DeploymentError(
                     f"candidate mask prestate is invalid: owned runtime mask is absent: {unit}"
@@ -1973,28 +1993,23 @@ class Deployment:
             if accepted:
                 expected_mask = runtime_masks.get(unit)
                 _runtime_mask_evidence(expected_mask, unit)
-                if observed_info == before and observed_mask == expected_mask:
+                if observed_mask == expected_mask:
                     continue
-                if (
-                    observed_info.get("UnitFileState") != "disabled"
-                    or observed_mask is not None
+                if observed_mask is not None or not _quiescent_unmasked_unit_info(
+                    observed_info, unit
                 ):
                     raise DeploymentError(f"candidate mask prestate drifted after owner restoration: {unit}")
                 self.host.runtime_mask(unit)
                 restored_mask = self.host.runtime_mask_attestation(unit)
                 if (
-                    self.host.unit_info(unit) != before
-                    or restored_mask is None
+                    restored_mask is None
                     or not _same_runtime_mask_layout(expected_mask, restored_mask, unit)
                 ):
                     raise DeploymentError(f"candidate runtime mask did not restore: {unit}")
             else:
-                if observed_info.get("UnitFileState") == "disabled" and observed_mask is None:
+                if observed_mask is None and _quiescent_unmasked_unit_info(observed_info, unit):
                     continue
-                if (
-                    observed_info.get("UnitFileState") != "masked-runtime"
-                    or observed_mask is None
-                ):
+                if observed_mask is None:
                     raise DeploymentError(
                         f"candidate mask prestate is invalid: owned runtime mask is absent: {unit}"
                     )

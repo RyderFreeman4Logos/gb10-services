@@ -108,11 +108,12 @@ class FakeHost:
         self.commands.append(("unmask", unit))
         self._masked.discard(unit)
         self.runtime_masks[unit] = None
-        self.info[unit]["UnitFileState"] = "disabled"
         if deployment._unit_target(unit).exists():
+            self.info[unit]["UnitFileState"] = "static"
             self.info[unit]["FragmentPath"] = str(deployment._unit_target(unit))
             self.info[unit]["LoadState"] = "loaded"
         else:
+            self.info[unit]["UnitFileState"] = "disabled"
             self.info[unit]["FragmentPath"] = ""
             self.info[unit]["LoadState"] = "not-found"
 
@@ -128,13 +129,20 @@ class FakeHost:
     def daemon_reload(self) -> None:
         self.commands.append(("daemon-reload", ""))
         for unit in deployment.CANDIDATE_UNITS:
-            if unit in self._masked:
+            if unit in self._masked and deployment._unit_target(unit).exists():
+                self.info[unit]["UnitFileState"] = "static"
+                self.info[unit]["FragmentPath"] = str(deployment._unit_target(unit))
+                self.info[unit]["LoadState"] = "loaded"
+            elif unit in self._masked:
+                self.info[unit]["UnitFileState"] = "masked-runtime"
                 self.info[unit]["FragmentPath"] = f"/run/user/1001/systemd/user/{unit}"
                 self.info[unit]["LoadState"] = "masked"
             elif deployment._unit_target(unit).exists():
+                self.info[unit]["UnitFileState"] = "static"
                 self.info[unit]["FragmentPath"] = str(deployment._unit_target(unit))
                 self.info[unit]["LoadState"] = "loaded"
             else:
+                self.info[unit]["UnitFileState"] = "disabled"
                 self.info[unit]["FragmentPath"] = ""
                 self.info[unit]["LoadState"] = "not-found"
 
@@ -469,7 +477,7 @@ class DeploymentTests(unittest.TestCase):
         self.assertTrue(self.artifact.exists())
         self.assertIn(("convert", str(self.artifact.parent / next(path.name for path in self.artifact.parent.iterdir() if path.name.startswith(".gb10-querit-owner-")) / "converted")), self.host.commands)
         for unit in deployment.CANDIDATE_UNITS:
-            self.assertEqual(self.host.info[unit]["UnitFileState"], "disabled")
+            self.assertEqual(self.host.info[unit]["UnitFileState"], "static")
         for mapped in self.targets:
             target = Path(str(mapped["target"]))
             self.assertTrue(target.exists())
