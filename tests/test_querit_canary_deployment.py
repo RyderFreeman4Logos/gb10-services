@@ -55,6 +55,7 @@ class FakeHost:
             "pressure_some_avg10": 0.0,
             "pressure_sha256": "p" * 64,
             "pswpout": 0,
+            "swap_topology_sha256": "0" * 64,
             "swaps_sha256": "s" * 64,
         }
         self.info = {
@@ -328,10 +329,16 @@ class DeploymentTests(unittest.TestCase):
 
     def test_system_host_admission_exposes_pressure_and_swap_counters(self) -> None:
         host = deployment.SystemHost()
+        swaps_reads = iter(
+            (
+                "Filename Type Size Used Priority\n/swapfile file 1024 16 -2\n",
+                "Filename Type Size Used Priority\n/swapfile file 1024 8 -2\n",
+            )
+        )
 
         def read_proc(path: Path, *_args: object, **_kwargs: object) -> str:
             if path == Path("/proc/swaps"):
-                return "Filename Type Size Used Priority\n"
+                return next(swaps_reads)
             if path == Path("/proc/pressure/memory"):
                 return (
                     "some avg10=0.00 avg60=0.01 avg300=0.02 total=17\n"
@@ -345,11 +352,14 @@ class DeploymentTests(unittest.TestCase):
             mock.patch.object(host._runtime, "memory_available_kib", return_value=91_000_000),
             mock.patch.object(Path, "read_text", autospec=True, side_effect=read_proc),
         ):
-            admission = host.admission()
+            first = host.admission()
+            second = host.admission()
 
-        self.assertEqual(admission["pressure_some_avg10"], 0.0)
-        self.assertEqual(admission["pressure_full_avg10"], 0.0)
-        self.assertEqual(admission["pswpout"], 9)
+        self.assertEqual(first["pressure_some_avg10"], 0.0)
+        self.assertEqual(first["pressure_full_avg10"], 0.0)
+        self.assertEqual(first["pswpout"], 9)
+        self.assertNotEqual(first["swaps_sha256"], second["swaps_sha256"])
+        self.assertEqual(first["swap_topology_sha256"], second["swap_topology_sha256"])
 
     def test_install_revalidates_safe_dynamic_admission_drift(self) -> None:
         self.owner.prepare(self.bundle)
@@ -359,6 +369,7 @@ class DeploymentTests(unittest.TestCase):
                 "mem_available_kib": current_mem_available_kib,
                 "mem_available_gib": current_mem_available_kib // profile.KIB_PER_GIB,
                 "pressure_sha256": "q" * 64,
+                "swaps_sha256": "u" * 64,
             }
         )
 

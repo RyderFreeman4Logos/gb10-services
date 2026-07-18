@@ -232,6 +232,13 @@ def validate_admission(admission: Mapping[str, object]) -> None:
     pswpout = admission.get("pswpout")
     if isinstance(pswpout, bool) or not isinstance(pswpout, int) or pswpout < 0:
         raise ProfileError("candidate admission pswpout is invalid")
+    swap_topology = admission.get("swap_topology_sha256")
+    if (
+        not isinstance(swap_topology, str)
+        or len(swap_topology) != 64
+        or any(character not in "0123456789abcdef" for character in swap_topology)
+    ):
+        raise ProfileError("candidate admission swap topology is invalid")
 
 
 def _pressure_avg10(pressure: str) -> dict[str, float]:
@@ -261,6 +268,26 @@ def _pswpout(vmstat: str) -> int:
     if value < 0:
         raise ValueError("vmstat pswpout data is invalid")
     return value
+
+
+def _swap_topology_sha256(swaps: str) -> str:
+    lines = [line.split() for line in swaps.splitlines()]
+    if not lines or lines[0] != ["Filename", "Type", "Size", "Used", "Priority"]:
+        raise ValueError("swap data header is malformed")
+    topology: list[tuple[str, str, int, int]] = []
+    for fields in lines[1:]:
+        if len(fields) != 5:
+            raise ValueError("swap data row is malformed")
+        try:
+            size = int(fields[2])
+            used = int(fields[3])
+            priority = int(fields[4])
+        except ValueError as exc:
+            raise ValueError("swap data row is malformed") from exc
+        if size < 0 or used < 0 or used > size:
+            raise ValueError("swap data row is invalid")
+        topology.append((fields[0], fields[1], size, priority))
+    return _sha256(_canonical(topology))
 
 
 class Host(Protocol):
@@ -427,6 +454,7 @@ class SystemHost:
             pressure = Path("/proc/pressure/memory").read_text()
             pressure_avg10 = _pressure_avg10(pressure)
             swap_out = _pswpout(Path("/proc/vmstat").read_text())
+            swap_topology_sha256 = _swap_topology_sha256(swaps)
         except (OSError, UnicodeError, ValueError, runtime.LifecycleError) as exc:
             raise DeploymentError("cannot collect memory/swap/PSI admission facts") from exc
         return {
@@ -436,6 +464,7 @@ class SystemHost:
             "pressure_some_avg10": pressure_avg10["some"],
             "pressure_sha256": _sha256(pressure.encode()),
             "pswpout": swap_out,
+            "swap_topology_sha256": swap_topology_sha256,
             "swaps_sha256": _sha256(swaps.encode()),
         }
 
@@ -1307,7 +1336,9 @@ class Deployment:
             validate_admission(current_admission)
         except ProfileError as exc:
             raise DeploymentError(str(exc)) from exc
-        if current_admission.get("swaps_sha256") != previous_admission.get("swaps_sha256"):
+        if current_admission.get("swap_topology_sha256") != previous_admission.get(
+            "swap_topology_sha256"
+        ):
             raise DeploymentError("swap configuration drifted before installation")
         if current_admission.get("pswpout") != previous_admission.get("pswpout"):
             raise DeploymentError("swap-out activity drifted before installation")
