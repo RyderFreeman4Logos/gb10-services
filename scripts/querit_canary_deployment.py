@@ -45,6 +45,10 @@ GPU_MEMORY_ENVELOPE_KIB = 128 * KIB_PER_GIB
 GPU_MEMORY_UTILIZATION_NUMERATOR = 17
 GPU_MEMORY_UTILIZATION_DENOMINATOR = 100
 GPU_MEMORY_UTILIZATION = "0.17"
+CONVERTER_IMAGE = (
+    "ghcr.io/aeon-7/aeon-vllm-ultimate@"
+    "sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d"
+)
 OBSERVED_MEMAVAILABLE_MINIMUM_KIB = 57_246_636
 RESERVE_KIB = 20 * KIB_PER_GIB
 UNCERTAINTY_MARGIN_KIB = 2 * KIB_PER_GIB
@@ -469,8 +473,44 @@ class SystemHost:
         }
 
     def convert(self, converter: Path, snapshot: Path, template: Path) -> None:
+        paths = (converter.parent, snapshot, template.parent)
+        if any(not path.is_absolute() or "," in str(path) for path in paths):
+            raise DeploymentError("converter bind paths must be absolute and comma-free")
         self._run(
-            ["/usr/bin/python3", str(converter), str(snapshot), "--template", str(template)],
+            [
+                "/usr/bin/docker",
+                "run",
+                "--rm",
+                "--pull",
+                "never",
+                "--network",
+                "none",
+                "--read-only",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
+                "--pids-limit=64",
+                "--memory=12g",
+                "--memory-swap=12g",
+                "--memory-swappiness=0",
+                "--oom-score-adj=500",
+                "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m",
+                "--mount",
+                f"type=bind,src={converter.parent},dst=/owner/scripts,readonly",
+                "--mount",
+                f"type=bind,src={snapshot},dst=/owner/snapshot",
+                "--mount",
+                f"type=bind,src={template.parent},dst=/owner/config,readonly",
+                "--env=HOME=/tmp",
+                "--env=HF_HUB_OFFLINE=1",
+                "--env=PYTHONDONTWRITEBYTECODE=1",
+                "--env=TRANSFORMERS_OFFLINE=1",
+                "--entrypoint=python3",
+                CONVERTER_IMAGE,
+                f"/owner/scripts/{converter.name}",
+                "/owner/snapshot",
+                "--template",
+                f"/owner/config/{template.name}",
+            ],
             timeout=7200,
         )
 

@@ -129,6 +129,16 @@ topology, and observe no additional swap-out before install and activation.
 This is source-level feasibility only: a fresh live memory gate and an actual
 vLLM startup still have to prove the candidate.
 
+The first live artifact publication after admission repair reached the
+converter and then failed because the owner invoked `/usr/bin/python3`, while
+the GB10 host interpreter intentionally had neither `torch` nor `safetensors`.
+The already-pinned canary image contained `torch 2.11.0+cu130` and
+`safetensors 0.7.0`. The owner therefore runs conversion in that same immutable
+image with pulls and networking disabled, a read-only container root and
+source mounts, a 12 GiB no-swap cgroup ceiling, and only the disposable copied
+snapshot mounted writable. This avoids mutable host-venv dependencies without
+changing the checkpoint conversion or scoring contract.
+
 The tracked lifecycle transaction verifies the converted artifact manifest and
 snapshots embedding, both current/legacy reranker units, Guard, and text. If
 headroom is low it may stop text only, then remeasures. It starts the backend

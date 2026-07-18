@@ -361,6 +361,56 @@ class DeploymentTests(unittest.TestCase):
         self.assertNotEqual(first["swaps_sha256"], second["swaps_sha256"])
         self.assertEqual(first["swap_topology_sha256"], second["swap_topology_sha256"])
 
+    def test_system_host_converts_in_the_pinned_offline_image(self) -> None:
+        host = deployment.SystemHost()
+        converter = Path("/owner/payload/scripts/querit_checkpoint_convert.py")
+        snapshot = Path("/home/obj/models/.candidate-stage/converted")
+        template = Path("/owner/payload/config/querit/querit-rerank.jinja")
+
+        with mock.patch.object(host, "_run") as run:
+            host.convert(converter, snapshot, template)
+
+        run.assert_called_once_with(
+            [
+                "/usr/bin/docker",
+                "run",
+                "--rm",
+                "--pull",
+                "never",
+                "--network",
+                "none",
+                "--read-only",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
+                "--pids-limit=64",
+                "--memory=12g",
+                "--memory-swap=12g",
+                "--memory-swappiness=0",
+                "--oom-score-adj=500",
+                "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m",
+                "--mount",
+                "type=bind,src=/owner/payload/scripts,dst=/owner/scripts,readonly",
+                "--mount",
+                (
+                    "type=bind,src=/home/obj/models/.candidate-stage/converted,"
+                    "dst=/owner/snapshot"
+                ),
+                "--mount",
+                "type=bind,src=/owner/payload/config/querit,dst=/owner/config,readonly",
+                "--env=HOME=/tmp",
+                "--env=HF_HUB_OFFLINE=1",
+                "--env=PYTHONDONTWRITEBYTECODE=1",
+                "--env=TRANSFORMERS_OFFLINE=1",
+                "--entrypoint=python3",
+                deployment.CONVERTER_IMAGE,
+                "/owner/scripts/querit_checkpoint_convert.py",
+                "/owner/snapshot",
+                "--template",
+                "/owner/config/querit-rerank.jinja",
+            ],
+            timeout=7200,
+        )
+
     def test_install_revalidates_safe_dynamic_admission_drift(self) -> None:
         self.owner.prepare(self.bundle)
         current_mem_available_kib = profile.REQUIRED_ADMISSION_KIB + 1_024

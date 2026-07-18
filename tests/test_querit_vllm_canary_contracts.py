@@ -204,7 +204,9 @@ def _backend_contract(unit: str) -> None:
 
 class QueritVllmCanaryContractTests(unittest.TestCase):
     def test_launch_profile_is_exact_and_digest_pinned(self) -> None:
-        _backend_contract(BACKEND_UNIT.read_text())
+        backend = BACKEND_UNIT.read_text()
+        _backend_contract(backend)
+        self.assertIn(profile.CONVERTER_IMAGE, backend)
 
     def test_candidate_budget_is_below_observed_envelope_with_reserve_and_margin(
         self,
