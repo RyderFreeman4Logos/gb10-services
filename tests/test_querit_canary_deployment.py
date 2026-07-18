@@ -51,7 +51,10 @@ class FakeHost:
         self._admission = {
             "mem_available_kib": profile.REQUIRED_ADMISSION_KIB,
             "mem_available_gib": 32,
+            "pressure_full_avg10": 0.0,
+            "pressure_some_avg10": 0.0,
             "pressure_sha256": "p" * 64,
+            "pswpout": 0,
             "swaps_sha256": "s" * 64,
         }
         self.info = {
@@ -322,6 +325,46 @@ class DeploymentTests(unittest.TestCase):
             self.owner.plan(self.bundle)
 
         self.assertEqual(self.host.commands, [])
+
+    def test_system_host_admission_exposes_pressure_and_swap_counters(self) -> None:
+        host = deployment.SystemHost()
+
+        def read_proc(path: Path, *_args: object, **_kwargs: object) -> str:
+            if path == Path("/proc/swaps"):
+                return "Filename Type Size Used Priority\n"
+            if path == Path("/proc/pressure/memory"):
+                return (
+                    "some avg10=0.00 avg60=0.01 avg300=0.02 total=17\n"
+                    "full avg10=0.00 avg60=0.00 avg300=0.00 total=3\n"
+                )
+            if path == Path("/proc/vmstat"):
+                return "pswpin 1\npswpout 9\n"
+            raise AssertionError(path)
+
+        with (
+            mock.patch.object(host._runtime, "memory_available_kib", return_value=91_000_000),
+            mock.patch.object(Path, "read_text", autospec=True, side_effect=read_proc),
+        ):
+            admission = host.admission()
+
+        self.assertEqual(admission["pressure_some_avg10"], 0.0)
+        self.assertEqual(admission["pressure_full_avg10"], 0.0)
+        self.assertEqual(admission["pswpout"], 9)
+
+    def test_install_revalidates_safe_dynamic_admission_drift(self) -> None:
+        self.owner.prepare(self.bundle)
+        current_mem_available_kib = profile.REQUIRED_ADMISSION_KIB + 1_024
+        self.host._admission.update(
+            {
+                "mem_available_kib": current_mem_available_kib,
+                "mem_available_gib": current_mem_available_kib // profile.KIB_PER_GIB,
+                "pressure_sha256": "q" * 64,
+            }
+        )
+
+        self.owner.install(self.source_snapshot)
+
+        self.assertTrue(self.artifact.exists())
 
     def test_owner_rejects_bundle_unit_profile_mismatch_before_mutation(self) -> None:
         payload = (

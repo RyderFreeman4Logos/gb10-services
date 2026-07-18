@@ -12,6 +12,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import shlex
 import shutil
@@ -217,6 +218,49 @@ def validate_admission(admission: Mapping[str, object]) -> None:
             "candidate admission is below profile threshold: "
             f"{available} KiB < {REQUIRED_ADMISSION_KIB} KiB"
         )
+    for key in ("pressure_some_avg10", "pressure_full_avg10"):
+        value = admission.get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ProfileError(f"candidate admission {key} is invalid")
+        if value != 0:
+            raise ProfileError(f"candidate admission {key} is nonzero")
+    pswpout = admission.get("pswpout")
+    if isinstance(pswpout, bool) or not isinstance(pswpout, int) or pswpout < 0:
+        raise ProfileError("candidate admission pswpout is invalid")
+
+
+def _pressure_avg10(pressure: str) -> dict[str, float]:
+    rows: dict[str, float] = {}
+    for line in pressure.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        try:
+            values = dict(field.split("=", 1) for field in fields[1:])
+            rows[fields[0]] = float(values["avg10"])
+        except (KeyError, ValueError) as exc:
+            raise ValueError("memory pressure data is malformed") from exc
+    if set(rows) != {"some", "full"}:
+        raise ValueError("memory pressure data is incomplete")
+    return rows
+
+
+def _pswpout(vmstat: str) -> int:
+    values = [line.split() for line in vmstat.splitlines() if line.startswith("pswpout ")]
+    if len(values) != 1 or len(values[0]) != 2:
+        raise ValueError("vmstat pswpout data is malformed")
+    try:
+        value = int(values[0][1])
+    except ValueError as exc:
+        raise ValueError("vmstat pswpout data is malformed") from exc
+    if value < 0:
+        raise ValueError("vmstat pswpout data is invalid")
+    return value
 
 
 class Host(Protocol):
@@ -381,12 +425,17 @@ class SystemHost:
             mem_available = mem_available_kib // KIB_PER_GIB
             swaps = Path("/proc/swaps").read_text()
             pressure = Path("/proc/pressure/memory").read_text()
-        except (OSError, UnicodeError, runtime.LifecycleError) as exc:
+            pressure_avg10 = _pressure_avg10(pressure)
+            swap_out = _pswpout(Path("/proc/vmstat").read_text())
+        except (OSError, UnicodeError, ValueError, runtime.LifecycleError) as exc:
             raise DeploymentError("cannot collect memory/swap/PSI admission facts") from exc
         return {
             "mem_available_kib": mem_available_kib,
             "mem_available_gib": mem_available,
+            "pressure_full_avg10": pressure_avg10["full"],
+            "pressure_some_avg10": pressure_avg10["some"],
             "pressure_sha256": _sha256(pressure.encode()),
+            "pswpout": swap_out,
             "swaps_sha256": _sha256(swaps.encode()),
         }
 
@@ -1250,8 +1299,18 @@ class Deployment:
             unit: _candidate_container(self.host, unit) for unit in CANDIDATE_UNITS
         }:
             raise DeploymentError("candidate container prestate drifted before installation")
-        if prestate.get("admission") != self.host.admission():
-            raise DeploymentError("memory/swap/PSI admission facts drifted before installation")
+        previous_admission = prestate.get("admission")
+        if not isinstance(previous_admission, dict):
+            raise DeploymentError("candidate admission prestate is invalid")
+        current_admission = self.host.admission()
+        try:
+            validate_admission(current_admission)
+        except ProfileError as exc:
+            raise DeploymentError(str(exc)) from exc
+        if current_admission.get("swaps_sha256") != previous_admission.get("swaps_sha256"):
+            raise DeploymentError("swap configuration drifted before installation")
+        if current_admission.get("pswpout") != previous_admission.get("pswpout"):
+            raise DeploymentError("swap-out activity drifted before installation")
 
     def plan(self, bundle: Path) -> dict[str, object]:
         """Return the non-secret mask ownership plan without mutating the host."""
