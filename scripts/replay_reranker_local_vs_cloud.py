@@ -233,11 +233,19 @@ def main() -> int:
             continue
         candidates = group["candidates"]
         expected = len(candidates)
-        request_body = {
-            "model": args.local_model,
-            "text_1": [group["query"]] * expected,
-            "text_2": [c["document"] for c in candidates],
-        }
+        query = group["query"]
+        documents = [c["document"] for c in candidates]
+        if args.local_contract == "deepinfra":
+            request_body = {
+                "queries": [query] * expected,
+                "documents": documents,
+            }
+        else:
+            request_body = {
+                "model": args.local_model,
+                "text_1": [query] * expected,
+                "text_2": documents,
+            }
         try:
             status, body = call_local(
                 args.local_url, args.local_path, args.local_model, request_body, args.timeout
