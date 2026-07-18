@@ -80,7 +80,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 self.assertEqual(log.count(f"restart {UNIT}"), 1)
                 for neighbor in (
                     "vllm-aeon-27b-dflash.service",
-                    "querit-4b-reranker.service",
+                    "vllm-querit-4b-reranker.service",
                     "vllm-qwen3-reranker-8b.service",
                 ):
                     self.assertNotIn(f"restart {neighbor}", log)

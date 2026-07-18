@@ -36,18 +36,21 @@ class QueritDeployerContractTests(unittest.TestCase):
         systemctl.write_text(
             "#!/usr/bin/env bash\n"
             f'printf \'systemctl %s\\n\' "$*" >> {calls}\n'
+            'if [[ "$*" == *"show"* ]]; then echo loaded; exit 0; fi\n'
             'if [[ "$*" == *"is-enabled"* ]]; then\n'
-            '  [[ "$*" == *"querit-4b-reranker.service"* ]] && { echo disabled; exit 1; }\n'
+            '  [[ "$*" == *"vllm-querit-4b-reranker.service"* ]] && { echo disabled; exit 1; }\n'
             '  [[ "$*" == *"vllm-qwen3-reranker-8b.service"* ]] && { echo enabled; exit 0; }\n'
+            '  [[ "$*" == *"vllm-querit-4b-canary"* ]] && { echo disabled; exit 1; }\n'
             "fi\n"
             'if [[ "$*" == *"is-active"* ]]; then\n'
-            f'  if [[ "$*" == *"querit-4b-reranker.service"* ]]; then [[ -f {rerank_active} ]] && {{ echo active; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
+            f'  if [[ "$*" == *"vllm-querit-4b-reranker.service"* ]]; then [[ -f {rerank_active} ]] && {{ echo active; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
+            '  [[ "$*" == *"vllm-querit-4b-canary"* ]] && { echo inactive; exit 3; }\n'
             "  echo active; exit 0\n"
             "fi\n"
-            'if [[ "$*" == *"start querit-4b-reranker.service"* ]]; then\n'
+            'if [[ "$*" == *"start vllm-querit-4b-reranker.service"* ]]; then\n'
             f'  : > {rerank_active}\n'
             "fi\n"
-            'if [[ "$*" == *"stop querit-4b-reranker.service"* ]]; then\n'
+            'if [[ "$*" == *"stop vllm-querit-4b-reranker.service"* ]]; then\n'
             f'  rm -f {rerank_active}\n'
             "fi\n"
             "exit 0\n"
@@ -119,19 +122,23 @@ class QueritDeployerContractTests(unittest.TestCase):
         )
         self.assertNotIn("EXPECTED_AEON_MEMORY_GIB:-64", self.source)
 
-    def test_does_not_restart_aeon_by_default(self) -> None:
-        self.assertIn("--restart-aeon", self.source)
-        restart = self.source.index('run_systemctl_start restart "$AEON_UNIT"')
-        guarded_region = self.source[max(0, restart - 250) : restart]
-        self.assertRegex(guarded_region, r"RESTART_AEON.*1")
+    def test_preserves_text_and_never_uses_systemctl_restart(self) -> None:
+        self.assertNotIn("--restart-aeon", self.source)
+        self.assertNotIn('restart "$AEON_UNIT"', self.source)
 
     def test_snapshots_and_restores_reranker_state(self) -> None:
         for contract in (
-            "LEGACY_UNIT=vllm-qwen3-reranker-8b.service",
+            "RERANK_UNIT=vllm-querit-4b-reranker.service",
+            "FALLBACK_UNIT=vllm-qwen3-reranker-8b.service",
+            "CANARY_BACKEND_UNIT=vllm-querit-4b-canary-backend.service",
+            "CANARY_ADAPTER_UNIT=vllm-querit-4b-canary.service",
             "unit_enabled_state",
             "unit_active_state",
+            "unit_is_present",
             "rollback_runtime_state",
-            'run_systemctl disable --now "$LEGACY_UNIT"',
+            'run_systemctl stop "$CANARY_ADAPTER_UNIT"',
+            'run_systemctl stop "$CANARY_BACKEND_UNIT"',
+            'run_systemctl disable "$FALLBACK_UNIT"',
             "restore_unit_enablement",
         ):
             self.assertIn(contract, self.source)
@@ -144,17 +151,13 @@ class QueritDeployerContractTests(unittest.TestCase):
             self.fail("rollback_runtime_state function missing")
         body = rollback.group("body")
         self.assertIn('restore_unit_enablement "$RERANK_UNIT"', body)
-        self.assertIn('restore_unit_enablement "$LEGACY_UNIT"', body)
-        self.assertIn('run_systemctl_start start "$LEGACY_UNIT"', body)
+        self.assertIn('restore_unit_enablement "$FALLBACK_UNIT"', body)
+        self.assertIn('restore_unit_enablement "$CANARY_BACKEND_UNIT"', body)
+        self.assertIn('run_systemctl_start start "$FALLBACK_UNIT"', body)
 
-    def test_guard_config_is_part_of_the_rollback_transaction(self) -> None:
-        for contract in (
-            "GB10_GUARD_CONFIG_PATH",
-            "GUARD_CONFIG_EXISTED",
-            "config/llm-guard-proxy/config.toml",
-            '"$BACKUP_DIR/guard-config.toml"',
-        ):
-            self.assertIn(contract, self.source)
+    def test_guard_configuration_is_not_mutated_by_the_owner_migration(self) -> None:
+        self.assertNotIn("GB10_GUARD_CONFIG_PATH", self.source)
+        self.assertNotIn("config/llm-guard-proxy/config.toml", self.source)
 
     def test_signal_and_exit_paths_share_idempotent_cleanup(self) -> None:
         for contract in (
@@ -199,21 +202,21 @@ class QueritDeployerContractTests(unittest.TestCase):
             self.assertEqual(result.stderr.count("DEPLOY_FAILED"), 1, result.stderr)
             recorded = calls.read_text().splitlines()
             self.assertEqual(
-                recorded.count("systemctl --user stop querit-4b-reranker.service"),
-                1,
+                recorded.count("systemctl --user stop vllm-querit-4b-reranker.service"),
+                2,
                 recorded,
             )
             switched = recorded.index(
-                "systemctl --user disable --now vllm-qwen3-reranker-8b.service"
+                "systemctl --user stop vllm-querit-4b-canary.service"
             )
             started = recorded.index(
-                "systemctl --user start querit-4b-reranker.service"
+                "systemctl --user start vllm-querit-4b-reranker.service"
             )
             stopped = len(recorded) - 1 - recorded[::-1].index(
-                "systemctl --user stop querit-4b-reranker.service"
+                "systemctl --user stop vllm-querit-4b-reranker.service"
             )
             disabled = len(recorded) - 1 - recorded[::-1].index(
-                "systemctl --user disable querit-4b-reranker.service"
+                "systemctl --user disable vllm-querit-4b-reranker.service"
             )
             expected_restore = (
                 "systemctl --user start vllm-qwen3-reranker-8b.service"
@@ -256,8 +259,8 @@ class QueritDeployerContractTests(unittest.TestCase):
             self.assertEqual(stderr.count("DEPLOY_FAILED"), 1, stderr)
             recorded = calls.read_text().splitlines()
             self.assertEqual(
-                recorded.count("systemctl --user stop querit-4b-reranker.service"),
-                1,
+                recorded.count("systemctl --user stop vllm-querit-4b-reranker.service"),
+                2,
                 recorded,
             )
             self.assertIn(
@@ -286,7 +289,7 @@ class QueritDeployerContractTests(unittest.TestCase):
             self.assertLess(elapsed, 4)
             self.assertEqual(result.stderr.count("DEPLOY_FAILED"), 1, result.stderr)
             self.assertNotIn(
-                "systemctl --user disable --now vllm-qwen3-reranker-8b.service",
+                "systemctl --user stop vllm-querit-4b-canary.service",
                 calls.read_text().splitlines(),
             )
 

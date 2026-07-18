@@ -17,7 +17,7 @@ from gb10_verify_embedding_profile import CANARY_INPUTS, vectors
 UNIT = "vllm-embedding.service"
 NEIGHBORS = (
     "vllm-aeon-27b-dflash.service",
-    "querit-4b-reranker.service",
+    "vllm-querit-4b-reranker.service",
     "vllm-qwen3-reranker-8b.service",
 )
 GENERATION_FIELDS = (

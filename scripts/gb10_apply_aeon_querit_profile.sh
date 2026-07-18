@@ -5,12 +5,11 @@ set -euo pipefail
 export DOCKER_HOST="${DOCKER_HOST:-unix:///run/user/1001/docker.sock}"
 
 AEON_UNIT=vllm-aeon-27b-dflash.service
-RERANK_UNIT=querit-4b-reranker.service
-LEGACY_UNIT=vllm-qwen3-reranker-8b.service
+RERANK_UNIT=vllm-querit-4b-reranker.service
+FALLBACK_UNIT=vllm-qwen3-reranker-8b.service
+CANARY_BACKEND_UNIT=vllm-querit-4b-canary-backend.service
+CANARY_ADAPTER_UNIT=vllm-querit-4b-canary.service
 GUARD_UNIT=llm-guard-proxy.service
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-GUARD_CONFIG_SOURCE="$ROOT_DIR/config/llm-guard-proxy/config.toml"
-GUARD_CONFIG_PATH="${GB10_GUARD_CONFIG_PATH:-$HOME/.config/llm-guard-proxy/config.toml}"
 AEON_CONTAINER=vllm-aeon-27b-dflash-n12
 AEON_URL="${GB10_AEON_URL:-http://100.105.4.92:18010}"
 RERANK_URL="${GB10_RERANK_URL:-http://100.105.4.92:18013}"
@@ -23,8 +22,6 @@ RERANK_READY_ATTEMPTS=${GB10_RERANK_READY_ATTEMPTS:-180}
 SYSTEMCTL_TIMEOUT_SECONDS=${GB10_SYSTEMCTL_TIMEOUT_SECONDS:-120}
 SYSTEMCTL_START_TIMEOUT_SECONDS=${GB10_SYSTEMCTL_START_TIMEOUT_SECONDS:-1900}
 DOCKER_TIMEOUT_SECONDS=${GB10_DOCKER_TIMEOUT_SECONDS:-15}
-RESTART_AEON=0
-
 for value in \
     "$EXPECTED_AEON_KV_MIB" \
     "$EXPECTED_AEON_MEMORY_GIB" \
@@ -40,10 +37,8 @@ for value in \
     fi
 done
 
-if [[ ${1:-} == "--restart-aeon" ]]; then
-    RESTART_AEON=1
-elif [[ $# -ne 0 ]]; then
-    echo "usage: $0 [--restart-aeon]" >&2
+if [[ $# -ne 0 ]]; then
+    echo "usage: $0" >&2
     exit 2
 fi
 
@@ -82,6 +77,19 @@ unit_active_state() {
     printf '%s' "$state"
 }
 
+unit_is_present() {
+    local state rc=0
+    state="$(run_systemctl show "$1" --property=LoadState --value 2>/dev/null)" || rc=$?
+    if [[ "$state" == "not-found" || $rc -eq 4 ]]; then
+        return 1
+    fi
+    if (( rc != 0 )) || [[ "$state" != "loaded" ]]; then
+        echo "cannot determine load state for $1 rc=$rc state=$state" >&2
+        return 48
+    fi
+    return 0
+}
+
 restore_unit_enablement() {
     local unit="$1" state="$2"
     case "$state" in
@@ -100,29 +108,44 @@ restore_unit_enablement() {
 
 PREV_RERANK_ENABLED=""
 PREV_RERANK_ACTIVE=""
-PREV_LEGACY_ENABLED=""
-PREV_LEGACY_ACTIVE=""
-BACKUP_DIR=""
-GUARD_CONFIG_EXISTED=0
+PREV_FALLBACK_ENABLED=""
+PREV_FALLBACK_ACTIVE=""
+PREV_CANARY_BACKEND_ENABLED=""
+PREV_CANARY_BACKEND_ACTIVE=""
+PREV_CANARY_ADAPTER_ENABLED=""
+PREV_CANARY_ADAPTER_ACTIVE=""
+CANARY_BACKEND_PRESENT=0
+CANARY_ADAPTER_PRESENT=0
 MIGRATION_STARTED=0
 DEPLOY_SUCCESS=0
 CLEANUP_STARTED=0
 
 rollback_runtime_state() {
     local rollback_failed=0
-    if (( GUARD_CONFIG_EXISTED == 1 )); then
-        /usr/bin/install -D -m 0644 \
-            "$BACKUP_DIR/guard-config.toml" "$GUARD_CONFIG_PATH" || rollback_failed=1
-    else
-        rm -f -- "$GUARD_CONFIG_PATH" || rollback_failed=1
-    fi
     run_systemctl stop "$RERANK_UNIT" || rollback_failed=1
-    run_systemctl stop "$LEGACY_UNIT" || rollback_failed=1
+    if (( CANARY_ADAPTER_PRESENT == 1 )); then
+        run_systemctl stop "$CANARY_ADAPTER_UNIT" || rollback_failed=1
+    fi
+    if (( CANARY_BACKEND_PRESENT == 1 )); then
+        run_systemctl stop "$CANARY_BACKEND_UNIT" || rollback_failed=1
+    fi
+    run_systemctl stop "$FALLBACK_UNIT" || rollback_failed=1
     restore_unit_enablement "$RERANK_UNIT" "$PREV_RERANK_ENABLED" || rollback_failed=1
-    restore_unit_enablement "$LEGACY_UNIT" "$PREV_LEGACY_ENABLED" || rollback_failed=1
+    restore_unit_enablement "$FALLBACK_UNIT" "$PREV_FALLBACK_ENABLED" || rollback_failed=1
+    if (( CANARY_BACKEND_PRESENT == 1 )); then
+        restore_unit_enablement "$CANARY_BACKEND_UNIT" "$PREV_CANARY_BACKEND_ENABLED" || rollback_failed=1
+    fi
+    if (( CANARY_ADAPTER_PRESENT == 1 )); then
+        restore_unit_enablement "$CANARY_ADAPTER_UNIT" "$PREV_CANARY_ADAPTER_ENABLED" || rollback_failed=1
+    fi
 
-    if [[ "$PREV_LEGACY_ACTIVE" == "active" ]]; then
-        run_systemctl_start start "$LEGACY_UNIT" || rollback_failed=1
+    if (( CANARY_BACKEND_PRESENT == 1 )) && [[ "$PREV_CANARY_BACKEND_ACTIVE" == "active" ]]; then
+        run_systemctl_start start "$CANARY_BACKEND_UNIT" || rollback_failed=1
+    fi
+    if (( CANARY_ADAPTER_PRESENT == 1 )) && [[ "$PREV_CANARY_ADAPTER_ACTIVE" == "active" ]]; then
+        run_systemctl_start start "$CANARY_ADAPTER_UNIT" || rollback_failed=1
+    elif [[ "$PREV_FALLBACK_ACTIVE" == "active" ]]; then
+        run_systemctl_start start "$FALLBACK_UNIT" || rollback_failed=1
     elif [[ "$PREV_RERANK_ACTIVE" == "active" ]]; then
         run_systemctl_start start "$RERANK_UNIT" || rollback_failed=1
     fi
@@ -147,7 +170,7 @@ cleanup_failure() {
         fi
     fi
     run_systemctl status \
-        "$AEON_UNIT" "$RERANK_UNIT" "$LEGACY_UNIT" "$GUARD_UNIT" \
+        "$AEON_UNIT" "$RERANK_UNIT" "$FALLBACK_UNIT" "$GUARD_UNIT" \
         --no-pager -l || true
     exit "$final_rc"
 }
@@ -175,8 +198,18 @@ trap cleanup_on_exit EXIT
 
 PREV_RERANK_ENABLED="$(unit_enabled_state "$RERANK_UNIT")"
 PREV_RERANK_ACTIVE="$(unit_active_state "$RERANK_UNIT")"
-PREV_LEGACY_ENABLED="$(unit_enabled_state "$LEGACY_UNIT")"
-PREV_LEGACY_ACTIVE="$(unit_active_state "$LEGACY_UNIT")"
+PREV_FALLBACK_ENABLED="$(unit_enabled_state "$FALLBACK_UNIT")"
+PREV_FALLBACK_ACTIVE="$(unit_active_state "$FALLBACK_UNIT")"
+if unit_is_present "$CANARY_BACKEND_UNIT"; then
+    CANARY_BACKEND_PRESENT=1
+    PREV_CANARY_BACKEND_ENABLED="$(unit_enabled_state "$CANARY_BACKEND_UNIT")"
+    PREV_CANARY_BACKEND_ACTIVE="$(unit_active_state "$CANARY_BACKEND_UNIT")"
+fi
+if unit_is_present "$CANARY_ADAPTER_UNIT"; then
+    CANARY_ADAPTER_PRESENT=1
+    PREV_CANARY_ADAPTER_ENABLED="$(unit_enabled_state "$CANARY_ADAPTER_UNIT")"
+    PREV_CANARY_ADAPTER_ACTIVE="$(unit_active_state "$CANARY_ADAPTER_UNIT")"
+fi
 
 read_mem_available_kib() {
     local key rest value
@@ -235,27 +268,24 @@ verify_aeon_profile() {
 run_systemctl is-active --quiet "$GUARD_UNIT"
 require_memory_headroom
 
-if (( RESTART_AEON == 1 )); then
-    echo "PHASE restart_aeon"
-    run_systemctl_start restart "$AEON_UNIT"
-else
-    echo "PHASE verify_existing_aeon"
-    run_systemctl is-active --quiet "$AEON_UNIT"
-fi
+echo "PHASE verify_existing_aeon"
+run_systemctl is-active --quiet "$AEON_UNIT"
 wait_for_url "$AEON_URL/v1/models" "$AEON_READY_ATTEMPTS" AEON
 verify_aeon_profile
 require_memory_headroom
 
 echo "PHASE switch_reranker"
-BACKUP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gb10-querit-deploy.XXXXXX")"
-if [[ -f "$GUARD_CONFIG_PATH" ]]; then
-    GUARD_CONFIG_EXISTED=1
-    /usr/bin/install -m 0644 "$GUARD_CONFIG_PATH" "$BACKUP_DIR/guard-config.toml"
-fi
 MIGRATION_STARTED=1
-/usr/bin/install -D -m 0644 "$GUARD_CONFIG_SOURCE" "$GUARD_CONFIG_PATH"
-run_systemctl disable --now "$LEGACY_UNIT"
-run_systemctl reset-failed "$LEGACY_UNIT" || true
+if (( CANARY_ADAPTER_PRESENT == 1 )); then
+    run_systemctl stop "$CANARY_ADAPTER_UNIT"
+fi
+if (( CANARY_BACKEND_PRESENT == 1 )); then
+    run_systemctl stop "$CANARY_BACKEND_UNIT"
+fi
+run_systemctl stop "$FALLBACK_UNIT"
+run_systemctl disable "$FALLBACK_UNIT"
+run_systemctl stop "$RERANK_UNIT"
+run_systemctl reset-failed "$FALLBACK_UNIT" || true
 run_systemctl reset-failed "$RERANK_UNIT" || true
 run_systemctl daemon-reload
 run_systemctl_start start "$RERANK_UNIT"
@@ -277,8 +307,8 @@ python3 -c 'import json,math,sys; d=json.loads(sys.argv[1]); s=float(d["data"][0
 
 run_systemctl enable "$RERANK_UNIT"
 run_systemctl is-enabled --quiet "$RERANK_UNIT"
-if run_systemctl is-enabled --quiet "$LEGACY_UNIT"; then
-    echo "legacy reranker unexpectedly enabled" >&2
+if run_systemctl is-enabled --quiet "$FALLBACK_UNIT"; then
+    echo "fallback reranker unexpectedly enabled" >&2
     exit 48
 fi
 run_systemctl is-active --quiet \

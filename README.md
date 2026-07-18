@@ -26,12 +26,12 @@ graph TD
    Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside the pinned AEON v0.25 GB10 Docker image for long-context processing up to 256k tokens, with FP8 KV cache and DFlash `TRITON_ATTN` enabled.
 2. **vllm-embedding.service**
    Serves BF16 `Qwen/Qwen3-Embedding-8B` with its full 4,096-dimensional output. This is the reliability-critical baseline service. The tracked source profile contracts for 32,768 tokens and 4,800 MiB explicit KV while preserving 8,192 batched tokens, 64 sequences, aliases, and quality semantics. Its equal 128 GiB memory/swap cgroup ceiling disables container swap without imposing the obsolete 20 GiB service budget; this source contract is not a live-activation claim. Its raw backend listens only on port `18012`; clients should use `llm-guard-proxy` on port `18009` or the guard-owned legacy listener `18002` with model `qwen3-embedding-8b`.
-3. **querit-4b-reranker.service**
-   Serves the pinned `Querit/Querit-4B` snapshot through a bounded, single-inference Transformers adapter. It keeps the `qwen3-reranker-8b` and `Qwen/Qwen3-Reranker-8B` aliases, a 40,960-token input profile, and an 18 GiB no-swap container cap. Its raw backend listens on `18013`; clients should use `llm-guard-proxy` on `18009` or the restricted listener `18003`. The old `vllm-qwen3-reranker-8b.service` remains tracked only as a disabled rollback artifact.
+3. **vllm-querit-4b-reranker.service**
+   The canonical production owner for `Querit/Querit-4B` is a BF16 vLLM pooling reranker with the `qwen3-reranker-8b` and `Qwen/Qwen3-Reranker-8B` aliases, a 32,768-token context, 4,800 MiB KV cache, and an 18 GiB no-swap container cap. Its raw backend listens on `18013`; `--max-num-batched-tokens 16384` and `--max-num-seqs 256` are backend scheduler ceilings, while `llm-guard-proxy` owns hot-reloadable production admission and concurrency. Clients should use Guard on `18009` or the restricted listener `18003`. `vllm-qwen3-reranker-8b.service` remains a disabled fallback only. The optional canary backend is loopback-only on `127.0.0.1:18015`, with its optional adapter on Tailnet `18014`; neither is boot-enabled.
 4. **llm-guard-proxy.service**
    A Rust-based shielding gateway proxy ([llm-guard-proxy](https://github.com/RyderFreeman4Logos/llm-guard-proxy)) sitting in front of the chat, embedding, and reranker endpoints. It routes requests by `model` to named upstream profiles, manages request queues, retries, stalls, and loop guards to protect backends from runaway generations. It owns the stable entrypoint `18009`, aggregate listener `18005`, and legacy restricted listeners `18002`/`18003`; raw vLLM backends stay on `18010`/`18012`/`18013`. It is also the runtime control plane for request concurrency and the sole automatic low-memory recovery actor. Edit `config/llm-guard-proxy/config.toml` to tune limits or the hot-reloadable `[guardian]` policy without restarting vLLM.
 
-   Queueing belongs primarily in Guard, not in an unbounded raw model adapter. The reference profile permits four concurrent body-routing reads and queues 128 requests before model routing; after routing it allows 4 active + 64 queued AEON requests, 8 + 64 embedding requests, and 8 + 64 Querit requests. Queued requests may wait up to 30 minutes. Only the 128-slot body-routing wait is pre-body and cheap; profile queues retain request bodies, so Guard caps every request at 4 MiB. The worst-case 216 body residencies use a documented 384 MiB baseline plus 1.5× body-overhead budget (1,680 MiB), below `MemoryHigh=1792M` and `MemoryMax=2G`. Querit admits at most sixteen backend connections through Uvicorn (leaving headroom for eight Guard-active requests plus health/control traffic); those bounded active requests serialize only the GPU inference section on a process lock, while the larger burst remains in Guard. AEON keeps a much higher vLLM scheduling ceiling (`--max-num-seqs 64`), calculated as `262144 / 8192 * 2`; Guard's lower hot-reloadable profile limit controls actual production concurrency.
+   Queueing belongs primarily in Guard, not in an unbounded raw model adapter. The reference profile permits four concurrent body-routing reads and queues 128 requests before model routing; after routing it allows 4 active + 64 queued AEON requests, 8 + 64 embedding requests, and 8 + 64 Querit requests. Queued requests may wait up to 30 minutes. Only the 128-slot body-routing wait is pre-body and cheap; profile queues retain request bodies, so Guard caps every request at 4 MiB. The worst-case 216 body residencies use a documented 384 MiB baseline plus 1.5× body-overhead budget (1,680 MiB), below `MemoryHigh=1792M` and `MemoryMax=2G`. Querit vLLM keeps deliberately higher scheduler ceilings (`--max-num-batched-tokens 16384`, `--max-num-seqs 256`), while Guard's lower hot-reloadable profile limit controls actual production concurrency. AEON keeps its own GB10 scheduler ceiling (`--max-num-seqs 16`).
 
    The reference config enables the production guard features that are useful on
    GB10: explicit named upstream profiles, bounded generation queues with HTTP
@@ -108,10 +108,10 @@ Capacity contracts and evidence:
 embedding:  source max-model-len 32,768, KV 4,800M -> projected 34,124 tokens (4.14% margin; live verification pending)
             validated baseline: KV 5,820M -> 41,376 tokens
 AEON chat:  max-model-len 262,144, FP8 KV 15,360M -> verified 269,589 tokens (1.028 full contexts)
-Querit:     snapshot 7b796de30ad8dc772d6c46c75659c1341283a665, max-model-len 40,960, MemoryMax 18G
+Querit:     canonical vLLM owner, max-model-len 32,768, KV 4,800M, MemoryMax 18G
 ```
 
-The committed container/cgroup caps are AEON 69G + embedding 20G + Querit 18G = 107 GiB, but that arithmetic is policy and does not guarantee physical NVML/UMA headroom. With the former 36 GiB text KV profile, stable all-three samples left only about 1.8–2.3 GiB `MemAvailable`, and the same text configuration had previously grown another 8,466 MiB. The live 15 GiB text KV activation reported 269,589 cache tokens, a 2.84% margin above one 262,144-token request, and the first 3,300-second attribution window ended with about 31.6 GiB `MemAvailable`, zero threshold events, and zero cgroup OOM kills. Two concurrent maximum-length requests are not supported; this is intentional under the service priority embedding > reranker > text. Use `scripts/gb10_apply_aeon_querit_profile.sh` for the reranker migration; it verifies the source AEON 15,360 MiB KV profile and does not restart AEON unless `--restart-aeon` is explicit.
+The committed container/cgroup caps are AEON 69G + embedding 20G + Querit 18G = 107 GiB, but that arithmetic is policy and does not guarantee physical NVML/UMA headroom. With the former 36 GiB text KV profile, stable all-three samples left only about 1.8–2.3 GiB `MemAvailable`, and the same text configuration had previously grown another 8,466 MiB. The live 15 GiB text KV activation reported 269,589 cache tokens, a 2.84% margin above one 262,144-token request, and the first 3,300-second attribution window ended with about 31.6 GiB `MemAvailable`, zero threshold events, and zero cgroup OOM kills. Two concurrent maximum-length requests are not supported; this is intentional under the service priority embedding > reranker > text. Use `scripts/gb10_apply_aeon_querit_profile.sh` for the reranker migration; it verifies the existing AEON profile and leaves text, embedding, and Guard state unchanged.
 
 ---
 
@@ -142,11 +142,11 @@ gb10-services/
 │   ├── gb10_apply_aeon_querit_profile.sh # Guarded Querit migration/deployer
 │   ├── gb10_check_mem_available.sh # Model startup headroom gate
 │   ├── llm_guard_proxy_publish_cgroup_registration.sh # Publish exact AEON cgroup identity
-│   ├── querit_openai_rerank_server.py # Bounded OpenAI-compatible adapter
+│   ├── querit_openai_rerank_server.py # Historical reproducibility adapter
 │   └── sysmon.sh           # Observer-only metrics with measured sample cadence
 └── systemd/
     ├── llm-guard-proxy.service
-    ├── querit-4b-reranker.service
+    ├── vllm-querit-4b-reranker.service
     ├── sysmon.service
     ├── vllm-aeon-27b-dflash.service
     ├── vllm-embedding.service
@@ -210,7 +210,6 @@ cp scripts/gb10_apply_aeon_querit_profile.sh ~/.local/bin/
 cp scripts/gb10_check_mem_available.sh ~/.local/bin/
 cp scripts/llm_guard_proxy_cached_rebuild.sh ~/.local/bin/
 cp scripts/llm_guard_proxy_publish_cgroup_registration.sh ~/.local/bin/
-cp scripts/querit_openai_rerank_server.py ~/.local/bin/
 cp scripts/sysmon.sh ~/.local/bin/
 
 
@@ -228,7 +227,7 @@ cp config/llm-guard-proxy/config.toml ~/.config/llm-guard-proxy/config.toml
 ```bash
 mkdir -p ~/.config/systemd/user/
 install -m 0644 systemd/llm-guard-proxy.service \
-  systemd/querit-4b-reranker.service systemd/sysmon.service \
+  systemd/vllm-querit-4b-reranker.service systemd/sysmon.service \
   systemd/vllm-aeon-27b-dflash.service systemd/vllm-embedding.service \
   systemd/vllm-qwen3-reranker-8b.service \
   ~/.config/systemd/user/
@@ -245,7 +244,7 @@ systemctl --user enable --now sysmon.service
 systemctl --user enable --now vllm-embedding.service
 systemctl --user enable --now vllm-aeon-27b-dflash.service
 systemctl --user disable --now vllm-qwen3-reranker-8b.service
-systemctl --user enable --now querit-4b-reranker.service
+systemctl --user enable --now vllm-querit-4b-reranker.service
 systemctl --user enable --now llm-guard-proxy.service
 
 ```
@@ -303,7 +302,7 @@ with manual copy/reload/restart or stack-cycle fragments.
 
 * **Process Status**:
   ```bash
-  systemctl --user status vllm-embedding vllm-aeon-27b-dflash querit-4b-reranker llm-guard-proxy sysmon
+  systemctl --user status vllm-embedding vllm-aeon-27b-dflash vllm-querit-4b-reranker llm-guard-proxy sysmon
   ```
 * **Checking logs**:
   ```bash

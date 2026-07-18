@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 EXPECTED_IMPORT_AUTHORITY: dict[str, str] = {
-    "gb10_embedding_activation_checks.py": "9c4720fff0d7eaf44e19ca6ce018b8a4688bf1ecafbb4ac78de3de6a2f1a84d6",
+    "gb10_embedding_activation_checks.py": "6f9eb64f3d150689adb0a239fadeef549be68dc080df174f07b46285d91d7729",
     "gb10_embedding_activation_config.py": "9a0f87fa66d55c59d755525eb779ed00aa6540375bfbf3855a6e443aef6e093f",
     "gb10_embedding_activation_storage.py": "38f93b566019b8a29b4c84dbe6882b4e55eb9ebcce75288d3d356953a625b339",
     "gb10_embedding_profile_contract.py": "0672654ffda1f03ca29002c1a1cfdc443b353d019705901d19370c0ef7ac1e24",

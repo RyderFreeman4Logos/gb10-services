@@ -11,7 +11,7 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
   * `18009`: `llm-guard-proxy.service` (stable OpenAI-compatible entrypoint for chat, embeddings, and rerank)
   * `18010`: `vllm-aeon-27b-dflash.service` (raw AEON chat backend)
   * `18012`: `vllm-embedding.service` (raw Qwen3-Embedding-8B backend routed by guard)
-  * `18013`: `vllm-qwen3-reranker-8b.service` (raw Qwen3-Reranker-8B backend routed by guard)
+  * `18013`: `vllm-querit-4b-reranker.service` (canonical raw Querit-4B backend routed by guard)
   * `18002`: `llm-guard-proxy.service` legacy embedding-compatible listener; only embedding upstream profiles are allowed
   * `18003`: `llm-guard-proxy.service` legacy reranker-compatible listener; only reranker upstream profiles are allowed
   * `18005`: `llm-guard-proxy.service` aggregate listener for chat, embedding, and rerank profiles
@@ -23,7 +23,9 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 * The 0.25.1 AEON build ports the MRv2 `lm_head` sharing fix across DFlash, Eagle, and DSpark, includes vLLM #47888 for torchcodec startup without FFmpeg, and guards the mixed-dtype FlashInfer TP>1 fusion via #48330. AEON calls the DSpark loader fix-covered and TP=2-ready but explicitly leaves TP>1 unvalidated; do not present this source migration as a multi-Spark hardware result.
 * `vllm-embedding.service` tracked source contract: BF16 Qwen3-Embedding-8B with 4,096-dimensional output, `max-model-len=32768`, `max-num-batched-tokens=8192`, `max-num-seqs=64`, and `kv-cache-memory-bytes=4800M`. Its equal 128 GiB memory/swap cgroup ceiling disables container swap without imposing the obsolete 20 GiB service budget; this source contract is not a live-activation claim. The validated 5,820 MiB baseline yielded 41,376 KV tokens; 4,800 MiB projects about 34,124 tokens (4.14% above 32,768) but is not production-verified until a live restart prints at least 32,768 tokens.
 * `vllm-aeon-27b-dflash.service`: tracked clean-start v0.25.1 reference (not a live-production activation claim): DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-seqs=16`, `max-num-batched-tokens=4096`, AUTO KV sizing via `gpu-memory-utilization=0.355` with no explicit `kv-cache-memory-bytes`; clean-start capacity 286,962 KV tokens.
+* `vllm-querit-4b-reranker.service`: canonical BF16 pooling production owner on `18013`, with a 32,768-token context, 4,800 MiB KV cache, an 18 GiB no-swap cgroup, and backend scheduler ceilings of 16,384 batched tokens / 256 sequences. Guard owns hot-reloadable request admission and concurrency; these scheduler ceilings are not a live-validation claim.
 * `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
+* `vllm-querit-4b-canary-backend.service` remains loopback-only on `127.0.0.1:18015`; its optional Tailnet adapter is on `18014`. Neither canary unit is boot-enabled.
 * `llm-guard-proxy` routes by request `model` to AEON chat (`aeon-ultimate`, `qwen3.6-27b-decensor-by-aeon`), embedding (`qwen3-embedding-8b`, `Qwen/Qwen3-Embedding-8B`), or reranker (`qwen3-reranker-8b`, `Qwen/Qwen3-Reranker-8B`).
 * `llm-guard-proxy` uses a shielded AEON retry ladder for chat: max thinking, bounded thinking, then no-thinking direct streaming relay if prior streaming attempts trip the loop guard. The legacy 18002/18003 ports are guard-owned downstream listeners, not raw vLLM publishes.
 * `llm-guard-proxy` also hot-reloads `config.toml`. Use `[server]` to change default/chat request parallelism and per-`[[upstreams]]` `max_in_flight_requests` / `max_queued_generation_requests` to tune embedding/reranker independently without restarting vLLM, trading total throughput against single-stream latency.
@@ -155,7 +157,7 @@ mkdir -p /home/obj/.config/systemd/user/
 
 # Install tracked services.
 install -m 0644 systemd/llm-guard-proxy.service \
-  systemd/querit-4b-reranker.service systemd/sysmon.service \
+  systemd/vllm-querit-4b-reranker.service systemd/sysmon.service \
   systemd/vllm-aeon-27b-dflash.service systemd/vllm-embedding.service \
   systemd/vllm-qwen3-reranker-8b.service \
   /home/obj/.config/systemd/user/
@@ -172,7 +174,7 @@ systemctl --user enable --now sysmon.service
 systemctl --user enable --now vllm-embedding.service
 systemctl --user enable --now vllm-aeon-27b-dflash.service
 systemctl --user disable --now vllm-qwen3-reranker-8b.service
-systemctl --user enable --now querit-4b-reranker.service
+systemctl --user enable --now vllm-querit-4b-reranker.service
 systemctl --user enable --now llm-guard-proxy.service
 ```
 
@@ -242,7 +244,7 @@ stack or replaying copy/reload/restart fragments.
 systemctl --user list-units --type=service --state=running
 
 # Check detailed status of core services
-systemctl --user status vllm-embedding vllm-aeon-27b-dflash querit-4b-reranker \
+systemctl --user status vllm-embedding vllm-aeon-27b-dflash vllm-querit-4b-reranker \
   llm-guard-proxy sysmon
 ```
 

@@ -14,7 +14,7 @@ profile = importlib.import_module("querit_canary_deployment")
 runtime = importlib.import_module("querit_canary_runtime")
 ADAPTER_UNIT = ROOT / "systemd" / "vllm-querit-4b-canary.service"
 BACKEND_UNIT = ROOT / "systemd" / "vllm-querit-4b-canary-backend.service"
-PRODUCTION_UNIT = ROOT / "systemd" / "querit-4b-reranker.service"
+PRODUCTION_UNIT = ROOT / "systemd" / "vllm-querit-4b-reranker.service"
 RESEARCH_NOTE = ROOT / "docs" / "research" / "2026-07-16-querit-vllm-migration.md"
 MODEL_DIR = "/home/obj/models/querit-4b-vllm"
 IMAGE = (
@@ -101,7 +101,7 @@ def _backend_contract(unit: str) -> None:
     expected_host = [
         "--rm",
         "--name",
-        "querit-4b-vllm",
+        "vllm-querit-4b-canary",
         "--cgroup-parent",
         "app.slice",
         "--gpus",
@@ -109,7 +109,7 @@ def _backend_contract(unit: str) -> None:
         "--ipc",
         "host",
         "-p",
-        "100.105.4.92:18013:8000",
+        "127.0.0.1:18015:8000",
         "-v",
         f"{MODEL_DIR}:{MODEL_DIR}:ro",
         "-e",
@@ -143,6 +143,7 @@ def _backend_contract(unit: str) -> None:
         "--tensor-parallel-size": 1,
         "--pipeline-parallel-size": 1,
         "--cpu-offload-gb": 1,
+        "--swap-space": 1,
         "--max-num-batched-tokens": 1,
         "--max-num-seqs": 1,
         "--enable-chunked-prefill": 0,
@@ -174,6 +175,7 @@ def _backend_contract(unit: str) -> None:
         "--tensor-parallel-size": ["1"],
         "--pipeline-parallel-size": ["1"],
         "--cpu-offload-gb": ["0"],
+        "--swap-space": ["0"],
         "--max-num-batched-tokens": ["1024"],
         "--max-num-seqs": ["1"],
         "--enable-chunked-prefill": [],
@@ -189,12 +191,12 @@ def _backend_contract(unit: str) -> None:
     if start_posts[0] != [
         "/home/obj/.local/bin/gb10_service_ready.sh",
         "rerank",
-        "http://100.105.4.92:18013",
+        "http://127.0.0.1:18015",
         "Querit/Querit-4B",
         "--deadline",
         "300",
     ]:
-        raise AssertionError("readiness must probe native rerank behavior on :18013")
+        raise AssertionError("readiness must probe native rerank behavior on loopback :18015")
 
 
 class QueritVllmCanaryContractTests(unittest.TestCase):
@@ -288,7 +290,7 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
             "peak readiness must run after systemctl reports an active adapter",
         )
 
-    def test_raw_canary_publishes_tailnet_once_without_wildcard(
+    def test_raw_canary_publishes_loopback_once_without_wildcard(
         self,
     ) -> None:
         backend = BACKEND_UNIT.read_text()
@@ -300,13 +302,13 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
         ]
         self.assertEqual(
             publishes,
-            ["100.105.4.92:18013:8000"],
+            ["127.0.0.1:18015:8000"],
         )
         self.assertEqual(len(publishes), len(set(publishes)))
         for binding in publishes:
             address, host_port, container_port = binding.rsplit(":", 2)
-            self.assertEqual(address, "100.105.4.92")
-            self.assertEqual(host_port, "18013")
+            self.assertEqual(address, "127.0.0.1")
+            self.assertEqual(host_port, "18015")
             self.assertEqual(container_port, "8000")
 
     def test_canary_is_memory_bounded_fail_closed_and_lifecycle_isolated(self) -> None:
@@ -322,7 +324,11 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
         self.assertNotIn("Restart=on-failure", unit)
         self.assertEqual(
             _logical_directive_argv(unit, "ExecCondition"),
-            [],
+            [["/home/obj/.local/bin/gb10_querit_canary_preflight.py"]],
+        )
+        self.assertEqual(
+            _logical_directive_argv(unit, "ExecStartPre"),
+            [["-/usr/bin/docker", "rm", "-f", "vllm-querit-4b-canary"]],
         )
         self.assertEqual(
             _logical_directive_argv(unit, "ExecStop"),
@@ -336,7 +342,7 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
                     "stop",
                     "--time",
                     "20",
-                    "querit-4b-vllm",
+                    "vllm-querit-4b-canary",
                 ]
             ],
         )
@@ -357,7 +363,7 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
         )
         for neighbor in (
             "vllm-embedding.service",
-            "querit-4b-reranker.service",
+            "vllm-querit-4b-reranker.service",
             "vllm-qwen3-reranker-8b.service",
         ):
             self.assertNotIn(neighbor, unit_section)
@@ -365,12 +371,12 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
         self.assertNotIn("guardian", lowered)
         self.assertNotIn("gb10_cgroup_registration", lowered)
         self.assertNotIn("publish_cgroup_registration", lowered)
+        self.assertNotIn("[Install]", unit)
+        self.assertNotIn("[Install]", adapter)
 
-    def test_production_transformers_reranker_stays_on_18013(self) -> None:
-        production = PRODUCTION_UNIT.read_text()
-        self.assertIn("100.105.4.92:18013:8000", production)
-        self.assertNotIn("100.105.4.92:18014:8000", production)
-        self.assertIn("querit_openai_rerank_server.py", production)
+    def test_canary_is_not_the_canonical_production_owner(self) -> None:
+        self.assertTrue(PRODUCTION_UNIT.exists())
+        self.assertNotIn("[Install]", BACKEND_UNIT.read_text())
 
     def test_research_note_records_adapter_and_transactional_operator_contract(
         self,

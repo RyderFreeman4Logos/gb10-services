@@ -465,7 +465,7 @@ class HostileEmbeddingUnitMutationTests(unittest.TestCase):
 class EmbeddingDeploymentContractTests(unittest.TestCase):
     FRESH_STACK_UNITS = {
         "llm-guard-proxy.service",
-        "querit-4b-reranker.service",
+        "vllm-querit-4b-reranker.service",
         "sysmon.service",
         "vllm-aeon-27b-dflash.service",
         "vllm-embedding.service",
@@ -473,7 +473,7 @@ class EmbeddingDeploymentContractTests(unittest.TestCase):
     }
     FORBIDDEN_NEIGHBORS = (
         "vllm-aeon-27b-dflash.service",
-        "querit-4b-reranker.service",
+        "vllm-querit-4b-reranker.service",
         "vllm-qwen3-reranker-8b.service",
     )
 

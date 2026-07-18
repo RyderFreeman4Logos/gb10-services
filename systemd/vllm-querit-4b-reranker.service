@@ -1,10 +1,11 @@
-# Temporary source-controlled raw backend. The separately tested adapter keeps
-# its DeepInfra-native listener on Tailnet :18014; this backend remains
-# loopback-only on :18015 for bounded lab work.
+# Canonical Querit-4B vLLM pooling reranker (AEON v0.25.1, raw Tailnet :18013).
+# The llm-guard-proxy adapter on :18009/:18003 forwards rerank requests to
+# this backend; clients (CodeSeek, mempal, verbatim) see a DeepInfra-compatible
+# contract through the adapter.
 [Unit]
-Description=Temporary Querit-4B vLLM pooling canary backend (loopback :18015)
+Description=Canonical Querit-4B vLLM pooling reranker (AEON v0.25.1, raw Tailnet :18013)
 After=network.target
-Conflicts=vllm-querit-4b-reranker.service vllm-qwen3-reranker-8b.service
+Conflicts=vllm-qwen3-reranker-8b.service vllm-querit-4b-canary-backend.service
 StartLimitIntervalSec=600
 StartLimitBurst=1
 
@@ -14,7 +15,7 @@ Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
 Environment=HF_HUB_OFFLINE=1
 Environment=TRANSFORMERS_OFFLINE=1
 
-# Wrapper/docker-CLI only. Docker bounds the 18 GiB canary separately.
+# Wrapper/docker-CLI only. Docker owns the 18 GiB no-swap service cap.
 MemoryMax=256M
 MemorySwapMax=0
 OOMScoreAdjust=500
@@ -22,12 +23,12 @@ Restart=no
 TimeoutStartSec=1800
 TimeoutStopSec=60
 
-ExecCondition=/home/obj/.local/bin/gb10_querit_canary_preflight.py
-ExecStartPre=-/usr/bin/docker rm -f vllm-querit-4b-canary
-ExecStart=/usr/bin/docker run --rm --name vllm-querit-4b-canary \
+ExecStartPre=-/usr/bin/docker rm -f querit-4b-vllm
+# Backend scheduler ceilings are not production admission limits; guard owns hot-reloadable request concurrency.
+ExecStart=/usr/bin/docker run --rm --name querit-4b-vllm \
   --cgroup-parent app.slice \
   --gpus all --ipc host \
-  -p 127.0.0.1:18015:8000 \
+  -p 100.105.4.92:18013:8000 \
   -v /home/obj/models/querit-4b-vllm:/home/obj/models/querit-4b-vllm:ro \
   -e HF_HUB_OFFLINE=1 \
   -e TRANSFORMERS_OFFLINE=1 \
@@ -49,18 +50,21 @@ ExecStart=/usr/bin/docker run --rm --name vllm-querit-4b-canary \
     --kv-cache-dtype auto \
     --tensor-parallel-size 1 \
     --pipeline-parallel-size 1 \
-    --swap-space 0 \
     --cpu-offload-gb 0 \
-    --max-num-batched-tokens 1024 \
-    --max-num-seqs 1 \
+    --swap-space 0 \
+    --max-num-batched-tokens 16384 \
+    --max-num-seqs 256 \
     --enable-chunked-prefill \
-    --max-num-partial-prefills 1 \
-    --max-long-partial-prefills 1 \
+    --max-num-partial-prefills 64 \
+    --max-long-partial-prefills 64 \
     --long-prefill-token-threshold 8192 \
     --enforce-eager \
     --chat-template /home/obj/models/querit-4b-vllm/querit-rerank.jinja
-ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh rerank http://127.0.0.1:18015 Querit/Querit-4B --deadline 300
-ExecStop=/usr/bin/timeout --signal=TERM --kill-after=5 30 /usr/bin/docker stop --time 20 vllm-querit-4b-canary
+ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh rerank http://100.105.4.92:18013 Querit/Querit-4B --deadline 300
+ExecStop=/usr/bin/timeout --signal=TERM --kill-after=5 30 /usr/bin/docker stop --time 20 querit-4b-vllm
 
 StandardOutput=journal
 StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -2,7 +2,7 @@
 Description=vLLM Qwen3-Reranker-8B (AEON v0.25.1 GB10 image, BF16, 40k ctx, pooling reranker, util=0.22, raw backend port 18013, behind llm-guard-proxy listeners 18009/18003/18005, 64 seq)
 # lifecycle-independent from text: guardian recovery must not change reranker state.
 After=network.target
-Conflicts=querit-4b-reranker.service vllm-qwen35-hauhau.service
+Conflicts=vllm-querit-4b-reranker.service vllm-querit-4b-canary-backend.service vllm-qwen35-hauhau.service
 StartLimitIntervalSec=600
 StartLimitBurst=3
 
@@ -38,6 +38,7 @@ ExecStart=/usr/bin/docker run --rm --name vllm-qwen3-reranker-8b \
     --max-num-seqs 64 \
     --gpu-memory-utilization 0.22 \
     --kv-cache-memory-bytes 5820M \
+    --swap-space 0 \
     --enforce-eager \
     --chat-template /vllm-workspace/examples/pooling/score/template/qwen3_reranker.jinja \
     --hf-overrides '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}' \

@@ -19,7 +19,7 @@ CANONICAL_UNIT = ROOT / "systemd" / UNIT
 MODELS = ("qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B")
 NEIGHBORS = (
     "vllm-aeon-27b-dflash.service",
-    "querit-4b-reranker.service",
+    "vllm-querit-4b-reranker.service",
     "vllm-qwen3-reranker-8b.service",
 )
 

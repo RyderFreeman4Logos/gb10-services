@@ -25,7 +25,7 @@ TEXT_UNIT = "vllm-aeon-27b-dflash.service"
 BACKEND_UNIT = "vllm-querit-4b-canary-backend.service"
 ADAPTER_UNIT = "vllm-querit-4b-canary.service"
 EMBEDDING_UNIT = "vllm-embedding.service"
-PRODUCTION_RERANKER_UNIT = "querit-4b-reranker.service"
+PRODUCTION_RERANKER_UNIT = "vllm-querit-4b-reranker.service"
 LEGACY_RERANKER_UNIT = "vllm-qwen3-reranker-8b.service"
 GUARD_UNIT = "llm-guard-proxy.service"
 IMMUTABLE_NEIGHBORS = (
@@ -48,7 +48,7 @@ CONTAINER_NAMES = {
     TEXT_UNIT: "vllm-aeon-27b-dflash-n12",
     BACKEND_UNIT: "vllm-querit-4b-canary",
     EMBEDDING_UNIT: "vllm-embedding",
-    PRODUCTION_RERANKER_UNIT: "querit-4b-reranker",
+    PRODUCTION_RERANKER_UNIT: "querit-4b-vllm",
     LEGACY_RERANKER_UNIT: "vllm-qwen3-reranker-8b",
 }
 

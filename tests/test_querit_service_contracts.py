@@ -17,7 +17,7 @@ from test_embedding_service_contracts import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-QUERIT_UNIT = ROOT / "systemd" / "querit-4b-reranker.service"
+QUERIT_UNIT = ROOT / "systemd" / "vllm-querit-4b-reranker.service"
 AEON_UNIT = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
 GUARD_UNIT = ROOT / "systemd" / "llm-guard-proxy.service"
 LEGACY_UNIT = ROOT / "systemd" / "vllm-qwen3-reranker-8b.service"
@@ -189,33 +189,33 @@ class QueritServiceContractTests(unittest.TestCase):
     def test_unit_uses_pinned_offline_artifacts(self) -> None:
         unit = QUERIT_UNIT.read_text()
         self.assertIn(f"@{QUERIT_IMAGE_DIGEST}", unit)
-        self.assertIn(
-            "models--Querit--Querit-4B:/models/querit-repo:ro", unit
-        )
-        self.assertIn(f"--model /models/querit-repo/snapshots/{MODEL_SNAPSHOT}", unit)
-        self.assertIn(
-            "querit_score_contract.py:/opt/querit/querit_score_contract.py:ro", unit
-        )
-        self.assertNotIn(
-            "--score-contract current-prompt-terminal-cls-v1", unit
-        )
+        self.assertIn("/home/obj/models/querit-4b-vllm:/home/obj/models/querit-4b-vllm:ro", unit)
+        self.assertIn("/usr/local/bin/vllm serve /home/obj/models/querit-4b-vllm", unit)
+        self.assertIn("--runner pooling", unit)
+        self.assertNotIn("querit_openai_rerank_server.py", unit)
+        self.assertNotIn("querit_score_contract.py", unit)
         self.assertIn("--entrypoint python3", unit)
         self.assertNotIn("pip install", unit)
         self.assertNotIn("--dns", unit)
         self.assertNotRegex(unit, r"aeon-vllm-ultimate:[^\s\\]+(?:\s|\\)")
 
-    def test_unit_follows_text_lifecycle_for_uma_safe_restart(self) -> None:
+    def test_unit_is_independent_from_text_and_guard_admission_controls_concurrency(self) -> None:
         unit = QUERIT_UNIT.read_text()
         unit_section = unit.split("[Service]", 1)[0]
         # Reranker is independent of text lifecycle so it doesn't stop during
         # text restart (user cannot accept rr downtime).
         self.assertNotIn("Requires=vllm-aeon-27b-dflash.service", unit_section)
         self.assertNotIn("After=vllm-aeon-27b-dflash.service", unit_section)
-        self.assertIn("Conflicts=vllm-reranker.service", unit)
+        self.assertIn("Conflicts=vllm-qwen3-reranker-8b.service", unit)
         self.assertNotIn("http://100.105.4.92:18010", unit)
-        self.assertIn("gb10_check_mem_available.sh 2", unit)
         self.assertIn("--memory 18g", unit)
         self.assertIn("--memory-swap 18g", unit)
+        self.assertIn("--memory-swappiness 0", unit)
+        self.assertIn("--swap-space 0", unit)
+        self.assertIn("--max-num-batched-tokens 16384", unit)
+        self.assertIn("--max-num-seqs 256", unit)
+        self.assertIn("--max-num-partial-prefills 64", unit)
+        self.assertIn("--max-long-partial-prefills 64", unit)
         ready = unit.index("gb10_service_ready.sh rerank")
         timeout = re.search(r"^TimeoutStartSec=(\d+)$", unit, re.MULTILINE)
         if timeout is None:
@@ -232,7 +232,7 @@ class QueritServiceContractTests(unittest.TestCase):
         for backend in (
             "vllm-aeon-27b-dflash.service",
             "vllm-embedding.service",
-            "querit-4b-reranker.service",
+            "vllm-querit-4b-reranker.service",
             "vllm-qwen3-reranker-8b.service",
         ):
             self.assertNotIn(backend, unit_section)
@@ -391,12 +391,12 @@ class QueritServiceContractTests(unittest.TestCase):
         profiles = {profile["name"]: profile for profile in config["upstreams"]}
         self.assertLess(profiles["aeon-chat"]["max_in_flight_requests"], backend_limit)
 
-    def test_readme_disables_legacy_before_enabling_querit(self) -> None:
+    def test_readme_disables_fallback_before_enabling_canonical_querit_vllm_owner(self) -> None:
         readme = README.read_text()
         disable = readme.index(
             "systemctl --user disable --now vllm-qwen3-reranker-8b.service"
         )
-        enable = readme.index("systemctl --user enable --now querit-4b-reranker.service")
+        enable = readme.index("systemctl --user enable --now vllm-querit-4b-reranker.service")
         self.assertLess(disable, enable)
 
 
