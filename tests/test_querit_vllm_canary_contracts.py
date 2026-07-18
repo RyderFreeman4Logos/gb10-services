@@ -210,15 +210,21 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
         self,
     ) -> None:
         self.assertGreater(
-            profile.candidate_budget_kib_for_utilization(22, 100),
+            profile.candidate_budget_kib_for_utilization(26, 100),
             profile.MAX_CANDIDATE_BUDGET_KIB,
         )
         self.assertLessEqual(
             profile.CANDIDATE_STARTUP_BUDGET_KIB,
             profile.MAX_CANDIDATE_BUDGET_KIB,
         )
-        self.assertEqual(profile.RESERVE_KIB, 30 * 1024 * 1024)
+        self.assertEqual(profile.RESERVE_KIB, 20 * 1024 * 1024)
         self.assertEqual(profile.UNCERTAINTY_MARGIN_KIB, 2 * 1024 * 1024)
+        self.assertEqual(
+            profile.MAX_CANDIDATE_BUDGET_KIB,
+            profile.OBSERVED_MEMAVAILABLE_MINIMUM_KIB
+            - profile.RESERVE_KIB
+            - profile.UNCERTAINTY_MARGIN_KIB,
+        )
         self.assertEqual(
             profile.REQUIRED_ADMISSION_KIB,
             profile.CANDIDATE_STARTUP_BUDGET_KIB
@@ -387,15 +393,15 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
             "input_tokens",
             "gb10_querit_canary_lifecycle.py activate",
             "gb10_querit_canary_lifecycle.py deactivate",
-            "56,371,446 KiB",
+            "45,885,686 KiB",
             "stop then start",
             "No production cutover",
             "127.0.0.1:18015",
             "100.105.4.92:18015",
             "without a wildcard bind",
             "--gpu-memory-utilization 0.17",
-            "22.595 GiB",
-            "30 GiB reserve",
+            "32.595 GiB",
+            "20 GiB reserve",
             "2 GiB uncertainty margin",
             "8,043,564,036",
             "8,043,558,914",

@@ -109,18 +109,23 @@ vLLM Querit (replacing RR): ~8G weights + 4.8G KV + overhead ≈ 15-18G (same or
 
 The aggregate-only candidate receipt observed a minimum `MemAvailable` of
 `57,246,636 KiB` while legacy Querit, embedding, and Guard remained online.
-The source-controlled profile retains the exact 30 GiB reserve
-(`31,457,280 KiB`) and a further 2 GiB uncertainty margin (`2,097,152 KiB`).
-It therefore permits at most `23,692,204 KiB` (about 22.595 GiB) for candidate
-startup. The explicit 0.17 GPU-utilization profile has a conservative
-`22,817,014 KiB` (21.76 GiB) startup budget and derives a
-`56,371,446 KiB` owner admission floor. The prior 0.22 profile exceeds the
-new candidate budget bound and is rejected.
+The refreshed legacy allocator initially exposed more than 87 GiB, but live
+traffic returned the host to `53,027,788 KiB` before the next 60-second gate.
+That high-water regrowth repeatedly defeated the earlier 30 GiB reserve even
+though PSI remained zero and `pswpout` did not increase. The source-controlled
+profile therefore uses the operator-authorized 20 GiB reserve
+(`20,971,520 KiB`) and retains the 2 GiB uncertainty margin (`2,097,152 KiB`).
+The observed envelope permits at most `34,177,964 KiB` (about 32.595 GiB) for
+candidate startup. The unchanged explicit 0.17 GPU-utilization profile has a
+conservative `22,817,014 KiB` (21.76 GiB) startup budget and now derives a
+`45,885,686 KiB` owner admission floor. The model, BF16 precision, 32K context,
+score semantics, and candidate memory ceiling are unchanged.
 
 Before any mutation, the owner parses the sealed candidate unit and rejects
 duplicate, missing, or mismatched vLLM profile options. It derives the
 admission floor from that same profile authority; the subsequent re-attestation
-must observe identical memory/swap/PSI facts before install and activation.
+must freshly satisfy the memory and PSI contract, retain the exact swap
+topology, and observe no additional swap-out before install and activation.
 This is source-level feasibility only: a fresh live memory gate and an actual
 vLLM startup still have to prove the candidate.
 
