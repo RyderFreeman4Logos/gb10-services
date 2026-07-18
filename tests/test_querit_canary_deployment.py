@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import shutil
 import stat
@@ -15,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 deployment = importlib.import_module("querit_canary_deployment")
+profile = deployment
 runtime = importlib.import_module("querit_canary_runtime")
 PRODUCTION_TARGETS = deployment.TARGETS
 VERIFY_BUNDLE_CONTENTS = deployment._verify_bundle_contents
@@ -47,6 +49,7 @@ class FakeHost:
         self._lifecycle_state = False
         self._text_was_paused = False
         self._admission = {
+            "mem_available_kib": profile.REQUIRED_ADMISSION_KIB,
             "mem_available_gib": 32,
             "pressure_sha256": "p" * 64,
             "swaps_sha256": "s" * 64,
@@ -309,6 +312,47 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn("config/querit/querit-rerank.jinja", mapping)
         self.assertIn("scripts/querit_canary_deployment.py", mapping)
         self.assertIn("scripts/gb10_querit_canary_deploy.py", mapping)
+
+    def test_owner_rejects_candidate_admission_below_profile_threshold(self) -> None:
+        self.host._admission["mem_available_kib"] = profile.REQUIRED_ADMISSION_KIB - 1
+
+        with self.assertRaisesRegex(
+            deployment.DeploymentError, "candidate admission is below profile threshold"
+        ):
+            self.owner.plan(self.bundle)
+
+        self.assertEqual(self.host.commands, [])
+
+    def test_owner_rejects_bundle_unit_profile_mismatch_before_mutation(self) -> None:
+        payload = (
+            self.bundle / "payload" / "systemd" / runtime.BACKEND_UNIT
+        )
+        changed = (
+            (ROOT / "systemd" / runtime.BACKEND_UNIT)
+            .read_text()
+            .replace("--gpu-memory-utilization 0.17", "--gpu-memory-utilization 0.16")
+            .encode()
+        )
+        payload.write_bytes(changed)
+        manifest = json.loads((self.bundle / "manifest.json").read_text())
+        entries = manifest["files"]
+        entry = next(
+            item
+            for item in entries
+            if item["path"] == "systemd/vllm-querit-4b-canary-backend.service"
+        )
+        entry["sha256"] = deployment._sha256(changed)
+        entry["size"] = len(changed)
+        (self.bundle / "manifest.json").write_bytes(
+            deployment._canonical(deployment._bundle_manifest(entries, "a" * 40))
+        )
+
+        with self.assertRaisesRegex(
+            deployment.DeploymentError, "profile authority"
+        ):
+            VERIFY_BUNDLE_CONTENTS(self.bundle)
+
+        self.assertEqual(self.host.commands, [])
 
     def test_prepare_install_activate_and_rollback_restore_exact_prestate(self) -> None:
         self.owner.prepare(self.bundle)

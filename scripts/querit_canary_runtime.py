@@ -136,12 +136,15 @@ class SystemHost:
         return querit_vllm_artifact.manifest_sha256(self.model_root)
 
     def memory_available_gib(self) -> int:
+        return self.memory_available_kib() // (1024 * 1024)
+
+    def memory_available_kib(self) -> int:
         try:
             for line in Path("/proc/meminfo").read_text().splitlines():
                 if line.startswith("MemAvailable:"):
                     parts = line.split()
                     if len(parts) == 3 and parts[2] == "kB":
-                        return int(parts[1]) // (1024 * 1024)
+                        return int(parts[1])
         except (OSError, UnicodeError, ValueError) as exc:
             raise LifecycleError("cannot read MemAvailable") from exc
         raise LifecycleError("MemAvailable is missing from /proc/meminfo")

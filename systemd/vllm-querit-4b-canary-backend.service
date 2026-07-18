@@ -44,10 +44,15 @@ ExecStart=/usr/bin/docker run --rm --name vllm-querit-4b-canary \
     --runner pooling \
     --dtype bfloat16 \
     --max-model-len 32768 \
-    --gpu-memory-utilization 0.22 \
+    --gpu-memory-utilization 0.17 \
     --kv-cache-memory-bytes 4800M \
-    --max-num-batched-tokens 4096 \
-    --max-num-seqs 16 \
+    --kv-cache-dtype auto \
+    --tensor-parallel-size 1 \
+    --pipeline-parallel-size 1 \
+    --swap-space 0 \
+    --cpu-offload-gb 0 \
+    --max-num-batched-tokens 1024 \
+    --max-num-seqs 1 \
     --enable-chunked-prefill \
     --max-num-partial-prefills 1 \
     --max-long-partial-prefills 1 \

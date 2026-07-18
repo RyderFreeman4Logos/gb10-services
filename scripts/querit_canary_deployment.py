@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -38,10 +39,184 @@ BIN_ROOT = Path("/home/obj/.local/bin")
 UNIT_ROOT = Path("/home/obj/.config/systemd/user")
 RUNTIME_UNIT_ROOT = Path("/run/user/1001/systemd/user")
 CANDIDATE_UNITS = (runtime.BACKEND_UNIT, runtime.ADAPTER_UNIT)
+KIB_PER_GIB = 1024 * 1024
+GPU_MEMORY_ENVELOPE_KIB = 128 * KIB_PER_GIB
+GPU_MEMORY_UTILIZATION_NUMERATOR = 17
+GPU_MEMORY_UTILIZATION_DENOMINATOR = 100
+GPU_MEMORY_UTILIZATION = "0.17"
+OBSERVED_MEMAVAILABLE_MINIMUM_KIB = 57_246_636
+RESERVE_KIB = 30 * KIB_PER_GIB
+UNCERTAINTY_MARGIN_KIB = 2 * KIB_PER_GIB
+MAX_CANDIDATE_BUDGET_KIB = 23_692_204
+MODEL_DIR = "/home/obj/models/querit-4b-vllm"
+SERVED_MODEL_NAMES = (
+    "qwen3-reranker-8b",
+    "Qwen/Qwen3-Reranker-8B",
+    "Querit/Querit-4B",
+)
+RUNNER = "pooling"
+DTYPE = "bfloat16"
+MAX_MODEL_LEN = 32_768
+MAX_NUM_BATCHED_TOKENS = 1_024
+MAX_NUM_SEQS = 1
 
 
 class DeploymentError(RuntimeError):
     """The source-controlled deployment contract was not satisfied."""
+
+
+class ProfileError(ValueError):
+    """The source-controlled canary profile is incomplete or inconsistent."""
+
+
+def candidate_budget_kib_for_utilization(numerator: int, denominator: int) -> int:
+    """Return the conservative whole-KiB vLLM GPU-allocation budget."""
+
+    if (
+        isinstance(numerator, bool)
+        or isinstance(denominator, bool)
+        or numerator <= 0
+        or denominator <= 0
+        or numerator > denominator
+    ):
+        raise ProfileError("GPU memory utilization ratio is invalid")
+    return (
+        GPU_MEMORY_ENVELOPE_KIB * numerator + denominator - 1
+    ) // denominator
+
+
+CANDIDATE_STARTUP_BUDGET_KIB = candidate_budget_kib_for_utilization(
+    GPU_MEMORY_UTILIZATION_NUMERATOR,
+    GPU_MEMORY_UTILIZATION_DENOMINATOR,
+)
+REQUIRED_ADMISSION_KIB = (
+    CANDIDATE_STARTUP_BUDGET_KIB + RESERVE_KIB + UNCERTAINTY_MARGIN_KIB
+)
+
+_VLLM_OPTION_ARITIES = {
+    "--host": 1,
+    "--port": 1,
+    "--served-model-name": 3,
+    "--runner": 1,
+    "--dtype": 1,
+    "--max-model-len": 1,
+    "--gpu-memory-utilization": 1,
+    "--kv-cache-memory-bytes": 1,
+    "--kv-cache-dtype": 1,
+    "--tensor-parallel-size": 1,
+    "--pipeline-parallel-size": 1,
+    "--swap-space": 1,
+    "--cpu-offload-gb": 1,
+    "--max-num-batched-tokens": 1,
+    "--max-num-seqs": 1,
+    "--enable-chunked-prefill": 0,
+    "--max-num-partial-prefills": 1,
+    "--max-long-partial-prefills": 1,
+    "--long-prefill-token-threshold": 1,
+    "--enforce-eager": 0,
+    "--chat-template": 1,
+}
+_VLLM_OPTION_VALUES = {
+    "--host": ("0.0.0.0",),
+    "--port": ("8000",),
+    "--served-model-name": SERVED_MODEL_NAMES,
+    "--runner": (RUNNER,),
+    "--dtype": (DTYPE,),
+    "--max-model-len": (str(MAX_MODEL_LEN),),
+    "--gpu-memory-utilization": (GPU_MEMORY_UTILIZATION,),
+    "--kv-cache-memory-bytes": ("4800M",),
+    "--kv-cache-dtype": ("auto",),
+    "--tensor-parallel-size": ("1",),
+    "--pipeline-parallel-size": ("1",),
+    "--swap-space": ("0",),
+    "--cpu-offload-gb": ("0",),
+    "--max-num-batched-tokens": (str(MAX_NUM_BATCHED_TOKENS),),
+    "--max-num-seqs": (str(MAX_NUM_SEQS),),
+    "--enable-chunked-prefill": (),
+    "--max-num-partial-prefills": ("1",),
+    "--max-long-partial-prefills": ("1",),
+    "--long-prefill-token-threshold": ("8192",),
+    "--enforce-eager": (),
+    "--chat-template": (f"{MODEL_DIR}/querit-rerank.jinja",),
+}
+
+
+def _logical_exec_start(unit: str) -> list[str]:
+    commands: list[list[str]] = []
+    pending: list[str] = []
+    for raw_line in unit.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if pending:
+            value = line
+        elif line.startswith("ExecStart="):
+            value = line.removeprefix("ExecStart=")
+        else:
+            continue
+        continued = value.endswith("\\")
+        if continued:
+            value = value[:-1].rstrip()
+        pending.append(value)
+        if not continued:
+            commands.append(shlex.split(" ".join(pending), posix=True))
+            pending = []
+    if pending or len(commands) != 1:
+        raise ProfileError("canary backend must have exactly one complete ExecStart")
+    return commands[0]
+
+
+def _backend_options(unit: str) -> dict[str, tuple[str, ...]]:
+    argv = _logical_exec_start(unit)
+    try:
+        vllm_index = argv.index("/usr/local/bin/vllm")
+    except ValueError as exc:
+        raise ProfileError("canary backend is missing the vLLM executable") from exc
+    if argv[vllm_index : vllm_index + 3] != [
+        "/usr/local/bin/vllm",
+        "serve",
+        MODEL_DIR,
+    ]:
+        raise ProfileError("canary backend vLLM command or model path is invalid")
+    options: dict[str, tuple[str, ...]] = {}
+    index = vllm_index + 3
+    while index < len(argv):
+        option = argv[index]
+        arity = _VLLM_OPTION_ARITIES.get(option)
+        if arity is None:
+            raise ProfileError(f"unknown vLLM option: {option}")
+        if option in options:
+            raise ProfileError(f"duplicate vLLM option: {option}")
+        values = tuple(argv[index + 1 : index + 1 + arity])
+        if len(values) != arity or any(value.startswith("--") for value in values):
+            raise ProfileError(f"vLLM option has invalid arity: {option}")
+        options[option] = values
+        index += 1 + arity
+    return options
+
+
+def validate_backend_unit(unit: str) -> None:
+    """Reject any unit whose explicit vLLM memory profile differs from this one."""
+
+    if _backend_options(unit) != _VLLM_OPTION_VALUES:
+        raise ProfileError("vLLM option set does not match profile authority")
+    if CANDIDATE_STARTUP_BUDGET_KIB > MAX_CANDIDATE_BUDGET_KIB:
+        raise ProfileError("candidate startup budget exceeds the measured envelope")
+    if REQUIRED_ADMISSION_KIB > OBSERVED_MEMAVAILABLE_MINIMUM_KIB:
+        raise ProfileError("candidate admission exceeds the observed memory minimum")
+
+
+def validate_admission(admission: Mapping[str, object]) -> None:
+    """Require the exact profile-derived admission floor before any mutation."""
+
+    available = admission.get("mem_available_kib")
+    if isinstance(available, bool) or not isinstance(available, int) or available < 0:
+        raise ProfileError("candidate admission MemAvailable is invalid")
+    if available < REQUIRED_ADMISSION_KIB:
+        raise ProfileError(
+            "candidate admission is below profile threshold: "
+            f"{available} KiB < {REQUIRED_ADMISSION_KIB} KiB"
+        )
 
 
 class Host(Protocol):
@@ -202,12 +377,14 @@ class SystemHost:
 
     def admission(self) -> dict[str, object]:
         try:
-            mem_available = self._runtime.memory_available_gib()
+            mem_available_kib = self._runtime.memory_available_kib()
+            mem_available = mem_available_kib // KIB_PER_GIB
             swaps = Path("/proc/swaps").read_text()
             pressure = Path("/proc/pressure/memory").read_text()
         except (OSError, UnicodeError, runtime.LifecycleError) as exc:
             raise DeploymentError("cannot collect memory/swap/PSI admission facts") from exc
         return {
+            "mem_available_kib": mem_available_kib,
             "mem_available_gib": mem_available,
             "pressure_sha256": _sha256(pressure.encode()),
             "swaps_sha256": _sha256(swaps.encode()),
@@ -530,6 +707,11 @@ def _verify_bundle_contents(bundle: Path) -> dict[str, object]:
         if (size, digest) != (entry["size"], entry["sha256"]):
             raise DeploymentError(f"bundle payload drifted: {entry['path']}")
         expected_entries.append(dict(entry))
+    backend_unit = bundle / "payload" / "systemd" / runtime.BACKEND_UNIT
+    try:
+        validate_backend_unit(backend_unit.read_text())
+    except (OSError, UnicodeError, ProfileError) as exc:
+        raise DeploymentError("candidate unit disagrees with profile authority") from exc
     expected = _bundle_manifest(expected_entries, head)
     if manifest != expected or bundle.name != expected["bundle_sha256"]:
         raise DeploymentError("bundle manifest identity is invalid")
@@ -1007,6 +1189,13 @@ class Deployment:
             raise DeploymentError("text service is masked and cannot be transactionally restored")
         if prestate.get("bundle_sha256") != manifest.get("bundle_sha256"):
             raise DeploymentError("prestate bundle identity is invalid")
+        admission = prestate.get("admission")
+        if not isinstance(admission, dict):
+            raise DeploymentError("candidate admission prestate is invalid")
+        try:
+            validate_admission(admission)
+        except ProfileError as exc:
+            raise DeploymentError(str(exc)) from exc
 
     def _reattest_preinstall(self, record: Mapping[str, object], manifest: Mapping[str, object]) -> None:
         prestate = record.get("prestate")

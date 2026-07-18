@@ -107,16 +107,32 @@ evidence alone.
 Current: text 41.4G + emb 20.3G + RR 17.6G = 79.3G / 121.6G, MemAvail 26.6G
 vLLM Querit (replacing RR): ~8G weights + 4.8G KV + overhead ≈ 15-18G (same or less)
 
-Canary activation requires **20 GiB** `MemAvailable` before the 18 GiB-bounded
-backend starts. The tracked lifecycle transaction verifies the converted
-artifact manifest and snapshots embedding, both current/legacy reranker units,
-Guard, and text. If headroom is low it may stop text only, then remeasures. It
-starts the backend and adapter with `stop then start` operations only, warms the
-public wire endpoint plus native peak-context and batching paths, then checks
-OOM counters, headroom, and unit/container/PID identity. It restores text plus
-canary pre-state after every failure or termination signal. It never stops
-embedding, either production reranker, or Guard, and the canary is never
-enrolled in the guardian.
+The aggregate-only candidate receipt observed a minimum `MemAvailable` of
+`57,246,636 KiB` while legacy Querit, embedding, and Guard remained online.
+The source-controlled profile retains the exact 30 GiB reserve
+(`31,457,280 KiB`) and a further 2 GiB uncertainty margin (`2,097,152 KiB`).
+It therefore permits at most `23,692,204 KiB` (about 22.595 GiB) for candidate
+startup. The explicit 0.17 GPU-utilization profile has a conservative
+`22,817,014 KiB` (21.76 GiB) startup budget and derives a
+`56,371,446 KiB` owner admission floor. The prior 0.22 profile exceeds the
+new candidate budget bound and is rejected.
+
+Before any mutation, the owner parses the sealed candidate unit and rejects
+duplicate, missing, or mismatched vLLM profile options. It derives the
+admission floor from that same profile authority; the subsequent re-attestation
+must observe identical memory/swap/PSI facts before install and activation.
+This is source-level feasibility only: a fresh live memory gate and an actual
+vLLM startup still have to prove the candidate.
+
+The tracked lifecycle transaction verifies the converted artifact manifest and
+snapshots embedding, both current/legacy reranker units, Guard, and text. If
+headroom is low it may stop text only, then remeasures. It starts the backend
+and adapter with `stop then start` operations only, warms the public wire
+endpoint plus native peak-context and batching paths, then checks OOM counters,
+headroom, and unit/container/PID identity. It restores text plus canary
+pre-state after every failure or termination signal. It never stops embedding,
+either production reranker, or Guard, and the canary is never enrolled in the
+guardian.
 
 ### v0.24 → v0.25.1 note
 
@@ -242,10 +258,15 @@ vllm serve /home/obj/models/querit-4b-vllm \
   --runner pooling \
   --dtype bfloat16 \
   --max-model-len 32768 \
-  --gpu-memory-utilization 0.22 \
+  --gpu-memory-utilization 0.17 \
   --kv-cache-memory-bytes 4800M \
-  --max-num-batched-tokens 4096 \
-  --max-num-seqs 16 \
+  --kv-cache-dtype auto \
+  --tensor-parallel-size 1 \
+  --pipeline-parallel-size 1 \
+  --swap-space 0 \
+  --cpu-offload-gb 0 \
+  --max-num-batched-tokens 1024 \
+  --max-num-seqs 1 \
   --enable-chunked-prefill \
   --max-num-partial-prefills 1 \
   --max-long-partial-prefills 1 \
@@ -261,10 +282,14 @@ backend path; the Tailnet publish is direct native `/v1/rerank` access. The
 adapter publishes the exact DeepInfra-native API only on Tailscale port 18014.
 Docker bounds the backend to 18 GiB memory and swap with swappiness 0; both
 systemd and the container use OOM score adjustment 500. The canary explicitly
-sets `--gpu-memory-utilization 0.22`; it never relies on vLLM 0.25.1's `0.92`
-default, while retaining the explicit `--kv-cache-memory-bytes 4800M` profile.
-`Restart=no` and the
-transaction-authorized `ExecCondition` prevent retry loops or ad-hoc starts.
+sets the model dtype, context, GPU utilization, KV allocation/dtype,
+tensor/pipeline parallelism, CPU swap/offload, batching, sequences, partial
+prefills, and eager mode; it never relies on a vLLM 0.25.1 memory default.
+The low-concurrency feasibility profile preserves the exact model, BF16
+precision, 32,768-token context, artifact, and scoring contracts while using
+`--gpu-memory-utilization 0.17`, `--max-num-batched-tokens 1024`, and
+`--max-num-seqs 1`. `Restart=no` and the transaction-authorized
+`ExecCondition` prevent retry loops or ad-hoc starts.
 
 ## Direct legacy/canary equivalence harness
 

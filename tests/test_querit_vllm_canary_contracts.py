@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import importlib
 import shlex
+import sys
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+profile = importlib.import_module("querit_canary_deployment")
+runtime = importlib.import_module("querit_canary_runtime")
 ADAPTER_UNIT = ROOT / "systemd" / "vllm-querit-4b-canary.service"
 BACKEND_UNIT = ROOT / "systemd" / "vllm-querit-4b-canary-backend.service"
 PRODUCTION_UNIT = ROOT / "systemd" / "querit-4b-reranker.service"
@@ -135,6 +141,11 @@ def _backend_contract(unit: str) -> None:
         "--max-model-len": 1,
         "--gpu-memory-utilization": 1,
         "--kv-cache-memory-bytes": 1,
+        "--kv-cache-dtype": 1,
+        "--tensor-parallel-size": 1,
+        "--pipeline-parallel-size": 1,
+        "--swap-space": 1,
+        "--cpu-offload-gb": 1,
         "--max-num-batched-tokens": 1,
         "--max-num-seqs": 1,
         "--enable-chunked-prefill": 0,
@@ -160,10 +171,15 @@ def _backend_contract(unit: str) -> None:
         "--runner": ["pooling"],
         "--dtype": ["bfloat16"],
         "--max-model-len": ["32768"],
-        "--gpu-memory-utilization": ["0.22"],
+        "--gpu-memory-utilization": ["0.17"],
         "--kv-cache-memory-bytes": ["4800M"],
-        "--max-num-batched-tokens": ["4096"],
-        "--max-num-seqs": ["16"],
+        "--kv-cache-dtype": ["auto"],
+        "--tensor-parallel-size": ["1"],
+        "--pipeline-parallel-size": ["1"],
+        "--swap-space": ["0"],
+        "--cpu-offload-gb": ["0"],
+        "--max-num-batched-tokens": ["1024"],
+        "--max-num-seqs": ["1"],
         "--enable-chunked-prefill": [],
         "--max-num-partial-prefills": ["1"],
         "--max-long-partial-prefills": ["1"],
@@ -173,6 +189,7 @@ def _backend_contract(unit: str) -> None:
     }
     if options != expected_options:
         raise AssertionError(f"wrong vLLM canary options: {options}")
+    profile.validate_backend_unit(unit)
 
     if start_posts[0] != [
         "/home/obj/.local/bin/gb10_service_ready.sh",
@@ -188,6 +205,59 @@ def _backend_contract(unit: str) -> None:
 class QueritVllmCanaryContractTests(unittest.TestCase):
     def test_launch_profile_is_exact_and_digest_pinned(self) -> None:
         _backend_contract(BACKEND_UNIT.read_text())
+
+    def test_candidate_budget_is_below_observed_envelope_with_reserve_and_margin(
+        self,
+    ) -> None:
+        self.assertGreater(
+            profile.candidate_budget_kib_for_utilization(22, 100),
+            profile.MAX_CANDIDATE_BUDGET_KIB,
+        )
+        self.assertLessEqual(
+            profile.CANDIDATE_STARTUP_BUDGET_KIB,
+            profile.MAX_CANDIDATE_BUDGET_KIB,
+        )
+        self.assertEqual(profile.RESERVE_KIB, 30 * 1024 * 1024)
+        self.assertEqual(profile.UNCERTAINTY_MARGIN_KIB, 2 * 1024 * 1024)
+        self.assertEqual(
+            profile.REQUIRED_ADMISSION_KIB,
+            profile.CANDIDATE_STARTUP_BUDGET_KIB
+            + profile.RESERVE_KIB
+            + profile.UNCERTAINTY_MARGIN_KIB,
+        )
+        self.assertLessEqual(
+            profile.REQUIRED_ADMISSION_KIB,
+            profile.OBSERVED_MEMAVAILABLE_MINIMUM_KIB,
+        )
+
+    def test_profile_rejects_duplicate_or_conflicting_memory_and_concurrency_flags(
+        self,
+    ) -> None:
+        unit = BACKEND_UNIT.read_text()
+        duplicate = unit.replace(
+            f"    --max-num-seqs {profile.MAX_NUM_SEQS} \\",
+            f"    --max-num-seqs {profile.MAX_NUM_SEQS} \\\n    --max-num-seqs 2 \\",
+        )
+        with self.assertRaisesRegex(profile.ProfileError, "duplicate vLLM option"):
+            profile.validate_backend_unit(duplicate)
+
+        conflicting = unit.replace(
+            f"    --gpu-memory-utilization {profile.GPU_MEMORY_UTILIZATION} \\",
+            "    --gpu-memory-utilization 0.16 \\",
+        )
+        with self.assertRaisesRegex(profile.ProfileError, "does not match profile"):
+            profile.validate_backend_unit(conflicting)
+
+    def test_peak_warmup_and_model_semantics_stay_bound_to_profile(self) -> None:
+        self.assertEqual(profile.MAX_MODEL_LEN, 32768)
+        self.assertEqual(runtime.PEAK_CONTEXT_TOKENS, profile.MAX_MODEL_LEN)
+        self.assertEqual(runtime.PEAK_BATCH_SIZE, 16)
+        self.assertEqual(profile.DTYPE, "bfloat16")
+        self.assertEqual(profile.RUNNER, "pooling")
+        self.assertEqual(
+            profile.SERVED_MODEL_NAMES,
+            ("qwen3-reranker-8b", "Qwen/Qwen3-Reranker-8B", "Querit/Querit-4B"),
+        )
 
     def test_public_18014_is_the_deepinfra_adapter_not_raw_vllm(self) -> None:
         unit = ADAPTER_UNIT.read_text()
@@ -317,19 +387,23 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
             "input_tokens",
             "gb10_querit_canary_lifecycle.py activate",
             "gb10_querit_canary_lifecycle.py deactivate",
-            "20 GiB",
+            "56,371,446 KiB",
             "stop then start",
             "No production cutover",
             "127.0.0.1:18015",
             "100.105.4.92:18015",
             "without a wildcard bind",
-            "--gpu-memory-utilization 0.22",
+            "--gpu-memory-utilization 0.17",
+            "22.595 GiB",
+            "30 GiB reserve",
+            "2 GiB uncertainty margin",
             "8,043,564,036",
             "8,043,558,914",
             "-5,122",
             "scripts/querit_replay_trust.py",
         ):
             self.assertIn(required, note)
+        self.assertNotIn("--gpu-memory-utilization 0.22", note)
 
 
 if __name__ == "__main__":
