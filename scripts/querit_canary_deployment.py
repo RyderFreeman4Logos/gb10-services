@@ -607,18 +607,246 @@ def _candidate_container(host: Host, unit: str) -> dict[str, str] | None:
     return host.container(name) if name is not None else None
 
 
-def _artifact_snapshot(path: Path) -> dict[str, object]:
+def _prestate_metadata(metadata: os.stat_result, node_type: str) -> dict[str, object]:
+    return {
+        "device": metadata.st_dev,
+        "gid": metadata.st_gid,
+        "inode": metadata.st_ino,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "nlink": metadata.st_nlink,
+        "type": node_type,
+        "uid": metadata.st_uid,
+    }
+
+
+def _prestate_relative(root: Path, path: Path) -> str:
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise DeploymentError("artifact prestate path escaped its root") from exc
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise DeploymentError("artifact prestate path traversal is unsafe")
+    return relative.as_posix()
+
+
+def _hash_prestate_file(path: Path, expected: os.stat_result) -> tuple[int, str]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise DeploymentError(f"cannot safely read artifact prestate file: {path}") from exc
+    try:
+        before = os.fstat(descriptor)
+        stable_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_nlink,
+            before.st_uid,
+            before.st_gid,
+            before.st_size,
+        )
+        stable_expected = (
+            expected.st_dev,
+            expected.st_ino,
+            expected.st_mode,
+            expected.st_nlink,
+            expected.st_uid,
+            expected.st_gid,
+            expected.st_size,
+        )
+        if (
+            stable_before != stable_expected
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size < 0
+            or before.st_size > artifact.MAX_FILE_BYTES
+        ):
+            raise DeploymentError(f"artifact prestate file is unsafe: {path}")
+        digest = hashlib.sha256()
+        observed = 0
+        while chunk := os.read(descriptor, 1024 * 1024):
+            observed += len(chunk)
+            if observed > artifact.MAX_FILE_BYTES:
+                raise DeploymentError(f"artifact prestate file grew while hashing: {path}")
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        stable_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_nlink,
+            after.st_uid,
+            after.st_gid,
+            after.st_size,
+        )
+        if stable_before != stable_after or observed != before.st_size:
+            raise DeploymentError(f"artifact prestate file changed while hashing: {path}")
+        return observed, digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _unsealed_artifact_prestate(path: Path) -> dict[str, object]:
+    try:
+        root_metadata = path.lstat()
+    except OSError as exc:
+        raise DeploymentError("cannot inspect unsealed artifact root") from exc
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+        raise DeploymentError("candidate artifact path is not a real directory")
+    if root_metadata.st_uid != os.geteuid() or root_metadata.st_gid != os.getegid():
+        raise DeploymentError("artifact prestate root ownership is unsupported")
+
+    root_identity = _prestate_metadata(root_metadata, "directory")
+    entries: list[dict[str, object]] = []
+    try:
+        for directory, dirnames, filenames in os.walk(path, followlinks=False):
+            directory_path = Path(directory)
+            directory_metadata = directory_path.lstat()
+            if (
+                stat.S_ISLNK(directory_metadata.st_mode)
+                or not stat.S_ISDIR(directory_metadata.st_mode)
+                or directory_metadata.st_uid != root_metadata.st_uid
+                or directory_metadata.st_gid != root_metadata.st_gid
+            ):
+                raise DeploymentError(f"artifact prestate directory is unsafe: {directory_path}")
+            if directory_path != path:
+                entries.append(
+                    {
+                        "path": _prestate_relative(path, directory_path),
+                        **_prestate_metadata(directory_metadata, "directory"),
+                    }
+                )
+                if len(entries) > artifact.MAX_FILES:
+                    raise DeploymentError("artifact prestate contains too many entries")
+            dirnames.sort()
+            filenames.sort()
+            for dirname in dirnames:
+                child = directory_path / dirname
+                metadata = child.lstat()
+                if (
+                    stat.S_ISLNK(metadata.st_mode)
+                    or not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != root_metadata.st_uid
+                    or metadata.st_gid != root_metadata.st_gid
+                ):
+                    raise DeploymentError(f"artifact prestate directory is unsafe: {child}")
+            for filename in filenames:
+                child = directory_path / filename
+                metadata = child.lstat()
+                if (
+                    stat.S_ISLNK(metadata.st_mode)
+                    or not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or metadata.st_uid != root_metadata.st_uid
+                    or metadata.st_gid != root_metadata.st_gid
+                ):
+                    raise DeploymentError(f"artifact prestate file is unsafe: {child}")
+                size, digest = _hash_prestate_file(child, metadata)
+                entries.append(
+                    {
+                        "path": _prestate_relative(path, child),
+                        "sha256": digest,
+                        "size": size,
+                        **_prestate_metadata(metadata, "regular"),
+                    }
+                )
+                if len(entries) > artifact.MAX_FILES:
+                    raise DeploymentError("artifact prestate contains too many entries")
+    except OSError as exc:
+        raise DeploymentError("cannot safely inventory unsealed artifact prestate") from exc
+    if _prestate_metadata(path.lstat(), "directory") != root_identity:
+        raise DeploymentError("artifact prestate root changed during inventory")
+    entries.sort(key=lambda entry: str(entry["path"]))
+    return {
+        "accepted_unsealed_prestate": True,
+        "exists": True,
+        "inventory": entries,
+        "kind": "unsealed-directory",
+        "root": root_identity,
+    }
+
+
+def _artifact_snapshot(
+    path: Path, *, accept_unsealed_artifact_prestate: bool = False
+) -> dict[str, object]:
     try:
         metadata = path.lstat()
     except FileNotFoundError:
-        return {"exists": False}
+        return {
+            "accept_unsealed_artifact_prestate": accept_unsealed_artifact_prestate,
+            "exists": False,
+        }
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise DeploymentError("candidate artifact path is not a real directory")
+    manifest_path = path / artifact.MANIFEST_NAME
+    if accept_unsealed_artifact_prestate and not os.path.lexists(manifest_path):
+        return _unsealed_artifact_prestate(path)
     return {
+        "accept_unsealed_artifact_prestate": accept_unsealed_artifact_prestate,
         "exists": True,
         "manifest_sha256": artifact.manifest_sha256(path),
         "mode": stat.S_IMODE(metadata.st_mode),
     }
+
+
+def _assert_artifact_prestate(path: Path, expected: Mapping[str, object]) -> None:
+    accepted = expected.get("accepted_unsealed_prestate")
+    if accepted is True:
+        observed = _unsealed_artifact_prestate(path)
+    elif accepted is None:
+        configured = expected.get("accept_unsealed_artifact_prestate")
+        if not isinstance(configured, bool):
+            raise DeploymentError("artifact prestate acceptance is invalid")
+        observed = _artifact_snapshot(
+            path, accept_unsealed_artifact_prestate=configured
+        )
+    else:
+        raise DeploymentError("artifact prestate acceptance is invalid")
+    if observed != expected:
+        raise DeploymentError("candidate artifact prestate drifted before installation")
+
+
+def _artifact_prestate_matches(path: Path, expected: Mapping[str, object]) -> bool:
+    try:
+        _assert_artifact_prestate(path, expected)
+    except (DeploymentError, artifact.ArtifactError):
+        return False
+    return True
+
+
+def _reserve_artifact_rollback_directory(parent: Path, bundle_sha256: str) -> Path:
+    try:
+        reserved = Path(
+            tempfile.mkdtemp(
+                prefix=f".gb10-querit-previous-{bundle_sha256[:16]}-",
+                dir=parent,
+            )
+        )
+        metadata = reserved.lstat()
+    except OSError as exc:
+        raise DeploymentError("cannot reserve artifact rollback directory") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or any(reserved.iterdir())
+    ):
+        raise DeploymentError("artifact rollback backup collision")
+    _fsync_directory(parent)
+    return reserved
+
+
+def _same_artifact_filesystem(path: Path, parent: Path) -> None:
+    try:
+        if path.lstat().st_dev != parent.stat().st_dev:
+            raise DeploymentError("cross-device artifact publication is forbidden")
+    except OSError as exc:
+        raise DeploymentError("cannot verify artifact publication filesystem") from exc
+
+
+def _path_lexists(path: Path) -> bool:
+    return os.path.lexists(path)
 
 
 def _copy_private_tree(source: Path, destination: Path) -> None:
@@ -643,13 +871,15 @@ class Deployment:
         artifact_path: Path,
         lifecycle_state: Path = DEFAULT_LIFECYCLE_STATE,
         accept_runtime_mask_prestate: bool = False,
+        accept_unsealed_artifact_prestate: bool = False,
     ) -> None:
         self.host = host
         self.state_path = state_path.expanduser().resolve(strict=False)
         self.source_root = source_root.expanduser().resolve(strict=True)
-        self.artifact_path = artifact_path.expanduser().resolve(strict=False)
+        self.artifact_path = artifact_path.expanduser().absolute()
         self.lifecycle_state = lifecycle_state.expanduser().resolve(strict=False)
         self.accept_runtime_mask_prestate = accept_runtime_mask_prestate
+        self.accept_unsealed_artifact_prestate = accept_unsealed_artifact_prestate
 
     def _write(self, record: dict[str, object]) -> None:
         _write_state(self.state_path, record)
@@ -679,7 +909,10 @@ class Deployment:
         }
         return {
             "admission": self.host.admission(),
-            "artifact": _artifact_snapshot(self.artifact_path),
+            "artifact": _artifact_snapshot(
+                self.artifact_path,
+                accept_unsealed_artifact_prestate=self.accept_unsealed_artifact_prestate,
+            ),
             "bundle_sha256": manifest["bundle_sha256"],
             "candidate_containers": containers,
             "candidate_runtime_masks": {
@@ -786,8 +1019,10 @@ class Deployment:
                 expected, _snapshot_file(target)
             ):
                 raise DeploymentError(f"deployed target drifted before installation: {target}")
-        if prestate.get("artifact") != _artifact_snapshot(self.artifact_path):
-            raise DeploymentError("candidate artifact prestate drifted before installation")
+        expected_artifact = prestate.get("artifact")
+        if not isinstance(expected_artifact, dict):
+            raise DeploymentError("candidate artifact prestate is invalid")
+        _assert_artifact_prestate(self.artifact_path, expected_artifact)
         if prestate.get("listeners") != list(self.host.listeners()):
             raise DeploymentError("candidate listener prestate drifted before installation")
         candidate_units = prestate.get("candidate_units")
@@ -845,6 +1080,7 @@ class Deployment:
             for unit in CANDIDATE_UNITS
         )
         return {
+            "artifact_prestate": prestate["artifact"],
             "bundle_sha256": manifest["bundle_sha256"],
             "candidate_runtime_mask_ownership": {
                 "accepted_prestate": accepted_runtime_masks,
@@ -941,20 +1177,36 @@ class Deployment:
         assert isinstance(artifact_record, dict)
         previous = artifact_record["artifact"]
         assert isinstance(previous, dict)
-        backup = self.artifact_path.parent / f".gb10-querit-previous-{manifest['bundle_sha256']}"
-        if backup.exists():
-            raise DeploymentError("previous candidate artifact backup path already exists")
+        previous_exists = previous.get("exists") is True
+        if previous.get("exists") not in {True, False}:
+            raise DeploymentError("candidate artifact prestate is invalid")
+        backup = (
+            _reserve_artifact_rollback_directory(
+                self.artifact_path.parent, str(manifest["bundle_sha256"])
+            )
+            if previous_exists
+            else None
+        )
         record["artifact_publication"] = {
             "new_manifest_sha256": new_manifest,
-            "previous_backup": str(backup),
-            "state": "staged",
+            "previous_backup": str(backup) if backup is not None else None,
+            "rename_started": False,
+            "state": "rename-intent",
         }
         self._write(record)
-        if self.artifact_path.exists():
+        _assert_artifact_prestate(self.artifact_path, previous)
+        if previous_exists:
+            assert backup is not None
+            _same_artifact_filesystem(self.artifact_path, self.artifact_path.parent)
+            _same_artifact_filesystem(stage, self.artifact_path.parent)
+        record["artifact_publication"]["rename_started"] = True  # type: ignore[index]
+        self._write(record)
+        if previous_exists:
+            assert backup is not None
             os.replace(self.artifact_path, backup)
             _fsync_directory(self.artifact_path.parent)
-            record["artifact_publication"]["state"] = "previous-moved"  # type: ignore[index]
-            self._write(record)
+        record["artifact_publication"]["state"] = "previous-moved"  # type: ignore[index]
+        self._write(record)
         os.replace(stage, self.artifact_path)
         _fsync_directory(self.artifact_path.parent)
         record["artifact_publication"]["state"] = "published"  # type: ignore[index]
@@ -1008,8 +1260,14 @@ class Deployment:
         self._reattest_preinstall(record, manifest)
         record["phase"] = "installing"
         self._write(record)
-        self._publish_artifact(record, manifest, source_snapshot)
-        self._install_files(record, manifest)
+        try:
+            self._publish_artifact(record, manifest, source_snapshot)
+            self._install_files(record, manifest)
+        except BaseException:
+            publication = record.get("artifact_publication")
+            if isinstance(publication, dict) and publication.get("rename_started") is True:
+                self.rollback()
+            raise
         record["phase"] = "installed"
         self._write(record)
 
@@ -1017,71 +1275,208 @@ class Deployment:
         record = self._read()
         if record.get("phase") != "installed":
             raise DeploymentError("deployment must be installed before activation")
-        manifest = verify_bundle(Path(str(record["bundle"])), self.source_root)
-        self._verify_installed(manifest)
-        prestate = record.get("prestate")
-        if not isinstance(prestate, dict):
-            raise DeploymentError("deployment prestate is missing")
-        self._assert_service_identities(prestate)
-        if self.host.listeners() or any(
-            _candidate_container(self.host, unit) for unit in CANDIDATE_UNITS
-        ):
-            raise DeploymentError("candidate listener or container appeared before activation")
-        if prestate.get("admission") != self.host.admission():
-            raise DeploymentError("memory/swap/PSI admission facts drifted before activation")
-        record["lifecycle_started"] = True
-        record["pause_text"] = pause_text
-        self._write(record)
-        self.host.lifecycle("activate", pause_text=pause_text)
-        record["lifecycle_active"] = True
-        record["phase"] = "active"
-        self._write(record)
-        _atomic_write(self.state_path.parent / "active-receipt.json", _canonical(record) + b"\n")
+        try:
+            manifest = verify_bundle(Path(str(record["bundle"])), self.source_root)
+            self._verify_installed(manifest)
+            prestate = record.get("prestate")
+            if not isinstance(prestate, dict):
+                raise DeploymentError("deployment prestate is missing")
+            self._assert_service_identities(prestate)
+            if self.host.listeners() or any(
+                _candidate_container(self.host, unit) for unit in CANDIDATE_UNITS
+            ):
+                raise DeploymentError("candidate listener or container appeared before activation")
+            if prestate.get("admission") != self.host.admission():
+                raise DeploymentError("memory/swap/PSI admission facts drifted before activation")
+            record["lifecycle_started"] = True
+            record["pause_text"] = pause_text
+            self._write(record)
+            self.host.lifecycle("activate", pause_text=pause_text)
+            record["lifecycle_active"] = True
+            record["phase"] = "active"
+            self._write(record)
+            _atomic_write(
+                self.state_path.parent / "active-receipt.json", _canonical(record) + b"\n"
+            )
+        except BaseException:
+            try:
+                if self.state_path.exists():
+                    self.rollback()
+            except BaseException as rollback_exc:
+                raise DeploymentError("activation failed and rollback was incomplete") from rollback_exc
+            raise
 
     def _restore_artifact(self, record: dict[str, object]) -> None:
         publication = record.get("artifact_publication")
         if not isinstance(publication, dict):
             return
         state = publication.get("state")
-        if state not in {"staged", "previous-moved", "published"}:
+        if state not in {
+            "rename-intent",
+            "previous-moved",
+            "published",
+            "rollback-old-restoring",
+        }:
             raise DeploymentError("artifact publication state is invalid")
-        backup = Path(str(publication.get("previous_backup", "")))
         prestate = record.get("prestate")
-        assert isinstance(prestate, dict)
+        if not isinstance(prestate, dict):
+            raise DeploymentError("deployment prestate is missing")
         previous = prestate.get("artifact")
-        assert isinstance(previous, dict)
-        restored = _artifact_snapshot(self.artifact_path)
-        if record.get("artifact_restored"):
-            if restored != previous or backup.exists():
-                raise DeploymentError("restored artifact no longer matches its prestate")
-            return
-        if restored == previous and not backup.exists():
+        if not isinstance(previous, dict) or previous.get("exists") not in {True, False}:
+            raise DeploymentError("artifact prestate is invalid")
+        previous_exists = previous["exists"] is True
+        raw_backup = publication.get("previous_backup")
+        if previous_exists:
+            if not isinstance(raw_backup, str):
+                raise DeploymentError("artifact rollback backup is missing")
+            backup = Path(raw_backup)
+            if (
+                backup.parent != self.artifact_path.parent
+                or not backup.name.startswith(".gb10-querit-previous-")
+            ):
+                raise DeploymentError("artifact rollback backup path is unsafe")
+        elif raw_backup is None:
+            backup = None
+        else:
+            raise DeploymentError("artifact rollback backup is unexpected")
+
+        def backup_matches_prestate() -> bool:
+            return backup is not None and _path_lexists(backup) and _artifact_prestate_matches(
+                backup, previous
+            )
+
+        def backup_is_empty_reservation() -> bool:
+            if backup is None or not _path_lexists(backup):
+                return False
+            metadata = backup.lstat()
+            return (
+                not stat.S_ISLNK(metadata.st_mode)
+                and stat.S_ISDIR(metadata.st_mode)
+                and metadata.st_uid == os.geteuid()
+                and not any(backup.iterdir())
+            )
+
+        def cleanup_displaced_publication() -> None:
+            raw_displaced = publication.get("rollback_displaced")
+            if raw_displaced is None:
+                return
+            if not isinstance(raw_displaced, str):
+                raise DeploymentError("artifact rollback displaced path is invalid")
+            displaced = Path(raw_displaced)
+            if (
+                displaced.parent != self.artifact_path.parent
+                or not displaced.name.startswith(".gb10-querit-discard-")
+            ):
+                raise DeploymentError("artifact rollback displaced path is unsafe")
+            if _path_lexists(displaced):
+                metadata = displaced.lstat()
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                    raise DeploymentError("artifact rollback displaced tree is unsafe")
+                shutil.rmtree(displaced)
+                _fsync_directory(displaced.parent)
+            publication.pop("rollback_displaced", None)
+            self._write(record)
+
+        def mark_restored() -> None:
+            if not _artifact_prestate_matches(self.artifact_path, previous):
+                raise DeploymentError("restored artifact does not match its prestate")
+            if backup is not None and _path_lexists(backup):
+                raise DeploymentError("artifact rollback backup remains after restoration")
             record["artifact_restored"] = True
             self._write(record)
+            cleanup_displaced_publication()
+
+        def restore_backup() -> None:
+            if not backup_matches_prestate():
+                raise DeploymentError("artifact rollback backup no longer matches prestate")
+            if _path_lexists(self.artifact_path):
+                raise DeploymentError("artifact rollback target is unexpectedly occupied")
+            assert backup is not None
+            _same_artifact_filesystem(backup, self.artifact_path.parent)
+            os.replace(backup, self.artifact_path)
+            _fsync_directory(self.artifact_path.parent)
+            mark_restored()
+
+        if record.get("artifact_restored"):
+            if not _artifact_prestate_matches(self.artifact_path, previous) or (
+                backup is not None and _path_lexists(backup)
+            ):
+                raise DeploymentError("restored artifact no longer matches its prestate")
+            cleanup_displaced_publication()
             return
-        if state == "staged":
-            raise DeploymentError("staged artifact publication drifted before rollback")
-        if self.artifact_path.exists():
+        target_matches_prestate = _artifact_prestate_matches(self.artifact_path, previous)
+        target_exists = _path_lexists(self.artifact_path)
+        backup_exists = backup is not None and _path_lexists(backup)
+        if state == "rename-intent":
+            if not previous_exists:
+                if target_matches_prestate and not backup_exists:
+                    mark_restored()
+                    return
+                raise DeploymentError("artifact rename intent recovery is ambiguous")
+            if target_matches_prestate and backup_is_empty_reservation():
+                assert backup is not None
+                backup.rmdir()
+                _fsync_directory(backup.parent)
+                mark_restored()
+                return
+            if not target_exists and backup_matches_prestate():
+                restore_backup()
+                return
+            raise DeploymentError("artifact rename intent recovery is ambiguous")
+        if state == "previous-moved" or state == "rollback-old-restoring":
+            if target_matches_prestate and not backup_exists:
+                mark_restored()
+                return
+            if not target_exists and backup_matches_prestate():
+                restore_backup()
+                return
+            raise DeploymentError("artifact rollback recovery is ambiguous")
+        if target_matches_prestate and not backup_exists:
+            mark_restored()
+            return
+        if not previous_exists:
+            if not target_exists:
+                raise DeploymentError("artifact publication rollback evidence is missing")
             expected = publication.get("new_manifest_sha256")
             if (
                 not isinstance(expected, str)
                 or artifact.manifest_sha256(self.artifact_path) != expected
             ):
                 raise DeploymentError("refusing to remove artifact whose identity changed")
-            shutil.rmtree(self.artifact_path)
-        if previous.get("exists"):
-            if not backup.exists():
-                raise DeploymentError("previous artifact backup is missing")
-            os.replace(backup, self.artifact_path)
+            displaced = Path(
+                tempfile.mkdtemp(
+                    prefix=".gb10-querit-discard-", dir=self.artifact_path.parent
+                )
+            )
+            publication["rollback_displaced"] = str(displaced)
+            self._write(record)
+            os.replace(self.artifact_path, displaced)
             _fsync_directory(self.artifact_path.parent)
-            if _artifact_snapshot(self.artifact_path) != previous:
-                raise DeploymentError("restored artifact does not match its prestate")
-        elif backup.exists():
-            raise DeploymentError("unexpected prior artifact backup exists")
-        if _artifact_snapshot(self.artifact_path) != previous:
-            raise DeploymentError("restored artifact does not match its prestate")
-        record["artifact_restored"] = True
-        self._write(record)
+            publication["state"] = "rollback-old-restoring"
+            self._write(record)
+            mark_restored()
+            return
+        if not backup_matches_prestate():
+            raise DeploymentError("artifact publication rollback evidence is missing")
+        if target_exists:
+            expected = publication.get("new_manifest_sha256")
+            if (
+                not isinstance(expected, str)
+                or artifact.manifest_sha256(self.artifact_path) != expected
+            ):
+                raise DeploymentError("refusing to remove artifact whose identity changed")
+            displaced = Path(
+                tempfile.mkdtemp(
+                    prefix=".gb10-querit-discard-", dir=self.artifact_path.parent
+                )
+            )
+            publication["rollback_displaced"] = str(displaced)
+            self._write(record)
+            os.replace(self.artifact_path, displaced)
+            _fsync_directory(self.artifact_path.parent)
+            publication["state"] = "rollback-old-restoring"
+            self._write(record)
+        restore_backup()
 
     def _remove_private_artifact_work(self, record: Mapping[str, object]) -> None:
         raw_work = record.get("artifact_work")
@@ -1408,6 +1803,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--pause-text", action="store_true")
     parser.add_argument("--accept-runtime-mask-prestate", action="store_true")
+    parser.add_argument("--accept-unsealed-artifact-prestate", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -1416,6 +1812,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.accept_runtime_mask_prestate and args.action not in {"plan", "prepare", "deploy"}:
         raise DeploymentError(
             "--accept-runtime-mask-prestate is valid only with plan, prepare, or deploy"
+        )
+    if args.accept_unsealed_artifact_prestate and args.action not in {
+        "plan",
+        "prepare",
+        "deploy",
+    }:
+        raise DeploymentError(
+            "--accept-unsealed-artifact-prestate is valid only with plan, prepare, or deploy"
         )
     state = args.state.expanduser().resolve(strict=False)
     descriptor = _lock(state.with_suffix(".lock"))
@@ -1427,6 +1831,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             source_root=source_root,
             artifact_path=args.artifact,
             accept_runtime_mask_prestate=args.accept_runtime_mask_prestate,
+            accept_unsealed_artifact_prestate=args.accept_unsealed_artifact_prestate,
         )
         if args.action in {"prepare", "deploy"} and state.exists():
             existing = owner._read()

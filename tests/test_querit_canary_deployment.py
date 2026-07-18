@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import shutil
 import stat
 import sys
@@ -264,6 +265,24 @@ class DeploymentTests(unittest.TestCase):
             artifact_path=self.artifact,
             accept_runtime_mask_prestate=True,
         )
+
+    def _unsealed_artifact_owner(self) -> deployment.Deployment:
+        return deployment.Deployment(
+            self.host,
+            self.state,
+            source_root=self.root,
+            artifact_path=self.artifact,
+            accept_unsealed_artifact_prestate=True,
+        )
+
+    def _write_unsealed_artifact(self) -> Path:
+        self.artifact.mkdir(mode=0o750)
+        nested = self.artifact / "nested"
+        nested.mkdir(mode=0o750)
+        original = nested / "weights.bin"
+        original.write_bytes(b"unsealed weights")
+        original.chmod(0o640)
+        return original
 
     def _assert_exact_runtime_mask_prestate_restored(self) -> None:
         self.assertEqual(self.host._masked, set(deployment.CANDIDATE_UNITS))
@@ -635,6 +654,193 @@ class DeploymentTests(unittest.TestCase):
         with self.assertRaisesRegex(deployment.DeploymentError, "container"):
             self.owner.prepare(self.bundle)
         self.assertEqual(self.host.commands, [])
+
+    def test_unsealed_artifact_prestate_requires_explicit_opt_in_without_mutation(self) -> None:
+        self.artifact.mkdir()
+        original = self.artifact / "weights.bin"
+        original.write_bytes(b"unsealed weights")
+        before = original.read_bytes()
+        deployment.artifact.manifest_sha256.side_effect = deployment.artifact.ArtifactError(
+            "manifest is absent"
+        )
+
+        with self.assertRaises(deployment.artifact.ArtifactError):
+            self.owner.plan(self.bundle)
+
+        accepted = deployment.Deployment(
+            self.host,
+            self.state,
+            source_root=self.root,
+            artifact_path=self.artifact,
+            accept_unsealed_artifact_prestate=True,
+        )
+        plan = accepted.plan(self.bundle)
+
+        self.assertTrue(plan["artifact_prestate"]["accepted_unsealed_prestate"])
+        self.assertEqual(original.read_bytes(), before)
+        self.assertEqual(self.host.commands, [])
+        parsed = deployment._parse_args(
+            ["plan", "--accept-unsealed-artifact-prestate"]
+        )
+        self.assertTrue(parsed.accept_unsealed_artifact_prestate)
+        with self.assertRaisesRegex(deployment.DeploymentError, "valid only"):
+            deployment.main(["install", "--accept-unsealed-artifact-prestate"])
+
+    def test_unsealed_prestate_rejects_symlink_and_special_roots_before_effects(self) -> None:
+        target = self.root / "symlink-target"
+        target.mkdir()
+        self.artifact.symlink_to(target, target_is_directory=True)
+        owner = self._unsealed_artifact_owner()
+        with self.assertRaisesRegex(deployment.DeploymentError, "real directory"):
+            owner.plan(self.bundle)
+        self.assertEqual(self.host.commands, [])
+
+        self.artifact.unlink()
+        os.mkfifo(self.artifact)
+        with self.assertRaisesRegex(deployment.DeploymentError, "real directory"):
+            owner.plan(self.bundle)
+        self.assertEqual(self.host.commands, [])
+
+        self.artifact.unlink()
+        self.artifact.mkdir()
+        payload = self.root / "payload"
+        payload.write_bytes(b"payload")
+        (self.artifact / "linked").symlink_to(payload)
+        with self.assertRaisesRegex(deployment.DeploymentError, "prestate file is unsafe"):
+            owner.plan(self.bundle)
+        (self.artifact / "linked").unlink()
+        os.mkfifo(self.artifact / "pipe")
+        with self.assertRaisesRegex(deployment.DeploymentError, "prestate file is unsafe"):
+            owner.plan(self.bundle)
+        self.assertEqual(self.host.commands, [])
+
+    def test_unsealed_prestate_drift_rejects_before_rename_or_publication(self) -> None:
+        original = self._write_unsealed_artifact()
+        owner = self._unsealed_artifact_owner()
+        owner.prepare(self.bundle)
+        original.write_bytes(b"drifted")
+
+        with self.assertRaisesRegex(deployment.DeploymentError, "prestate drifted"):
+            owner.install(self.source_snapshot)
+
+        self.assertTrue(self.artifact.exists())
+        self.assertFalse(any(self.artifact.parent.glob(".gb10-querit-previous-*")))
+        owner.rollback()
+
+    def test_failure_after_old_rename_restores_unsealed_prestate_automatically(self) -> None:
+        original = self._write_unsealed_artifact()
+        owner = self._unsealed_artifact_owner()
+        owner.prepare(self.bundle)
+        real_replace = deployment.os.replace
+
+        def fail_after_old_rename(source: str | Path, destination: str | Path) -> None:
+            real_replace(source, destination)
+            if Path(source) == self.artifact:
+                raise deployment.DeploymentError("injected after old rename")
+
+        with mock.patch.object(deployment.os, "replace", side_effect=fail_after_old_rename):
+            with self.assertRaisesRegex(deployment.DeploymentError, "injected after old rename"):
+                owner.install(self.source_snapshot)
+
+        self.assertEqual(original.read_bytes(), b"unsealed weights")
+        self.assertFalse(self.state.exists())
+
+    def test_failure_after_fresh_publication_restores_unsealed_prestate_automatically(self) -> None:
+        original = self._write_unsealed_artifact()
+        owner = self._unsealed_artifact_owner()
+        owner.prepare(self.bundle)
+
+        with mock.patch.object(
+            owner,
+            "_install_files",
+            side_effect=deployment.DeploymentError("injected after publication"),
+        ):
+            with self.assertRaisesRegex(deployment.DeploymentError, "injected after publication"):
+                owner.install(self.source_snapshot)
+
+        self.assertEqual(original.read_bytes(), b"unsealed weights")
+        self.assertFalse(self.state.exists())
+
+    def test_active_unsealed_prestate_retains_recovery_state_then_deactivate_restores_it(self) -> None:
+        original = self._write_unsealed_artifact()
+        owner = self._unsealed_artifact_owner()
+        owner.prepare(self.bundle)
+        owner.install(self.source_snapshot)
+        owner.activate(pause_text=False)
+
+        record = owner._read()
+        publication = record["artifact_publication"]
+        self.assertEqual(publication["state"], "published")
+        backup = Path(publication["previous_backup"])
+        self.assertTrue(backup.exists())
+        self.assertEqual((backup / "nested" / "weights.bin").read_bytes(), b"unsealed weights")
+
+        owner.rollback()
+        self.assertEqual(original.read_bytes(), b"unsealed weights")
+        self.assertFalse(self.state.exists())
+
+    def test_unsealed_rollback_replay_restores_exact_prestate_after_later_failure(self) -> None:
+        original = self._write_unsealed_artifact()
+        owner = self._unsealed_artifact_owner()
+        owner.prepare(self.bundle)
+        owner.install(self.source_snapshot)
+        owner.activate(pause_text=False)
+
+        with mock.patch.object(
+            owner,
+            "_restore_files",
+            side_effect=deployment.DeploymentError("injected later rollback failure"),
+        ):
+            with self.assertRaisesRegex(deployment.DeploymentError, "rollback was incomplete"):
+                owner.rollback()
+
+        self.assertTrue(owner._read()["artifact_restored"])
+        self.assertEqual(original.read_bytes(), b"unsealed weights")
+        owner.rollback()
+        self.assertEqual(original.read_bytes(), b"unsealed weights")
+        self.assertFalse(self.state.exists())
+
+    def test_unsealed_backup_collision_and_ambiguous_recovery_fail_closed(self) -> None:
+        original = self._write_unsealed_artifact()
+        owner = self._unsealed_artifact_owner()
+        owner.prepare(self.bundle)
+
+        with mock.patch.object(
+            deployment,
+            "_reserve_artifact_rollback_directory",
+            create=True,
+            side_effect=deployment.DeploymentError("artifact rollback backup collision"),
+        ):
+            with self.assertRaisesRegex(deployment.DeploymentError, "backup collision"):
+                owner.install(self.source_snapshot)
+        self.assertEqual(original.read_bytes(), b"unsealed weights")
+
+        backup = self.artifact.parent / ".gb10-querit-previous-ambiguous"
+        backup.mkdir()
+        (backup / "foreign").write_text("do not overwrite")
+        record = owner._read()
+        record["artifact_publication"] = {
+            "new_manifest_sha256": "m" * 64,
+            "previous_backup": str(backup),
+            "state": "rename-intent",
+        }
+        owner._write(record)
+        with self.assertRaisesRegex(deployment.DeploymentError, "ambiguous"):
+            owner.rollback()
+        self.assertEqual(original.read_bytes(), b"unsealed weights")
+        self.assertEqual((backup / "foreign").read_text(), "do not overwrite")
+
+    def test_absent_and_sealed_artifact_prestate_contracts_remain_distinct(self) -> None:
+        absent = self.owner.plan(self.bundle)["artifact_prestate"]
+        self.assertEqual(
+            absent,
+            {"accept_unsealed_artifact_prestate": False, "exists": False},
+        )
+
+        self.artifact.mkdir()
+        sealed = self.owner.plan(self.bundle)["artifact_prestate"]
+        self.assertEqual(sealed["manifest_sha256"], "m" * 64)
+        self.assertFalse(sealed["accept_unsealed_artifact_prestate"])
 
     def test_atomic_artifact_publication_restores_previous_tree(self) -> None:
         self.artifact.mkdir()
