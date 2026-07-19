@@ -1,0 +1,288 @@
+from __future__ import annotations
+
+import importlib
+import io
+import json
+import os
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+collector = importlib.import_module("collect_reranker_cloud_baseline")
+
+
+def _group(index: int) -> dict[str, object]:
+    return {
+        "query_id": f"query-{index}",
+        "query": "q",
+        "source_language": "en",
+        "candidates": [
+            {
+                "document": "d",
+                "document_id": f"document-{index}",
+                "relevance": 1,
+                "source_language": "en",
+                "top_ranked_rank": 1,
+            }
+        ],
+    }
+
+
+def _write_corpus(path: Path, count: int) -> list[dict[str, object]]:
+    groups = [_group(index) for index in range(count)]
+    path.write_text(
+        "".join(json.dumps(group, separators=(",", ":")) + "\n" for group in groups),
+        encoding="utf-8",
+    )
+    return groups
+
+
+def _baseline_row(group: dict[str, object], charged_tokens: int) -> dict[str, object]:
+    request = collector.build_request(group, collector.DEFAULT_INSTRUCTION)
+    return {
+        "schema": "reranker-cloud-baseline-v1",
+        "provider": "deepinfra",
+        "model": "Qwen/Qwen3-Reranker-8B",
+        "query_id": group["query_id"],
+        "source_language": group["source_language"],
+        "request_fingerprint": collector.request_fingerprint(group, request),
+        "request_instruction": collector.DEFAULT_INSTRUCTION,
+        "pair_count": 1,
+        "candidate_document_ids": [f"document-{str(group['query_id']).removeprefix('query-')}"],
+        "candidate_relevance": [1],
+        "response": {"input_tokens": charged_tokens, "scores": [0.5]},
+        "timing": {"http_status": 200},
+        "charged_input_tokens": charged_tokens,
+        "estimated_input_tokens": collector.estimate_tokens(request),
+        "cumulative_cost_usd": charged_tokens / 1_000_000,
+    }
+
+
+def _run_main(
+    arguments: list[str],
+    response: tuple[int, dict[str, object], dict[str, object]],
+) -> tuple[int, MagicMock]:
+    with (
+        patch.object(sys, "argv", ["collect_reranker_cloud_baseline.py", *arguments]),
+        patch.dict(os.environ, {"DEEPINFRA_KEY": "unit-secret"}),
+        patch.object(collector, "call_deepinfra", return_value=response) as cloud_call,
+        redirect_stdout(io.StringIO()),
+        redirect_stderr(io.StringIO()),
+    ):
+        return collector.main(), cloud_call
+
+
+class CloudCollectorSafetyTests(unittest.TestCase):
+    def test_estimate_includes_utf8_instruction_and_prompt_overhead_per_pair(self) -> None:
+        request = {
+            "queries": ["查询"],
+            "documents": ["文"],
+            "instruction": "rank",
+        }
+        self.assertEqual(collector.estimate_tokens(request), 6 + 3 + 4 + 256)
+
+    def test_budget_preflights_all_chargeable_groups_before_first_paid_call(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            corpus = root / "corpus.jsonl"
+            output = root / "baseline.jsonl"
+            _write_corpus(corpus, 2)
+            result, cloud_call = _run_main(
+                [
+                    "--corpus",
+                    str(corpus),
+                    "--output",
+                    str(output),
+                    "--price-per-mtok",
+                    "1",
+                    "--budget-usd",
+                    "0.0006",
+                    "--rate-delay-seconds",
+                    "0",
+                ],
+                (200, {"input_tokens": 1, "scores": [0.5]}, {}),
+            )
+            self.assertEqual(result, 2)
+            cloud_call.assert_not_called()
+            self.assertFalse(output.exists())
+
+    def test_request_intent_is_durable_before_paid_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            corpus = root / "corpus.jsonl"
+            output = root / "baseline.jsonl"
+            groups = _write_corpus(corpus, 1)
+            request = collector.build_request(groups[0], collector.DEFAULT_INSTRUCTION)
+            fingerprint = collector.request_fingerprint(groups[0], request)
+
+            def paid_call(*_args: object, **_kwargs: object) -> tuple[int, dict[str, object], dict[str, object]]:
+                ledger = collector.intent_path(output)
+                self.assertTrue(ledger.exists())
+                rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+                self.assertEqual(rows[-1]["request_fingerprint"], fingerprint)
+                self.assertTrue(fsync_call.called)
+                return 200, {"input_tokens": 1, "scores": [0.5]}, {}
+
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "collect_reranker_cloud_baseline.py",
+                        "--corpus",
+                        str(corpus),
+                        "--output",
+                        str(output),
+                        "--budget-usd",
+                        "1",
+                        "--rate-delay-seconds",
+                        "0",
+                    ],
+                ),
+                patch.dict(os.environ, {"DEEPINFRA_KEY": "unit-secret"}),
+                patch.object(collector.os, "fsync", wraps=os.fsync) as fsync_call,
+                patch.object(collector, "call_deepinfra", side_effect=paid_call),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(collector.main(), 0)
+
+    def test_ambiguous_paid_transport_blocks_automatic_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            corpus = root / "corpus.jsonl"
+            output = root / "baseline.jsonl"
+            _write_corpus(corpus, 1)
+            arguments = [
+                "--corpus",
+                str(corpus),
+                "--output",
+                str(output),
+                "--budget-usd",
+                "1",
+                "--rate-delay-seconds",
+                "0",
+            ]
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    ["collect_reranker_cloud_baseline.py", *arguments],
+                ),
+                patch.dict(os.environ, {"DEEPINFRA_KEY": "unit-secret"}),
+                patch.object(
+                    collector, "call_deepinfra", side_effect=TimeoutError("ambiguous")
+                ),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(collector.main(), 1)
+            self.assertTrue(collector.intent_path(output).exists())
+            self.assertFalse(output.exists())
+
+            result, cloud_call = _run_main(
+                [*arguments, "--resume"],
+                (200, {"input_tokens": 1, "scores": [0.5]}, {}),
+            )
+            self.assertEqual(result, 2)
+            cloud_call.assert_not_called()
+
+    def test_resume_rejects_malformed_output_instead_of_resending(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            corpus = root / "corpus.jsonl"
+            output = root / "baseline.jsonl"
+            _write_corpus(corpus, 1)
+            output.write_text("{\n", encoding="utf-8")
+            result, cloud_call = _run_main(
+                [
+                    "--corpus",
+                    str(corpus),
+                    "--output",
+                    str(output),
+                    "--resume",
+                    "--budget-usd",
+                    "1",
+                    "--rate-delay-seconds",
+                    "0",
+                ],
+                (200, {"input_tokens": 1, "scores": [0.5]}, {}),
+            )
+            self.assertEqual(result, 2)
+            cloud_call.assert_not_called()
+
+    def test_resume_rejects_intent_without_complete_response_row(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            corpus = root / "corpus.jsonl"
+            output = root / "baseline.jsonl"
+            groups = _write_corpus(corpus, 1)
+            request = collector.build_request(groups[0], collector.DEFAULT_INSTRUCTION)
+            fingerprint = collector.request_fingerprint(groups[0], request)
+            collector.intent_path(output).write_text(
+                json.dumps(
+                    {
+                        "schema": "reranker-cloud-request-intent-v1",
+                        "request_fingerprint": fingerprint,
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result, cloud_call = _run_main(
+                [
+                    "--corpus",
+                    str(corpus),
+                    "--output",
+                    str(output),
+                    "--resume",
+                    "--budget-usd",
+                    "1",
+                    "--rate-delay-seconds",
+                    "0",
+                ],
+                (200, {"input_tokens": 1, "scores": [0.5]}, {}),
+            )
+            self.assertEqual(result, 2)
+            cloud_call.assert_not_called()
+
+    def test_resume_charges_completed_rows_in_full_plan_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            corpus = root / "corpus.jsonl"
+            output = root / "baseline.jsonl"
+            groups = _write_corpus(corpus, 2)
+            output.write_text(
+                json.dumps(_baseline_row(groups[0], 400), separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+            result, cloud_call = _run_main(
+                [
+                    "--corpus",
+                    str(corpus),
+                    "--output",
+                    str(output),
+                    "--resume",
+                    "--price-per-mtok",
+                    "1",
+                    "--budget-usd",
+                    "0.0006",
+                    "--rate-delay-seconds",
+                    "0",
+                ],
+                (200, {"input_tokens": 1, "scores": [0.5]}, {}),
+            )
+            self.assertEqual(result, 2)
+            cloud_call.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
