@@ -42,6 +42,7 @@ from typing import Any
 from reranker_cloud_evidence import (
     CURRENT_BASELINE_SCHEMA,
     LEGACY_BASELINE_SCHEMA,
+    assert_credential_absent,
     canonical_json,
     request_fingerprint,
 )
@@ -706,7 +707,16 @@ def _run_owned(args: argparse.Namespace) -> int:
             "cumulative_cost_usd": round(total_cost, 6),
         }
         try:
+            assert_credential_absent(record, api_key)
             _append_durable(args.output, record)
+        except ValueError:
+            failed += 1
+            print(
+                "ERROR: artifact contains the configured bearer key; "
+                "request intent is ambiguous and resume is blocked",
+                file=sys.stderr,
+            )
+            break
         except OSError as exc:
             failed += 1
             print(

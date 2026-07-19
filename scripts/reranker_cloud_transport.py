@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-import json
 import time
 import urllib.error
 import urllib.request
 from typing import Any
 
-from reranker_cloud_evidence import canonical_json
+from reranker_cloud_evidence import (
+    assert_credential_absent,
+    canonical_json,
+    decode_json_strict,
+)
 
 MAX_CLOUD_RESPONSE_BYTES = 4 * 1024 * 1024
 
@@ -53,9 +56,16 @@ def call_deepinfra(
     elapsed = time.monotonic() - started
     _reject_echoed_key(raw, api_key)
     try:
-        body = json.loads(raw.decode("utf-8"))
-    except Exception:
-        body = {"_raw": raw.decode("utf-8", errors="replace")}
+        body = decode_json_strict(raw)
+    except (UnicodeError, ValueError) as exc:
+        raise RuntimeError("cloud response is not strict JSON") from exc
+    try:
+        assert_credential_absent(body, api_key)
+    except ValueError as exc:
+        raise RuntimeError(
+            "cloud response contains the configured bearer key"
+        ) from exc
+    _reject_echoed_key(canonical_json(body), api_key)
     timing = {
         "http_status": status,
         "elapsed_seconds": round(elapsed, 4),

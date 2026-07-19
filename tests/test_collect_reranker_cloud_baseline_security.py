@@ -119,6 +119,102 @@ class CloudCollectorArtifactSecurityTests(unittest.TestCase):
             self.assertNotIn(secret, stdout.getvalue())
             self.assertNotIn(secret, stderr.getvalue())
 
+    def test_json_escaped_bearer_key_is_rejected_recursively_before_persistence(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "unicode-escaped-key",
+                "fixture-bearer-key",
+                b'{"scores":[0.5],"input_tokens":1,"\\u0066ixture-bearer-key":"echo"}',
+            ),
+            (
+                "escaped-slash-value",
+                "fixture/bearer-key",
+                b'{"scores":[0.5],"input_tokens":1,"request_id":"fixture\\/bearer-key"}',
+            ),
+            (
+                "nested-inference-status-value",
+                "fixture-bearer-key",
+                b'{"scores":[0.5],"input_tokens":1,"inference_status":{"detail":["fixture-\\u0062earer-key"]}}',
+            ),
+        )
+        for label, secret, raw_response in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw_tmp:
+                root = Path(raw_tmp)
+                corpus = root / "corpus.jsonl"
+                output = root / "baseline.jsonl"
+                _write_corpus(corpus)
+                response = MagicMock()
+                response.status = 200
+                response.read.return_value = raw_response
+                response.__enter__.return_value = response
+                response.__exit__.return_value = None
+                stderr = io.StringIO()
+                with (
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "collect_reranker_cloud_baseline.py",
+                            *_arguments(corpus, output),
+                        ],
+                    ),
+                    patch.dict(os.environ, {"DEEPINFRA_KEY": secret}),
+                    patch.object(
+                        collector.urllib.request, "urlopen", return_value=response
+                    ),
+                    redirect_stdout(io.StringIO()),
+                    redirect_stderr(stderr),
+                ):
+                    result = collector.main()
+
+                self.assertEqual(result, 1)
+                self.assertFalse(output.exists())
+                self.assertIn(
+                    "response contains the configured bearer key", stderr.getvalue()
+                )
+                persisted = b"".join(
+                    path.read_bytes() for path in root.iterdir() if path.is_file()
+                )
+                self.assertNotIn(secret.encode(), persisted)
+
+    def test_final_committable_artifact_is_checked_for_bearer_key(self) -> None:
+        secret = "fixture-bearer-key"
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            corpus = root / "corpus.jsonl"
+            output = root / "baseline.jsonl"
+            _write_corpus(corpus)
+            body = {
+                "input_tokens": 1,
+                "scores": [0.5],
+                "inference_status": {"nested": [secret]},
+            }
+            stderr = io.StringIO()
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    ["collect_reranker_cloud_baseline.py", *_arguments(corpus, output)],
+                ),
+                patch.dict(os.environ, {"DEEPINFRA_KEY": secret}),
+                patch.object(
+                    collector,
+                    "call_deepinfra",
+                    return_value=(200, body, {"http_status": 200}),
+                ),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(stderr),
+            ):
+                result = collector.main()
+
+            self.assertEqual(result, 1)
+            self.assertFalse(output.exists())
+            self.assertIn(
+                "artifact contains the configured bearer key", stderr.getvalue()
+            )
+
     def test_committable_response_uses_an_explicit_field_allowlist(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)

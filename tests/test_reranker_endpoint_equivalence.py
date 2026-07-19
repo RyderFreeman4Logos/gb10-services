@@ -378,6 +378,59 @@ class EndpointEvidenceCacheTests(unittest.TestCase):
                     timeout=1,
                 )
 
+    def test_json_escaped_secrets_are_rejected_recursively_before_cache_write(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "unicode-escaped-key",
+                "fixture-secret",
+                b'{"scores":[0.5],"input_tokens":1,"\\u0066ixture-secret":"echo"}',
+            ),
+            (
+                "escaped-slash-value",
+                "fixture/secret",
+                b'{"scores":[0.5],"input_tokens":1,"request_id":"fixture\\/secret"}',
+            ),
+            (
+                "nested-inference-status-value",
+                "fixture-secret",
+                b'{"scores":[0.5],"input_tokens":1,"inference_status":{"detail":["fixture-\\u0073ecret"]}}',
+            ),
+        )
+        for label, secret, response_body in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw_tmp:
+                root = Path(raw_tmp)
+                identity = reranker.request_identity(
+                    reranker.canonical_payload(["q"], ["d"]),
+                    reranker.CLOUD_ENDPOINT,
+                )
+                cache = reranker.EndpointEvidenceCache(
+                    root,
+                    transport=lambda *_args, body=response_body: reranker.HttpResult(
+                        200, {}, body, 1
+                    ),
+                )
+
+                with self.assertRaisesRegex(
+                    reranker.EvidenceError,
+                    "response body contains the configured API key",
+                ):
+                    cache.fetch(
+                        identity,
+                        base_url="https://api.deepinfra.com",
+                        api_key=secret,
+                        timeout=1,
+                    )
+
+                request_dir = root / reranker.canonical_request_hash(identity)
+                self.assertFalse((request_dir / "response.body").exists())
+                self.assertFalse((request_dir / "response.json").exists())
+                persisted = b"".join(
+                    path.read_bytes() for path in root.rglob("*") if path.is_file()
+                )
+                self.assertNotIn(secret.encode(), persisted)
+
 
 class OfflineMainTests(unittest.TestCase):
     def test_readme_says_cache_only_reads_both_endpoint_caches_offline(self) -> None:

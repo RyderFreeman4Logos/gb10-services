@@ -24,6 +24,48 @@ def canonical_json(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def decode_json_strict(payload: bytes) -> Any:
+    """Decode one UTF-8 JSON value while rejecting duplicates and extensions."""
+
+    def reject_constant(value: str) -> Any:
+        raise ValueError(f"non-standard JSON constant is forbidden: {value}")
+
+    def unique_object(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError(f"duplicate JSON object key is forbidden: {key}")
+            result[key] = value
+        return result
+
+    return json.loads(
+        payload.decode("utf-8"),
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
+
+
+def assert_credential_absent(value: Any, credential: str) -> None:
+    """Reject a credential in every nested JSON key or string value."""
+
+    if not credential:
+        return
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            if credential in current:
+                raise ValueError("decoded JSON contains the configured credential")
+        elif isinstance(current, dict):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+        elif isinstance(current, (list, tuple)):
+            pending.extend(current)
+
+    if credential.encode("utf-8") in canonical_json(value):
+        raise ValueError("canonical JSON contains the configured credential")
+
+
 def request_fingerprint(
     group: dict[str, Any],
     request_body: dict[str, Any],

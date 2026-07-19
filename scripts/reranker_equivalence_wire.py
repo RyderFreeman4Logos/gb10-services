@@ -16,6 +16,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from reranker_cloud_evidence import assert_credential_absent, decode_json_strict
+
 
 ENDPOINT_PATH = "/v1/inference/Qwen/Qwen3-Reranker-8B"
 DEEPINFRA_MODEL_VERSION = "5fa94080caafeaa45a15d11f969d7978e087a3db"
@@ -596,6 +598,16 @@ class EndpointEvidenceCache:
             )
         if api_key and api_key.encode("utf-8") in result.body:
             raise EvidenceError("response body contains the configured API key")
+        try:
+            decoded_body = decode_json_strict(result.body)
+        except (UnicodeError, ValueError) as exc:
+            raise EvidenceError("response body is not strict JSON") from exc
+        try:
+            assert_credential_absent(decoded_body, api_key)
+        except ValueError as exc:
+            raise EvidenceError(
+                "response body contains the configured API key"
+            ) from exc
         sanitized_headers = sanitize_response_headers(
             result.headers, secrets=(api_key, f"Bearer {api_key}")
         )
@@ -608,8 +620,19 @@ class EndpointEvidenceCache:
             "schema": "reranker-endpoint-response-v2",
             "status": result.status,
         }
+        response_record_bytes = _json_bytes(response_record, pretty=True)
+        try:
+            assert_credential_absent(response_record, api_key)
+        except ValueError as exc:
+            raise EvidenceError(
+                "final response artifact contains the configured API key"
+            ) from exc
+        if api_key and api_key.encode("utf-8") in response_record_bytes:
+            raise EvidenceError(
+                "final response artifact contains the configured API key"
+            )
         _atomic_write(
-            request_dir / "response.json", _json_bytes(response_record, pretty=True)
+            request_dir / "response.json", response_record_bytes
         )
         return EvidenceResponse(
             status=result.status,
