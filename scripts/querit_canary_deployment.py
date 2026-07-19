@@ -1747,10 +1747,10 @@ class Deployment:
                 and not any(backup.iterdir())
             )
 
-        def cleanup_displaced_publication() -> None:
+        def displaced_publication(*, require_exists: bool) -> Path | None:
             raw_displaced = publication.get("rollback_displaced")
             if raw_displaced is None:
-                return
+                return None
             if not isinstance(raw_displaced, str):
                 raise DeploymentError("artifact rollback displaced path is invalid")
             displaced = Path(raw_displaced)
@@ -1759,10 +1759,31 @@ class Deployment:
                 or not displaced.name.startswith(".gb10-querit-discard-")
             ):
                 raise DeploymentError("artifact rollback displaced path is unsafe")
+            if not _path_lexists(displaced):
+                if require_exists:
+                    raise DeploymentError("artifact rollback displaced tree is missing")
+                return displaced
+            metadata = displaced.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise DeploymentError("artifact rollback displaced tree is unsafe")
+            return displaced
+
+        def validate_displaced_publication() -> None:
+            displaced = displaced_publication(require_exists=True)
+            if displaced is None:
+                return
+            expected = publication.get("new_manifest_sha256")
+            if (
+                not isinstance(expected, str)
+                or artifact.manifest_sha256(displaced) != expected
+            ):
+                raise DeploymentError("artifact rollback displaced identity changed")
+
+        def cleanup_displaced_publication() -> None:
+            displaced = displaced_publication(require_exists=False)
+            if displaced is None:
+                return
             if _path_lexists(displaced):
-                metadata = displaced.lstat()
-                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-                    raise DeploymentError("artifact rollback displaced tree is unsafe")
                 shutil.rmtree(displaced)
                 _fsync_directory(displaced.parent)
             publication.pop("rollback_displaced", None)
@@ -1773,6 +1794,8 @@ class Deployment:
                 raise DeploymentError("restored artifact does not match its prestate")
             if backup is not None and _path_lexists(backup):
                 raise DeploymentError("artifact rollback backup remains after restoration")
+            if not previous_exists:
+                validate_displaced_publication()
             record["artifact_restored"] = True
             self._write(record)
             cleanup_displaced_publication()

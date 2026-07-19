@@ -1277,6 +1277,44 @@ class DeploymentTests(unittest.TestCase):
         self.assertFalse(self.state.exists())
         self.assertEqual((self.artifact / "old").read_text(), "previous")
 
+    def test_absent_prestate_rollback_retries_after_displacing_publication(self) -> None:
+        self._set_exact_runtime_mask_prestate()
+        owner = self._runtime_mask_owner()
+        owner.prepare(self.bundle)
+        owner.install(self.source_snapshot)
+        owner.activate(pause_text=False)
+        real_replace = deployment.os.replace
+
+        def fail_after_publication_displacement(
+            source: str | Path, destination: str | Path
+        ) -> None:
+            real_replace(source, destination)
+            if Path(source) == self.artifact:
+                raise deployment.DeploymentError("injected after publication displacement")
+
+        with mock.patch.object(
+            deployment.os, "replace", side_effect=fail_after_publication_displacement
+        ):
+            with self.assertRaisesRegex(deployment.DeploymentError, "rollback was incomplete"):
+                owner.rollback()
+
+        retained = owner._read()
+        publication = retained["artifact_publication"]
+        self.assertEqual(publication["state"], "published")
+        self.assertFalse(self.artifact.exists())
+        displaced = Path(publication["rollback_displaced"])
+        self.assertTrue(displaced.exists())
+        deployment.artifact.manifest_sha256.reset_mock()
+
+        owner.rollback()
+
+        deployment.artifact.manifest_sha256.assert_any_call(displaced)
+        self.assertFalse(self.state.exists())
+        self.assertFalse(self.artifact.exists())
+        self.assertTrue((self.state.parent / "restore-receipt.json").exists())
+        self.assertTrue(all(not Path(str(item["target"])).exists() for item in self.targets))
+        self._assert_exact_runtime_mask_prestate_restored()
+
 
 if __name__ == "__main__":
     unittest.main()
