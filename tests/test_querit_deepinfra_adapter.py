@@ -236,6 +236,57 @@ class QueritDeepinfraAdapterTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=1)
 
+    def test_partial_request_line_or_header_cannot_monopolize_the_only_slot(
+        self,
+    ) -> None:
+        partials = (
+            b"POST /v1/inference",
+            b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Stall:",
+        )
+        for partial in partials:
+            with self.subTest(partial=partial):
+                handler = adapter._handler("http://unused.invalid/v1/score", 0.5)
+                with patch.object(adapter, "REQUEST_BODY_TIMEOUT_SECONDS", 0.05):
+                    server = adapter.BoundedThreadingHTTPServer(
+                        ("127.0.0.1", 0), handler, max_concurrency=1
+                    )
+                    server_thread = threading.Thread(
+                        target=server.serve_forever, daemon=True
+                    )
+                    server_thread.start()
+                    stalled = socket.create_connection(
+                        ("127.0.0.1", server.server_port), timeout=1
+                    )
+                    completed = threading.Event()
+                    status: list[int] = []
+
+                    def valid_request() -> None:
+                        connection = http.client.HTTPConnection(
+                            "127.0.0.1", server.server_port, timeout=1
+                        )
+                        try:
+                            connection.request("GET", "/")
+                            response = connection.getresponse()
+                            response.read()
+                            status.append(response.status)
+                        finally:
+                            connection.close()
+                            completed.set()
+
+                    client_thread = threading.Thread(target=valid_request)
+                    try:
+                        stalled.sendall(partial)
+                        time.sleep(0.02)
+                        client_thread.start()
+                        self.assertTrue(completed.wait(timeout=0.5))
+                        self.assertEqual(status, [501])
+                    finally:
+                        stalled.close()
+                        client_thread.join(timeout=1)
+                        server.shutdown()
+                        server.server_close()
+                        server_thread.join(timeout=1)
+
     def test_exact_public_request_maps_to_vllm_score_and_back(self) -> None:
         request = adapter.parse_public_request(_public_request())
         self.assertEqual(

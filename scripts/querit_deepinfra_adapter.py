@@ -82,6 +82,15 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
         self._handler_slots = threading.BoundedSemaphore(max_concurrency)
         super().__init__(server_address, request_handler_class)
 
+    def get_request(self) -> tuple[Any, Any]:
+        request, client_address = super().get_request()
+        try:
+            request.settimeout(REQUEST_BODY_TIMEOUT_SECONDS)
+        except BaseException:
+            request.close()
+            raise
+        return request, client_address
+
     def process_request(self, request: Any, client_address: Any) -> None:
         self._handler_slots.acquire()
         try:
