@@ -44,6 +44,9 @@ class IntegratedGuardianRegistrationTests(unittest.TestCase):
         self.assertIn("ReadWritePaths=", proxy_unit)
         self.assertIn("/sys/fs/cgroup", proxy_unit)
         for path in (
+            ROOT / "config" / "gb10-memory-guardian",
+            ROOT / "crates" / "gb10-memory-guardian",
+            ROOT / "crates" / "gb10-memory-guardian-core",
             ROOT / "systemd" / "gb10-memory-guardian.service",
             ROOT / "systemd" / "gb10-stack-recovery.service",
             ROOT / "systemd" / "aeon-healthcheck.timer",

@@ -79,6 +79,12 @@ before writing directly to a pre-opened `cgroup.kill` descriptor; it does not
 invoke Docker or systemd under pressure. Embedding and reranker remain outside
 the target set. `sysmon.service` remains the observer-only host monitor.
 
+This service repository intentionally ships no standalone memory-guardian
+Cargo workspace, binary, config, or unit. The external `llm-guard-proxy`
+checkout owns the integrated guardian implementation and build. The retained
+`%t/gb10-memory-guardian` name is only the runtime registration directory
+shared by the proxy and text unit.
+
 ### Reference Production Profile (source updated 2026-07-17)
 
 The tracked source selects this friendly release and immutable repository digest
@@ -120,18 +126,11 @@ The committed Docker memory ceilings are AEON 128g, embedding 128g, and Querit 1
 
 ```text
 gb10-services/
-├── Cargo.toml              # Persistent Rust workspace (resolver 2)
-├── Cargo.lock              # Reviewed dependency lock
 ├── LICENSE
 ├── README.md               # User guide (human-facing)
 ├── config/
-│   ├── gb10-memory-guardian/
-│   │   └── config.toml     # Generic runtime-relative recovery target
 │   └── llm-guard-proxy/
-│       └── config.toml     # llm-guard-proxy shielding rules & limits
-├── crates/
-│   ├── gb10-memory-guardian-core/ # Parsers, registration, retained FDs, kill path
-│   └── gb10-memory-guardian/      # Polling user-service binary
+│       └── config.toml     # Proxy routing, shielding, and guardian policy
 ├── docs/
 │   ├── deployment/
 │   │   └── AGENTS.md       # Agent-facing service deployment playbook
