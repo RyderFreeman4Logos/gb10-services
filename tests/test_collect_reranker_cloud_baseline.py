@@ -107,6 +107,35 @@ def _run_main(
 
 
 class CloudCollectorSafetyTests(unittest.TestCase):
+    def test_empty_corpus_is_not_a_success_and_creates_no_artifacts(self) -> None:
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run), tempfile.TemporaryDirectory() as raw_tmp:
+                root = Path(raw_tmp)
+                corpus = root / "corpus.jsonl"
+                output = root / "baseline.jsonl"
+                corpus.write_text("")
+                arguments = [
+                    "--corpus",
+                    str(corpus),
+                    "--output",
+                    str(output),
+                    "--budget-usd",
+                    "1",
+                ]
+                if dry_run:
+                    arguments.append("--dry-run")
+
+                result, cloud_call, stdout = _run_main_capture(
+                    arguments,
+                    (200, {"input_tokens": 1, "scores": [0.5]}, {"http_status": 200}),
+                )
+
+                self.assertEqual(result, 2)
+                cloud_call.assert_not_called()
+                self.assertEqual(stdout, "")
+                self.assertFalse(output.exists())
+                self.assertFalse(collector.intent_path(output).exists())
+
     def test_structurally_invalid_corpus_rows_exit_cleanly_before_planning(self) -> None:
         invalid_rows = (
             {"query": "q", "candidates": None},

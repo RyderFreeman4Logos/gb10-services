@@ -35,6 +35,86 @@ class _OversizedHTTPResponse:
 
 
 class RankingMetricTests(unittest.TestCase):
+    def test_nonfinite_values_cannot_be_serialized_as_json_evidence(self) -> None:
+        with self.assertRaises(ValueError):
+            replay.canonical_json({"metric": float("nan")})
+
+    def test_empty_baseline_or_corpus_fails_before_requests_and_outputs(self) -> None:
+        cases = (("", ""), ("", json.dumps({"query_id": "q1"})), ("{}\n", ""))
+        for baseline_text, corpus_text in cases:
+            with (
+                self.subTest(baseline=baseline_text, corpus=corpus_text),
+                tempfile.TemporaryDirectory() as raw_tmp,
+            ):
+                root = Path(raw_tmp)
+                baseline = root / "baseline.jsonl"
+                corpus = root / "corpus.jsonl"
+                output = root / "receipt.json"
+                baseline.write_text(baseline_text)
+                corpus.write_text(corpus_text)
+                with (
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "replay_reranker_local_vs_cloud.py",
+                            "--baseline",
+                            str(baseline),
+                            "--corpus",
+                            str(corpus),
+                            "--output",
+                            str(output),
+                            "--local-url",
+                            "http://127.0.0.1:18014",
+                        ],
+                    ),
+                    patch.object(replay, "call_local") as local_call,
+                    patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                    patch("sys.stderr", new_callable=io.StringIO),
+                ):
+                    result = replay.main()
+
+                self.assertEqual(result, 2)
+                local_call.assert_not_called()
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertFalse(output.exists())
+                self.assertFalse(output.with_suffix(".groups.jsonl").exists())
+
+    def test_zero_valid_comparisons_cannot_write_a_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            baseline = root / "baseline.jsonl"
+            corpus = root / "corpus.jsonl"
+            output = root / "receipt.json"
+            baseline.write_text(json.dumps({"query_id": "missing"}) + "\n")
+            corpus.write_text(json.dumps({"query_id": "q1"}) + "\n")
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "replay_reranker_local_vs_cloud.py",
+                        "--baseline",
+                        str(baseline),
+                        "--corpus",
+                        str(corpus),
+                        "--output",
+                        str(output),
+                        "--local-url",
+                        "http://127.0.0.1:18014",
+                    ],
+                ),
+                patch.object(replay, "call_local") as local_call,
+                patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                patch("sys.stderr", new_callable=io.StringIO),
+            ):
+                result = replay.main()
+
+            self.assertEqual(result, 1)
+            local_call.assert_not_called()
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertFalse(output.exists())
+
     def test_score_normalizers_reject_boolean_indices_scores_and_domain_drift(self) -> None:
         invalid_vllm = (
             {"data": [{"index": False, "score": 0.0}]},

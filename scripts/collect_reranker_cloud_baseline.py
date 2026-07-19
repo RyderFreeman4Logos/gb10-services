@@ -423,6 +423,8 @@ def main() -> int:
         groups = load_corpus(args.corpus)
         if args.max_groups > 0:
             groups = groups[: args.max_groups]
+        if not groups:
+            raise CollectionStateError("corpus must contain at least one query group")
         plans: list[tuple[dict[str, Any], dict[str, Any], str, int]] = []
         planned_fingerprints: set[str] = set()
         for group in groups:

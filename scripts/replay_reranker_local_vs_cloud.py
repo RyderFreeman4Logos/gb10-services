@@ -55,7 +55,13 @@ class ReplayInputError(ValueError):
 
 
 def canonical_json(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -256,11 +262,15 @@ def main() -> int:
     try:
         corpus_index = load_corpus_index(args.corpus)
         baseline_rows = load_jsonl(args.baseline)
+        if args.max_groups > 0:
+            baseline_rows = baseline_rows[: args.max_groups]
+        if not corpus_index:
+            raise ReplayInputError("corpus must contain at least one query group")
+        if not baseline_rows:
+            raise ReplayInputError("baseline must contain at least one response row")
     except (OSError, UnicodeError, ReplayInputError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    if args.max_groups > 0:
-        baseline_rows = baseline_rows[: args.max_groups]
 
     normalizer = normalize_vllm_score if args.local_contract == "vllm-score" else normalize_deepinfra
 
@@ -314,6 +324,20 @@ def main() -> int:
             t5 = top_k_overlap(local_scores, cloud_scores, 5)
             l_ndcg = ndcg_at_k(local_scores, relevance, 10)
             c_ndcg = ndcg_at_k(cloud_scores, relevance, 10)
+            if not all(math.isfinite(value) for value in (sp, t3, t5, l_ndcg, c_ndcg)):
+                raise ReplayInputError("comparison produced a non-finite metric")
+            per_group = {
+                "query_id": qid,
+                "source_language": group.get("source_language"),
+                "pair_count": expected,
+                "spearman": round(sp, 6),
+                "top1_match": t1,
+                "top3_overlap": round(t3, 4),
+                "top5_overlap": round(t5, 4),
+                "local_ndcg10": round(l_ndcg, 6),
+                "cloud_ndcg10": round(c_ndcg, 6),
+            }
+            per_group_line = canonical_json(per_group).decode("utf-8") + "\n"
         except Exception as exc:
             failed += 1
             print(f"ERROR {row.get('query_id')}: {exc}", file=sys.stderr)
@@ -328,26 +352,19 @@ def main() -> int:
             top1_matches += 1
         groups_compared += 1
 
-        per_group = {
-            "query_id": qid,
-            "source_language": group.get("source_language"),
-            "pair_count": expected,
-            "spearman": round(sp, 6),
-            "top1_match": t1,
-            "top3_overlap": round(t3, 4),
-            "top5_overlap": round(t5, 4),
-            "local_ndcg10": round(l_ndcg, 6),
-            "cloud_ndcg10": round(c_ndcg, 6),
-        }
         with per_group_path.open("a", encoding="utf-8") as per_group_handle:
-            per_group_handle.write(canonical_json(per_group).decode("utf-8") + "\n")
+            per_group_handle.write(per_group_line)
             per_group_handle.flush()
 
         if args.rate_delay_seconds > 0:
             time.sleep(args.rate_delay_seconds)
 
+    if groups_compared == 0:
+        print("ERROR: no groups produced valid comparison evidence", file=sys.stderr)
+        return 1
+
     def mean(values: list[float]) -> float:
-        return sum(values) / len(values) if values else float("nan")
+        return sum(values) / len(values)
 
     receipt = {
         "schema": "reranker-local-vs-cloud-receipt-v1",
@@ -360,7 +377,7 @@ def main() -> int:
         "groups_compared": groups_compared,
         "groups_failed": failed,
         "mean_spearman": round(mean(spearman_values), 6),
-        "top1_agreement": round(top1_matches / groups_compared, 6) if groups_compared else float("nan"),
+        "top1_agreement": round(top1_matches / groups_compared, 6),
         "mean_top3_overlap": round(mean(top3_overlaps), 6),
         "mean_top5_overlap": round(mean(top5_overlaps), 6),
         "mean_local_ndcg10": round(mean(local_ndcg), 6),
@@ -369,7 +386,7 @@ def main() -> int:
     }
     args.output.write_text(canonical_json(receipt).decode("utf-8") + "\n", encoding="utf-8")
     print(json.dumps(receipt, indent=2, sort_keys=True))
-    return 0 if failed == 0 else 1
+    return 0 if failed == 0 and groups_compared > 0 else 1
 
 
 if __name__ == "__main__":
