@@ -67,12 +67,14 @@ def _write_corpus(path: Path, count: int) -> list[dict[str, object]]:
 def _baseline_row(group: dict[str, object], charged_tokens: int) -> dict[str, object]:
     request = collector.build_request(group, collector.DEFAULT_INSTRUCTION)
     return {
-        "schema": "reranker-cloud-baseline-v1",
+        "schema": collector.CURRENT_BASELINE_SCHEMA,
         "provider": "deepinfra",
         "model": "Qwen/Qwen3-Reranker-8B",
         "query_id": group["query_id"],
         "source_language": group["source_language"],
-        "request_fingerprint": collector.request_fingerprint(group, request),
+        "request_fingerprint": collector.request_fingerprint(
+            group, request, baseline_schema=collector.CURRENT_BASELINE_SCHEMA
+        ),
         "request_instruction": collector.DEFAULT_INSTRUCTION,
         "pair_count": 1,
         "candidate_document_ids": [f"document-{str(group['query_id']).removeprefix('query-')}"],
@@ -267,6 +269,46 @@ class CloudCollectorSafetyTests(unittest.TestCase):
                 redirect_stderr(io.StringIO()),
             ):
                 self.assertEqual(collector.main(), 0)
+            baseline_row = json.loads(output.read_text())
+            self.assertEqual(
+                baseline_row["schema"], collector.CURRENT_BASELINE_SCHEMA
+            )
+            self.assertEqual(baseline_row["request_fingerprint"], fingerprint)
+
+    def test_legacy_baseline_resumes_with_its_original_fingerprint_algorithm(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            corpus = root / "corpus.jsonl"
+            output = root / "baseline.jsonl"
+            group = _write_corpus(corpus, 1)[0]
+            row = _baseline_row(group, 1)
+            request = collector.build_request(group, collector.DEFAULT_INSTRUCTION)
+            row["schema"] = collector.LEGACY_BASELINE_SCHEMA
+            row["request_fingerprint"] = collector.request_fingerprint(
+                group,
+                request,
+                baseline_schema=collector.LEGACY_BASELINE_SCHEMA,
+            )
+            output.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+            result, cloud_call, stdout = _run_main_capture(
+                [
+                    "--corpus",
+                    str(corpus),
+                    "--output",
+                    str(output),
+                    "--budget-usd",
+                    "1",
+                    "--resume",
+                    "--dry-run",
+                ],
+                (200, {"input_tokens": 1, "scores": [0.5]}, {}),
+            )
+            self.assertEqual(result, 0)
+            cloud_call.assert_not_called()
+            self.assertEqual(json.loads(stdout)["groups_skipped"], 1)
 
     def test_two_processes_share_one_owner_and_issue_one_paid_request(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:

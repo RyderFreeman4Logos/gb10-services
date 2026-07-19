@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import io
 import json
 import math
@@ -15,6 +16,49 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 replay = importlib.import_module("replay_reranker_local_vs_cloud")
+collector = importlib.import_module("collect_reranker_cloud_baseline")
+
+
+def _evidence_fixture(root: Path) -> tuple[Path, Path, Path, dict[str, object]]:
+    candidates = [
+        {"document_id": f"d{i}", "document": f"document {i}", "relevance": i == 0}
+        for i in range(5)
+    ]
+    group = {
+        "query_id": "q1",
+        "source_language": "en",
+        "query": "query",
+        "candidates": candidates,
+    }
+    instruction = collector.DEFAULT_INSTRUCTION
+    request = collector.build_request(group, instruction)
+    row: dict[str, object] = {
+        "schema": collector.LEGACY_BASELINE_SCHEMA,
+        "provider": collector.DEFAULT_PROVIDER,
+        "model": collector.DEFAULT_MODEL,
+        "query_id": "q1",
+        "source_language": "en",
+        "request_fingerprint": collector.request_fingerprint(
+            group,
+            request,
+            baseline_schema=collector.LEGACY_BASELINE_SCHEMA,
+        ),
+        "request_instruction": instruction,
+        "pair_count": 5,
+        "candidate_document_ids": [f"d{i}" for i in range(5)],
+        "candidate_relevance": [True, False, False, False, False],
+        "response": {"scores": [0.9, 0.7, 0.5, 0.3, 0.1], "input_tokens": 5},
+        "timing": {"http_status": 200},
+        "charged_input_tokens": 5,
+        "estimated_input_tokens": collector.estimate_tokens(request),
+        "cumulative_cost_usd": 0.1,
+    }
+    corpus = root / "corpus.jsonl"
+    baseline = root / "baseline.jsonl"
+    output = root / "receipt.json"
+    corpus.write_bytes(replay.canonical_json(group) + b"\n")
+    baseline.write_bytes(replay.canonical_json(row) + b"\n")
+    return corpus, baseline, output, row
 
 
 class _OversizedHTTPResponse:
@@ -35,6 +79,163 @@ class _OversizedHTTPResponse:
 
 
 class RankingMetricTests(unittest.TestCase):
+    def test_committed_legacy_baseline_binds_every_exact_corpus_request(self) -> None:
+        data = ROOT / "data" / "reranker-equivalence"
+        corpus_rows, _corpus_hash = replay.load_jsonl(
+            data / "miracl-reranking-en-zh-dev.jsonl"
+        )
+        baseline_rows, _baseline_hash = replay.load_jsonl(
+            data / "cloud-baseline-deepinfra-qwen3-reranker-8b.jsonl"
+        )
+        corpus_index = replay.load_corpus_index(corpus_rows)
+        self.assertEqual(len(baseline_rows), 200)
+        for row in baseline_rows:
+            replay.validate_baseline_identity(
+                row,
+                corpus_index[(row["query_id"], row["source_language"])],
+                provider=collector.DEFAULT_PROVIDER,
+                model=collector.DEFAULT_MODEL,
+            )
+
+    def test_versioned_fingerprints_bind_legacy_and_current_experiment_identity(
+        self,
+    ) -> None:
+        group = {
+            "query_id": "q1",
+            "source_language": "en",
+            "query": "query",
+            "candidates": [{"document": "document"}],
+        }
+        request = collector.build_request(group, collector.DEFAULT_INSTRUCTION)
+        legacy_identity = {
+            "query_id": "q1",
+            "source_language": "en",
+            "request": request,
+        }
+        legacy = hashlib.sha256(collector.canonical_json(legacy_identity)).hexdigest()
+        self.assertEqual(
+            collector.request_fingerprint(
+                group,
+                request,
+                baseline_schema=collector.LEGACY_BASELINE_SCHEMA,
+            ),
+            legacy,
+        )
+        current = collector.request_fingerprint(
+            group, request, baseline_schema=collector.CURRENT_BASELINE_SCHEMA
+        )
+        self.assertNotEqual(current, legacy)
+        self.assertNotEqual(
+            current,
+            collector.request_fingerprint(
+                group,
+                request,
+                provider="other-provider",
+                baseline_schema=collector.CURRENT_BASELINE_SCHEMA,
+            ),
+        )
+        self.assertNotEqual(
+            current,
+            collector.request_fingerprint(
+                group,
+                request,
+                model="other-model",
+                baseline_schema=collector.CURRENT_BASELINE_SCHEMA,
+            ),
+        )
+
+    def test_replay_rejects_identity_mutations_before_local_request(self) -> None:
+        mutations = {
+            "schema": "unknown-schema",
+            "provider": "other-provider",
+            "model": "other-model",
+            "source_language": "zh",
+            "request_fingerprint": "0" * 64,
+            "request_instruction": "different instruction",
+            "candidate_document_ids": ["wrong"] * 5,
+            "candidate_relevance": [False] * 5,
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as raw_tmp:
+                corpus, baseline, output, row = _evidence_fixture(Path(raw_tmp))
+                row[field] = value
+                baseline.write_bytes(replay.canonical_json(row) + b"\n")
+                with (
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "replay_reranker_local_vs_cloud.py",
+                            "--baseline",
+                            str(baseline),
+                            "--corpus",
+                            str(corpus),
+                            "--output",
+                            str(output),
+                            "--local-url",
+                            "http://127.0.0.1:18014",
+                            "--rate-delay-seconds",
+                            "0",
+                        ],
+                    ),
+                    patch.object(replay, "call_local") as local_call,
+                    redirect_stdout(io.StringIO()),
+                    redirect_stderr(io.StringIO()),
+                ):
+                    result = replay.main()
+                self.assertEqual(result, 2)
+                local_call.assert_not_called()
+                self.assertFalse(output.exists())
+
+    def test_receipt_binds_exact_baseline_and_corpus_content_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            corpus, baseline, output, _row = _evidence_fixture(Path(raw_tmp))
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "replay_reranker_local_vs_cloud.py",
+                        "--baseline",
+                        str(baseline),
+                        "--corpus",
+                        str(corpus),
+                        "--output",
+                        str(output),
+                        "--local-url",
+                        "http://127.0.0.1:18014",
+                        "--rate-delay-seconds",
+                        "0",
+                    ],
+                ),
+                patch.object(
+                    replay,
+                    "call_local",
+                    return_value=(
+                        200,
+                        {
+                            "data": [
+                                {"index": index, "score": score}
+                                for index, score in enumerate(
+                                    (0.8, 0.4, 0.0, -0.4, -0.8)
+                                )
+                            ]
+                        },
+                    ),
+                ),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                result = replay.main()
+            self.assertEqual(result, 0)
+            receipt = json.loads(output.read_text())
+            self.assertEqual(
+                receipt["baseline_sha256"], hashlib.sha256(baseline.read_bytes()).hexdigest()
+            )
+            self.assertEqual(
+                receipt["corpus_sha256"], hashlib.sha256(corpus.read_bytes()).hexdigest()
+            )
+
     def test_nonfinite_values_cannot_be_serialized_as_json_evidence(self) -> None:
         with self.assertRaises(ValueError):
             replay.canonical_json({"metric": float("nan")})
@@ -110,7 +311,7 @@ class RankingMetricTests(unittest.TestCase):
             ):
                 result = replay.main()
 
-            self.assertEqual(result, 1)
+            self.assertEqual(result, 2)
             local_call.assert_not_called()
             self.assertEqual(stdout.getvalue(), "")
             self.assertFalse(output.exists())

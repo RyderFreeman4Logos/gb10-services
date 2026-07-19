@@ -28,7 +28,6 @@ from __future__ import annotations
 import argparse
 import errno
 import fcntl
-import hashlib
 import json
 import math
 import os
@@ -41,6 +40,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from reranker_cloud_evidence import (
+    CURRENT_BASELINE_SCHEMA,
+    LEGACY_BASELINE_SCHEMA,
+    canonical_json,
+    request_fingerprint,
+)
 from reranker_equivalence_metrics import PROMPT_OVERHEAD_TOKENS_PER_PAIR
 from reranker_score_validation import ScoreValidationError, validate_scores
 
@@ -83,6 +88,8 @@ class ExpectedPlanRow:
     candidate_document_ids: tuple[object, ...]
     candidate_relevance: tuple[object, ...]
     estimated_input_tokens: int
+    current_fingerprint: str
+    legacy_fingerprint: str
 
 
 def _corpus_text(value: object, label: str, line_number: int) -> str:
@@ -146,28 +153,6 @@ def build_request(group: dict[str, Any], instruction: str) -> dict[str, Any]:
         "documents": documents,
         "instruction": instruction,
     }
-
-
-def canonical_json(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-
-
-def request_fingerprint(
-    group: dict[str, Any],
-    request_body: dict[str, Any],
-    *,
-    provider: str = DEFAULT_PROVIDER,
-    model: str = DEFAULT_MODEL,
-) -> str:
-    identity = {
-        "schema": "reranker-cloud-request-v1",
-        "provider": provider,
-        "model": model,
-        "query_id": group.get("query_id"),
-        "source_language": group.get("source_language"),
-        "request": request_body,
-    }
-    return hashlib.sha256(canonical_json(identity)).hexdigest()
 
 
 def estimate_tokens(request_body: dict[str, Any]) -> int:
@@ -330,16 +315,18 @@ def _load_resume_state(
     }
     for row in _load_jsonl_strict(output, "cloud baseline"):
         fingerprint = row.get("request_fingerprint")
+        expected = planned.get(fingerprint) if isinstance(fingerprint, str) else None
         charged = row.get("charged_input_tokens")
         estimated = row.get("estimated_input_tokens")
         pair_count = row.get("pair_count")
         cumulative_cost = row.get("cumulative_cost_usd")
         if (
             set(row) != baseline_fields
-            or row.get("schema") != "reranker-cloud-baseline-v1"
+            or row.get("schema")
+            not in {LEGACY_BASELINE_SCHEMA, CURRENT_BASELINE_SCHEMA}
             or not isinstance(fingerprint, str)
-            or fingerprint not in planned
-            or fingerprint in completed
+            or expected is None
+            or expected.current_fingerprint in completed
             or isinstance(charged, bool)
             or not isinstance(charged, int)
             or charged < 0
@@ -364,9 +351,14 @@ def _load_resume_state(
             or not isinstance(row.get("timing"), dict)
         ):
             raise CollectionStateError("cloud baseline resume row is inconsistent")
-        expected = planned[fingerprint]
+        schema_fingerprint = (
+            expected.legacy_fingerprint
+            if row["schema"] == LEGACY_BASELINE_SCHEMA
+            else expected.current_fingerprint
+        )
         if (
-            row["provider"] != expected.provider
+            fingerprint != schema_fingerprint
+            or row["provider"] != expected.provider
             or row["model"] != expected.model
             or row["query_id"] != expected.query_id
             or row["source_language"] != expected.source_language
@@ -406,9 +398,9 @@ def _load_resume_state(
                 )
             except ScoreValidationError:
                 score_payload_invalid = True
-        completed.add(fingerprint)
+        completed.add(expected.current_fingerprint)
         if http_status != 200 or token_count_invalid or score_payload_invalid:
-            terminal_failures.add(fingerprint)
+            terminal_failures.add(expected.current_fingerprint)
         charged_input_tokens += charged
 
     intents: set[str] = set()
@@ -430,7 +422,7 @@ def _load_resume_state(
             or row.get("schema") != "reranker-cloud-request-intent-v1"
             or not isinstance(fingerprint, str)
             or expected is None
-            or fingerprint in intents
+            or expected.current_fingerprint in intents
             or row.get("provider") != expected.provider
             or row.get("model") != expected.model
             or row.get("query_id") != expected.query_id
@@ -441,7 +433,7 @@ def _load_resume_state(
             or estimated_cost < 0
         ):
             raise CollectionStateError("cloud request intent row is inconsistent")
-        intents.add(fingerprint)
+        intents.add(expected.current_fingerprint)
     unresolved = intents - completed
     if unresolved:
         raise CollectionStateError(
@@ -544,7 +536,14 @@ def _run_owned(args: argparse.Namespace) -> int:
                 provider=args.provider,
                 model=args.model,
             )
-            if fingerprint in planned:
+            legacy_fingerprint = request_fingerprint(
+                group,
+                request_body,
+                provider=args.provider,
+                model=args.model,
+                baseline_schema=LEGACY_BASELINE_SCHEMA,
+            )
+            if fingerprint in planned or legacy_fingerprint in planned:
                 raise CollectionStateError("cloud plan contains duplicate requests")
             estimated_tokens = estimate_tokens(request_body)
             planned[fingerprint] = ExpectedPlanRow(
@@ -561,7 +560,10 @@ def _run_owned(args: argparse.Namespace) -> int:
                     candidate.get("relevance") for candidate in group["candidates"]
                 ),
                 estimated_input_tokens=estimated_tokens,
+                current_fingerprint=fingerprint,
+                legacy_fingerprint=legacy_fingerprint,
             )
+            planned[legacy_fingerprint] = planned[fingerprint]
             plans.append((group, request_body, fingerprint, estimated_tokens))
 
         if args.resume:
@@ -690,7 +692,7 @@ def _run_owned(args: argparse.Namespace) -> int:
         total_cost = total_input_tokens / 1_000_000 * args.price_per_mtok
 
         record = {
-            "schema": "reranker-cloud-baseline-v1",
+            "schema": CURRENT_BASELINE_SCHEMA,
             "provider": args.provider,
             "model": args.model,
             "query_id": group.get("query_id"),

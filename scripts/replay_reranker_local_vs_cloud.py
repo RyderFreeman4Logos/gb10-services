@@ -32,6 +32,7 @@ The ``--local-contract`` flag selects how the local response is normalized:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
@@ -41,6 +42,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from reranker_cloud_evidence import (
+    SUPPORTED_BASELINE_SCHEMAS,
+    canonical_json,
+    request_fingerprint,
+)
 from reranker_equivalence_metrics import rank_indices
 from reranker_score_validation import validate_scores
 
@@ -54,49 +60,46 @@ class ReplayInputError(ValueError):
     """A replay JSONL input cannot be interpreted safely."""
 
 
-def canonical_json(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-
-
-def load_jsonl(path: Path) -> list[dict[str, Any]]:
+def load_jsonl(path: Path) -> tuple[list[dict[str, Any]], str]:
     rows: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(
-                    line,
-                    parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
-                )
-            except (json.JSONDecodeError, ValueError) as exc:
-                raise ReplayInputError(
-                    f"{path.name} JSONL row {line_number} is malformed"
-                ) from exc
-            if not isinstance(row, dict):
-                raise ReplayInputError(
-                    f"{path.name} JSONL row {line_number} is not an object"
-                )
-            rows.append(row)
-    return rows
+    raw = path.read_bytes()
+    text = raw.decode("utf-8")
+    for line_number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(
+                line,
+                parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+            )
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ReplayInputError(
+                f"{path.name} JSONL row {line_number} is malformed"
+            ) from exc
+        if not isinstance(row, dict):
+            raise ReplayInputError(
+                f"{path.name} JSONL row {line_number} is not an object"
+            )
+        rows.append(row)
+    return rows, hashlib.sha256(raw).hexdigest()
 
 
-def load_corpus_index(path: Path) -> dict[str, dict[str, Any]]:
-    index: dict[str, dict[str, Any]] = {}
-    for group in load_jsonl(path):
+def load_corpus_index(
+    groups: list[dict[str, Any]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    index: dict[tuple[str, str], dict[str, Any]] = {}
+    for group in groups:
         qid = group.get("query_id")
+        language = group.get("source_language")
         if not isinstance(qid, str) or not qid:
             raise ReplayInputError("corpus query_id must be non-empty text")
-        if qid in index:
-            raise ReplayInputError("corpus contains duplicate query_id")
-        index[qid] = group
+        if not isinstance(language, str) or not language:
+            raise ReplayInputError("corpus source_language must be non-empty text")
+        identity = (qid, language)
+        if identity in index:
+            raise ReplayInputError("corpus contains duplicate query identity")
+        index[identity] = group
     return index
 
 
@@ -115,6 +118,68 @@ def prepare_group(group: dict[str, Any]) -> tuple[str, list[dict[str, Any]], lis
         if not isinstance(document, str) or not document:
             raise ReplayInputError("corpus candidate document must be non-empty text")
         documents.append(document)
+    return query, candidates, documents
+
+
+BASELINE_FIELDS = {
+    "candidate_document_ids",
+    "candidate_relevance",
+    "charged_input_tokens",
+    "cumulative_cost_usd",
+    "estimated_input_tokens",
+    "model",
+    "pair_count",
+    "provider",
+    "query_id",
+    "request_fingerprint",
+    "request_instruction",
+    "response",
+    "schema",
+    "source_language",
+    "timing",
+}
+
+
+def validate_baseline_identity(
+    row: dict[str, Any],
+    group: dict[str, Any],
+    *,
+    provider: str,
+    model: str,
+) -> tuple[str, list[dict[str, Any]], list[str]]:
+    query, candidates, documents = prepare_group(group)
+    schema = row.get("schema")
+    instruction = row.get("request_instruction")
+    if set(row) != BASELINE_FIELDS or schema not in SUPPORTED_BASELINE_SCHEMAS:
+        raise ReplayInputError("cloud baseline schema or fields are unsupported")
+    if row.get("provider") != provider or row.get("model") != model:
+        raise ReplayInputError("cloud baseline provider/model identity mismatch")
+    if (
+        row.get("query_id") != group.get("query_id")
+        or row.get("source_language") != group.get("source_language")
+        or not isinstance(instruction, str)
+        or not instruction
+        or row.get("pair_count") != len(candidates)
+        or row.get("candidate_document_ids")
+        != [candidate.get("document_id") for candidate in candidates]
+        or row.get("candidate_relevance")
+        != [candidate.get("relevance") for candidate in candidates]
+    ):
+        raise ReplayInputError("cloud baseline does not match corpus identity")
+    request_body = {
+        "queries": [query] * len(documents),
+        "documents": documents,
+        "instruction": instruction,
+    }
+    expected_fingerprint = request_fingerprint(
+        group,
+        request_body,
+        provider=provider,
+        model=model,
+        baseline_schema=schema,
+    )
+    if row.get("request_fingerprint") != expected_fingerprint:
+        raise ReplayInputError("cloud baseline request fingerprint mismatch")
     return query, candidates, documents
 
 
@@ -249,6 +314,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--corpus", type=Path, required=True)
+    parser.add_argument("--cloud-provider", default="deepinfra")
+    parser.add_argument("--cloud-model", default="Qwen/Qwen3-Reranker-8B")
     parser.add_argument("--local-url", required=True)
     parser.add_argument("--local-path", default="/v1/score")
     parser.add_argument("--local-model", default="Querit/Querit-4B")
@@ -260,15 +327,51 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        corpus_index = load_corpus_index(args.corpus)
-        baseline_rows = load_jsonl(args.baseline)
+        corpus_rows, corpus_sha256 = load_jsonl(args.corpus)
+        baseline_rows, baseline_sha256 = load_jsonl(args.baseline)
+        corpus_index = load_corpus_index(corpus_rows)
         if args.max_groups > 0:
             baseline_rows = baseline_rows[: args.max_groups]
         if not corpus_index:
             raise ReplayInputError("corpus must contain at least one query group")
         if not baseline_rows:
             raise ReplayInputError("baseline must contain at least one response row")
-    except (OSError, UnicodeError, ReplayInputError) as exc:
+        validated_rows: list[
+            tuple[
+                dict[str, Any],
+                dict[str, Any],
+                str,
+                list[dict[str, Any]],
+                list[str],
+                tuple[float, ...],
+            ]
+        ] = []
+        seen_query_ids: set[tuple[str, str]] = set()
+        for row in baseline_rows:
+            qid = row.get("query_id")
+            language = row.get("source_language")
+            if not isinstance(qid, str) or not qid:
+                raise ReplayInputError("baseline query_id must be non-empty text")
+            if not isinstance(language, str) or not language:
+                raise ReplayInputError("baseline source_language must be non-empty text")
+            identity = (qid, language)
+            if identity in seen_query_ids:
+                raise ReplayInputError("baseline contains duplicate query identity")
+            seen_query_ids.add(identity)
+            group = corpus_index.get(identity)
+            if group is None:
+                raise ReplayInputError("baseline query_id is absent from corpus")
+            query, candidates, documents = validate_baseline_identity(
+                row,
+                group,
+                provider=args.cloud_provider,
+                model=args.cloud_model,
+            )
+            cloud_scores = extract_cloud_scores(row, len(candidates))
+            validated_rows.append(
+                (row, group, query, candidates, documents, cloud_scores)
+            )
+    except (OSError, UnicodeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
@@ -287,15 +390,9 @@ def main() -> int:
     per_group_path = args.output.with_suffix(".groups.jsonl")
     per_group_path.write_text("", encoding="utf-8")
 
-    for row in baseline_rows:
+    for row, group, query, candidates, documents, cloud_scores in validated_rows:
         try:
-            qid = row.get("query_id")
-            if not isinstance(qid, str) or not qid:
-                raise ReplayInputError("baseline query_id must be non-empty text")
-            group = corpus_index.get(qid)
-            if group is None:
-                raise ReplayInputError("baseline query_id is absent from corpus")
-            query, candidates, documents = prepare_group(group)
+            qid = row["query_id"]
             expected = len(candidates)
             if args.local_contract == "deepinfra":
                 request_body = {
@@ -314,7 +411,6 @@ def main() -> int:
             if status != 200:
                 raise ReplayInputError(f"local endpoint returned HTTP {status}")
             local_scores = normalizer(body, expected)
-            cloud_scores = extract_cloud_scores(row, expected)
             relevance = [
                 int(candidate.get("relevance", 0)) for candidate in candidates
             ]
@@ -367,9 +463,14 @@ def main() -> int:
         return sum(values) / len(values)
 
     receipt = {
-        "schema": "reranker-local-vs-cloud-receipt-v1",
+        "schema": "reranker-local-vs-cloud-receipt-v2",
         "baseline": str(args.baseline),
+        "baseline_sha256": baseline_sha256,
         "corpus": str(args.corpus),
+        "corpus_sha256": corpus_sha256,
+        "cloud_provider": args.cloud_provider,
+        "cloud_model": args.cloud_model,
+        "baseline_schemas": sorted({row["schema"] for row in baseline_rows}),
         "local_url": args.local_url,
         "local_path": args.local_path,
         "local_model": args.local_model,
