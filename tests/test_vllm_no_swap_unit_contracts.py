@@ -186,6 +186,27 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                     self.assertEqual(argv[: len(PRODUCTION_PREFIX)], PRODUCTION_PREFIX)
                     self.assertNotIn("--test-only", argv)
 
+    def test_deployment_agents_names_current_guardian_and_cleanup_authority(self) -> None:
+        text = (ROOT / "docs" / "deployment" / "AGENTS.md").read_text()
+        for current in (
+            "integrated guardian",
+            'mem_threshold_gib = 5',
+            "gb10_verify_vllm_no_swap.sh --cleanup",
+            "ExecStopPost",
+        ):
+            with self.subTest(current=current):
+                self.assertIn(current, text)
+        for stale in (
+            "2G kill threshold",
+            "MemAvail < 2G",
+            "Rust guardian log",
+            "automatically purge hung docker containers",
+            "docker rm -f",
+            "vllm-querit-4b.service",
+        ):
+            with self.subTest(stale=stale):
+                self.assertNotIn(stale, text)
+
     def test_install_and_transactions_own_the_verifier_bundle(self) -> None:
         for path in (ROOT / "README.md", ROOT / "docs" / "deployment" / "AGENTS.md"):
             text = path.read_text()

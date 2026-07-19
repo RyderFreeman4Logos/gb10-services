@@ -205,14 +205,15 @@ parent-service `MemorySwapMax=0` substitutes for Docker-generation attribution.
 
 Verifier and cleanup calls in production units run through fixed absolute tools
 under `env -i` with the fixed rootless socket. The explicit `--test-only` seam is
-not present in units. Each unit uses a private cidfile and bounded cleanup that
-validates full CID plus exact name-to-ID before stop/remove; malformed, stale,
-or replacement identity fails closed. Install the digest-bound pair
-source-identically before units, core `0644` before wrapper `0755`: the Querit
-deployment owner includes both in its fixed transactional file bundle, and the
-embedding activator snapshots prior absence/bytes/mode for both, publishes core
-before wrapper, re-attests both authorities, and restores both exactly on
-rollback.
+not present in units. `ExecStartPre`, `ExecStop`, and `ExecStopPost` invoke the
+fixed `gb10_verify_vllm_no_swap.sh --cleanup` authority. Each unit uses a private
+cidfile, and cleanup validates full CID plus exact name-to-ID before stop/remove;
+malformed, stale, or replacement identity fails closed. Install the digest-bound
+pair source-identically before units, core `0644` before wrapper `0755`: the
+Querit deployment owner includes both in its fixed transactional file bundle,
+and the embedding activator snapshots prior absence/bytes/mode for both,
+publishes core before wrapper, re-attests both authorities, and restores both
+exactly on rollback.
 
 Memory recovery is integrated, source-first, and text-only. The text unit's
 post-start publisher validates the immutable Docker CID and exact rootless
@@ -356,34 +357,38 @@ ninja compiles in parallel → multiple nvcc/cc1plus procs exhaust UMA → kerne
 **This is the #1 cause of text startup failures on v0.25.x.**
 
 The text unit sets `MAX_JOBS=1` + `CMAKE_BUILD_PARALLEL_LEVEL=1` to serialize
-compilation. Peak memory stays ~7G above floor — well clear of the guardian's
-2G kill threshold. JIT cache is NOT persisted (ephemeral `--rm` container);
-recompilation adds ~2 min to every cold start but eliminates deployment complexity.
-
-Guardian can stay running during text startup — it only kills at MemAvail < 2G,
-and serialized compilation never drops that low.
+compilation. JIT cache is NOT persisted (ephemeral `--rm` container), so a cold
+start recompiles for roughly two minutes. The integrated guardian remains active
+and enforces the configured 5 GiB `MemAvailable` threshold during startup;
+serialized compilation is pressure reduction, not an exemption from that guard.
 
 ### 1. CUDA Hang or Service Crash
-If `vllm-aeon-27b-dflash.service` hangs or refuses to respond:
+If `vllm-aeon-27b-dflash.service` hangs or refuses to respond, use the tracked
+unit lifecycle so its generation-bound cleanup authority remains in control:
 ```bash
-# Restart the chat service (ExecStartPre will automatically purge hung docker containers)
 systemctl --user restart vllm-aeon-27b-dflash.service
 ```
 
-### 2. Manual Docker Cleanups
-If a Docker container gets stuck in a dead state and systemd fails to restart:
-```bash
-# Explicitly force remove the containers
-docker rm -f vllm-aeon-27b-dflash vllm-aeon-27b-dflash-n12 vllm-qwen3-reranker-8b vllm-embedding
+### 2. Generation-bound cleanup failures
 
-# Restart target systemd service
-systemctl --user restart vllm-aeon-27b-dflash.service
+Do not bypass the unit with direct Docker stop, kill, or remove commands.
+`ExecStartPre`, `ExecStop`, and `ExecStopPost` all route through the fixed
+`gb10_verify_vllm_no_swap.sh --cleanup` authority, which validates the private
+cidfile's full CID and exact name-to-ID binding before bounded stop/remove. If it
+fails closed, preserve the evidence and inspect the unit journal rather than
+removing a possibly replacement container:
+```bash
+systemctl --user status vllm-aeon-27b-dflash.service --no-pager
+journalctl --user -u vllm-aeon-27b-dflash.service -n 100 --no-pager
 ```
 
 ### 3. OOM / Swap Critical
-If the swap observer alerts, inspect its evidence and the Rust guardian log.
-The observer does not mutate service or container state:
+If the swap observer alerts, inspect its evidence and the integrated guardian
+messages in the proxy journal. The observer does not mutate service or container
+state, while only the integrated text guardian owns emergency recovery:
 ```bash
+journalctl --user -u llm-guard-proxy.service -n 100 --no-pager
+
 # Check memory allocation
 free -h
 
