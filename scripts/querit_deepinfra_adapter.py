@@ -35,10 +35,12 @@ BACKEND_MODEL = "Querit/Querit-4B"
 DEFAULT_INSTRUCTION = (
     "Given a web search query, retrieve relevant passages that answer the query"
 )
-MAX_REQUEST_BYTES = 32 * 1024 * 1024
+MAX_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 REQUEST_BODY_TIMEOUT_SECONDS = 5.0
-DEFAULT_MAX_CONCURRENCY = 4
+# A single admitted body keeps the worst-case parse/serialization peak inside
+# the adapter unit's 256 MiB cgroup with explicit interpreter/server reserve.
+DEFAULT_MAX_CONCURRENCY = 1
 MAX_CONCURRENCY = 64
 
 

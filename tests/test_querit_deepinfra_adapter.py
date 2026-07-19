@@ -4,10 +4,12 @@ import importlib
 import http.client
 import json
 import math
+import re
 import socket
 import sys
 import threading
 import time
+import tracemalloc
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -58,6 +60,38 @@ def _backend_response(scores: list[float]) -> bytes:
 
 
 class QueritDeepinfraAdapterTests(unittest.TestCase):
+    def test_default_peak_request_memory_fits_adapter_unit_envelope(self) -> None:
+        self.assertLessEqual(adapter.MAX_REQUEST_BYTES, 8 * 1024 * 1024)
+        self.assertEqual(adapter.DEFAULT_MAX_CONCURRENCY, 1)
+
+        document = "d" * (adapter.MAX_REQUEST_BYTES - 1024)
+        body = json.dumps(
+            {"documents": [document], "queries": ["q"]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        self.assertGreaterEqual(len(body), adapter.MAX_REQUEST_BYTES - 2048)
+        self.assertLessEqual(len(body), adapter.MAX_REQUEST_BYTES)
+
+        tracemalloc.start()
+        try:
+            request = adapter.parse_public_request(body)
+            backend_body = adapter.backend_request_bytes(request)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertTrue(backend_body)
+
+        unit = (ROOT / "systemd" / "vllm-querit-4b-canary.service").read_text()
+        memory_match = re.search(r"^MemoryMax=(\d+)M$", unit, re.MULTILINE)
+        self.assertIsNotNone(memory_match)
+        assert memory_match is not None
+        memory_max = int(memory_match.group(1)) * 1024 * 1024
+        interpreter_and_server_reserve = 128 * 1024 * 1024
+        measured_envelope = len(body) + peak + interpreter_and_server_reserve
+        self.assertLess(measured_envelope, memory_max)
+
     def test_handler_threads_and_large_body_allocations_are_bounded(self) -> None:
         handler = adapter._handler("http://unused.invalid/v1/score", 0.5)
         server = adapter.BoundedThreadingHTTPServer(
