@@ -52,6 +52,8 @@ __all__ = [
 DEFAULT_PRICE_PER_MTOK = 0.05
 MAX_CLOUD_RESPONSE_BYTES = 4 * 1024 * 1024
 DEFAULT_INSTRUCTION = "Given a web search query, retrieve relevant passages that answer the query"
+DEFAULT_PROVIDER = "deepinfra"
+DEFAULT_MODEL = "Qwen/Qwen3-Reranker-8B"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CORPUS = REPO_ROOT / "data" / "reranker-equivalence" / "miracl-reranking-en-zh-dev.jsonl"
 
@@ -65,6 +67,19 @@ class ResumeState:
     completed: frozenset[str]
     charged_input_tokens: int
     terminal_failures: frozenset[str]
+
+
+@dataclass(frozen=True)
+class ExpectedPlanRow:
+    provider: str
+    model: str
+    query_id: object
+    source_language: object
+    request_instruction: str
+    pair_count: int
+    candidate_document_ids: tuple[object, ...]
+    candidate_relevance: tuple[object, ...]
+    estimated_input_tokens: int
 
 
 def _corpus_text(value: object, label: str, line_number: int) -> str:
@@ -134,8 +149,17 @@ def canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
-def request_fingerprint(group: dict[str, Any], request_body: dict[str, Any]) -> str:
+def request_fingerprint(
+    group: dict[str, Any],
+    request_body: dict[str, Any],
+    *,
+    provider: str = DEFAULT_PROVIDER,
+    model: str = DEFAULT_MODEL,
+) -> str:
     identity = {
+        "schema": "reranker-cloud-request-v1",
+        "provider": provider,
+        "model": model,
         "query_id": group.get("query_id"),
         "source_language": group.get("source_language"),
         "request": request_body,
@@ -236,7 +260,9 @@ def _load_jsonl_strict(path: Path, label: str) -> list[dict[str, Any]]:
     return rows
 
 
-def _load_resume_state(output: Path, planned: set[str]) -> ResumeState:
+def _load_resume_state(
+    output: Path, planned: dict[str, ExpectedPlanRow]
+) -> ResumeState:
     completed: set[str] = set()
     terminal_failures: set[str] = set()
     charged_input_tokens = 0
@@ -293,6 +319,21 @@ def _load_resume_state(output: Path, planned: set[str]) -> ResumeState:
             or not isinstance(row.get("timing"), dict)
         ):
             raise CollectionStateError("cloud baseline resume row is inconsistent")
+        expected = planned[fingerprint]
+        if (
+            row["provider"] != expected.provider
+            or row["model"] != expected.model
+            or row["query_id"] != expected.query_id
+            or row["source_language"] != expected.source_language
+            or row["request_instruction"] != expected.request_instruction
+            or row["pair_count"] != expected.pair_count
+            or row["candidate_document_ids"] != list(expected.candidate_document_ids)
+            or row["candidate_relevance"] != list(expected.candidate_relevance)
+            or row["estimated_input_tokens"] != expected.estimated_input_tokens
+        ):
+            raise CollectionStateError(
+                "cloud baseline resume row does not match the requested experiment"
+            )
         timing = row["timing"]
         response = row["response"]
         http_status = timing.get("http_status")
@@ -328,11 +369,31 @@ def _load_resume_state(output: Path, planned: set[str]) -> ResumeState:
     intents: set[str] = set()
     for row in _load_jsonl_strict(intent_path(output), "cloud request intent ledger"):
         fingerprint = row.get("request_fingerprint")
+        expected = planned.get(fingerprint) if isinstance(fingerprint, str) else None
+        estimated_cost = row.get("estimated_cost_usd")
         if (
-            row.get("schema") != "reranker-cloud-request-intent-v1"
+            set(row)
+            != {
+                "estimated_cost_usd",
+                "estimated_input_tokens",
+                "model",
+                "provider",
+                "query_id",
+                "request_fingerprint",
+                "schema",
+            }
+            or row.get("schema") != "reranker-cloud-request-intent-v1"
             or not isinstance(fingerprint, str)
-            or fingerprint not in planned
+            or expected is None
             or fingerprint in intents
+            or row.get("provider") != expected.provider
+            or row.get("model") != expected.model
+            or row.get("query_id") != expected.query_id
+            or row.get("estimated_input_tokens") != expected.estimated_input_tokens
+            or isinstance(estimated_cost, bool)
+            or not isinstance(estimated_cost, (int, float))
+            or not math.isfinite(estimated_cost)
+            or estimated_cost < 0
         ):
             raise CollectionStateError("cloud request intent row is inconsistent")
         intents.add(fingerprint)
@@ -391,8 +452,8 @@ def call_deepinfra(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--provider", default="deepinfra", choices=["deepinfra"])
-    parser.add_argument("--model", default="Qwen/Qwen3-Reranker-8B")
+    parser.add_argument("--provider", default=DEFAULT_PROVIDER, choices=[DEFAULT_PROVIDER])
+    parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
@@ -426,17 +487,37 @@ def main() -> int:
         if not groups:
             raise CollectionStateError("corpus must contain at least one query group")
         plans: list[tuple[dict[str, Any], dict[str, Any], str, int]] = []
-        planned_fingerprints: set[str] = set()
+        planned: dict[str, ExpectedPlanRow] = {}
         for group in groups:
             request_body = build_request(group, args.instruction)
-            fingerprint = request_fingerprint(group, request_body)
-            if fingerprint in planned_fingerprints:
+            fingerprint = request_fingerprint(
+                group,
+                request_body,
+                provider=args.provider,
+                model=args.model,
+            )
+            if fingerprint in planned:
                 raise CollectionStateError("cloud plan contains duplicate requests")
-            planned_fingerprints.add(fingerprint)
-            plans.append((group, request_body, fingerprint, estimate_tokens(request_body)))
+            estimated_tokens = estimate_tokens(request_body)
+            planned[fingerprint] = ExpectedPlanRow(
+                provider=args.provider,
+                model=args.model,
+                query_id=group.get("query_id"),
+                source_language=group.get("source_language"),
+                request_instruction=args.instruction,
+                pair_count=len(request_body["queries"]),
+                candidate_document_ids=tuple(
+                    candidate.get("document_id") for candidate in group["candidates"]
+                ),
+                candidate_relevance=tuple(
+                    candidate.get("relevance") for candidate in group["candidates"]
+                ),
+                estimated_input_tokens=estimated_tokens,
+            )
+            plans.append((group, request_body, fingerprint, estimated_tokens))
 
         if args.resume:
-            resume = _load_resume_state(args.output, planned_fingerprints)
+            resume = _load_resume_state(args.output, planned)
         else:
             if args.output.exists() or intent_path(args.output).exists():
                 raise CollectionStateError(

@@ -424,6 +424,42 @@ class CloudCollectorSafetyTests(unittest.TestCase):
             self.assertNotIn("Traceback", stderr.getvalue())
             self.assertFalse(output.exists())
 
+    def test_resume_rejects_baseline_from_a_different_model_without_false_done(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            corpus = root / "corpus.jsonl"
+            output = root / "baseline.jsonl"
+            _write_corpus(corpus, 1)
+            arguments = [
+                "--corpus",
+                str(corpus),
+                "--output",
+                str(output),
+                "--budget-usd",
+                "1",
+                "--rate-delay-seconds",
+                "0",
+            ]
+
+            first, first_call, first_stdout = _run_main_capture(
+                [*arguments, "--model", "provider/model-a"],
+                (200, {"input_tokens": 1, "scores": [0.5]}, {"http_status": 200}),
+            )
+            self.assertEqual(first, 0)
+            first_call.assert_called_once()
+            self.assertEqual(json.loads(first_stdout)["status"], "DONE")
+
+            resumed, resumed_call, resumed_stdout = _run_main_capture(
+                [*arguments, "--model", "provider/model-b", "--resume"],
+                (200, {"input_tokens": 1, "scores": [0.5]}, {"http_status": 200}),
+            )
+
+            self.assertEqual(resumed, 2)
+            resumed_call.assert_not_called()
+            self.assertEqual(resumed_stdout, "")
+            persisted = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual([row["model"] for row in persisted], ["provider/model-a"])
+
     def test_resume_rejects_malformed_output_instead_of_resending(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
