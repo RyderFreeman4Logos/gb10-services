@@ -254,7 +254,7 @@ class CurrentGenerationVerifierTests(unittest.TestCase):
         with VerifierFixture() as fixture:
             fixture.state["systemd_outputs"][0] = fixture.state[
                 "systemd_outputs"
-            ][0].replace(" --enforce-eager ;", " --enforce-eager -m 24g ;")
+            ][0].replace(" --swap-space 0 ;", " --swap-space 0 -m 24g ;")
             self.assert_fixture_rejected(fixture)
 
     def test_rejects_replaced_or_unpopulated_container_cgroup(self) -> None:
@@ -271,6 +271,26 @@ class CurrentGenerationVerifierTests(unittest.TestCase):
                 / "cgroup.events"
             )
             cgroup_events.write_text("populated 0\nfrozen 0\n")
+            self.assert_fixture_rejected(fixture)
+
+    def test_rejects_missing_malformed_or_process_mismatched_docker_scope(self) -> None:
+        malformed = (
+            "",
+            "app.slice/not-absolute",
+            "/app.slice/not-the-container.scope",
+            f"/app.slice/docker-{CONTAINER_ID}.scope\n/second",
+        )
+        for scope in malformed:
+            with self.subTest(scope=scope), VerifierFixture() as fixture:
+                fixture.state["docker_scopes"][CONTAINER_ID] = scope
+                self.assert_fixture_rejected(fixture)
+        with VerifierFixture() as fixture:
+            del fixture.state["docker_scopes"][CONTAINER_ID]
+            self.assert_fixture_rejected(fixture)
+        with VerifierFixture() as fixture:
+            (fixture.proc / "303" / "cgroup").write_text(
+                "0::/app.slice/docker-" + "b" * 64 + ".scope\n"
+            )
             self.assert_fixture_rejected(fixture)
 
     def test_rejects_ambiguous_engine_capacity_metrics(self) -> None:

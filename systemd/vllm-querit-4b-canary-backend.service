@@ -10,21 +10,23 @@ StartLimitBurst=1
 
 [Service]
 Type=simple
+UMask=0077
 Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
 Environment=HF_HUB_OFFLINE=1
 Environment=TRANSFORMERS_OFFLINE=1
 
 # Wrapper/docker-CLI only. Docker bounds the 18 GiB canary separately.
 MemoryMax=256M
-MemorySwapMax=0
 OOMScoreAdjust=500
 Restart=no
 TimeoutStartSec=1800
 TimeoutStopSec=60
 
+ExecCondition=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-querit-4b-canary-backend.service
 ExecCondition=/home/obj/.local/bin/gb10_querit_canary_preflight.py
-ExecStartPre=-/usr/bin/docker rm -f vllm-querit-4b-canary
-ExecStart=/usr/bin/docker run --rm --name vllm-querit-4b-canary \
+ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-vllm-cids
+ExecStartPre=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-querit-4b-canary --cidfile %t/gb10-vllm-cids/vllm-querit-4b-canary-backend.cid
+ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-vllm-cids/vllm-querit-4b-canary-backend.cid --name vllm-querit-4b-canary \
   --cgroup-parent app.slice \
   --gpus all --ipc host \
   -p 127.0.0.1:18015:8000 \
@@ -59,8 +61,10 @@ ExecStart=/usr/bin/docker run --rm --name vllm-querit-4b-canary \
     --long-prefill-token-threshold 8192 \
     --enforce-eager \
     --chat-template /home/obj/models/querit-4b-vllm/querit-rerank.jinja
+ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-querit-4b-canary-backend.service --container vllm-querit-4b-canary
 ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh rerank http://127.0.0.1:18015 Querit/Querit-4B --deadline 300
-ExecStop=/usr/bin/timeout --signal=TERM --kill-after=5 30 /usr/bin/docker stop --time 20 vllm-querit-4b-canary
+ExecStop=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-querit-4b-canary --cidfile %t/gb10-vllm-cids/vllm-querit-4b-canary-backend.cid
+ExecStopPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-querit-4b-canary --cidfile %t/gb10-vllm-cids/vllm-querit-4b-canary-backend.cid
 
 StandardOutput=journal
 StandardError=journal

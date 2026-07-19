@@ -24,6 +24,8 @@ class QueritDeployerContractTests(unittest.TestCase):
         *,
         guard_mode: str = "fail",
         docker_mode: str = "ok",
+        cgroup_version: str = "2",
+        no_swap_fail_at: int = 0,
     ) -> tuple[dict[str, str], Path, Path, Path]:
         fake_bin = tmp / "bin"
         fake_bin.mkdir()
@@ -61,6 +63,10 @@ class QueritDeployerContractTests(unittest.TestCase):
         docker.write_text(
             "#!/usr/bin/env bash\n"
             f'printf \'docker %s\\n\' "$*" >> {calls}\n'
+            'if [[ "$*" == "info --format {{.CgroupVersion}}" ]]; then\n'
+            '  printf \'%s\\n\' "${FAKE_CGROUP_VERSION-2}"\n'
+            '  exit 0\n'
+            'fi\n'
             'if [[ "${FAKE_DOCKER_MODE:-ok}" == hang ]]; then\n'
             f"  : > {docker_marker}\n"
             "  /bin/sleep 30\n"
@@ -94,6 +100,18 @@ class QueritDeployerContractTests(unittest.TestCase):
         python.write_text("#!/usr/bin/env bash\necho RAW_RERANK_OK\n")
         python.chmod(0o755)
 
+        no_swap = fake_bin / "gb10_verify_vllm_no_swap.sh"
+        no_swap_count = tmp / "no-swap-count"
+        no_swap.write_text(
+            "#!/usr/bin/env bash\n"
+            f"count=$(cat {no_swap_count} 2>/dev/null || printf 0)\n"
+            "count=$((count + 1))\n"
+            f"printf '%s\\n' \"$count\" > {no_swap_count}\n"
+            f"printf 'no-swap %s\\n' \"$*\" >> {calls}\n"
+            'if (( count == ${FAKE_NO_SWAP_FAIL_AT:-0} )); then exit 85; fi\n'
+        )
+        no_swap.chmod(0o755)
+
         meminfo = tmp / "meminfo"
         meminfo.write_text("MemAvailable: 8388608 kB\n")
         guard_config = tmp / "guard-config.toml"
@@ -108,6 +126,10 @@ class QueritDeployerContractTests(unittest.TestCase):
             "GB10_RERANK_READY_ATTEMPTS": "1",
             "FAKE_GUARD_MODE": guard_mode,
             "FAKE_DOCKER_MODE": docker_mode,
+            "FAKE_CGROUP_VERSION": cgroup_version,
+            "FAKE_NO_SWAP_FAIL_AT": str(no_swap_fail_at),
+            "GB10_NO_SWAP_HELPER_TEST_PATH": str(no_swap),
+            "GB10_QUERIT_PROFILE_TEST_ONLY": "1",
         }
         return env, calls, signal_marker, docker_marker
 
@@ -174,12 +196,43 @@ class QueritDeployerContractTests(unittest.TestCase):
         self.assertIn("/usr/bin/timeout --signal=TERM", self.source)
         self.assertNotIn('command_json="$(docker inspect', self.source)
 
+    def test_no_swap_verification_uses_clean_production_environment(self) -> None:
+        for contract in (
+            "/usr/bin/env -i",
+            "DOCKER_HOST=unix:///run/user/1001/docker.sock",
+            "/usr/bin/bash --noprofile --norc",
+            "NO_SWAP_HELPER=/home/obj/.local/bin/gb10_verify_vllm_no_swap.sh",
+            'verify_no_swap "$RERANK_UNIT" "$RERANK_CONTAINER"',
+            'verify_no_swap "$EMBEDDING_UNIT" "$EMBEDDING_CONTAINER"',
+        ):
+            self.assertIn(contract, self.source)
+
     def test_enables_querit_only_after_readiness_and_smoke(self) -> None:
         ready = self.source.index("RERANK_READY")
         smoke = self.source.index("RAW_RERANK_OK")
         enable = self.source.rindex('run_systemctl enable "$RERANK_UNIT"')
         self.assertLess(ready, smoke)
         self.assertLess(smoke, enable)
+
+    def test_non_v2_docker_cgroup_preflight_fails_before_service_mutation(self) -> None:
+        for version in ("1", "unknown", ""):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as raw_tmp:
+                env, calls, _, _ = self._make_fake_stack(
+                    Path(raw_tmp), cgroup_version=version
+                )
+                result = subprocess.run(
+                    ["bash", str(DEPLOYER)],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                call_text = calls.read_text()
+                self.assertIn("docker info --format {{.CgroupVersion}}", call_text)
+                for mutation in (" start ", " stop ", " enable ", " disable "):
+                    self.assertNotIn(mutation, call_text)
 
     def test_shell_syntax(self) -> None:
         result = subprocess.run(
@@ -234,6 +287,33 @@ class QueritDeployerContractTests(unittest.TestCase):
             self.assertEqual(
                 (Path(raw_tmp) / "guard-config.toml").read_text(),
                 "original-guard-config\n",
+            )
+
+    def test_post_start_no_swap_failure_rolls_back_without_embedding_outage(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            env, calls, _, _ = self._make_fake_stack(
+                Path(raw_tmp), no_swap_fail_at=4
+            )
+            result = subprocess.run(
+                ["bash", str(DEPLOYER)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            recorded = calls.read_text().splitlines()
+            self.assertIn(
+                "systemctl --user start vllm-qwen3-reranker-8b.service",
+                recorded,
+            )
+            self.assertNotIn(
+                "systemctl --user stop vllm-embedding.service",
+                recorded,
+            )
+            self.assertGreaterEqual(
+                sum(line.startswith("no-swap ") for line in recorded), 7
             )
 
     def test_sigterm_after_switch_rolls_back_once(self) -> None:

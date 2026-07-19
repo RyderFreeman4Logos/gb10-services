@@ -11,6 +11,18 @@ CANARY_UNIT = ROOT / "systemd" / "vllm-querit-4b-canary-backend.service"
 LEGACY_TRANSFORMERS_UNIT = ROOT / "systemd" / "querit-4b-reranker.service"
 LEGACY_QWEN_UNIT = ROOT / "systemd" / "vllm-qwen3-reranker-8b.service"
 MODEL_DIR = "/home/obj/models/querit-4b-vllm"
+NO_SWAP_PREFIX = [
+    "/usr/bin/env",
+    "-i",
+    "HOME=/home/obj",
+    "PATH=/usr/bin:/bin",
+    "LC_ALL=C",
+    "DOCKER_HOST=unix:///run/user/1001/docker.sock",
+    "/usr/bin/bash",
+    "--noprofile",
+    "--norc",
+    "/home/obj/.local/bin/gb10_verify_vllm_no_swap.sh",
+]
 IMAGE = (
     "ghcr.io/aeon-7/aeon-vllm-ultimate@"
     "sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d"
@@ -116,7 +128,8 @@ class QueritVllmProductionContractTests(unittest.TestCase):
         self.assertEqual(
             host,
             [
-                "--rm", "--name", "querit-4b-vllm", "--cgroup-parent", "app.slice",
+                "--rm", "--cidfile=%t/gb10-vllm-cids/vllm-querit-4b-reranker.cid",
+                "--name", "querit-4b-vllm", "--cgroup-parent", "app.slice",
                 "--gpus", "all", "--ipc", "host", "-p", "100.105.4.92:18013:8000",
                 "-v", f"{MODEL_DIR}:{MODEL_DIR}:ro", "-e", "HF_HUB_OFFLINE=1",
                 "-e", "TRANSFORMERS_OFFLINE=1", "--memory", "18g", "--memory-swap",
@@ -142,7 +155,7 @@ class QueritVllmProductionContractTests(unittest.TestCase):
             },
         )
         self.assertIn("MemoryMax=256M", unit)
-        self.assertIn("MemorySwapMax=0", unit)
+        self.assertNotIn("MemorySwapMax=0", unit)
         self.assertIn("Restart=no", unit)
         self.assertIn("Backend scheduler ceilings", unit)
         self.assertIn("guard owns hot-reloadable request concurrency", unit)
@@ -152,9 +165,18 @@ class QueritVllmProductionContractTests(unittest.TestCase):
 
     def test_production_readiness_and_enablement_are_canonical(self) -> None:
         unit = PRODUCTION_UNIT.read_text()
+        expected_unit = "/home/obj/.config/systemd/user/vllm-querit-4b-reranker.service"
+        self.assertEqual(
+            _logical_argv(unit, "ExecCondition"),
+            [NO_SWAP_PREFIX + ["--unit", expected_unit]],
+        )
         self.assertEqual(
             _logical_argv(unit, "ExecStartPost"),
-            [["/home/obj/.local/bin/gb10_service_ready.sh", "rerank", "http://100.105.4.92:18013", "Querit/Querit-4B", "--deadline", "300"]],
+            [
+                NO_SWAP_PREFIX
+                + ["--unit", expected_unit, "--container", "querit-4b-vllm"],
+                ["/home/obj/.local/bin/gb10_service_ready.sh", "rerank", "http://100.105.4.92:18013", "Querit/Querit-4B", "--deadline", "300"],
+            ],
         )
         self.assertIn("[Install]", unit)
         self.assertIn("WantedBy=default.target", unit)

@@ -11,8 +11,13 @@ An existing ignored draft contains a longer incident chronology. This tracked no
 > **Superseded memory cap:** Commit `33f4564413f195c68f76f9fec79359a6624c4c20`
 > restored equal `--memory 128g` and `--memory-swap 128g` on 2026-07-16 because
 > Docker otherwise created no memory cgroup and `--memory-swappiness 0` had no
-> effect. The equal values disable container swap, superseding the 20 GiB cap
-> decision below while preserving its dated measurements as historical evidence.
+> effect. The equal values request Docker `MemorySwap == Memory`; a live proof must
+> bind the full CID, PID, Docker `StartedAt`, `/proc` starttime and canonical
+> `docker-<full-cid>.scope`, scope inode/population, then re-read unchanged
+> identity while proving exact `memory.max`, `memory.swap.max == 0`, and
+> activation-time `memory.swap.current == 0`. A parent systemd cgroup is not a
+> substitute. They supersede the 20 GiB cap decision below while preserving its
+> dated measurements as historical evidence.
 
 ## Facts
 

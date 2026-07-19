@@ -14,6 +14,7 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
+UMask=0077
 Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
 Environment=HF_HUB_OFFLINE=1
 Environment=GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1
@@ -44,7 +45,6 @@ OOMScoreAdjust=800
 # util=0.355 is the tracked co-resident target; 0.6 is the too-fat upstream baseline.
 # Restart via gb10_restart_text_safe.sh (stops rr first, never emb).
 MemoryMax=256M
-MemorySwapMax=0
 # Recover from any stop cause (crash, OOM kill, guardian cgroup.kill).
 # Manual `systemctl --user stop` is NOT restarted because systemd treats
 # an explicit stop as a clean deactivation, not a failure.
@@ -53,10 +53,11 @@ RestartSec=30
 TimeoutStartSec=2400
 TimeoutStopSec=60
 
+ExecCondition=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-aeon-27b-dflash.service
 ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-memory-guardian
 ExecStartPre=/usr/bin/install -d -m 0700 /home/obj/.cache/vllm-compile/aeon-qwen36-v0251-c15e2c
-ExecStartPre=-/usr/bin/docker rm -f vllm-aeon-27b-dflash-n12 vllm-aeon-27b-dflash vllm-aeon-27b
-ExecStartPre=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1 %t/gb10-memory-guardian/aeon-text.cid
+ExecStartPre=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-aeon-27b-dflash-n12 --cidfile %t/gb10-memory-guardian/aeon-text.cid
+ExecStartPre=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1
 ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.cid --name vllm-aeon-27b-dflash-n12 \
   --cgroup-parent app.slice \
   --gpus all --ipc host \
@@ -104,14 +105,18 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
     --tool-call-parser qwen3_coder \
     --default-chat-template-kwargs "{\"enable_thinking\":false}" \
     --override-generation-config "{\"temperature\":0.6,\"top_p\":0.95,\"top_k\":20}" \
+    --swap-space 0 \
     --trust-remote-code
 # Multimodal retained: no --language-model-only
+# Verify the immutable vLLM command and this Docker generation's exact user scope first.
+ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-aeon-27b-dflash.service --container vllm-aeon-27b-dflash-n12
 # Publish the exact Docker cgroup for llm-guard-proxy's integrated guardian.
 ExecStartPost=/home/obj/.local/bin/llm_guard_proxy_publish_cgroup_registration.sh
 # Raw :18010 readiness (defaults target Guard :18009).
 ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh chat http://100.105.4.92:18010 aeon-ultimate --deadline 2200
-ExecStop=/usr/bin/timeout --signal=TERM --kill-after=5 30 /usr/bin/docker stop --time 20 vllm-aeon-27b-dflash-n12
-ExecStopPost=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1 %t/gb10-memory-guardian/aeon-text.cid
+ExecStop=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-aeon-27b-dflash-n12 --cidfile %t/gb10-memory-guardian/aeon-text.cid
+ExecStopPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-aeon-27b-dflash-n12 --cidfile %t/gb10-memory-guardian/aeon-text.cid
+ExecStopPost=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1
 StandardOutput=journal
 StandardError=journal
 

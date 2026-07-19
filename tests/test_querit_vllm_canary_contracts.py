@@ -17,6 +17,18 @@ BACKEND_UNIT = ROOT / "systemd" / "vllm-querit-4b-canary-backend.service"
 PRODUCTION_UNIT = ROOT / "systemd" / "vllm-querit-4b-reranker.service"
 RESEARCH_NOTE = ROOT / "docs" / "research" / "2026-07-16-querit-vllm-migration.md"
 MODEL_DIR = "/home/obj/models/querit-4b-vllm"
+NO_SWAP_PREFIX = [
+    "/usr/bin/env",
+    "-i",
+    "HOME=/home/obj",
+    "PATH=/usr/bin:/bin",
+    "LC_ALL=C",
+    "DOCKER_HOST=unix:///run/user/1001/docker.sock",
+    "/usr/bin/bash",
+    "--noprofile",
+    "--norc",
+    "/home/obj/.local/bin/gb10_verify_vllm_no_swap.sh",
+]
 IMAGE = (
     "ghcr.io/aeon-7/aeon-vllm-ultimate@"
     "sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d"
@@ -94,12 +106,13 @@ def _backend_contract(unit: str) -> None:
     start_posts = _logical_directive_argv(unit, "ExecStartPost")
     if len(starts) != 1:
         raise AssertionError(f"expected one ExecStart, found {len(starts)}")
-    if len(start_posts) != 1:
-        raise AssertionError(f"expected one ExecStartPost, found {len(start_posts)}")
+    if len(start_posts) != 2:
+        raise AssertionError(f"expected verifier and readiness ExecStartPost commands, found {len(start_posts)}")
 
     host, container = _split_at_image(starts[0])
     expected_host = [
         "--rm",
+        "--cidfile=%t/gb10-vllm-cids/vllm-querit-4b-canary-backend.cid",
         "--name",
         "vllm-querit-4b-canary",
         "--cgroup-parent",
@@ -188,13 +201,22 @@ def _backend_contract(unit: str) -> None:
     if options != expected_options:
         raise AssertionError(f"wrong vLLM canary options: {options}")
 
-    if start_posts[0] != [
-        "/home/obj/.local/bin/gb10_service_ready.sh",
-        "rerank",
-        "http://127.0.0.1:18015",
-        "Querit/Querit-4B",
-        "--deadline",
-        "300",
+    if start_posts != [
+        NO_SWAP_PREFIX
+        + [
+            "--unit",
+            "/home/obj/.config/systemd/user/vllm-querit-4b-canary-backend.service",
+            "--container",
+            "vllm-querit-4b-canary",
+        ],
+        [
+            "/home/obj/.local/bin/gb10_service_ready.sh",
+            "rerank",
+            "http://127.0.0.1:18015",
+            "Querit/Querit-4B",
+            "--deadline",
+            "300",
+        ],
     ]:
         raise AssertionError("readiness must probe native rerank behavior on loopback :18015")
 
@@ -314,7 +336,7 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
     def test_canary_is_memory_bounded_fail_closed_and_lifecycle_isolated(self) -> None:
         unit = BACKEND_UNIT.read_text()
         self.assertIn("MemoryMax=256M", unit)
-        self.assertIn("MemorySwapMax=0", unit)
+        self.assertNotIn("MemorySwapMax=0", unit)
         self.assertIn("OOMScoreAdjust=500", unit)
         self.assertIn("TimeoutStartSec=1800", unit)
         self.assertIn("Environment=HF_HUB_OFFLINE=1", unit)
@@ -324,28 +346,32 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
         self.assertNotIn("Restart=on-failure", unit)
         self.assertEqual(
             _logical_directive_argv(unit, "ExecCondition"),
-            [["/home/obj/.local/bin/gb10_querit_canary_preflight.py"]],
-        )
-        self.assertEqual(
-            _logical_directive_argv(unit, "ExecStartPre"),
-            [["-/usr/bin/docker", "rm", "-f", "vllm-querit-4b-canary"]],
-        )
-        self.assertEqual(
-            _logical_directive_argv(unit, "ExecStop"),
             [
-                [
-                    "/usr/bin/timeout",
-                    "--signal=TERM",
-                    "--kill-after=5",
-                    "30",
-                    "/usr/bin/docker",
-                    "stop",
-                    "--time",
-                    "20",
-                    "vllm-querit-4b-canary",
-                ]
+                NO_SWAP_PREFIX
+                + [
+                    "--unit",
+                    "/home/obj/.config/systemd/user/vllm-querit-4b-canary-backend.service",
+                ],
+                ["/home/obj/.local/bin/gb10_querit_canary_preflight.py"],
             ],
         )
+        cidfile = "%t/gb10-vllm-cids/vllm-querit-4b-canary-backend.cid"
+        cleanup = NO_SWAP_PREFIX + [
+            "--cleanup",
+            "--container",
+            "vllm-querit-4b-canary",
+            "--cidfile",
+            cidfile,
+        ]
+        self.assertEqual(
+            _logical_directive_argv(unit, "ExecStartPre"),
+            [
+                ["/usr/bin/install", "-d", "-m", "0700", "%t/gb10-vllm-cids"],
+                cleanup,
+            ],
+        )
+        self.assertEqual(_logical_directive_argv(unit, "ExecStop"), [cleanup])
+        self.assertEqual(_logical_directive_argv(unit, "ExecStopPost"), [cleanup])
 
         adapter = ADAPTER_UNIT.read_text()
         self.assertIn("Restart=no", adapter)

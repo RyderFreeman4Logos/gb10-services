@@ -51,6 +51,8 @@ CONTAINER_NAMES = {
     PRODUCTION_RERANKER_UNIT: "querit-4b-vllm",
     LEGACY_RERANKER_UNIT: "vllm-qwen3-reranker-8b",
 }
+NO_SWAP_HELPER = "/home/obj/.local/bin/gb10_verify_vllm_no_swap.sh"
+UNIT_ROOT = "/home/obj/.config/systemd/user"
 
 
 class LifecycleError(RuntimeError):
@@ -131,6 +133,59 @@ class ServiceState:
 class SystemHost:
     def __init__(self, model_root: Path = DEFAULT_MODEL) -> None:
         self.model_root = model_root
+
+    def require_cgroup_v2(self) -> None:
+        try:
+            completed = subprocess.run(
+                [
+                    "/usr/bin/docker",
+                    "info",
+                    "--format",
+                    "{{.CgroupVersion}}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise LifecycleError("Docker cgroup-version preflight failed") from exc
+        if completed.returncode != 0 or completed.stdout not in {"2", "2\n"}:
+            raise LifecycleError("Docker must report cgroup version exactly 2")
+
+    def verify_no_swap(self, unit: str, container: str | None = None) -> None:
+        if unit != BACKEND_UNIT:
+            raise LifecycleError(f"refusing no-swap verification outside canary: {unit}")
+        arguments = [
+            "/usr/bin/env",
+            "-i",
+            "HOME=/home/obj",
+            "PATH=/usr/bin:/bin",
+            "LC_ALL=C",
+            "DOCKER_HOST=unix:///run/user/1001/docker.sock",
+            "/usr/bin/bash",
+            "--noprofile",
+            "--norc",
+            NO_SWAP_HELPER,
+            "--unit",
+            f"{UNIT_ROOT}/{unit}",
+        ]
+        if container is not None:
+            if container != CONTAINER_NAMES[BACKEND_UNIT]:
+                raise LifecycleError("canary container name is not canonical")
+            arguments.extend(["--container", container])
+        try:
+            completed = subprocess.run(
+                arguments,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise LifecycleError("generation-bound no-swap verification failed") from exc
+        if completed.returncode != 0:
+            raise LifecycleError("generation-bound no-swap verification failed")
 
     def verify_artifact(self) -> str:
         return querit_vllm_artifact.manifest_sha256(self.model_root)
@@ -298,7 +353,39 @@ class SystemHost:
             return fields[0], 0, "", ()
         if pid <= 0:
             raise LifecycleError(f"running container lacks a PID for {unit}")
-        cgroup, pids = cls._process_cgroup(pid)
+        process_cgroup, process_pids = cls._process_cgroup(pid)
+        scope_unit = f"docker-{fields[0]}.scope"
+        scope_result = cls._systemctl(
+            "show", "-p", "ControlGroup", "--value", scope_unit
+        )
+        scope_rows = scope_result.stdout.splitlines()
+        if len(scope_rows) != 1:
+            raise LifecycleError(f"Docker scope evidence is malformed for {unit}")
+        cgroup = scope_rows[0]
+        if (
+            not cgroup.startswith("/")
+            or not cgroup.endswith(f"/{scope_unit}")
+            or ".." in Path(cgroup).parts
+            or process_cgroup != cgroup
+        ):
+            raise LifecycleError(
+                f"container cgroup does not match Docker user scope for {unit}"
+            )
+        pids = cls._cgroup_pids(cgroup)
+        if pids != process_pids:
+            raise LifecycleError(f"Docker scope PID evidence changed for {unit}")
+        cgroup_path = Path("/sys/fs/cgroup") / cgroup.lstrip("/")
+        for metric in ("memory.swap.max", "memory.swap.current"):
+            try:
+                raw = (cgroup_path / metric).read_bytes()
+            except OSError as exc:
+                raise LifecycleError(
+                    f"cannot read Docker scope {metric} for {unit}"
+                ) from exc
+            if raw not in {b"0", b"0\n"}:
+                raise LifecycleError(
+                    f"Docker scope {metric} is not exactly zero for {unit}"
+                )
         return fields[0], pid, cgroup, pids
 
     def start(self, unit: str) -> None:

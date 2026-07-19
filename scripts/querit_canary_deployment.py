@@ -295,6 +295,8 @@ def _swap_topology_sha256(swaps: str) -> str:
 
 
 class Host(Protocol):
+    def require_cgroup_v2(self) -> None: ...
+
     def unit_info(self, unit: str) -> dict[str, str]: ...
 
     def service_state(self, unit: str) -> runtime.ServiceState: ...
@@ -331,6 +333,9 @@ class SystemHost:
     ) -> None:
         self._runtime = runtime.SystemHost(model_root)
         self.lifecycle_state = lifecycle_state
+
+    def require_cgroup_v2(self) -> None:
+        self._runtime.require_cgroup_v2()
 
     @staticmethod
     def _run(arguments: list[str], *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
@@ -693,6 +698,12 @@ TARGETS = (
     _mapping("scripts/gb10_querit_canary_preflight.py", BIN_ROOT / "gb10_querit_canary_preflight.py", 0o755),
     _mapping("scripts/gb10_querit_canary_deploy.py", BIN_ROOT / "gb10_querit_canary_deploy.py", 0o755),
     _mapping("scripts/gb10_service_ready.sh", BIN_ROOT / "gb10_service_ready.sh", 0o755),
+    _mapping(
+        "scripts/gb10_verify_vllm_no_swap_core.py",
+        BIN_ROOT / "gb10_verify_vllm_no_swap_core.py",
+        0o644,
+    ),
+    _mapping("scripts/gb10_verify_vllm_no_swap.sh", BIN_ROOT / "gb10_verify_vllm_no_swap.sh", 0o755),
     _mapping("systemd/vllm-querit-4b-canary.service", UNIT_ROOT / runtime.ADAPTER_UNIT, 0o644),
     _mapping("systemd/vllm-querit-4b-canary-backend.service", UNIT_ROOT / runtime.BACKEND_UNIT, 0o644),
 )
@@ -1443,6 +1454,7 @@ class Deployment:
                 raise DeploymentError(f"service identity drifted before deployment: {unit}")
 
     def prepare(self, bundle: Path) -> None:
+        self.host.require_cgroup_v2()
         manifest = verify_bundle(bundle, self.source_root)
         if self.state_path.exists():
             raise DeploymentError("existing deployment receipt must be recovered before prepare")
@@ -1589,6 +1601,7 @@ class Deployment:
                 raise DeploymentError(f"loaded candidate unit is not the installed disabled unit: {unit}")
 
     def install(self, source_snapshot: Path) -> None:
+        self.host.require_cgroup_v2()
         record = self._read()
         if record.get("phase") != "prepared":
             raise DeploymentError("deployment must be prepared before installation")
@@ -1609,6 +1622,7 @@ class Deployment:
         self._write(record)
 
     def activate(self, *, pause_text: bool) -> None:
+        self.host.require_cgroup_v2()
         record = self._read()
         if record.get("phase") != "installed":
             raise DeploymentError("deployment must be installed before activation")
@@ -2056,6 +2070,7 @@ class Deployment:
                 )
 
     def rollback(self) -> None:
+        self.host.require_cgroup_v2()
         record = self._read()
         was_active = record.get("phase") == "active"
         record["phase"] = "restoring"
@@ -2097,6 +2112,7 @@ class Deployment:
         _fsync_directory(self.state_path.parent)
 
     def deploy(self, bundle: Path, source_snapshot: Path, *, pause_text: bool) -> None:
+        self.host.require_cgroup_v2()
         if self.state_path.exists():
             existing = self._read()
             if existing.get("phase") == "active":

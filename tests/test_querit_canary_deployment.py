@@ -48,6 +48,8 @@ class FakeHost:
         }
         self._lifecycle_state = False
         self._text_was_paused = False
+        self.cgroup_version = "2"
+        self.cgroup_preflights = 0
         self._admission = {
             "mem_available_kib": profile.REQUIRED_ADMISSION_KIB,
             "mem_available_gib": 32,
@@ -76,6 +78,13 @@ class FakeHost:
             }
             for unit in (*runtime.IMMUTABLE_NEIGHBORS, runtime.TEXT_UNIT)
         }
+
+    def require_cgroup_v2(self) -> None:
+        self.cgroup_preflights += 1
+        if self.cgroup_version != "2":
+            raise deployment.DeploymentError(
+                "Docker cgroup version is not exactly 2"
+            )
 
     def unit_info(self, unit: str) -> dict[str, str]:
         if unit in self.info:
@@ -320,10 +329,91 @@ class DeploymentTests(unittest.TestCase):
     def test_exact_mapping_covers_ready_converter_template_and_owner(self) -> None:
         mapping = {str(item["source"]): item for item in PRODUCTION_TARGETS}
         self.assertEqual(mapping["scripts/gb10_service_ready.sh"]["mode"], 0o755)
+        self.assertEqual(mapping["scripts/gb10_verify_vllm_no_swap_core.py"]["mode"], 0o644)
+        self.assertEqual(mapping["scripts/gb10_verify_vllm_no_swap.sh"]["mode"], 0o755)
+        sources = [str(item["source"]) for item in PRODUCTION_TARGETS]
+        self.assertEqual(
+            sources.index("scripts/gb10_verify_vllm_no_swap_core.py") + 1,
+            sources.index("scripts/gb10_verify_vllm_no_swap.sh"),
+        )
         self.assertIn("scripts/querit_checkpoint_convert.py", mapping)
         self.assertIn("config/querit/querit-rerank.jinja", mapping)
         self.assertIn("scripts/querit_canary_deployment.py", mapping)
         self.assertIn("scripts/gb10_querit_canary_deploy.py", mapping)
+
+    def test_bundle_layout_rejects_legacy_order_and_arbitrary_targets(self) -> None:
+        def materialize(
+            mappings: tuple[dict[str, object], ...], name: str
+        ) -> Path:
+            entries: list[dict[str, object]] = []
+            raw_by_source: dict[str, bytes] = {}
+            for mapped in mappings:
+                source_name = str(mapped["source"])
+                raw = (ROOT / source_name).read_bytes()
+                raw_by_source[source_name] = raw
+                entries.append(
+                    {
+                        "mode": mapped["mode"],
+                        "path": source_name,
+                        "sha256": deployment._sha256(raw),
+                        "size": len(raw),
+                        "target": mapped["target"],
+                    }
+                )
+            manifest = deployment._bundle_manifest(entries, "b" * 40)
+            bundle = self.root / f"{name}-{manifest['bundle_sha256']}"
+            bundle.mkdir(mode=0o700)
+            for source_name, raw in raw_by_source.items():
+                payload = bundle / "payload" / source_name
+                payload.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                payload.write_bytes(raw)
+                payload.chmod(0o600)
+            (bundle / "manifest.json").write_bytes(
+                deployment._canonical(manifest) + b"\n"
+            )
+            (bundle / "manifest.json").chmod(0o600)
+            canonical = self.root / str(manifest["bundle_sha256"])
+            bundle.rename(canonical)
+            return canonical
+
+        with mock.patch.object(
+            deployment, "TARGETS", PRODUCTION_TARGETS
+        ), mock.patch.object(deployment, "validate_backend_unit"):
+            valid = materialize(PRODUCTION_TARGETS, "valid")
+            self.assertEqual(
+                VERIFY_BUNDLE_CONTENTS(valid)["schema"], deployment.BUNDLE_SCHEMA
+            )
+            valid.rename(self.root / "verified-valid")
+            legacy = tuple(
+                mapped
+                for mapped in PRODUCTION_TARGETS
+                if mapped["source"] != "scripts/gb10_verify_vllm_no_swap_core.py"
+            )
+            with self.assertRaisesRegex(deployment.DeploymentError, "mapping is incomplete"):
+                VERIFY_BUNDLE_CONTENTS(materialize(legacy, "legacy"))
+            core_index = next(
+                index
+                for index, mapped in enumerate(PRODUCTION_TARGETS)
+                if mapped["source"] == "scripts/gb10_verify_vllm_no_swap_core.py"
+            )
+            reordered = list(PRODUCTION_TARGETS)
+            reordered[core_index], reordered[core_index + 1] = (
+                reordered[core_index + 1],
+                reordered[core_index],
+            )
+            with self.assertRaisesRegex(
+                deployment.DeploymentError, "mapping differs"
+            ):
+                VERIFY_BUNDLE_CONTENTS(materialize(tuple(reordered), "reordered"))
+            arbitrary = PRODUCTION_TARGETS + (
+                deployment._mapping(
+                    "scripts/gb10_verify_vllm_no_swap_core.py",
+                    self.root / "arbitrary-target",
+                    0o644,
+                ),
+            )
+            with self.assertRaisesRegex(deployment.DeploymentError, "mapping is incomplete"):
+                VERIFY_BUNDLE_CONTENTS(materialize(arbitrary, "arbitrary"))
 
     def test_owner_rejects_candidate_admission_below_profile_threshold(self) -> None:
         self.host._admission["mem_available_kib"] = profile.REQUIRED_ADMISSION_KIB - 1
@@ -524,6 +614,15 @@ class DeploymentTests(unittest.TestCase):
             },
         )
         self.assertEqual(self.host.commands, [])
+
+    def test_non_v2_cgroup_preflight_rejects_prepare_before_owner_mutation(self) -> None:
+        self._set_exact_runtime_mask_prestate()
+        self.host.commands.clear()
+        self.host.cgroup_version = "unknown"
+        with self.assertRaises(deployment.DeploymentError):
+            self._runtime_mask_owner().prepare(self.bundle)
+        self.assertEqual(self.host.commands, [])
+        self.assertEqual(self.host.cgroup_preflights, 1)
 
     def test_plan_declares_runtime_mask_ownership_without_mutation(self) -> None:
         self._set_exact_runtime_mask_prestate()

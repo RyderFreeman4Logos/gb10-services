@@ -23,6 +23,10 @@ from querit_canary_runtime import (
 
 
 class Host(Protocol):
+    def require_cgroup_v2(self) -> None: ...
+
+    def verify_no_swap(self, unit: str, container: str | None = None) -> None: ...
+
     def verify_artifact(self) -> str: ...
 
     def memory_available_gib(self) -> int: ...
@@ -195,6 +199,7 @@ def _restore_original(
 ) -> BaseException | None:
     global _RESTORING_ORIGINAL
 
+    host.require_cgroup_v2()
     text_before = ServiceState.from_record(record.get("text_before"), "text")
     backend_before = ServiceState.from_record(
         record.get("backend_before"), "backend"
@@ -261,6 +266,13 @@ def _restore_original(
             _assert_neighbors(host, neighbors, context="original-state restoration")
         except BaseException as exc:
             unresolved.append(f"protected neighbors: {type(exc).__name__}: {exc}")
+        error = _retry_restore(
+            "rollback no-swap verification",
+            lambda: host.verify_no_swap(BACKEND_UNIT),
+            failures,
+        )
+        if error:
+            unresolved.append(error)
         if unresolved:
             record["phase"] = "rollback-failed"
             record["rollback_errors"] = unresolved
@@ -285,8 +297,10 @@ def _recover_stale_transaction(host: Host, state_path: Path) -> None:
 
 
 def activate(host: Host, state_path: Path, *, pause_text: bool = False) -> None:
+    host.require_cgroup_v2()
     if state_path.exists():
         _recover_stale_transaction(host, state_path)
+    host.verify_no_swap(BACKEND_UNIT)
     artifact_sha256 = host.verify_artifact()
     neighbors = _snapshot_neighbors(host)
     text_before = host.service_state(TEXT_UNIT)
@@ -331,7 +345,9 @@ def activate(host: Host, state_path: Path, *, pause_text: bool = False) -> None:
         backend_active = host.service_state(BACKEND_UNIT)
         if not backend_active.active or backend_active == backend_before:
             raise LifecycleError("canary backend did not enter a new active identity")
+        host.verify_no_swap(BACKEND_UNIT, "vllm-querit-4b-canary")
         record["backend_active"] = backend_active.record()
+        record["no_swap_verified"] = True
         _write_state(state_path, record)
         host.start(ADAPTER_UNIT)
         adapter_active = host.service_state(ADAPTER_UNIT)
@@ -366,6 +382,7 @@ def _state_bool(record: Mapping[str, object], key: str) -> bool:
 
 
 def deactivate(host: Host, state_path: Path) -> None:
+    host.require_cgroup_v2()
     record = _read_state(state_path)
     phase = record.get("phase")
     preflight_error: BaseException | None = None

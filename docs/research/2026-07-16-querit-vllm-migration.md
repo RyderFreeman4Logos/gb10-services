@@ -135,8 +135,17 @@ the GB10 host interpreter intentionally had neither `torch` nor `safetensors`.
 The already-pinned canary image contained `torch 2.11.0+cu130` and
 `safetensors 0.7.0`. The owner therefore runs conversion in that same immutable
 image with pulls and networking disabled, a read-only container root and
-source mounts, a 12 GiB no-swap cgroup ceiling, and only the disposable copied
-snapshot mounted writable. This avoids mutable host-venv dependencies without
+source mounts, equal 12 GiB Docker memory/swap caps for the disposable
+conversion process, and only the disposable copied snapshot mounted writable.
+This conversion-container limit is not the vLLM runtime no-swap attestation.
+Every tracked production/canary vLLM backend instead has one direct
+`--swap-space 0` pair and equal Docker memory/swap intent; before readiness the
+canonical helper binds full CID/PID/`StartedAt`, `/proc` starttime and exact
+Docker scope, scope inode/population, then proves exact `memory.max`, zero
+`memory.swap.max`, and zero activation-time `memory.swap.current` across an
+unchanged re-read. Querit deployment owns source-identical helper installation,
+and canary/production transactions verify preflight, post-start, and rollback
+without stopping embedding. This avoids mutable host-venv dependencies without
 changing the checkpoint conversion or scoring contract.
 
 The next live install also established a user-systemd detail that the original

@@ -27,11 +27,25 @@ EXPECTED_IMAGE = (
 EXPECTED_CONTAINER = "vllm-embedding"
 EXPECTED_MODELS = ("qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B")
 EXPECTED_PROFILE = "qwen3-embedding-8b-32k-4800M-128GiB"
-EXPECTED_UNIT_SHA256 = "097fce4d4cc6f2226ac5786f77e20491aa63a8481b0ee773c345912185374a76"
+EXPECTED_UNIT_SHA256 = "05516709daf448e84ebc1e2a7b9074fd5480c5279039ccfe5001eecd500a0df4"
+EXPECTED_NO_SWAP_PREFIX = [
+    "/usr/bin/env",
+    "-i",
+    "HOME=/home/obj",
+    "PATH=/usr/bin:/bin",
+    "LC_ALL=C",
+    "DOCKER_HOST=unix:///run/user/1001/docker.sock",
+    "/usr/bin/bash",
+    "--noprofile",
+    "--norc",
+    "/home/obj/.local/bin/gb10_verify_vllm_no_swap.sh",
+]
+EXPECTED_CIDFILE = "%t/gb10-vllm-cids/vllm-embedding.cid"
 EXPECTED_HOST_ARGV = [
     "/usr/bin/docker",
     "run",
     "--rm",
+    f"--cidfile={EXPECTED_CIDFILE}",
     "--name",
     EXPECTED_CONTAINER,
     "--gpus",
@@ -80,18 +94,46 @@ EXPECTED_CONTAINER_ARGV = [
     "--gpu-memory-utilization",
     "0.15",
     "--enforce-eager",
+    "--swap-space",
+    "0",
 ]
 EXPECTED_EXEC_START = [*EXPECTED_HOST_ARGV, EXPECTED_IMAGE, *EXPECTED_CONTAINER_ARGV]
-EXPECTED_EXEC_START_PRE = ["-/usr/bin/docker", "rm", "-f", EXPECTED_CONTAINER]
-EXPECTED_EXEC_START_POST = [
-    "/home/obj/.local/bin/gb10_service_ready.sh",
-    "embedding",
-    "http://100.105.4.92:18012",
-    "qwen3-embedding-8b",
-    "--deadline",
-    "300",
+EXPECTED_EXEC_CONDITION = [
+    *EXPECTED_NO_SWAP_PREFIX,
+    "--unit",
+    "/home/obj/.config/systemd/user/vllm-embedding.service",
 ]
-EXPECTED_EXEC_STOP = ["/usr/bin/docker", "stop", "--time", "20", EXPECTED_CONTAINER]
+EXPECTED_CLEANUP = [
+    *EXPECTED_NO_SWAP_PREFIX,
+    "--cleanup",
+    "--container",
+    EXPECTED_CONTAINER,
+    "--cidfile",
+    EXPECTED_CIDFILE,
+]
+EXPECTED_EXEC_START_PRE = (
+    ["/usr/bin/install", "-d", "-m", "0700", "%t/gb10-vllm-cids"],
+    EXPECTED_CLEANUP,
+)
+EXPECTED_EXEC_START_POST = (
+    [
+        *EXPECTED_NO_SWAP_PREFIX,
+        "--unit",
+        "/home/obj/.config/systemd/user/vllm-embedding.service",
+        "--container",
+        EXPECTED_CONTAINER,
+    ],
+    [
+        "/home/obj/.local/bin/gb10_service_ready.sh",
+        "embedding",
+        "http://100.105.4.92:18012",
+        "qwen3-embedding-8b",
+        "--deadline",
+        "300",
+    ],
+)
+EXPECTED_EXEC_STOP = EXPECTED_CLEANUP
+EXPECTED_EXEC_STOP_POST = EXPECTED_CLEANUP
 _MAX_UNIT_BYTES = 64 * 1024
 _MAX_UNIT_LINES = 512
 _MAX_TOKENS = 256
@@ -138,9 +180,8 @@ def _logical_directives(text: str, directive: str) -> list[list[str]]:
     return result
 
 
-def _expect_single(text: str, directive: str, expected: list[str]) -> None:
-    commands = _logical_directives(text, directive)
-    if commands != [expected]:
+def _expect_commands(text: str, directive: str, expected: object) -> None:
+    if _logical_directives(text, directive) != expected:
         _fail(f"{directive} does not match the canonical embedding contract")
 
 
@@ -149,14 +190,14 @@ def validate_unit_text(text: str) -> None:
 
     if hashlib.sha256(text.encode()).hexdigest() != EXPECTED_UNIT_SHA256:
         _fail("unit bytes do not match the canonical embedding source")
-    _expect_single(text, "ExecStart", EXPECTED_EXEC_START)
-    _expect_single(text, "ExecStartPre", EXPECTED_EXEC_START_PRE)
-    _expect_single(text, "ExecStartPost", EXPECTED_EXEC_START_POST)
-    _expect_single(text, "ExecStop", EXPECTED_EXEC_STOP)
+    _expect_commands(text, "ExecCondition", [EXPECTED_EXEC_CONDITION])
+    _expect_commands(text, "ExecStart", [EXPECTED_EXEC_START])
+    _expect_commands(text, "ExecStartPre", list(EXPECTED_EXEC_START_PRE))
+    _expect_commands(text, "ExecStartPost", list(EXPECTED_EXEC_START_POST))
+    _expect_commands(text, "ExecStop", [EXPECTED_EXEC_STOP])
+    _expect_commands(text, "ExecStopPost", [EXPECTED_EXEC_STOP_POST])
     for directive in (
-        "ExecCondition",
         "ExecReload",
-        "ExecStopPost",
         "RootDirectoryStartOnly",
     ):
         if _logical_directives(text, directive):
@@ -197,18 +238,29 @@ def _parse_effective_exec(value: str) -> tuple[list[str], bool]:
     return argv, ignore_value == "yes"
 
 
+def _parse_effective_execs(value: str) -> list[tuple[list[str], bool]]:
+    separator = " ; } ; "
+    parts = value.split(separator)
+    if not parts:
+        _fail("effective systemd command is missing")
+    commands: list[tuple[list[str], bool]] = []
+    for index, part in enumerate(parts):
+        candidate = part if index == len(parts) - 1 else part + " ; }"
+        commands.append(_parse_effective_exec(candidate))
+    return commands
+
+
 def validate_effective_commands(fields: dict[str, str]) -> None:
     """Apply the exact tracked command contract to systemd's effective view."""
 
     expected = {
-        "ExecStart": (EXPECTED_EXEC_START, False),
-        "ExecStartPre": (
-            [EXPECTED_EXEC_START_PRE[0].removeprefix("-"), *EXPECTED_EXEC_START_PRE[1:]],
-            True,
-        ),
-        "ExecStartPost": (EXPECTED_EXEC_START_POST, False),
-        "ExecStop": (EXPECTED_EXEC_STOP, False),
+        "ExecCondition": [(EXPECTED_EXEC_CONDITION, False)],
+        "ExecStart": [(EXPECTED_EXEC_START, False)],
+        "ExecStartPre": [(argv, False) for argv in EXPECTED_EXEC_START_PRE],
+        "ExecStartPost": [(argv, False) for argv in EXPECTED_EXEC_START_POST],
+        "ExecStop": [(EXPECTED_EXEC_STOP, False)],
+        "ExecStopPost": [(EXPECTED_EXEC_STOP_POST, False)],
     }
     for name, contract in expected.items():
-        if _parse_effective_exec(fields[name]) != contract:
+        if _parse_effective_execs(fields[name]) != contract:
             _fail(f"effective {name} differs from canonical unit")

@@ -11,21 +11,23 @@ StartLimitBurst=1
 
 [Service]
 Type=simple
+UMask=0077
 Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
 Environment=HF_HUB_OFFLINE=1
 Environment=TRANSFORMERS_OFFLINE=1
 
-# Wrapper/docker-CLI only. Docker owns the 18 GiB no-swap service cap.
+# Wrapper/docker-CLI only. Docker owns the 18 GiB container cap.
 MemoryMax=256M
-MemorySwapMax=0
 OOMScoreAdjust=500
 Restart=no
 TimeoutStartSec=1800
 TimeoutStopSec=60
 
-ExecStartPre=-/usr/bin/docker rm -f querit-4b-vllm
+ExecCondition=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-querit-4b-reranker.service
+ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-vllm-cids
+ExecStartPre=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container querit-4b-vllm --cidfile %t/gb10-vllm-cids/vllm-querit-4b-reranker.cid
 # Backend scheduler ceilings are not production admission limits; guard owns hot-reloadable request concurrency.
-ExecStart=/usr/bin/docker run --rm --name querit-4b-vllm \
+ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-vllm-cids/vllm-querit-4b-reranker.cid --name querit-4b-vllm \
   --cgroup-parent app.slice \
   --gpus all --ipc host \
   -p 100.105.4.92:18013:8000 \
@@ -60,8 +62,10 @@ ExecStart=/usr/bin/docker run --rm --name querit-4b-vllm \
     --long-prefill-token-threshold 8192 \
     --enforce-eager \
     --chat-template /home/obj/models/querit-4b-vllm/querit-rerank.jinja
+ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-querit-4b-reranker.service --container querit-4b-vllm
 ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh rerank http://100.105.4.92:18013 Querit/Querit-4B --deadline 300
-ExecStop=/usr/bin/timeout --signal=TERM --kill-after=5 30 /usr/bin/docker stop --time 20 querit-4b-vllm
+ExecStop=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container querit-4b-vllm --cidfile %t/gb10-vllm-cids/vllm-querit-4b-reranker.cid
+ExecStopPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container querit-4b-vllm --cidfile %t/gb10-vllm-cids/vllm-querit-4b-reranker.cid
 
 StandardOutput=journal
 StandardError=journal

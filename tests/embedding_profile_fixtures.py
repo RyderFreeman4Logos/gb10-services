@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import stat
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+profile = importlib.import_module("gb10_embedding_profile_contract")
 UNIT = ROOT / "systemd" / "vllm-embedding.service"
 IMAGE = (
     "ghcr.io/aeon-7/aeon-vllm-ultimate@"
@@ -167,12 +171,13 @@ class VerifierFixture:
         argv = _unit_argv()
         image_index = argv.index(IMAGE)
         effective = " ".join(argv)
-        pre = "/usr/bin/docker rm -f vllm-embedding"
-        post = (
-            "/home/obj/.local/bin/gb10_service_ready.sh embedding "
-            "http://100.105.4.92:18012 qwen3-embedding-8b --deadline 300"
-        )
-        stop = "/usr/bin/docker stop --time 20 vllm-embedding"
+
+        def serialized(commands: list[list[str]]) -> str:
+            return " ; ".join(
+                f"{{ path={command[0]} ; argv[]={' '.join(command)} ; ignore_errors=no ; }}"
+                for command in commands
+            )
+
         rows = {
             "Id": "vllm-embedding.service",
             "LoadState": "loaded",
@@ -184,19 +189,14 @@ class VerifierFixture:
             "ControlGroup": "/app.slice/vllm-embedding.service",
             "InvocationID": CURRENT_INVOCATION,
             "ExecMainStartTimestampMonotonic": "2000000",
+            "ExecCondition": serialized([profile.EXPECTED_EXEC_CONDITION]),
             "ExecStart": (
                 f"{{ path={argv[0]} ; argv[]={effective} ; ignore_errors=no ; }}"
             ),
-            "ExecStartPre": (
-                f"{{ path=/usr/bin/docker ; argv[]={pre} ; ignore_errors=yes ; }}"
-            ),
-            "ExecStartPost": (
-                f"{{ path=/home/obj/.local/bin/gb10_service_ready.sh ; "
-                f"argv[]={post} ; ignore_errors=no ; }}"
-            ),
-            "ExecStop": (
-                f"{{ path=/usr/bin/docker ; argv[]={stop} ; ignore_errors=no ; }}"
-            ),
+            "ExecStartPre": serialized(profile.EXPECTED_EXEC_START_PRE),
+            "ExecStartPost": serialized(profile.EXPECTED_EXEC_START_POST),
+            "ExecStop": serialized([profile.EXPECTED_EXEC_STOP]),
+            "ExecStopPost": serialized([profile.EXPECTED_EXEC_STOP_POST]),
         }
         if image_index <= 2:
             raise AssertionError("fixture has no Docker host/image boundary")
@@ -239,6 +239,9 @@ class VerifierFixture:
         return {
             "systemd_outputs": [systemd, systemd],
             "docker_outputs": [[container], [container]],
+            "docker_scopes": {
+                CONTAINER_ID: f"/app.slice/docker-{CONTAINER_ID}.scope"
+            },
             "journal": [journal],
             "models": {"data": [{"id": model} for model in MODELS]},
             "embeddings": {model: embedding_payload(model) for model in MODELS},
@@ -287,6 +290,10 @@ class VerifierFixture:
             "    return outputs[min(index, len(outputs) - 1)]\n"
             "if args and args[0] == 'inspect':\n"
             "    print(json.dumps(selected('docker', state['docker_outputs'])))\n"
+            "elif 'ControlGroup' in args and any(value.startswith('docker-') for value in args):\n"
+            "    unit = next(value for value in args if value.startswith('docker-'))\n"
+            "    identifier = unit.removeprefix('docker-').removesuffix('.scope')\n"
+            "    sys.stdout.write(state['docker_scopes'][identifier] + '\\n')\n"
             "elif 'show' in args:\n"
             "    sys.stdout.write(selected('systemd', state['systemd_outputs']))\n"
             "elif '-o' in args and 'json' in args:\n"

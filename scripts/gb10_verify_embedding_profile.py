@@ -57,10 +57,12 @@ _SYSTEMD_FIELDS = (
     "ControlGroup",
     "InvocationID",
     "ExecMainStartTimestampMonotonic",
+    "ExecCondition",
     "ExecStart",
     "ExecStartPre",
     "ExecStartPost",
     "ExecStop",
+    "ExecStopPost",
 )
 
 
@@ -210,8 +212,37 @@ def _container_payload(config: RuntimeConfig, deadline: float) -> dict[str, Any]
     return payload[0]
 
 
+def _docker_scope(config: RuntimeConfig, identifier: str, deadline: float) -> str:
+    scope_unit = f"docker-{identifier}.scope"
+    raw = command(
+        [
+            config.systemctl,
+            "--user",
+            "show",
+            "-p",
+            "ControlGroup",
+            "--value",
+            scope_unit,
+        ],
+        timeout=10,
+        deadline=deadline,
+    )
+    rows = raw.splitlines()
+    if len(rows) != 1:
+        fail("Docker scope lookup did not return one ControlGroup")
+    scope = rows[0]
+    if (
+        not scope.startswith("/")
+        or ".." in Path(scope).parts
+        or re.fullmatch(r"/[A-Za-z0-9_.@:/-]+", scope) is None
+        or not scope.endswith(f"/{scope_unit}")
+    ):
+        fail("Docker scope ControlGroup is malformed")
+    return scope
+
+
 def _verify_container(
-    config: RuntimeConfig, payload: dict[str, Any]
+    config: RuntimeConfig, payload: dict[str, Any], deadline: float
 ) -> ContainerState:
     identifier = payload.get("Id")
     name = payload.get("Name")
@@ -256,10 +287,10 @@ def _verify_container(
     for key, expected in expected_host.items():
         if host.get(key) != expected:
             fail(f"running Docker host contract differs: {key}")
-    relative = _unified_cgroup(config.proc_root, pid)
-    expected_suffix = f"/app.slice/docker-{identifier}.scope"
-    if not relative.endswith(expected_suffix):
-        fail("container PID is outside its immutable Docker cgroup")
+    relative = _docker_scope(config, identifier, deadline)
+    process_relative = _unified_cgroup(config.proc_root, pid)
+    if process_relative != relative:
+        fail("container PID and Docker user scope cgroups disagree")
     cgroup, identity = _verify_populated(config.cgroup_root, relative)
     expected_metrics = {
         "memory.max": EXPECTED_MEMORY,
@@ -620,13 +651,13 @@ def _verify(config: RuntimeConfig, evidence: Path) -> None:
         fail("embedding service did not enter a truly new systemd generation")
     service_cgroup_identity = _verify_main_process(config, first_systemd)
     first_container = _verify_container(
-        config, _container_payload(config, deadline)
+        config, _container_payload(config, deadline), deadline
     )
     capacity = _verify_engine_capacity(config, first_systemd, deadline)
     _verify_models(config, deadline)
     minimum_cosine = _verify_quality(config, evidence, deadline)
     second_container = _verify_container(
-        config, _container_payload(config, deadline)
+        config, _container_payload(config, deadline), deadline
     )
     second_systemd = _query_systemd(config, deadline)
     second_service_cgroup = _verify_main_process(config, second_systemd)

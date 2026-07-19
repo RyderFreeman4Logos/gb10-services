@@ -5,21 +5,43 @@ use gb10_memory_guardian_core::{
     kill_direct, read_mem_available_fd, EmergencyReserve, MemInfoError, RegistrationManager,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct CountingAllocator;
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+std::thread_local! {
+    static TRACKED_ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+fn record_allocation() {
+    let _ = TRACKED_ALLOCATIONS.try_with(|counter| {
+        if let Some(count) = counter.get() {
+            counter.set(Some(count.saturating_add(1)));
+        }
+    });
+}
+
+fn start_tracking_allocations() {
+    TRACKED_ALLOCATIONS.with(|counter| counter.set(Some(0)));
+}
+
+fn stop_tracking_allocations() -> usize {
+    TRACKED_ALLOCATIONS.with(|counter| {
+        let count = counter.get().unwrap_or(usize::MAX);
+        counter.set(None);
+        count
+    })
+}
 
 // SAFETY: This delegates every operation to the process-wide System allocator
-// and only adds an atomic counter before successful allocation entry points.
+// and only updates the calling test thread's counter before allocation entry points.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
+        record_allocation();
         // SAFETY: The caller supplied a valid Layout under GlobalAlloc's contract.
         unsafe { System.alloc(layout) }
     }
@@ -30,13 +52,13 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
+        record_allocation();
         // SAFETY: The caller supplied a valid Layout under GlobalAlloc's contract.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
+        record_allocation();
         // SAFETY: ptr and layout came from System and new_size is forwarded unchanged.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -88,9 +110,9 @@ fn reserve_release_and_direct_write_allocate_nothing() {
     let target = manager.target().expect("target");
     let mut reserve = EmergencyReserve::with_page_size(16 * 1024, 4096).expect("allocate reserve");
 
-    ALLOCATIONS.store(0, Ordering::SeqCst);
+    start_tracking_allocations();
     let result = kill_direct(&mut reserve, target);
-    let allocations = ALLOCATIONS.load(Ordering::SeqCst);
+    let allocations = stop_tracking_allocations();
 
     assert!(result.is_ok());
     assert_eq!(allocations, 0, "direct emergency function allocated");
@@ -107,9 +129,9 @@ fn malformed_meminfo_error_allocates_nothing() {
     let file = fs::File::open(&path).expect("open malformed meminfo");
     let mut buffer = [0_u8; 128];
 
-    ALLOCATIONS.store(0, Ordering::SeqCst);
+    start_tracking_allocations();
     let result = read_mem_available_fd(&file, &mut buffer);
-    let allocations = ALLOCATIONS.load(Ordering::SeqCst);
+    let allocations = stop_tracking_allocations();
 
     assert_eq!(result, Err(MemInfoError::InvalidData));
     assert_eq!(allocations, 0, "compact meminfo failure allocated");

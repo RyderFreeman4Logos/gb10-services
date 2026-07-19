@@ -10,7 +10,24 @@ FALLBACK_UNIT=vllm-qwen3-reranker-8b.service
 CANARY_BACKEND_UNIT=vllm-querit-4b-canary-backend.service
 CANARY_ADAPTER_UNIT=vllm-querit-4b-canary.service
 GUARD_UNIT=llm-guard-proxy.service
+EMBEDDING_UNIT=vllm-embedding.service
 AEON_CONTAINER=vllm-aeon-27b-dflash-n12
+EMBEDDING_CONTAINER=vllm-embedding
+RERANK_CONTAINER=querit-4b-vllm
+FALLBACK_CONTAINER=vllm-qwen3-reranker-8b
+NO_SWAP_HELPER=/home/obj/.local/bin/gb10_verify_vllm_no_swap.sh
+NO_SWAP_TEST_ARGS=()
+if [[ "${GB10_QUERIT_PROFILE_TEST_ONLY:-0}" == 1 ]]; then
+    NO_SWAP_HELPER="${GB10_NO_SWAP_HELPER_TEST_PATH:?test helper path required}"
+    [[ "$NO_SWAP_HELPER" == /* && -x "$NO_SWAP_HELPER" ]] || {
+        echo "test no-swap helper must be an executable absolute path" >&2
+        exit 2
+    }
+    NO_SWAP_TEST_ARGS=(--test-only)
+elif [[ -n "${GB10_NO_SWAP_HELPER_TEST_PATH:-}" ]]; then
+    echo "test no-swap helper selector requires explicit test-only mode" >&2
+    exit 2
+fi
 AEON_URL="${GB10_AEON_URL:-http://100.105.4.92:18010}"
 RERANK_URL="${GB10_RERANK_URL:-http://100.105.4.92:18013}"
 GUARD_SCORE_URL="${GB10_GUARD_SCORE_URL:-http://100.105.4.92:18003/v1/score}"
@@ -55,6 +72,40 @@ run_systemctl_start() {
 run_docker() {
     /usr/bin/timeout --signal=TERM --kill-after=5 "$DOCKER_TIMEOUT_SECONDS" \
         docker "$@"
+}
+
+verify_no_swap() {
+    local unit="$1" container="${2:-}"
+    local -a arguments=(
+        "${NO_SWAP_TEST_ARGS[@]}"
+        --unit "/home/obj/.config/systemd/user/$unit"
+    )
+    if [[ -n "$container" ]]; then
+        arguments+=(--container "$container")
+    fi
+    if (( ${#NO_SWAP_TEST_ARGS[@]} == 1 )); then
+        "$NO_SWAP_HELPER" "${arguments[@]}"
+    else
+        /usr/bin/env -i \
+            HOME=/home/obj \
+            PATH=/usr/bin:/bin \
+            LC_ALL=C \
+            DOCKER_HOST=unix:///run/user/1001/docker.sock \
+            /usr/bin/bash --noprofile --norc \
+            "$NO_SWAP_HELPER" "${arguments[@]}"
+    fi
+}
+
+require_cgroup_v2() {
+    local version
+    if ! version="$(run_docker info --format '{{.CgroupVersion}}')"; then
+        printf 'Docker cgroup-version preflight failed\n' >&2
+        return 1
+    fi
+    if [[ "$version" != "2" ]]; then
+        printf 'Docker must report cgroup version exactly 2 (got %q)\n' "$version" >&2
+        return 1
+    fi
 }
 
 unit_enabled_state() {
@@ -121,6 +172,10 @@ DEPLOY_SUCCESS=0
 CLEANUP_STARTED=0
 
 rollback_runtime_state() {
+    if ! require_cgroup_v2; then
+        printf 'Rollback refused service mutation without Docker cgroup v2\n' >&2
+        return 1
+    fi
     local rollback_failed=0
     run_systemctl stop "$RERANK_UNIT" || rollback_failed=1
     if (( CANARY_ADAPTER_PRESENT == 1 )); then
@@ -148,6 +203,13 @@ rollback_runtime_state() {
         run_systemctl_start start "$FALLBACK_UNIT" || rollback_failed=1
     elif [[ "$PREV_RERANK_ACTIVE" == "active" ]]; then
         run_systemctl_start start "$RERANK_UNIT" || rollback_failed=1
+    fi
+    verify_no_swap "$AEON_UNIT" "$AEON_CONTAINER" || rollback_failed=1
+    verify_no_swap "$EMBEDDING_UNIT" "$EMBEDDING_CONTAINER" || rollback_failed=1
+    if [[ "$PREV_FALLBACK_ACTIVE" == "active" ]]; then
+        verify_no_swap "$FALLBACK_UNIT" "$FALLBACK_CONTAINER" || rollback_failed=1
+    elif [[ "$PREV_RERANK_ACTIVE" == "active" ]]; then
+        verify_no_swap "$RERANK_UNIT" "$RERANK_CONTAINER" || rollback_failed=1
     fi
     return "$rollback_failed"
 }
@@ -196,6 +258,8 @@ trap 'cleanup_on_signal INT 130' INT
 trap 'cleanup_on_signal TERM 143' TERM
 trap cleanup_on_exit EXIT
 
+require_cgroup_v2
+
 PREV_RERANK_ENABLED="$(unit_enabled_state "$RERANK_UNIT")"
 PREV_RERANK_ACTIVE="$(unit_active_state "$RERANK_UNIT")"
 PREV_FALLBACK_ENABLED="$(unit_enabled_state "$FALLBACK_UNIT")"
@@ -209,6 +273,14 @@ if unit_is_present "$CANARY_ADAPTER_UNIT"; then
     CANARY_ADAPTER_PRESENT=1
     PREV_CANARY_ADAPTER_ENABLED="$(unit_enabled_state "$CANARY_ADAPTER_UNIT")"
     PREV_CANARY_ADAPTER_ACTIVE="$(unit_active_state "$CANARY_ADAPTER_UNIT")"
+fi
+run_systemctl is-active --quiet "$EMBEDDING_UNIT"
+verify_no_swap "$AEON_UNIT" "$AEON_CONTAINER"
+verify_no_swap "$EMBEDDING_UNIT" "$EMBEDDING_CONTAINER"
+if [[ "$PREV_FALLBACK_ACTIVE" == "active" ]]; then
+    verify_no_swap "$FALLBACK_UNIT" "$FALLBACK_CONTAINER"
+elif [[ "$PREV_RERANK_ACTIVE" == "active" ]]; then
+    verify_no_swap "$RERANK_UNIT" "$RERANK_CONTAINER"
 fi
 
 read_mem_available_kib() {
@@ -289,6 +361,9 @@ run_systemctl reset-failed "$FALLBACK_UNIT" || true
 run_systemctl reset-failed "$RERANK_UNIT" || true
 run_systemctl daemon-reload
 run_systemctl_start start "$RERANK_UNIT"
+verify_no_swap "$RERANK_UNIT" "$RERANK_CONTAINER"
+verify_no_swap "$AEON_UNIT" "$AEON_CONTAINER"
+verify_no_swap "$EMBEDDING_UNIT" "$EMBEDDING_CONTAINER"
 
 wait_for_url "$RERANK_URL/v1/models" "$RERANK_READY_ATTEMPTS" RERANK
 run_systemctl is-active --quiet "$RERANK_UNIT"

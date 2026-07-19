@@ -19,6 +19,18 @@ VALIDATED_KV_MIB = 5_820
 VALIDATED_KV_TOKENS = 41_376
 CONTRACT_TOKENS = 32_768
 MIN_KV_MARGIN_BPS = 400
+NO_SWAP_PREFIX = [
+    "/usr/bin/env",
+    "-i",
+    "HOME=/home/obj",
+    "PATH=/usr/bin:/bin",
+    "LC_ALL=C",
+    "DOCKER_HOST=unix:///run/user/1001/docker.sock",
+    "/usr/bin/bash",
+    "--noprofile",
+    "--norc",
+    "/home/obj/.local/bin/gb10_verify_vllm_no_swap.sh",
+]
 
 
 def _logical_directive_argv(unit: str, directive: str) -> list[list[str]]:
@@ -182,17 +194,13 @@ def _standalone_option(argv: list[str], flag: str) -> None:
 
 
 def _embedding_contract(unit: str) -> dict[str, int]:
+    exec_conditions = _logical_directive_argv(unit, "ExecCondition")
     exec_starts = _logical_directive_argv(unit, "ExecStart")
     exec_start_posts = _logical_directive_argv(unit, "ExecStartPost")
     if len(exec_starts) != 1:
         raise AssertionError(
             f"expected exactly one ExecStart, found {len(exec_starts)}"
         )
-    if len(exec_start_posts) != 1:
-        raise AssertionError(
-            f"expected exactly one ExecStartPost, found {len(exec_start_posts)}"
-        )
-
     argv = exec_starts[0]
     host_argv, container_argv = _split_docker_run_argv(argv, EMBEDDING_IMAGE)
     expected_host_options = {
@@ -227,6 +235,7 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         "--kv-cache-memory-bytes": 1,
         "--gpu-memory-utilization": 1,
         "--enforce-eager": 0,
+        "--swap-space": 1,
     }
     model_command = [
         "/usr/local/bin/vllm",
@@ -251,6 +260,7 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         "--kv-cache-memory-bytes": ["4800M"],
         "--gpu-memory-utilization": ["0.15"],
         "--enforce-eager": [],
+        "--swap-space": ["0"],
     }
     for flag, expected in expected_container_options.items():
         actual = parsed_options[flag]
@@ -264,7 +274,21 @@ def _embedding_contract(unit: str) -> dict[str, int]:
             if lowered == forbidden or lowered.startswith(f"{forbidden}="):
                 raise AssertionError(f"forbidden embedding option: {token}")
 
-    readiness = exec_start_posts[0]
+    if len(exec_start_posts) != 2:
+        raise AssertionError(
+            f"expected verifier and readiness ExecStartPost commands, found {len(exec_start_posts)}"
+        )
+    verifier, readiness = exec_start_posts
+    expected_unit = "/home/obj/.config/systemd/user/vllm-embedding.service"
+    if exec_conditions != [NO_SWAP_PREFIX + ["--unit", expected_unit]]:
+        raise AssertionError("ExecCondition must fail closed on unit and cgroup-v2 evidence")
+    if verifier != NO_SWAP_PREFIX + [
+        "--unit",
+        expected_unit,
+        "--container",
+        "vllm-embedding",
+    ]:
+        raise AssertionError("ExecStartPost must verify the exact embedding cgroup first")
     if not readiness or not readiness[0].endswith("gb10_service_ready.sh"):
         raise AssertionError(
             "ExecStartPost must use gb10_service_ready.sh"
@@ -381,7 +405,9 @@ class HostileEmbeddingUnitMutationTests(unittest.TestCase):
     def test_rejects_duplicate_post_start_readiness_poll(self) -> None:
         unit = EMBEDDING_UNIT.read_text()
         readiness = next(
-            line for line in unit.splitlines() if line.startswith("ExecStartPost=")
+            line
+            for line in unit.splitlines()
+            if line.startswith("ExecStartPost=") and "gb10_service_ready.sh" in line
         )
         self.assert_contract_rejects(f"{unit}\n{readiness}\n")
 
@@ -566,12 +592,12 @@ class EmbeddingDeploymentContractTests(unittest.TestCase):
             "20 GiB no-swap hard cap",
             "32,768-token / 4,800 MiB KV / 20 GiB profile",
             "32K/4,800M/20GiB",
-            "20 GiB no-swap cgroup/container",
+            "20 GiB Docker memory/swap cap",
         )
         for path in (README, AGENT_PLAYBOOK):
             text = path.read_text()
             with self.subTest(path=path):
-                self.assertIn("equal 128 GiB memory/swap cgroup ceiling", text)
+                self.assertIn("equal 128 GiB Docker memory/swap caps", text)
                 self.assertIn("without imposing the obsolete 20 GiB service budget", text)
                 for stale in stale_claims:
                     self.assertNotIn(stale, text)
@@ -579,7 +605,7 @@ class EmbeddingDeploymentContractTests(unittest.TestCase):
         unit = EMBEDDING_UNIT.read_text()
         self.assertNotIn("No docker --memory", unit)
         self.assertIn("Equal --memory 128g and --memory-swap 128g", unit)
-        self.assertIn("disable container swap", unit)
+        self.assertIn("post-start verifier", unit)
 
     def test_documented_activation_and_rollback_mutate_only_embedding(self) -> None:
         sections = (

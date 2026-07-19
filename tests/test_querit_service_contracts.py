@@ -63,19 +63,18 @@ def _aeon_contract(unit: str) -> dict[str, int | float]:
     argv = exec_starts[0]
     image = f"ghcr.io/aeon-7/aeon-vllm-ultimate@{IMAGE_DIGEST}"
     host_argv, container_argv = _split_docker_run_argv(argv, image)
-    # Docker --memory-swap == --memory disables swap (swap=0).
-    # Without --memory, Docker creates no memory cgroup and
-    # --memory-swappiness 0 is silently ignored by the kernel.
+    # Equal Docker memory settings are an intent contract. The post-start
+    # verifier, rather than these requested options, proves live swap=0.
     # The cap is a high safety label, not a physical UMA ceiling.
     memory_values = _option_values(host_argv, "--memory")
     swap_values = _option_values(host_argv, "--memory-swap")
     if not memory_values:
         raise AssertionError("text unit must set --memory for swappiness enforcement")
     if not swap_values:
-        raise AssertionError("text unit must set --memory-swap (== --memory) for swap=0")
+        raise AssertionError("text unit must set an equal --memory-swap request")
     if swap_values[0] != memory_values[0]:
         raise AssertionError(
-            f"--memory-swap must equal --memory (swap=0): {swap_values[0]} != {memory_values[0]}"
+            f"--memory-swap must equal --memory: {swap_values[0]} != {memory_values[0]}"
         )
     for flag, expected in {
         "--memory-swappiness": "0",
@@ -263,7 +262,7 @@ class QueritServiceContractTests(unittest.TestCase):
         ):
             self.assertIn(contract, unit)
         self.assertNotIn("--memory 69g", unit)
-        # --memory-swap == --memory is valid (swap=0). 69g is the old cap.
+        # Equal Docker caps retain the source request. 69g is the old cap.
         self.assertNotIn("--dns", unit)
         self.assertNotRegex(unit, r"aeon-vllm-ultimate:[^\s\\]+(?:\s|\\)")
 
@@ -296,7 +295,7 @@ class QueritServiceContractTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "updated UMA headroom evidence"):
             _assert_aeon_headroom_evidence(_aeon_contract(unit))
 
-    def test_legacy_unit_remains_canonical_fallback(self) -> None:
+    def test_retained_qwen_vllm_fallback_is_available(self) -> None:
         self.assertTrue(LEGACY_UNIT.exists())
         self.assertIn("WantedBy=default.target", LEGACY_UNIT.read_text())
 

@@ -49,9 +49,14 @@ class ActivationCheckError(RuntimeError):
 class RuntimeConfig:
     source_unit: Path
     installed_unit: Path
+    source_no_swap_core: Path
+    installed_no_swap_core: Path
+    source_no_swap_helper: Path
+    installed_no_swap_helper: Path
     unit_dir: Path
     state_root: Path
     systemctl: str
+    docker: str
     curl: str
     verifier: str
     ready_seconds: int
@@ -97,6 +102,20 @@ class Generation:
     @property
     def running(self) -> bool:
         return self.load == "loaded" and self.active == "active" and self.sub == "running"
+
+
+def require_docker_cgroup_v2(config: RuntimeConfig, deadline: float) -> None:
+    """Reject every mutation path unless rootless Docker reports cgroup v2."""
+
+    output = command(
+        [config.docker, "info", "--format", "{{.CgroupVersion}}"],
+        timeout=config.command_seconds,
+        deadline=deadline,
+    )
+    if output not in {"2", "2\n"}:
+        raise ActivationCheckError(
+            "Docker must report cgroup version exactly 2 before activation"
+        )
 
 
 def _parse_exact_fields(text: str, expected: tuple[str, ...]) -> dict[str, str]:

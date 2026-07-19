@@ -63,12 +63,18 @@ def _write_converted_artifact(root: Path) -> None:
 
 class FakeHost:
     def __init__(
-        self, *, memory: list[int], warm_error: Exception | None = None
+        self,
+        *,
+        memory: list[int],
+        warm_error: Exception | None = None,
+        no_swap_fail_at: int = 0,
     ) -> None:
         self.memory = iter(memory)
         self.warm_error = warm_error
         self.commands: list[tuple[str, str]] = []
         self.verify_calls = 0
+        self.no_swap_calls: list[tuple[str, str | None]] = []
+        self.no_swap_fail_at = no_swap_fail_at
         self.sequence = 1
         self.states = {
             lifecycle.TEXT_UNIT: lifecycle.ServiceState(True, "text-before"),
@@ -83,6 +89,18 @@ class FakeHost:
         }
         self.stop_failures: dict[str, BaseException] = {}
         self.unit_file_states = {lifecycle.TEXT_UNIT: "disabled"}
+        self.cgroup_version = "2"
+        self.cgroup_preflights = 0
+
+    def require_cgroup_v2(self) -> None:
+        self.cgroup_preflights += 1
+        if self.cgroup_version != "2":
+            raise lifecycle.LifecycleError("Docker cgroup version is not exactly 2")
+
+    def verify_no_swap(self, unit: str, container: str | None = None) -> None:
+        self.no_swap_calls.append((unit, container))
+        if self.no_swap_fail_at == len(self.no_swap_calls):
+            raise lifecycle.LifecycleError("no-swap verification failed")
 
     def verify_artifact(self) -> str:
         self.verify_calls += 1
@@ -263,6 +281,18 @@ class ArtifactManifestTests(unittest.TestCase):
 
 
 class CanaryLifecycleTests(unittest.TestCase):
+    def test_cgroup_v1_or_unknown_fails_before_state_or_service_mutation(self) -> None:
+        for version in ("1", "unknown", ""):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as raw_tmp:
+                host = FakeHost(memory=[32])
+                host.cgroup_version = version
+                state = Path(raw_tmp) / "state.json"
+                with self.assertRaises(lifecycle.LifecycleError):
+                    lifecycle.activate(host, state)
+                self.assertEqual(host.commands, [])
+                self.assertFalse(state.exists())
+                self.assertEqual(host.cgroup_preflights, 1)
+
     def test_service_snapshot_binds_unit_container_and_all_observed_pids(self) -> None:
         state = lifecycle.ServiceState(
             active=True,
@@ -328,6 +358,13 @@ class CanaryLifecycleTests(unittest.TestCase):
 
             self.assertEqual(host.verify_calls, 1)
             self.assertEqual(
+                host.no_swap_calls,
+                [
+                    (lifecycle.BACKEND_UNIT, None),
+                    (lifecycle.BACKEND_UNIT, "vllm-querit-4b-canary"),
+                ],
+            )
+            self.assertEqual(
                 host.commands,
                 [
                     ("stop", lifecycle.TEXT_UNIT),
@@ -355,6 +392,7 @@ class CanaryLifecycleTests(unittest.TestCase):
             self.assertFalse(
                 any(command == "restart" for command, _unit in host.commands)
             )
+            self.assertEqual(host.no_swap_calls[-1], (lifecycle.BACKEND_UNIT, None))
 
     def test_high_headroom_never_stops_text(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -411,6 +449,37 @@ class CanaryLifecycleTests(unittest.TestCase):
             )
             self.assertTrue(host.states[lifecycle.TEXT_UNIT].active)
             self.assertFalse(state.exists())
+
+    def test_post_start_no_swap_failure_removes_candidate_without_neighbor_outage(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            state = Path(raw_tmp) / "state.json"
+            host = FakeHost(memory=[24], no_swap_fail_at=2)
+            neighbor_before = {
+                unit: host.states[unit] for unit in lifecycle.IMMUTABLE_NEIGHBORS
+            }
+
+            with self.assertRaisesRegex(
+                lifecycle.LifecycleError, "no-swap verification failed"
+            ):
+                lifecycle.activate(host, state)
+
+            self.assertFalse(state.exists())
+            self.assertFalse(host.states[lifecycle.BACKEND_UNIT].active)
+            self.assertFalse(host.states[lifecycle.ADAPTER_UNIT].active)
+            self.assertEqual(
+                {unit: host.states[unit] for unit in lifecycle.IMMUTABLE_NEIGHBORS},
+                neighbor_before,
+            )
+            self.assertEqual(
+                host.no_swap_calls,
+                [
+                    (lifecycle.BACKEND_UNIT, None),
+                    (lifecycle.BACKEND_UNIT, "vllm-querit-4b-canary"),
+                    (lifecycle.BACKEND_UNIT, None),
+                ],
+            )
 
     def test_explicit_pause_rejects_persistent_or_runtime_mask_before_mutation(self) -> None:
         for mask in ("masked", "masked-runtime"):
