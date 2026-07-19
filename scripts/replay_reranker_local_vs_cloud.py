@@ -46,6 +46,7 @@ from reranker_equivalence_metrics import rank_indices
 __all__ = ["main", "top1_agreement", "top_k_overlap"]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+MAX_LOCAL_RESPONSE_BYTES = 4 * 1024 * 1024
 
 
 def canonical_json(value: Any) -> bytes:
@@ -181,10 +182,14 @@ def call_local(
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
+            raw = resp.read(MAX_LOCAL_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_LOCAL_RESPONSE_BYTES:
+                raise RuntimeError("local response exceeded bounded read limit")
             status = resp.status
     except urllib.error.HTTPError as exc:
-        raw = exc.read()
+        raw = exc.read(MAX_LOCAL_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_LOCAL_RESPONSE_BYTES:
+            raise RuntimeError("local error response exceeded bounded read limit") from exc
         status = exc.code
     try:
         body = json.loads(raw.decode("utf-8"))

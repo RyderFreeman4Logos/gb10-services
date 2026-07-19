@@ -17,6 +17,24 @@ sys.path.insert(0, str(ROOT / "scripts"))
 collector = importlib.import_module("collect_reranker_cloud_baseline")
 
 
+class _OversizedHTTPResponse:
+    status = 200
+    headers: dict[str, str] = {}
+
+    def __init__(self) -> None:
+        self.read_limit = -1
+
+    def __enter__(self) -> _OversizedHTTPResponse:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self, limit: int = -1) -> bytes:
+        self.read_limit = limit
+        return b"x" * (collector.MAX_CLOUD_RESPONSE_BYTES + 1)
+
+
 def _group(index: int) -> dict[str, object]:
     return {
         "query_id": f"query-{index}",
@@ -79,6 +97,24 @@ def _run_main(
 
 
 class CloudCollectorSafetyTests(unittest.TestCase):
+    def test_cloud_response_body_is_read_with_a_hard_limit(self) -> None:
+        response = _OversizedHTTPResponse()
+        with (
+            patch.object(collector.urllib.request, "urlopen", return_value=response),
+            self.assertRaisesRegex(RuntimeError, "response exceeded"),
+        ):
+            collector.call_deepinfra(
+                "Qwen/Qwen3-Reranker-8B",
+                {
+                    "documents": ["document"],
+                    "instruction": "rank",
+                    "queries": ["query"],
+                },
+                "unit-secret",
+                1,
+            )
+        self.assertEqual(response.read_limit, collector.MAX_CLOUD_RESPONSE_BYTES + 1)
+
     def test_estimate_includes_utf8_instruction_and_prompt_overhead_per_pair(self) -> None:
         request = {
             "queries": ["查询"],

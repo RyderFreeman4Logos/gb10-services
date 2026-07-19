@@ -49,6 +49,7 @@ __all__ = [
 ]
 
 DEFAULT_PRICE_PER_MTOK = 0.05
+MAX_CLOUD_RESPONSE_BYTES = 4 * 1024 * 1024
 DEFAULT_INSTRUCTION = "Given a web search query, retrieve relevant passages that answer the query"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CORPUS = REPO_ROOT / "data" / "reranker-equivalence" / "miracl-reranking-en-zh-dev.jsonl"
@@ -296,10 +297,14 @@ def call_deepinfra(
     started = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
+            raw = resp.read(MAX_CLOUD_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_CLOUD_RESPONSE_BYTES:
+                raise RuntimeError("cloud response exceeded bounded read limit")
             status = resp.status
     except urllib.error.HTTPError as exc:
-        raw = exc.read()
+        raw = exc.read(MAX_CLOUD_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_CLOUD_RESPONSE_BYTES:
+            raise RuntimeError("cloud error response exceeded bounded read limit") from exc
         status = exc.code
     elapsed = time.monotonic() - started
     try:

@@ -6,12 +6,27 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+__all__ = [
+    "AdapterError",
+    "BackendResponse",
+    "BoundedThreadingHTTPServer",
+    "PublicRequest",
+    "backend_request_bytes",
+    "main",
+    "parse_backend_response",
+    "parse_public_request",
+    "public_response_bytes",
+    "valid_public_target",
+]
 
 
 PUBLIC_PATH = "/v1/inference/Qwen/Qwen3-Reranker-8B"
@@ -23,6 +38,8 @@ DEFAULT_INSTRUCTION = (
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 REQUEST_BODY_TIMEOUT_SECONDS = 5.0
+DEFAULT_MAX_CONCURRENCY = 4
+MAX_CONCURRENCY = 64
 
 
 class AdapterError(RuntimeError):
@@ -42,6 +59,40 @@ class BackendResponse:
     scores: tuple[float, ...]
     input_tokens: int
     request_id: str
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Threading HTTP server that acquires admission before spawning a handler."""
+
+    daemon_threads = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        request_handler_class: type[BaseHTTPRequestHandler],
+        *,
+        max_concurrency: int,
+    ) -> None:
+        if not 1 <= max_concurrency <= MAX_CONCURRENCY:
+            raise ValueError(
+                f"max concurrency must be in [1, {MAX_CONCURRENCY}]"
+            )
+        self._handler_slots = threading.BoundedSemaphore(max_concurrency)
+        super().__init__(server_address, request_handler_class)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        self._handler_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._handler_slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._handler_slots.release()
 
 
 def _json_bytes(value: object) -> bytes:
@@ -309,19 +360,29 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--listen-port", required=True, type=int)
     parser.add_argument("--backend-url", required=True)
     parser.add_argument("--backend-timeout", type=float, default=120.0)
+    parser.add_argument(
+        "--max-concurrency", type=int, default=DEFAULT_MAX_CONCURRENCY
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
-    if not 1 <= args.listen_port <= 65535 or args.backend_timeout <= 0:
-        raise SystemExit("listen port and backend timeout must be positive")
+    if (
+        not 1 <= args.listen_port <= 65535
+        or not math.isfinite(args.backend_timeout)
+        or args.backend_timeout <= 0
+        or not 1 <= args.max_concurrency <= MAX_CONCURRENCY
+    ):
+        raise SystemExit(
+            "listen port, backend timeout, and max concurrency are invalid"
+        )
     backend_url = _backend_url(args.backend_url)
-    server = ThreadingHTTPServer(
+    server = BoundedThreadingHTTPServer(
         (args.listen_host, args.listen_port),
         _handler(backend_url, args.backend_timeout),
+        max_concurrency=args.max_concurrency,
     )
-    server.daemon_threads = True
     server.serve_forever()
     return 0
 

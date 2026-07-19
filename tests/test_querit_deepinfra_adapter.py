@@ -7,6 +7,7 @@ import math
 import socket
 import sys
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -57,6 +58,78 @@ def _backend_response(scores: list[float]) -> bytes:
 
 
 class QueritDeepinfraAdapterTests(unittest.TestCase):
+    def test_handler_threads_and_large_body_allocations_are_bounded(self) -> None:
+        handler = adapter._handler("http://unused.invalid/v1/score", 0.5)
+        server = adapter.BoundedThreadingHTTPServer(
+            ("127.0.0.1", 0), handler, max_concurrency=2
+        )
+        server.daemon_threads = True
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        release = threading.Event()
+        two_entered = threading.Event()
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+        entered = 0
+        statuses: list[int] = []
+
+        def blocked_backend(*_args: object, **_kwargs: object) -> bytes:
+            nonlocal active, max_active, entered
+            with lock:
+                active += 1
+                entered += 1
+                max_active = max(max_active, active)
+                if entered == 2:
+                    two_entered.set()
+            self.assertTrue(release.wait(timeout=2))
+            with lock:
+                active -= 1
+            return _backend_response([-1.0, 0.0, 1.0])
+
+        def request() -> None:
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", server.server_port, timeout=2
+            )
+            body = _public_request()
+            try:
+                connection.request(
+                    "POST",
+                    "/v1/inference/Qwen/Qwen3-Reranker-8B"
+                    "?version=5fa94080caafeaa45a15d11f969d7978e087a3db",
+                    body=body,
+                    headers={
+                        "Content-Length": str(len(body)),
+                        "Content-Type": "application/json",
+                    },
+                )
+                response = connection.getresponse()
+                response.read()
+                statuses.append(response.status)
+            finally:
+                connection.close()
+
+        clients = [threading.Thread(target=request) for _ in range(3)]
+        try:
+            with patch.object(adapter, "_call_backend", side_effect=blocked_backend):
+                for client in clients:
+                    client.start()
+                self.assertTrue(two_entered.wait(timeout=1))
+                time.sleep(0.1)
+                with lock:
+                    self.assertEqual(entered, 2)
+                    self.assertEqual(max_active, 2)
+                release.set()
+                for client in clients:
+                    client.join(timeout=2)
+                    self.assertFalse(client.is_alive())
+            self.assertEqual(statuses, [200, 200, 200])
+        finally:
+            release.set()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=1)
+
     def test_loopback_exact_content_length_request_completes(self) -> None:
         handler = adapter._handler("http://unused.invalid/v1/score", 0.5)
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
