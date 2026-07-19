@@ -139,13 +139,26 @@ EXPECTED_EXPORTS = {
         "warm_schedule",
         "write_owner_only_receipt",
     ),
+    "scripts/reranker_cloud_evidence.py": (
+        "CURRENT_BASELINE_SCHEMA",
+        "LEGACY_BASELINE_SCHEMA",
+        "SUPPORTED_BASELINE_SCHEMAS",
+        "assert_credential_absent",
+        "canonical_json",
+        "decode_json_strict",
+        "request_fingerprint",
+    ),
+    "scripts/reranker_cloud_transport.py": (
+        "MAX_CLOUD_RESPONSE_BYTES",
+        "call_deepinfra",
+    ),
     "scripts/verify_systemd_units.py": ("main",),
 }
 
 
 class ProductionModuleExportContractTests(unittest.TestCase):
     def test_new_production_modules_declare_exact_public_api(self) -> None:
-        self.assertEqual(len(EXPECTED_EXPORTS), 17)
+        self.assertEqual(len(EXPECTED_EXPORTS), 19)
         for relative_path, expected in EXPECTED_EXPORTS.items():
             with self.subTest(module=relative_path):
                 tree = ast.parse((ROOT / relative_path).read_text(), filename=relative_path)

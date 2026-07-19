@@ -7,6 +7,16 @@ import hashlib
 import json
 from typing import Any
 
+__all__ = (
+    "CURRENT_BASELINE_SCHEMA",
+    "LEGACY_BASELINE_SCHEMA",
+    "SUPPORTED_BASELINE_SCHEMAS",
+    "assert_credential_absent",
+    "canonical_json",
+    "decode_json_strict",
+    "request_fingerprint",
+)
+
 LEGACY_BASELINE_SCHEMA = "reranker-cloud-baseline-v1"
 CURRENT_BASELINE_SCHEMA = "reranker-cloud-baseline-v2"
 SUPPORTED_BASELINE_SCHEMAS = frozenset(
