@@ -195,6 +195,68 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
         )
         self.assertGreaterEqual(log.count("docker inspect --type container vllm-test"), 2)
 
+    def test_timed_out_command_does_not_wait_for_setsid_pipe_holder(self) -> None:
+        escaped_pid = self.root / "escaped.pid"
+        self.docker.write_text(
+            "#!/usr/bin/python3\n"
+            "import os, time\n"
+            "from pathlib import Path\n"
+            "child = os.fork()\n"
+            "if child == 0:\n"
+            "    os.setsid()\n"
+            f"    Path({str(escaped_pid)!r}).write_text(str(os.getpid()))\n"
+            "    time.sleep(30)\n"
+            "    os._exit(0)\n"
+            "time.sleep(30)\n"
+        )
+        self.docker.chmod(0o700)
+        environment = self._test_environment()
+        environment["GB10_VLLM_NO_SWAP_COMMAND_TIMEOUT_SECONDS"] = "1"
+        argv = [
+            "/usr/bin/env",
+            "-i",
+            *[f"{key}={value}" for key, value in environment.items()],
+            "/usr/bin/bash",
+            "--noprofile",
+            "--norc",
+            str(VERIFIER),
+            "--test-only",
+            "--unit",
+            str(self.unit),
+        ]
+        started = time.monotonic()
+        process = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        completed_within_bound = True
+        stdout = ""
+        stderr = ""
+        try:
+            try:
+                stdout, stderr = process.communicate(timeout=6)
+            except subprocess.TimeoutExpired:
+                completed_within_bound = False
+                stdout = stderr = ""
+        finally:
+            if escaped_pid.exists():
+                try:
+                    os.kill(int(escaped_pid.read_text()), 9)
+                except ProcessLookupError:
+                    pass
+            if process.poll() is None:
+                process.kill()
+            final_stdout, final_stderr = process.communicate(timeout=2)
+            stdout += final_stdout
+            stderr += final_stderr
+
+        self.assertTrue(completed_within_bound, stdout + stderr)
+        self.assertLess(time.monotonic() - started, 6)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("bounded command timed out", stderr)
+
     def test_preflight_rejects_non_v2_or_failed_info_before_unit_or_container_access(self) -> None:
         for version, info_fail in (("1", False), ("unknown", False), ("2", True)):
             with self.subTest(version=version, info_fail=info_fail):

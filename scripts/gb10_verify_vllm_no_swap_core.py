@@ -111,19 +111,23 @@ def run_command(
     except OSError as error:
         reject(f"cannot execute required command: {arguments[0]}: {error}")
     try:
-        stdout, stderr = process.communicate(
-            timeout=COMMAND_TIMEOUT_SECONDS if timeout is None else timeout
-        )
+        stdout, stderr = process.communicate(timeout=COMMAND_TIMEOUT_SECONDS if timeout is None else timeout)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.communicate(timeout=2)
-        except (OSError, subprocess.TimeoutExpired):
+        for selected_signal, grace in ((signal.SIGTERM, 2), (signal.SIGKILL, 1)):
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(process.pid, selected_signal)
             except OSError:
                 pass
-            process.communicate()
+            try:
+                process.communicate(timeout=grace)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        else:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:  # Stop escaped descendants from owning our read ends.
+                    stream.close()
+            process.wait(timeout=1)
         reject(f"bounded command timed out: {arguments[0]}")
     if len(stdout) > MAX_OUTPUT or len(stderr) > MAX_OUTPUT:
         reject(f"bounded command output exceeded limit: {arguments[0]}")
