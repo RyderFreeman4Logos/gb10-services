@@ -32,16 +32,18 @@ The ``--local-contract`` flag selects how the local response is normalized:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
-import os
 import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+from reranker_equivalence_metrics import rank_indices
+
+__all__ = ["main", "top1_agreement", "top_k_overlap"]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -131,13 +133,13 @@ def ranks(scores: tuple[float, ...]) -> list[int]:
 def top_k_overlap(a: tuple[float, ...], b: tuple[float, ...], k: int) -> float:
     if k <= 0 or len(a) < k:
         return float("nan")
-    ra = set(ranks(a)[:k])
-    rb = set(ranks(b)[:k])
+    ra = set(rank_indices(a)[:k])
+    rb = set(rank_indices(b)[:k])
     return len(ra & rb) / k
 
 
 def top1_agreement(a: tuple[float, ...], b: tuple[float, ...]) -> bool:
-    return ranks(a)[0] == ranks(b)[0]
+    return rank_indices(a)[0] == rank_indices(b)[0]
 
 
 def spearman(a: tuple[float, ...], b: tuple[float, ...]) -> float:
