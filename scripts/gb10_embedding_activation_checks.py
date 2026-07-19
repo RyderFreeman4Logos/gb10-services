@@ -14,6 +14,24 @@ from gb10_embedding_profile_contract import EXPECTED_MODELS
 from gb10_embedding_verifier_runtime import command, json_text, remaining
 from gb10_verify_embedding_profile import CANARY_INPUTS, vectors
 
+__all__ = [
+    "ActivationCheckError",
+    "GENERATION_FIELDS",
+    "Generation",
+    "NEIGHBORS",
+    "NEIGHBOR_FIELDS",
+    "RuntimeConfig",
+    "UNIT",
+    "capture_baselines",
+    "generation_is_new",
+    "neighbors",
+    "query_generation",
+    "require_docker_cgroup_v2",
+    "run_systemctl",
+    "verify_models",
+    "wait_new_generation",
+]
+
 UNIT = "vllm-embedding.service"
 NEIGHBORS = (
     "vllm-aeon-27b-dflash.service",

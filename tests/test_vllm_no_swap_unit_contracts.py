@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import json
 import hashlib
 import os
 import shlex
 import stat
-import subprocess
-import tempfile
 import unittest
-from pathlib import Path
 
 from vllm_no_swap_fixtures import ROOT, VERIFIER, VERIFIER_CORE
 

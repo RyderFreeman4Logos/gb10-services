@@ -10,9 +10,67 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_EXPORTS = {
+    "scripts/aeon_hang_guard.py": ("FLUSH_INTERVAL", "apply"),
+    "scripts/gb10_embedding_activation.py": (
+        "ActivationInterrupted",
+        "activate",
+        "main",
+    ),
+    "scripts/gb10_embedding_activation_checks.py": (
+        "ActivationCheckError",
+        "GENERATION_FIELDS",
+        "Generation",
+        "NEIGHBORS",
+        "NEIGHBOR_FIELDS",
+        "RuntimeConfig",
+        "UNIT",
+        "capture_baselines",
+        "generation_is_new",
+        "neighbors",
+        "query_generation",
+        "require_docker_cgroup_v2",
+        "run_systemctl",
+        "verify_models",
+        "wait_new_generation",
+    ),
+    "scripts/gb10_embedding_activation_config.py": (
+        "ActivationConfigError",
+        "production_config",
+        "test_config",
+    ),
+    "scripts/gb10_embedding_activation_storage.py": (
+        "ActivationStorageError",
+        "EXPECTED_NO_SWAP_SHA256",
+        "EXPECTED_VERIFIER_AUTHORITY",
+        "NO_SWAP_KEYS",
+        "NO_SWAP_PRIOR_FILES",
+        "NO_SWAP_PRIVATE_FILES",
+        "PHASES",
+        "SourceSnapshot",
+        "TRANSITIONS",
+        "TransactionError",
+        "atomic_json",
+        "atomic_write",
+        "fsync_directory",
+        "secure_directory",
+        "secure_regular",
+    ),
     "scripts/gb10_querit_canary_deploy.py": ("main",),
     "scripts/gb10_querit_canary_lifecycle.py": ("main",),
     "scripts/gb10_querit_canary_preflight.py": (),
+    "scripts/gb10_verify_embedding_profile.py": (
+        "CANARY_INPUTS",
+        "ContainerState",
+        "EXPECTED_MEMORY",
+        "RuntimeConfig",
+        "SystemdState",
+        "UNIT",
+        "cosine",
+        "main",
+        "validate_unit",
+        "vectors",
+        "verify_production",
+    ),
     "scripts/gb10_verify_vllm_no_swap_core.py": ("main",),
     "scripts/hooks/receipt-store.py": ("StoreError", "main", "run"),
     "scripts/querit_canary_lifecycle.py": (
@@ -81,12 +139,13 @@ EXPECTED_EXPORTS = {
         "warm_schedule",
         "write_owner_only_receipt",
     ),
+    "scripts/verify_systemd_units.py": ("main",),
 }
 
 
 class ProductionModuleExportContractTests(unittest.TestCase):
     def test_new_production_modules_declare_exact_public_api(self) -> None:
-        self.assertEqual(len(EXPECTED_EXPORTS), 10)
+        self.assertEqual(len(EXPECTED_EXPORTS), 17)
         for relative_path, expected in EXPECTED_EXPORTS.items():
             with self.subTest(module=relative_path):
                 tree = ast.parse((ROOT / relative_path).read_text(), filename=relative_path)

@@ -39,6 +39,20 @@ from gb10_embedding_verifier_runtime import (  # noqa: E402
     validate_evidence_dir as _validate_evidence_dir,
 )
 
+__all__ = [
+    "CANARY_INPUTS",
+    "ContainerState",
+    "EXPECTED_MEMORY",
+    "RuntimeConfig",
+    "SystemdState",
+    "UNIT",
+    "cosine",
+    "main",
+    "validate_unit",
+    "vectors",
+    "verify_production",
+]
+
 EXPECTED_MEMORY = 128 * 1024**3
 UNIT = "vllm-embedding.service"
 CANARY_INPUTS = (

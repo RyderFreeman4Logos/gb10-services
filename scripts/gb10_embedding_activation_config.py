@@ -10,6 +10,8 @@ from pathlib import Path
 from gb10_embedding_activation_checks import RuntimeConfig, UNIT
 from gb10_embedding_verifier_runtime import json_file
 
+__all__ = ["ActivationConfigError", "production_config", "test_config"]
+
 
 class ActivationConfigError(RuntimeError):
     pass

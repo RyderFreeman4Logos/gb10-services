@@ -9,6 +9,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+__all__ = ["main"]
+
 
 ROOT = Path(__file__).resolve().parents[1]
 UNIT_SOURCE = ROOT / "systemd"

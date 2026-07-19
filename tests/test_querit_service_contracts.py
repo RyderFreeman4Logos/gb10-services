@@ -210,7 +210,7 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertIn("--max-num-seqs 256", unit)
         self.assertIn("--max-num-partial-prefills 64", unit)
         self.assertIn("--max-long-partial-prefills 64", unit)
-        ready = unit.index("gb10_service_ready.sh rerank")
+        self.assertIn("gb10_service_ready.sh rerank", unit)
         timeout = re.search(r"^TimeoutStartSec=(\d+)$", unit, re.MULTILINE)
         if timeout is None:
             self.fail("TimeoutStartSec missing")

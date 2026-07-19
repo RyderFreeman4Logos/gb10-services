@@ -16,6 +16,8 @@ import functools
 import logging
 import os
 
+__all__ = ["FLUSH_INTERVAL", "apply"]
+
 logger = logging.getLogger("vllm.hang_guard")
 
 FLUSH_INTERVAL = int(os.environ.get("HANG_GUARD_FLUSH_INTERVAL", "5000"))

@@ -15,10 +15,28 @@ from typing import Any, Callable
 
 from gb10_embedding_activation_checks import Generation, RuntimeConfig, UNIT
 from gb10_embedding_profile_contract import validate_unit_text
-from gb10_embedding_verifier_runtime import json_file, json_text, read_nofollow
+from gb10_embedding_verifier_runtime import json_text, read_nofollow
+
+__all__ = [
+    "ActivationStorageError",
+    "EXPECTED_NO_SWAP_SHA256",
+    "EXPECTED_VERIFIER_AUTHORITY",
+    "NO_SWAP_KEYS",
+    "NO_SWAP_PRIOR_FILES",
+    "NO_SWAP_PRIVATE_FILES",
+    "PHASES",
+    "SourceSnapshot",
+    "TRANSITIONS",
+    "TransactionError",
+    "atomic_json",
+    "atomic_write",
+    "fsync_directory",
+    "secure_directory",
+    "secure_regular",
+]
 
 EXPECTED_VERIFIER_AUTHORITY: dict[str, str] = {
-    "gb10_verify_embedding_profile.py": "ec2b81b1653130615f77e463845adced13ad4e9adc75f599e58eadd7297f44f3",
+    "gb10_verify_embedding_profile.py": "5ddbea42ec11ab6cf8fd8a0df14d40edd6b3920d33851510274c24a5092732f4",
     "gb10_embedding_profile_contract.py": "cbb89060e5f8d5a2391023811b1223200cdc57976d2349374705e8a0e123bce7",
     "gb10_embedding_verifier_runtime.py": "599af1c802e1a0d3e942fb0b16cdfd3a66f9e928ab64eabf3fb455ec007df629",
 }

@@ -3,27 +3,25 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
-import re
-import shutil
 import signal
 import stat
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+__all__ = ["ActivationInterrupted", "activate", "main"]
+
 EXPECTED_IMPORT_AUTHORITY: dict[str, str] = {
-    "gb10_embedding_activation_checks.py": "88a06823da2b976df3eb45cfc4bccb6f2067ff35625752d90b517519cb3bc91d",
-    "gb10_embedding_activation_config.py": "1a3b8df549d5ff6aeb061067827d0befc1dada3431760920c428096bbe9fb4eb",
-    "gb10_embedding_activation_storage.py": "27e20e181fb244a599802f42c5c60724f9c4bf80d6e2aaaca8648924aa2f9bbe",
+    "gb10_embedding_activation_checks.py": "7e6d00538e8d952c137e5b5114fc16919f6e1bab59d6260602f989a2103f44a4",
+    "gb10_embedding_activation_config.py": "8cfe41e37a31adc2c060cd68700c304775231b62d9e8f03170f0bc371ced5de7",
+    "gb10_embedding_activation_storage.py": "0a18a6bb5be090b47ac37a826d301dce574155ced6e69bc28ce5d00264be453a",
     "gb10_embedding_profile_contract.py": "cbb89060e5f8d5a2391023811b1223200cdc57976d2349374705e8a0e123bce7",
     "gb10_embedding_verifier_runtime.py": "599af1c802e1a0d3e942fb0b16cdfd3a66f9e928ab64eabf3fb455ec007df629",
-    "gb10_verify_embedding_profile.py": "ec2b81b1653130615f77e463845adced13ad4e9adc75f599e58eadd7297f44f3",
+    "gb10_verify_embedding_profile.py": "5ddbea42ec11ab6cf8fd8a0df14d40edd6b3920d33851510274c24a5092732f4",
 }
 def _verify_import_authority(script_directory: Path) -> None:
     for name, expected in EXPECTED_IMPORT_AUTHORITY.items():
@@ -54,7 +52,6 @@ _SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 _verify_import_authority(_SCRIPT_DIRECTORY)
 sys.path.insert(0, str(_SCRIPT_DIRECTORY))
 from gb10_embedding_activation_checks import (  # noqa: E402
-    Generation,
     RuntimeConfig,
     UNIT,
     capture_baselines as _capture_baselines,
@@ -69,7 +66,6 @@ from gb10_embedding_activation_config import (  # noqa: E402
     test_config as _test_config,
 )
 from gb10_embedding_activation_storage import (  # noqa: E402
-    ActivationStorageError,
     NO_SWAP_KEYS,
     SourceSnapshot,
     TransactionError,
@@ -85,7 +81,6 @@ from gb10_embedding_activation_storage import (  # noqa: E402
     _install_transaction_sources,
     _load_manifest,
     _manifest_generation,
-    _no_swap_source_snapshot,
     _no_swap_source_snapshots,
     _persist_transaction,
     _read_phase,
@@ -110,7 +105,6 @@ from gb10_embedding_profile_contract import (  # noqa: E402
 from gb10_embedding_verifier_runtime import (  # noqa: E402
     command,
     json_file,
-    json_text,
     read_nofollow,
 )
 from gb10_verify_embedding_profile import verify_production  # noqa: E402

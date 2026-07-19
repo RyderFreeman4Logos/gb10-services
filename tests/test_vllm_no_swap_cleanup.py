@@ -1,12 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
-import shlex
-import stat
 import subprocess
-import tempfile
-import unittest
 from pathlib import Path
 
 from vllm_no_swap_fixtures import VERIFIER, VllmNoSwapFixture
