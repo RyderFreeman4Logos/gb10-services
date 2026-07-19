@@ -63,6 +63,7 @@ class CollectionStateError(RuntimeError):
 class ResumeState:
     completed: frozenset[str]
     charged_input_tokens: int
+    terminal_failures: frozenset[str]
 
 
 def load_corpus(path: Path) -> list[dict[str, Any]]:
@@ -200,6 +201,7 @@ def _load_jsonl_strict(path: Path, label: str) -> list[dict[str, Any]]:
 
 def _load_resume_state(output: Path, planned: set[str]) -> ResumeState:
     completed: set[str] = set()
+    terminal_failures: set[str] = set()
     charged_input_tokens = 0
     baseline_fields = {
         "candidate_document_ids",
@@ -254,7 +256,24 @@ def _load_resume_state(output: Path, planned: set[str]) -> ResumeState:
             or not isinstance(row.get("timing"), dict)
         ):
             raise CollectionStateError("cloud baseline resume row is inconsistent")
+        timing = row["timing"]
+        response = row["response"]
+        http_status = timing.get("http_status")
+        reported_tokens = response.get("input_tokens")
+        if (
+            isinstance(http_status, bool)
+            or not isinstance(http_status, int)
+            or not 100 <= http_status <= 599
+        ):
+            raise CollectionStateError("cloud baseline HTTP status is invalid")
+        token_count_invalid = reported_tokens is not None and (
+            isinstance(reported_tokens, bool)
+            or not isinstance(reported_tokens, int)
+            or reported_tokens < 0
+        )
         completed.add(fingerprint)
+        if http_status != 200 or token_count_invalid:
+            terminal_failures.add(fingerprint)
         charged_input_tokens += charged
 
     intents: set[str] = set()
@@ -273,7 +292,9 @@ def _load_resume_state(output: Path, planned: set[str]) -> ResumeState:
         raise CollectionStateError(
             "paid request intent has no complete response row; automatic resend is forbidden"
         )
-    return ResumeState(frozenset(completed), charged_input_tokens)
+    return ResumeState(
+        frozenset(completed), charged_input_tokens, frozenset(terminal_failures)
+    )
 
 
 def call_deepinfra(
@@ -370,7 +391,7 @@ def main() -> int:
                 raise CollectionStateError(
                     "output or request intent ledger already exists; use --resume"
                 )
-            resume = ResumeState(frozenset(), 0)
+            resume = ResumeState(frozenset(), 0, frozenset())
     except (CollectionStateError, OSError, UnicodeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -389,16 +410,17 @@ def main() -> int:
         return 2
 
     if args.dry_run:
+        failed = len(resume.terminal_failures)
         print(
             json.dumps(
                 {
-                    "status": "DRY_RUN",
+                    "status": "FAILED" if failed else "DRY_RUN",
                     "provider": args.provider,
                     "model": args.model,
                     "groups_total": len(groups),
                     "groups_completed": len(remaining),
                     "groups_skipped": len(resume.completed),
-                    "groups_failed": 0,
+                    "groups_failed": failed,
                     "total_input_tokens": projected_input_tokens,
                     "total_cost_usd": round(projected_cost, 6),
                     "budget_usd": args.budget_usd,
@@ -407,7 +429,7 @@ def main() -> int:
                 sort_keys=True,
             )
         )
-        return 0
+        return 1 if failed else 0
 
     api_key = os.environ.get("DEEPINFRA_KEY", "")
     if not api_key:
@@ -417,7 +439,7 @@ def main() -> int:
     total_input_tokens = resume.charged_input_tokens
     completed = 0
     skipped = len(resume.completed)
-    failed = 0
+    failed = len(resume.terminal_failures)
 
     for index, (group, request_body, fingerprint, est_tokens) in enumerate(plans, 1):
         if fingerprint in resume.completed:
@@ -495,7 +517,8 @@ def main() -> int:
                 file=sys.stderr,
             )
             break
-        completed += 1
+        if status == 200 and not token_count_invalid:
+            completed += 1
 
         remaining_estimate = sum(
             pending_estimate
@@ -539,7 +562,7 @@ def main() -> int:
     print(
         json.dumps(
             {
-                "status": "DONE",
+                "status": "FAILED" if failed else "DONE",
                 "provider": args.provider,
                 "model": args.model,
                 "groups_total": len(groups),

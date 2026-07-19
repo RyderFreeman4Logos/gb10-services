@@ -82,18 +82,28 @@ def _baseline_row(group: dict[str, object], charged_tokens: int) -> dict[str, ob
     }
 
 
-def _run_main(
+def _run_main_capture(
     arguments: list[str],
     response: tuple[int, dict[str, object], dict[str, object]],
-) -> tuple[int, MagicMock]:
+) -> tuple[int, MagicMock, str]:
+    stdout = io.StringIO()
     with (
         patch.object(sys, "argv", ["collect_reranker_cloud_baseline.py", *arguments]),
         patch.dict(os.environ, {"DEEPINFRA_KEY": "unit-secret"}),
         patch.object(collector, "call_deepinfra", return_value=response) as cloud_call,
-        redirect_stdout(io.StringIO()),
+        redirect_stdout(stdout),
         redirect_stderr(io.StringIO()),
     ):
-        return collector.main(), cloud_call
+        result = collector.main()
+    return result, cloud_call, stdout.getvalue()
+
+
+def _run_main(
+    arguments: list[str],
+    response: tuple[int, dict[str, object], dict[str, object]],
+) -> tuple[int, MagicMock]:
+    result, cloud_call, _stdout = _run_main_capture(arguments, response)
+    return result, cloud_call
 
 
 class CloudCollectorSafetyTests(unittest.TestCase):
@@ -228,6 +238,50 @@ class CloudCollectorSafetyTests(unittest.TestCase):
             )
             self.assertEqual(result, 2)
             cloud_call.assert_not_called()
+
+    def test_durable_provider_failures_remain_terminal_on_every_resume(self) -> None:
+        failures = (
+            (500, {"input_tokens": 7, "scores": [0.5]}),
+            (200, {"input_tokens": "invalid", "scores": [0.5]}),
+        )
+        for status, body in failures:
+            with self.subTest(status=status, body=body), tempfile.TemporaryDirectory() as raw_tmp:
+                root = Path(raw_tmp)
+                corpus = root / "corpus.jsonl"
+                output = root / "baseline.jsonl"
+                _write_corpus(corpus, 1)
+                arguments = [
+                    "--corpus",
+                    str(corpus),
+                    "--output",
+                    str(output),
+                    "--budget-usd",
+                    "1",
+                    "--rate-delay-seconds",
+                    "0",
+                ]
+                first_result, _first_call, first_stdout = _run_main_capture(
+                    arguments,
+                    (status, body, {"http_status": status}),
+                )
+                self.assertEqual(first_result, 1)
+                self.assertEqual(json.loads(first_stdout)["status"], "FAILED")
+                self.assertEqual(len(output.read_text().splitlines()), 1)
+
+                for extra in ([], ["--dry-run"]):
+                    result, cloud_call, stdout = _run_main_capture(
+                        [*arguments, "--resume", *extra],
+                        (200, {"input_tokens": 1, "scores": [0.5]}, {"http_status": 200}),
+                    )
+                    self.assertEqual(result, 1)
+                    cloud_call.assert_not_called()
+                    summary = json.loads(stdout)
+                    self.assertEqual(summary["status"], "FAILED")
+                    self.assertEqual(summary["groups_failed"], 1)
+                self.assertEqual(len(output.read_text().splitlines()), 1)
+                self.assertEqual(
+                    len(collector.intent_path(output).read_text().splitlines()), 1
+                )
 
     def test_resume_rejects_malformed_output_instead_of_resending(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
