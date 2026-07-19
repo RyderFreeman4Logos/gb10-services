@@ -3,8 +3,8 @@
 
 This script sends the fixed MIRACLReranking (en+zh) corpus to a cloud reranker
 API (DeepInfra Qwen3-Reranker-8B by default) using its native inference contract,
-stores each raw response alongside the request fingerprint, and tracks token
-budget so the run is reproducible and auditable.
+stores only documented response fields alongside the request fingerprint, and
+tracks token budget so the run is reproducible and auditable.
 
 The output is a companion baseline file under ``data/reranker-equivalence/`` so
 that a locally-deployed vLLM Querit-4B (behind llm-guard-proxy) can later replay
@@ -34,7 +34,6 @@ import os
 import stat
 import sys
 import time
-import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +45,7 @@ from reranker_cloud_evidence import (
     canonical_json,
     request_fingerprint,
 )
+from reranker_cloud_transport import MAX_CLOUD_RESPONSE_BYTES, call_deepinfra
 from reranker_equivalence_metrics import PROMPT_OVERHEAD_TOKENS_PER_PAIR
 from reranker_score_validation import ScoreValidationError, validate_scores
 
@@ -58,7 +58,6 @@ __all__ = [
 ]
 
 DEFAULT_PRICE_PER_MTOK = 0.05
-MAX_CLOUD_RESPONSE_BYTES = 4 * 1024 * 1024
 DEFAULT_INSTRUCTION = "Given a web search query, retrieve relevant passages that answer the query"
 DEFAULT_PROVIDER = "deepinfra"
 DEFAULT_MODEL = "Qwen/Qwen3-Reranker-8B"
@@ -236,6 +235,30 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _harden_existing_artifact(path: Path) -> None:
+    """Force an existing owner-controlled baseline artifact to mode 0600."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise CollectionStateError("cannot open existing baseline artifact safely") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+        ):
+            raise CollectionStateError("existing baseline artifact is unsafe")
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _append_durable(path: Path, record: dict[str, Any]) -> None:
     """Append one canonical JSONL row and make it durable before returning."""
 
@@ -251,6 +274,7 @@ def _append_durable(path: Path, record: dict[str, Any]) -> None:
     descriptor = os.open(path, flags, 0o600)
     payload = canonical_json(record) + b"\n"
     try:
+        os.fchmod(descriptor, 0o600)
         offset = 0
         while offset < len(payload):
             written = os.write(descriptor, payload[offset:])
@@ -444,47 +468,18 @@ def _load_resume_state(
     )
 
 
-def call_deepinfra(
-    model: str,
-    request_body: dict[str, Any],
-    api_key: str,
-    timeout: float,
-    endpoint: str = "https://api.deepinfra.com/v1/inference",
-) -> tuple[int, dict[str, Any], dict[str, Any]]:
-    url = f"{endpoint}/{model}"
-    payload = canonical_json(request_body)
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    started = time.monotonic()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read(MAX_CLOUD_RESPONSE_BYTES + 1)
-            if len(raw) > MAX_CLOUD_RESPONSE_BYTES:
-                raise RuntimeError("cloud response exceeded bounded read limit")
-            status = resp.status
-    except urllib.error.HTTPError as exc:
-        raw = exc.read(MAX_CLOUD_RESPONSE_BYTES + 1)
-        if len(raw) > MAX_CLOUD_RESPONSE_BYTES:
-            raise RuntimeError("cloud error response exceeded bounded read limit") from exc
-        status = exc.code
-    elapsed = time.monotonic() - started
-    try:
-        body = json.loads(raw.decode("utf-8"))
-    except Exception:
-        body = {"_raw": raw.decode("utf-8", errors="replace")}
-    timing = {
-        "http_status": status,
-        "elapsed_seconds": round(elapsed, 4),
-        "response_bytes": len(raw),
-    }
-    return status, body, timing
+BASELINE_RESPONSE_FIELDS = (
+    "inference_status",
+    "input_tokens",
+    "request_id",
+    "scores",
+)
+
+
+def _artifact_response(body: dict[str, Any]) -> dict[str, Any]:
+    """Return only documented provider fields for the committable baseline."""
+
+    return {field: body[field] for field in BASELINE_RESPONSE_FIELDS if field in body}
 
 
 def _parse_args() -> argparse.Namespace:
@@ -567,6 +562,8 @@ def _run_owned(args: argparse.Namespace) -> int:
             plans.append((group, request_body, fingerprint, estimated_tokens))
 
         if args.resume:
+            _harden_existing_artifact(args.output)
+            _harden_existing_artifact(intent_path(args.output))
             resume = _load_resume_state(args.output, planned)
         else:
             if args.output.exists() or intent_path(args.output).exists():
@@ -702,7 +699,7 @@ def _run_owned(args: argparse.Namespace) -> int:
             "pair_count": len(request_body["queries"]),
             "candidate_document_ids": [c.get("document_id") for c in group["candidates"]],
             "candidate_relevance": [c.get("relevance") for c in group["candidates"]],
-            "response": body,
+            "response": _artifact_response(body) if isinstance(body, dict) else {},
             "timing": timing,
             "charged_input_tokens": charged_tokens,
             "estimated_input_tokens": est_tokens,
