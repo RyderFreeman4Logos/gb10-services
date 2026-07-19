@@ -27,9 +27,8 @@ IMAGE = (
     "ghcr.io/aeon-7/aeon-vllm-ultimate@"
     "sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d"
 )
-RERANK_OWNERS = {
+EXCLUSIVE_PRODUCTION_OWNERS = {
     "vllm-querit-4b-reranker.service",
-    "vllm-querit-4b-canary-backend.service",
     "vllm-qwen3-reranker-8b.service",
 }
 
@@ -195,15 +194,16 @@ class QueritVllmProductionContractTests(unittest.TestCase):
         self.assertEqual(canary_publish, "127.0.0.1:18015:8000")
         self.assertNotEqual(production_publish, canary_publish)
 
-    def test_reranker_owner_conflicts_are_symmetric(self) -> None:
+    def test_production_reranker_conflicts_are_symmetric_but_canary_coexists(self) -> None:
         units = {
             "vllm-querit-4b-reranker.service": PRODUCTION_UNIT.read_text(),
-            "vllm-querit-4b-canary-backend.service": CANARY_UNIT.read_text(),
             "vllm-qwen3-reranker-8b.service": LEGACY_QWEN_UNIT.read_text(),
         }
         for name, unit in units.items():
             conflicts = set(" ".join(_unit_directive_values(unit, "Conflicts")).split())
-            self.assertTrue(RERANK_OWNERS - {name} <= conflicts, name)
+            self.assertTrue(EXCLUSIVE_PRODUCTION_OWNERS - {name} <= conflicts, name)
+            self.assertNotIn("vllm-querit-4b-canary-backend.service", conflicts, name)
+        self.assertEqual(_unit_directive_values(CANARY_UNIT.read_text(), "Conflicts"), [])
 
     def test_all_reranker_publishes_are_single_address_bindings(self) -> None:
         for path in (PRODUCTION_UNIT, CANARY_UNIT, LEGACY_QWEN_UNIT):

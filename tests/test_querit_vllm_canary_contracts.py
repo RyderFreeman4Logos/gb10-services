@@ -382,11 +382,6 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
         )
 
         unit_section = unit.split("[Service]", 1)[0] + adapter.split("[Service]", 1)[0]
-        # Conflicts= is an intentional mutual-exclusion declaration, not a dependency.
-        # Strip Conflicts lines before checking for accidental neighbor dependencies.
-        unit_section = "\n".join(
-            line for line in unit_section.splitlines() if not line.strip().startswith("Conflicts=")
-        )
         for neighbor in (
             "vllm-embedding.service",
             "vllm-querit-4b-reranker.service",

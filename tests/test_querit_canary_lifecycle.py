@@ -281,6 +281,40 @@ class ArtifactManifestTests(unittest.TestCase):
 
 
 class CanaryLifecycleTests(unittest.TestCase):
+    def test_systemd_conflicts_cannot_stop_immutable_rerankers_before_exec_condition(
+        self,
+    ) -> None:
+        class ConflictAwareHost(FakeHost):
+            state_path: Path
+
+            def start(self, unit: str) -> None:
+                if unit == lifecycle.BACKEND_UNIT:
+                    source = (ROOT / "systemd" / f"{unit}").read_text()
+                    conflicts = next(
+                        (
+                            line.removeprefix("Conflicts=").split()
+                            for line in source.splitlines()
+                            if line.startswith("Conflicts=")
+                        ),
+                        [],
+                    )
+                    for conflict in conflicts:
+                        if self.states.get(conflict, lifecycle.ServiceState(False, "")).active:
+                            self.states[conflict] = lifecycle.ServiceState(False, "")
+                    lifecycle.preflight(self, self.state_path)
+                super().start(unit)
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            state = Path(raw_tmp) / "state.json"
+            host = ConflictAwareHost(memory=[24, 24])
+            host.state_path = state
+            neighbor_before = {unit: host.states[unit] for unit in lifecycle.IMMUTABLE_NEIGHBORS}
+            lifecycle.activate(host, state)
+            self.assertEqual(
+                {unit: host.states[unit] for unit in lifecycle.IMMUTABLE_NEIGHBORS},
+                neighbor_before,
+            )
+
     def test_cgroup_v1_or_unknown_fails_before_state_or_service_mutation(self) -> None:
         for version in ("1", "unknown", ""):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as raw_tmp:

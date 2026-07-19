@@ -5,7 +5,7 @@
 [Unit]
 Description=Canonical Querit-4B vLLM pooling reranker (AEON v0.25.1, raw Tailnet :18013)
 After=network.target
-Conflicts=vllm-qwen3-reranker-8b.service vllm-querit-4b-canary-backend.service
+Conflicts=vllm-qwen3-reranker-8b.service
 StartLimitIntervalSec=600
 StartLimitBurst=1
 

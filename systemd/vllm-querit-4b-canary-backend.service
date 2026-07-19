@@ -4,7 +4,6 @@
 [Unit]
 Description=Temporary Querit-4B vLLM pooling canary backend (loopback :18015)
 After=network.target
-Conflicts=vllm-querit-4b-reranker.service vllm-qwen3-reranker-8b.service
 StartLimitIntervalSec=600
 StartLimitBurst=1
 
