@@ -22,6 +22,9 @@ from querit_canary_runtime import (
 )
 
 
+__all__ = ["Host", "activate", "deactivate", "restoring_original"]
+
+
 class Host(Protocol):
     def require_cgroup_v2(self) -> None: ...
 

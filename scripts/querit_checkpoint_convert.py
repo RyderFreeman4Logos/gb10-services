@@ -18,6 +18,16 @@ from typing import Any
 
 import querit_vllm_artifact
 
+
+__all__ = [
+    "convert_snapshot",
+    "main",
+    "rewrite_config",
+    "rewrite_head_state",
+    "rewrite_weight_index",
+]
+
+
 SHARD_NAME = "model-00002-of-00002.safetensors"
 INDEX_NAME = "model.safetensors.index.json"
 CONFIG_NAME = "config.json"

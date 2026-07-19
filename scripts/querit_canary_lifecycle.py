@@ -32,6 +32,9 @@ from querit_canary_transaction import (
 )
 
 
+__all__ = ["LifecycleCancelled", "main", "preflight"]
+
+
 DEFAULT_STATE = Path("/home/obj/.local/state/gb10-querit-canary/state.json")
 ADAPTER_UNIT = runtime.ADAPTER_UNIT
 IMMUTABLE_NEIGHBORS = runtime.IMMUTABLE_NEIGHBORS

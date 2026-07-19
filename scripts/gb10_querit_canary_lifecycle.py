@@ -5,6 +5,9 @@ import importlib
 import sys
 
 
+__all__ = ["main"]
+
+
 sys.path.insert(0, "/home/obj/.local/lib/gb10")
 main = importlib.import_module("querit_canary_lifecycle").main
 

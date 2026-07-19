@@ -21,6 +21,23 @@ from reranker_equivalence_wire import (
 )
 
 
+__all__ = [
+    "ADAPTER_UNIT",
+    "BACKEND_UNIT",
+    "DEFAULT_MODEL",
+    "EMBEDDING_UNIT",
+    "GUARD_UNIT",
+    "IMMUTABLE_NEIGHBORS",
+    "LEGACY_RERANKER_UNIT",
+    "LifecycleError",
+    "MINIMUM_HEADROOM_GIB",
+    "PRODUCTION_RERANKER_UNIT",
+    "ServiceState",
+    "SystemHost",
+    "TEXT_UNIT",
+]
+
+
 TEXT_UNIT = "vllm-aeon-27b-dflash.service"
 BACKEND_UNIT = "vllm-querit-4b-canary-backend.service"
 ADAPTER_UNIT = "vllm-querit-4b-canary.service"

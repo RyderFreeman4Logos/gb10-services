@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import NoReturn, Sequence
 
 
+__all__ = ["main"]
+
+
 class ContractError(RuntimeError):
     pass
 

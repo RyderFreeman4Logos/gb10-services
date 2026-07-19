@@ -5,6 +5,9 @@ import importlib
 import sys
 
 
+__all__: list[str] = []
+
+
 sys.path.insert(0, "/home/obj/.local/lib/gb10")
 lifecycle = importlib.import_module("querit_canary_lifecycle")
 

@@ -12,6 +12,9 @@ import sys
 from pathlib import Path
 
 
+__all__ = ["StoreError", "main", "run"]
+
+
 MAX_RECEIPT_BYTES = 4 * 1024 * 1024
 RECEIPT_SUFFIX = ".receipt"
 LOCK_NAME = ".lock"
