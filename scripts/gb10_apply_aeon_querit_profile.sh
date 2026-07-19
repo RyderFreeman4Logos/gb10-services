@@ -199,7 +199,8 @@ rollback_runtime_state() {
     fi
     if (( CANARY_ADAPTER_PRESENT == 1 )) && [[ "$PREV_CANARY_ADAPTER_ACTIVE" == "active" ]]; then
         run_systemctl_start start "$CANARY_ADAPTER_UNIT" || rollback_failed=1
-    elif [[ "$PREV_FALLBACK_ACTIVE" == "active" ]]; then
+    fi
+    if [[ "$PREV_FALLBACK_ACTIVE" == "active" ]]; then
         run_systemctl_start start "$FALLBACK_UNIT" || rollback_failed=1
     elif [[ "$PREV_RERANK_ACTIVE" == "active" ]]; then
         run_systemctl_start start "$RERANK_UNIT" || rollback_failed=1
