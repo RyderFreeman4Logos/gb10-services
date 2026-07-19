@@ -20,7 +20,7 @@ from typing import Any
 EXPECTED_IMPORT_AUTHORITY: dict[str, str] = {
     "gb10_embedding_activation_checks.py": "88a06823da2b976df3eb45cfc4bccb6f2067ff35625752d90b517519cb3bc91d",
     "gb10_embedding_activation_config.py": "1a3b8df549d5ff6aeb061067827d0befc1dada3431760920c428096bbe9fb4eb",
-    "gb10_embedding_activation_storage.py": "bbde36905697a5fcd8008fdc4e0178f909996db034320b5ab168a323f0f784d1",
+    "gb10_embedding_activation_storage.py": "27e20e181fb244a599802f42c5c60724f9c4bf80d6e2aaaca8648924aa2f9bbe",
     "gb10_embedding_profile_contract.py": "cbb89060e5f8d5a2391023811b1223200cdc57976d2349374705e8a0e123bce7",
     "gb10_embedding_verifier_runtime.py": "599af1c802e1a0d3e942fb0b16cdfd3a66f9e928ab64eabf3fb455ec007df629",
     "gb10_verify_embedding_profile.py": "ec2b81b1653130615f77e463845adced13ad4e9adc75f599e58eadd7297f44f3",

@@ -43,9 +43,7 @@ CGROUP_ROOT = Path(CGROUP_ROOT_RAW)
 MAX_OUTPUT = 2 * 1024 * 1024
 FULL_ID = re.compile(r"[0-9a-f]{64}")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
-STARTED_AT = re.compile(
-    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z"
-)
+STARTED_AT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z")
 COMPONENT = re.compile(r"[A-Za-z0-9_.@:-]+")
 
 
@@ -127,7 +125,10 @@ def run_command(
             for stream in (process.stdout, process.stderr):
                 if stream is not None:  # Stop escaped descendants from owning our read ends.
                     stream.close()
-            process.wait(timeout=1)
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                reject(f"bounded command could not be reaped after timeout: {arguments[0]}")
         reject(f"bounded command timed out: {arguments[0]}")
     if len(stdout) > MAX_OUTPUT or len(stderr) > MAX_OUTPUT:
         reject(f"bounded command output exceeded limit: {arguments[0]}")

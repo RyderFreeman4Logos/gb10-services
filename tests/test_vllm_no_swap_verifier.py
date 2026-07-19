@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -256,6 +257,52 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
         self.assertLess(time.monotonic() - started, 6)
         self.assertNotEqual(process.returncode, 0)
         self.assertIn("bounded command timed out", stderr)
+
+    def test_final_reap_timeout_is_a_controlled_fail_closed_rejection(self) -> None:
+        process = mock.Mock()
+        process.pid = 424242
+        process.stdout = mock.Mock()
+        process.stderr = mock.Mock()
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired("/usr/bin/docker", 1),
+            subprocess.TimeoutExpired("/usr/bin/docker", 2),
+            subprocess.TimeoutExpired("/usr/bin/docker", 1),
+        ]
+        process.wait.side_effect = subprocess.TimeoutExpired("/usr/bin/docker", 1)
+        spec = importlib.util.spec_from_file_location(
+            "vllm_no_swap_final_reap_under_test", VERIFIER_CORE
+        )
+        if spec is None or spec.loader is None:
+            self.fail("could not load no-swap verifier core")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        stderr = io.StringIO()
+        argv = [
+            str(VERIFIER_CORE),
+            "/usr/bin/docker",
+            "/usr/bin/systemctl",
+            "/proc",
+            "/sys/fs/cgroup",
+            "1",
+            "1",
+            "1",
+            "--unit",
+            "/tmp/not-read-before-docker-preflight.service",
+        ]
+        try:
+            with mock.patch.object(sys, "argv", argv), mock.patch(
+                "subprocess.Popen", return_value=process
+            ), mock.patch("os.killpg"), mock.patch.object(sys, "stderr", stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    spec.loader.exec_module(module)
+        finally:
+            sys.modules.pop(spec.name, None)
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(process.communicate.call_count, 3)
+        process.wait.assert_called_once_with(timeout=1)
+        self.assertIn("could not be reaped after timeout", stderr.getvalue())
+        self.assertNotIn("TimeoutExpired", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_preflight_rejects_non_v2_or_failed_info_before_unit_or_container_access(self) -> None:
         for version, info_fail in (("1", False), ("unknown", False), ("2", True)):
