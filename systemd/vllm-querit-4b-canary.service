@@ -1,0 +1,23 @@
+# Temporary public adapter. Production reranking remains on :18013.
+[Unit]
+Description=Temporary Querit-4B DeepInfra-compatible canary adapter (public port 18014)
+Requires=vllm-querit-4b-canary-backend.service
+After=network.target
+After=vllm-querit-4b-canary-backend.service
+StartLimitIntervalSec=600
+StartLimitBurst=1
+
+[Service]
+Type=simple
+Restart=no
+TimeoutStartSec=600
+TimeoutStopSec=30
+MemoryMax=256M
+MemorySwapMax=0
+OOMScoreAdjust=500
+
+ExecCondition=/home/obj/.local/bin/gb10_querit_canary_preflight.py
+ExecStart=/usr/bin/python3 /home/obj/.local/lib/gb10/querit_deepinfra_adapter.py --listen-host 100.105.4.92 --listen-port 18014 --backend-url http://127.0.0.1:18015
+
+StandardOutput=journal
+StandardError=journal

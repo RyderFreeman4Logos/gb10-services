@@ -1,17 +1,47 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
+import shlex
 import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
+from test_embedding_service_contracts import _logical_directive_argv, _option_values
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOYER = ROOT / "scripts" / "gb10_apply_aeon_querit_profile.sh"
+AEON_UNIT = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
+GIB = 1024 * 1024 * 1024
+
+
+def _canonical_aeon_docker_profile() -> tuple[list[str], int, int]:
+    exec_starts = _logical_directive_argv(AEON_UNIT.read_text(), "ExecStart")
+    if len(exec_starts) != 1:
+        raise AssertionError(f"expected one AEON ExecStart, found {len(exec_starts)}")
+    argv = exec_starts[0]
+    if argv[:2] != ["/usr/bin/docker", "run"]:
+        raise AssertionError("AEON unit must use the canonical docker run command")
+    try:
+        image_index = next(
+            index
+            for index, token in enumerate(argv)
+            if token.startswith("ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:")
+        )
+    except StopIteration as error:
+        raise AssertionError("AEON unit has no immutable AEON image") from error
+    host_argv = argv[2:image_index]
+    command = argv[image_index + 1 :]
+    memory = _option_values(host_argv, "--memory")[0]
+    memory_swap = _option_values(host_argv, "--memory-swap")[0]
+    if not memory.endswith("g") or not memory_swap.endswith("g"):
+        raise AssertionError("AEON Docker memory values must use GiB units")
+    return command, int(memory[:-1]) * GIB, int(memory_swap[:-1]) * GIB
 
 
 class QueritDeployerContractTests(unittest.TestCase):
@@ -24,31 +54,103 @@ class QueritDeployerContractTests(unittest.TestCase):
         *,
         guard_mode: str = "fail",
         docker_mode: str = "ok",
+        cgroup_version: str = "2",
+        no_swap_fail_at: int = 0,
+        aeon_command: list[str] | None = None,
+        aeon_memory_bytes: int | None = None,
+        aeon_memory_swap_bytes: int | None = None,
+        initial_reranker: str = "fallback",
+        canary_active: bool = False,
     ) -> tuple[dict[str, str], Path, Path, Path]:
         fake_bin = tmp / "bin"
         fake_bin.mkdir()
         calls = tmp / "calls"
         rerank_active = tmp / "rerank-active"
+        fallback_active = tmp / "fallback-active"
+        canary_backend_active = tmp / "canary-backend-active"
+        canary_adapter_active = tmp / "canary-adapter-active"
+        rerank_enabled = tmp / "rerank-enabled"
+        fallback_enabled = tmp / "fallback-enabled"
+        if initial_reranker == "canonical":
+            rerank_active.touch()
+            rerank_enabled.touch()
+        elif initial_reranker == "fallback":
+            fallback_active.touch()
+            fallback_enabled.touch()
+        else:
+            raise ValueError(f"unsupported initial reranker: {initial_reranker}")
+        if canary_active:
+            canary_backend_active.touch()
+            canary_adapter_active.touch()
         signal_marker = tmp / "guard-score-entered"
         docker_marker = tmp / "docker-entered"
+        canonical_command, canonical_memory, canonical_memory_swap = (
+            _canonical_aeon_docker_profile()
+        )
+        aeon_command = canonical_command if aeon_command is None else aeon_command
+        aeon_memory_bytes = (
+            canonical_memory if aeon_memory_bytes is None else aeon_memory_bytes
+        )
+        aeon_memory_swap_bytes = (
+            canonical_memory_swap
+            if aeon_memory_swap_bytes is None
+            else aeon_memory_swap_bytes
+        )
+        command_json = tmp / "aeon-command.json"
+        command_json.write_text(json.dumps(aeon_command))
 
         systemctl = fake_bin / "systemctl"
         systemctl.write_text(
             "#!/usr/bin/env bash\n"
             f'printf \'systemctl %s\\n\' "$*" >> {calls}\n'
+            'if [[ "$*" == *"show"* ]]; then echo loaded; exit 0; fi\n'
             'if [[ "$*" == *"is-enabled"* ]]; then\n'
-            '  [[ "$*" == *"querit-4b-reranker.service"* ]] && { echo disabled; exit 1; }\n'
-            '  [[ "$*" == *"vllm-qwen3-reranker-8b.service"* ]] && { echo enabled; exit 0; }\n'
+            f'  [[ "$*" == *"vllm-querit-4b-reranker.service"* ]] && {{ [[ -f {rerank_enabled} ]] && {{ echo enabled; exit 0; }} || {{ echo disabled; exit 1; }}; }}\n'
+            f'  [[ "$*" == *"vllm-qwen3-reranker-8b.service"* ]] && {{ [[ -f {fallback_enabled} ]] && {{ echo enabled; exit 0; }} || {{ echo disabled; exit 1; }}; }}\n'
+            '  [[ "$*" == *"vllm-querit-4b-canary"* ]] && { echo disabled; exit 1; }\n'
             "fi\n"
             'if [[ "$*" == *"is-active"* ]]; then\n'
-            f'  if [[ "$*" == *"querit-4b-reranker.service"* ]]; then [[ -f {rerank_active} ]] && {{ echo active; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
+            f'  if [[ "$*" == *"vllm-querit-4b-reranker.service"* ]]; then [[ -f {rerank_active} ]] && {{ echo active; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
+            f'  if [[ "$*" == *"vllm-qwen3-reranker-8b.service"* ]]; then [[ -f {fallback_active} ]] && {{ echo active; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
+            f'  if [[ "$*" == *"vllm-querit-4b-canary-backend.service"* ]]; then [[ -f {canary_backend_active} ]] && {{ echo active; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
+            f'  if [[ "$*" == *"vllm-querit-4b-canary.service"* ]]; then [[ -f {canary_adapter_active} ]] && {{ echo active; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
             "  echo active; exit 0\n"
             "fi\n"
-            'if [[ "$*" == *"start querit-4b-reranker.service"* ]]; then\n'
+            'if [[ "$*" == *"start vllm-querit-4b-reranker.service"* ]]; then\n'
             f'  : > {rerank_active}\n'
             "fi\n"
-            'if [[ "$*" == *"stop querit-4b-reranker.service"* ]]; then\n'
+            'if [[ "$*" == *"enable vllm-querit-4b-reranker.service"* ]]; then\n'
+            f'  : > {rerank_enabled}\n'
+            "fi\n"
+            'if [[ "$*" == *"stop vllm-querit-4b-reranker.service"* ]]; then\n'
             f'  rm -f {rerank_active}\n'
+            "fi\n"
+            'if [[ "$*" == *"start vllm-qwen3-reranker-8b.service"* ]]; then\n'
+            f'  : > {fallback_active}\n'
+            "fi\n"
+            'if [[ "$*" == *"stop vllm-qwen3-reranker-8b.service"* ]]; then\n'
+            f'  rm -f {fallback_active}\n'
+            "fi\n"
+            'if [[ "$*" == *"start vllm-querit-4b-canary-backend.service"* ]]; then\n'
+            f'  : > {canary_backend_active}\n'
+            "fi\n"
+            'if [[ "$*" == *"stop vllm-querit-4b-canary-backend.service"* ]]; then\n'
+            f'  rm -f {canary_backend_active}\n'
+            "fi\n"
+            'if [[ "$*" == *"start vllm-querit-4b-canary.service"* ]]; then\n'
+            f'  : > {canary_adapter_active}\n'
+            "fi\n"
+            'if [[ "$*" == *"stop vllm-querit-4b-canary.service"* ]]; then\n'
+            f'  rm -f {canary_adapter_active}\n'
+            "fi\n"
+            'if [[ "$*" == *"disable vllm-querit-4b-reranker.service"* ]]; then\n'
+            f'  rm -f {rerank_enabled}\n'
+            "fi\n"
+            'if [[ "$*" == *"enable vllm-qwen3-reranker-8b.service"* ]]; then\n'
+            f'  : > {fallback_enabled}\n'
+            "fi\n"
+            'if [[ "$*" == *"disable vllm-qwen3-reranker-8b.service"* ]]; then\n'
+            f'  rm -f {fallback_enabled}\n'
             "fi\n"
             "exit 0\n"
         )
@@ -58,13 +160,21 @@ class QueritDeployerContractTests(unittest.TestCase):
         docker.write_text(
             "#!/usr/bin/env bash\n"
             f'printf \'docker %s\\n\' "$*" >> {calls}\n'
+            'if [[ "$*" == "info --format {{.CgroupVersion}}" ]]; then\n'
+            '  printf \'%s\\n\' "${FAKE_CGROUP_VERSION-2}"\n'
+            '  exit 0\n'
+            'fi\n'
             'if [[ "${FAKE_DOCKER_MODE:-ok}" == hang ]]; then\n'
             f"  : > {docker_marker}\n"
             "  /bin/sleep 30\n"
             "fi\n"
-            'if [[ "$*" == *"Config.Cmd"* ]]; then '
-            'echo \'["--kv-cache-memory-bytes","15360M"]\'; '
-            "else echo 74088185856; fi\n"
+            'if [[ "$*" == *"Config.Cmd"* ]]; then\n'
+            f"  cat {shlex.quote(str(command_json))}\n"
+            'elif [[ "$*" == *"HostConfig.MemorySwap"* ]]; then\n'
+            f"  echo {aeon_memory_swap_bytes}\n"
+            "else\n"
+            f"  echo {aeon_memory_bytes}\n"
+            "fi\n"
         )
         docker.chmod(0o755)
 
@@ -91,6 +201,18 @@ class QueritDeployerContractTests(unittest.TestCase):
         python.write_text("#!/usr/bin/env bash\necho RAW_RERANK_OK\n")
         python.chmod(0o755)
 
+        no_swap = fake_bin / "gb10_verify_vllm_no_swap.sh"
+        no_swap_count = tmp / "no-swap-count"
+        no_swap.write_text(
+            "#!/usr/bin/env bash\n"
+            f"count=$(cat {no_swap_count} 2>/dev/null || printf 0)\n"
+            "count=$((count + 1))\n"
+            f"printf '%s\\n' \"$count\" > {no_swap_count}\n"
+            f"printf 'no-swap %s\\n' \"$*\" >> {calls}\n"
+            'if (( count == ${FAKE_NO_SWAP_FAIL_AT:-0} )); then exit 85; fi\n'
+        )
+        no_swap.chmod(0o755)
+
         meminfo = tmp / "meminfo"
         meminfo.write_text("MemAvailable: 8388608 kB\n")
         guard_config = tmp / "guard-config.toml"
@@ -105,33 +227,114 @@ class QueritDeployerContractTests(unittest.TestCase):
             "GB10_RERANK_READY_ATTEMPTS": "1",
             "FAKE_GUARD_MODE": guard_mode,
             "FAKE_DOCKER_MODE": docker_mode,
+            "FAKE_CGROUP_VERSION": cgroup_version,
+            "FAKE_NO_SWAP_FAIL_AT": str(no_swap_fail_at),
+            "GB10_NO_SWAP_HELPER_TEST_PATH": str(no_swap),
+            "GB10_QUERIT_PROFILE_TEST_ONLY": "1",
         }
         return env, calls, signal_marker, docker_marker
 
-    def test_matches_committed_production_aeon_profile(self) -> None:
-        self.assertIn(
-            "EXPECTED_AEON_MEMORY_GIB=${GB10_EXPECTED_AEON_MEMORY_GIB:-69}",
-            self.source,
-        )
-        self.assertIn(
-            "EXPECTED_AEON_KV_MIB=${GB10_EXPECTED_AEON_KV_MIB:-15360}",
-            self.source,
-        )
-        self.assertNotIn("EXPECTED_AEON_MEMORY_GIB:-64", self.source)
+    def test_validates_the_canonical_aeon_profile_before_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            env, calls, _, _ = self._make_fake_stack(
+                Path(raw_tmp), guard_mode="ok"
+            )
+            result = subprocess.run(
+                ["bash", str(DEPLOYER)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("DEPLOY_SUCCESS", result.stdout)
+            recorded = calls.read_text().splitlines()
+            aeon_no_swap = (
+                "no-swap --test-only --unit "
+                "/home/obj/.config/systemd/user/vllm-aeon-27b-dflash.service "
+                "--container vllm-aeon-27b-dflash-n12"
+            )
+            self.assertGreaterEqual(recorded.count(aeon_no_swap), 2, recorded)
 
-    def test_does_not_restart_aeon_by_default(self) -> None:
-        self.assertIn("--restart-aeon", self.source)
-        restart = self.source.index('run_systemctl_start restart "$AEON_UNIT"')
-        guarded_region = self.source[max(0, restart - 250) : restart]
-        self.assertRegex(guarded_region, r"RESTART_AEON.*1")
+    def test_rejects_stale_or_noncanonical_aeon_profiles_before_mutation(self) -> None:
+        command, memory_bytes, memory_swap_bytes = _canonical_aeon_docker_profile()
+        utilization_index = command.index("--gpu-memory-utilization")
+        wrong_utilization = [*command]
+        wrong_utilization[utilization_index + 1] = "0.354"
+        profiles = {
+            "explicit KV pin": (
+                [*command, "--kv-cache-memory-bytes", "15360M"],
+                memory_bytes,
+                memory_swap_bytes,
+                "AEON_KV_PINNED",
+            ),
+            "wrong GPU utilization": (
+                wrong_utilization,
+                memory_bytes,
+                memory_swap_bytes,
+                "AEON_GPU_UTILIZATION_MISMATCH",
+            ),
+            "old 69g memory ceiling": (
+                command,
+                69 * GIB,
+                69 * GIB,
+                "AEON_MEMORY_MISMATCH",
+            ),
+            "old 69g memory swap ceiling": (
+                command,
+                memory_bytes,
+                69 * GIB,
+                "AEON_MEMORY_SWAP_MISMATCH",
+            ),
+        }
+        for label, (
+            candidate_command,
+            candidate_memory,
+            candidate_memory_swap,
+            expected_error,
+        ) in profiles.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw_tmp:
+                env, calls, _, _ = self._make_fake_stack(
+                    Path(raw_tmp),
+                    guard_mode="ok",
+                    aeon_command=candidate_command,
+                    aeon_memory_bytes=candidate_memory,
+                    aeon_memory_swap_bytes=candidate_memory_swap,
+                )
+                result = subprocess.run(
+                    ["bash", str(DEPLOYER)],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+                self.assertNotIn("PHASE switch_reranker", result.stdout)
+                self.assertNotIn(
+                    "systemctl --user stop vllm-querit-4b-canary.service",
+                    calls.read_text().splitlines(),
+                )
+
+    def test_preserves_text_and_never_uses_systemctl_restart(self) -> None:
+        self.assertNotIn("--restart-aeon", self.source)
+        self.assertNotIn('restart "$AEON_UNIT"', self.source)
 
     def test_snapshots_and_restores_reranker_state(self) -> None:
         for contract in (
-            "LEGACY_UNIT=vllm-qwen3-reranker-8b.service",
+            "RERANK_UNIT=vllm-querit-4b-reranker.service",
+            "FALLBACK_UNIT=vllm-qwen3-reranker-8b.service",
+            "CANARY_BACKEND_UNIT=vllm-querit-4b-canary-backend.service",
+            "CANARY_ADAPTER_UNIT=vllm-querit-4b-canary.service",
             "unit_enabled_state",
             "unit_active_state",
+            "unit_is_present",
             "rollback_runtime_state",
-            'run_systemctl disable --now "$LEGACY_UNIT"',
+            'run_systemctl stop "$CANARY_ADAPTER_UNIT"',
+            'run_systemctl stop "$CANARY_BACKEND_UNIT"',
+            'run_systemctl disable "$FALLBACK_UNIT"',
             "restore_unit_enablement",
         ):
             self.assertIn(contract, self.source)
@@ -144,17 +347,13 @@ class QueritDeployerContractTests(unittest.TestCase):
             self.fail("rollback_runtime_state function missing")
         body = rollback.group("body")
         self.assertIn('restore_unit_enablement "$RERANK_UNIT"', body)
-        self.assertIn('restore_unit_enablement "$LEGACY_UNIT"', body)
-        self.assertIn('run_systemctl_start start "$LEGACY_UNIT"', body)
+        self.assertIn('restore_unit_enablement "$FALLBACK_UNIT"', body)
+        self.assertIn('restore_unit_enablement "$CANARY_BACKEND_UNIT"', body)
+        self.assertIn('run_systemctl_start start "$FALLBACK_UNIT"', body)
 
-    def test_guard_config_is_part_of_the_rollback_transaction(self) -> None:
-        for contract in (
-            "GB10_GUARD_CONFIG_PATH",
-            "GUARD_CONFIG_EXISTED",
-            "config/llm-guard-proxy/config.toml",
-            '"$BACKUP_DIR/guard-config.toml"',
-        ):
-            self.assertIn(contract, self.source)
+    def test_guard_configuration_is_not_mutated_by_the_owner_migration(self) -> None:
+        self.assertNotIn("GB10_GUARD_CONFIG_PATH", self.source)
+        self.assertNotIn("config/llm-guard-proxy/config.toml", self.source)
 
     def test_signal_and_exit_paths_share_idempotent_cleanup(self) -> None:
         for contract in (
@@ -171,12 +370,43 @@ class QueritDeployerContractTests(unittest.TestCase):
         self.assertIn("/usr/bin/timeout --signal=TERM", self.source)
         self.assertNotIn('command_json="$(docker inspect', self.source)
 
+    def test_no_swap_verification_uses_clean_production_environment(self) -> None:
+        for contract in (
+            "/usr/bin/env -i",
+            "DOCKER_HOST=unix:///run/user/1001/docker.sock",
+            "/usr/bin/bash --noprofile --norc",
+            "NO_SWAP_HELPER=/home/obj/.local/bin/gb10_verify_vllm_no_swap.sh",
+            'verify_no_swap "$RERANK_UNIT" "$RERANK_CONTAINER"',
+            'verify_no_swap "$EMBEDDING_UNIT" "$EMBEDDING_CONTAINER"',
+        ):
+            self.assertIn(contract, self.source)
+
     def test_enables_querit_only_after_readiness_and_smoke(self) -> None:
         ready = self.source.index("RERANK_READY")
         smoke = self.source.index("RAW_RERANK_OK")
         enable = self.source.rindex('run_systemctl enable "$RERANK_UNIT"')
         self.assertLess(ready, smoke)
         self.assertLess(smoke, enable)
+
+    def test_non_v2_docker_cgroup_preflight_fails_before_service_mutation(self) -> None:
+        for version in ("1", "unknown", ""):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as raw_tmp:
+                env, calls, _, _ = self._make_fake_stack(
+                    Path(raw_tmp), cgroup_version=version
+                )
+                result = subprocess.run(
+                    ["bash", str(DEPLOYER)],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                call_text = calls.read_text()
+                self.assertIn("docker info --format {{.CgroupVersion}}", call_text)
+                for mutation in (" start ", " stop ", " enable ", " disable "):
+                    self.assertNotIn(mutation, call_text)
 
     def test_shell_syntax(self) -> None:
         result = subprocess.run(
@@ -199,21 +429,21 @@ class QueritDeployerContractTests(unittest.TestCase):
             self.assertEqual(result.stderr.count("DEPLOY_FAILED"), 1, result.stderr)
             recorded = calls.read_text().splitlines()
             self.assertEqual(
-                recorded.count("systemctl --user stop querit-4b-reranker.service"),
-                1,
+                recorded.count("systemctl --user stop vllm-querit-4b-reranker.service"),
+                2,
                 recorded,
             )
             switched = recorded.index(
-                "systemctl --user disable --now vllm-qwen3-reranker-8b.service"
+                "systemctl --user stop vllm-querit-4b-canary.service"
             )
             started = recorded.index(
-                "systemctl --user start querit-4b-reranker.service"
+                "systemctl --user start vllm-querit-4b-reranker.service"
             )
             stopped = len(recorded) - 1 - recorded[::-1].index(
-                "systemctl --user stop querit-4b-reranker.service"
+                "systemctl --user stop vllm-querit-4b-reranker.service"
             )
             disabled = len(recorded) - 1 - recorded[::-1].index(
-                "systemctl --user disable querit-4b-reranker.service"
+                "systemctl --user disable vllm-querit-4b-reranker.service"
             )
             expected_restore = (
                 "systemctl --user start vllm-qwen3-reranker-8b.service"
@@ -231,6 +461,95 @@ class QueritDeployerContractTests(unittest.TestCase):
             self.assertEqual(
                 (Path(raw_tmp) / "guard-config.toml").read_text(),
                 "original-guard-config\n",
+            )
+
+    def _assert_guard_failure_restores_canary_and_production(
+        self,
+        *,
+        initial_reranker: str,
+        production_unit: str,
+        active_marker: str,
+        expected_start_count: int,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            env, calls, _, _ = self._make_fake_stack(
+                tmp,
+                initial_reranker=initial_reranker,
+                canary_active=True,
+            )
+            result = subprocess.run(
+                ["bash", str(DEPLOYER)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stderr.count("DEPLOY_FAILED"), 1, result.stderr)
+            recorded = calls.read_text().splitlines()
+            for unit in (
+                "vllm-querit-4b-canary-backend.service",
+                "vllm-querit-4b-canary.service",
+                production_unit,
+            ):
+                self.assertIn(
+                    f"systemctl --user start {unit}",
+                    recorded,
+                    f"unit={unit} stdout={result.stdout!r} "
+                    f"stderr={result.stderr!r} calls={recorded!r}",
+                )
+            self.assertEqual(
+                recorded.count(f"systemctl --user start {production_unit}"),
+                expected_start_count,
+                recorded,
+            )
+            self.assertTrue((tmp / "canary-backend-active").exists())
+            self.assertTrue((tmp / "canary-adapter-active").exists())
+            self.assertTrue((tmp / active_marker).exists())
+
+    def test_guard_failure_restores_canary_and_canonical_coexistence(self) -> None:
+        self._assert_guard_failure_restores_canary_and_production(
+            initial_reranker="canonical",
+            production_unit="vllm-querit-4b-reranker.service",
+            active_marker="rerank-active",
+            expected_start_count=2,
+        )
+
+    def test_guard_failure_restores_canary_and_fallback_coexistence(self) -> None:
+        self._assert_guard_failure_restores_canary_and_production(
+            initial_reranker="fallback",
+            production_unit="vllm-qwen3-reranker-8b.service",
+            active_marker="fallback-active",
+            expected_start_count=1,
+        )
+
+    def test_post_start_no_swap_failure_rolls_back_without_embedding_outage(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            env, calls, _, _ = self._make_fake_stack(
+                Path(raw_tmp), no_swap_fail_at=4
+            )
+            result = subprocess.run(
+                ["bash", str(DEPLOYER)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            recorded = calls.read_text().splitlines()
+            self.assertIn(
+                "systemctl --user start vllm-qwen3-reranker-8b.service",
+                recorded,
+            )
+            self.assertNotIn(
+                "systemctl --user stop vllm-embedding.service",
+                recorded,
+            )
+            self.assertGreaterEqual(
+                sum(line.startswith("no-swap ") for line in recorded), 7
             )
 
     def test_sigterm_after_switch_rolls_back_once(self) -> None:
@@ -256,8 +575,8 @@ class QueritDeployerContractTests(unittest.TestCase):
             self.assertEqual(stderr.count("DEPLOY_FAILED"), 1, stderr)
             recorded = calls.read_text().splitlines()
             self.assertEqual(
-                recorded.count("systemctl --user stop querit-4b-reranker.service"),
-                1,
+                recorded.count("systemctl --user stop vllm-querit-4b-reranker.service"),
+                2,
                 recorded,
             )
             self.assertIn(
@@ -286,7 +605,7 @@ class QueritDeployerContractTests(unittest.TestCase):
             self.assertLess(elapsed, 4)
             self.assertEqual(result.stderr.count("DEPLOY_FAILED"), 1, result.stderr)
             self.assertNotIn(
-                "systemctl --user disable --now vllm-qwen3-reranker-8b.service",
+                "systemctl --user stop vllm-querit-4b-canary.service",
                 calls.read_text().splitlines(),
             )
 

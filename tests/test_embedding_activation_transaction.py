@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import ast
+import hashlib
 import importlib.util
 import json
 import os
 import pwd
+import re
 import signal
 import subprocess
 import sys
@@ -22,13 +25,67 @@ from embedding_activation_fixtures import (  # noqa: E402
 )
 
 
+def _literal_string_map(path: Path, name: str) -> dict[str, str]:
+    tree = ast.parse(path.read_text(), filename=str(path))
+    value: object | None = None
+    for node in tree.body:
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == name
+            and node.value is not None
+        ):
+            value = ast.literal_eval(node.value)
+            break
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name for target in node.targets
+        ):
+            value = ast.literal_eval(node.value)
+            break
+    if not isinstance(value, dict) or any(
+        not isinstance(key, str) or not isinstance(item, str)
+        for key, item in value.items()
+    ):
+        raise AssertionError(f"missing literal string-map authority {name} in {path}")
+    return value
+
+
 class EmbeddingActivationTransactionTests(unittest.TestCase):
-    def assert_restored(self, fixture: ActivationFixture, *, present: bool = True) -> None:
+    def assert_restored(
+        self,
+        fixture: ActivationFixture,
+        *,
+        present: bool = True,
+        helper_present: bool = True,
+        core_present: bool | None = None,
+    ) -> None:
+        if core_present is None:
+            core_present = helper_present
         if present:
             self.assertEqual(fixture.installed_unit.read_bytes(), fixture.prior_bytes)
             self.assertEqual(fixture.installed_unit.stat().st_mode & 0o777, fixture.prior_mode)
         else:
             self.assertFalse(fixture.installed_unit.exists())
+        if helper_present:
+            self.assertEqual(
+                fixture.installed_helper.read_bytes(), fixture.prior_helper_bytes
+            )
+            self.assertEqual(
+                fixture.installed_helper.stat().st_mode & 0o777,
+                fixture.prior_helper_mode,
+            )
+        else:
+            self.assertFalse(fixture.installed_helper.exists())
+        if core_present:
+            self.assertEqual(
+                fixture.installed_core.read_bytes(), fixture.prior_core_bytes
+            )
+            self.assertEqual(
+                fixture.installed_core.stat().st_mode & 0o777,
+                fixture.prior_core_mode,
+            )
+        else:
+            self.assertFalse(fixture.installed_core.exists())
         self.assertFalse(fixture.transaction().exists())
         receipt = fixture.state_root / "rollback.receipt.json"
         self.assertTrue(receipt.is_file())
@@ -58,12 +115,32 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(fixture.installed_unit.read_bytes(), CANONICAL_UNIT.read_bytes())
                 self.assertEqual(fixture.installed_unit.stat().st_mode & 0o777, 0o644)
+                self.assertEqual(
+                    fixture.installed_helper.read_bytes(),
+                    fixture.source_helper.read_bytes(),
+                )
+                self.assertEqual(
+                    fixture.installed_helper.stat().st_mode & 0o777, 0o755
+                )
+                self.assertEqual(
+                    fixture.installed_core.read_bytes(),
+                    fixture.source_core.read_bytes(),
+                )
+                self.assertEqual(
+                    fixture.installed_core.stat().st_mode & 0o777, 0o644
+                )
                 transaction = fixture.transaction()
+                manifest = json.loads((transaction / "manifest.json").read_text())
+                self.assertEqual(set(manifest["no_swap_artifacts"]), {"core", "wrapper"})
                 self.assertEqual((transaction / "phase").read_text(), "committed\n")
                 receipt_path = transaction / "activation.receipt.json"
                 receipt = json.loads(receipt_path.read_text())
                 self.assertEqual(receipt["commit_requires_phase"], "committed")
                 self.assertEqual(receipt["verification"], "passed")
+                self.assertEqual(
+                    receipt["profile"],
+                    "qwen3-embedding-8b-32k-4800M-128GiB",
+                )
                 self.assertNotIn("transaction", receipt)
                 self.assertNotIn("rollback_available", receipt)
                 self.assertEqual(receipt_path.stat().st_mode & 0o777, 0o600)
@@ -73,14 +150,35 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 self.assertNotIn("1" * 32, serialized)
                 log = fixture.log()
                 self.assertIn("verifier argc=1", log)
+                self.assertGreaterEqual(
+                    log.count("no-swap --test-only --unit "), 2
+                )
+                self.assertIn("--container vllm-embedding", log)
                 self.assertEqual(log.count(f"restart {UNIT}"), 1)
                 for neighbor in (
                     "vllm-aeon-27b-dflash.service",
-                    "querit-4b-reranker.service",
+                    "vllm-querit-4b-reranker.service",
                     "vllm-qwen3-reranker-8b.service",
                 ):
                     self.assertNotIn(f"restart {neighbor}", log)
                     self.assertNotIn(f"stop {neighbor}", log)
+
+    def test_cgroup_v1_unknown_or_failed_docker_preflight_rejects_before_mutation(self) -> None:
+        cases = (("1", False), ("unknown", False), ("2", True))
+        for version, info_fail in cases:
+            with self.subTest(version=version, info_fail=info_fail), ActivationFixture() as fixture:
+                fixture.state["cgroup_version"] = version
+                fixture.state["docker_info_fail"] = info_fail
+                result = fixture.run()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(
+                    fixture.installed_unit.read_bytes(), fixture.prior_bytes
+                )
+                self.assertFalse(fixture.transaction().exists())
+                log = fixture.log()
+                self.assertIn("tool info --format {{.CgroupVersion}}", log)
+                for mutation in ("daemon-reload", "restart ", "stop "):
+                    self.assertNotIn(mutation, log)
 
     def test_verification_generation_and_receipt_failures_all_roll_back(self) -> None:
         cases = (
@@ -102,6 +200,9 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 self.assert_restored(fixture)
                 self.assertFalse((fixture.state_root / "activation.receipt.json").exists())
                 self.assertGreaterEqual(fixture.log().count(f"restart {UNIT}"), 2)
+                self.assertGreaterEqual(
+                    fixture.log().count("no-swap --test-only --unit "), 2
+                )
 
     def test_rollback_does_not_rewrite_unit_after_daemon_reload(self) -> None:
         with ActivationFixture() as fixture:
@@ -158,7 +259,11 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 contender = fixture.run()
                 self.assertNotEqual(contender.returncode, 0, contender.stdout + contender.stderr)
                 self.assertIn("holds the lock", contender.stderr)
-                self.assertEqual(fixture.log(), events_before)
+                contender_events = fixture.log()[len(events_before) :]
+                self.assertEqual(
+                    contender_events,
+                    "tool info --format {{.CgroupVersion}}\n",
+                )
                 fixture.release.write_text("release\n")
                 stdout, stderr = owner.communicate(timeout=15)
                 self.assertEqual(owner.returncode, 0, stdout + stderr)
@@ -314,6 +419,179 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                     os.killpg(process.pid, signal.SIGKILL)
                     process.communicate(timeout=5)
 
+    def test_no_swap_bundle_first_install_and_installed_drift_are_owned(self) -> None:
+        for prior_helper_present, prior_core_present in (
+            (False, False),
+            (True, True),
+            (True, False),
+            (False, True),
+        ):
+            with self.subTest(
+                prior_helper_present=prior_helper_present,
+                prior_core_present=prior_core_present,
+            ), ActivationFixture(
+                prior_helper_present=prior_helper_present,
+                prior_core_present=prior_core_present,
+            ) as fixture:
+                if prior_helper_present:
+                    fixture.installed_helper.write_bytes(b"#!/bin/sh\nexit 99\n")
+                    fixture.installed_helper.chmod(0o711)
+                if prior_core_present:
+                    fixture.installed_core.write_bytes(b"hostile prior core\n")
+                    fixture.installed_core.chmod(0o600)
+                result = fixture.run()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(
+                    fixture.installed_helper.read_bytes(),
+                    fixture.source_helper.read_bytes(),
+                )
+                self.assertEqual(
+                    fixture.installed_helper.stat().st_mode & 0o777, 0o755
+                )
+                self.assertEqual(
+                    fixture.installed_core.read_bytes(), fixture.source_core.read_bytes()
+                )
+                self.assertEqual(
+                    fixture.installed_core.stat().st_mode & 0o777, 0o644
+                )
+
+    def test_no_swap_manifest_rejects_legacy_missing_and_arbitrary_artifacts(self) -> None:
+        for case in ("legacy", "missing-core", "arbitrary"):
+            with self.subTest(case=case), ActivationFixture() as fixture:
+                initial = fixture.run()
+                self.assertEqual(
+                    initial.returncode, 0, initial.stdout + initial.stderr
+                )
+                transaction = fixture.transaction()
+                manifest_path = transaction / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                if case == "legacy":
+                    manifest["schema"] = 1
+                    manifest["no_swap_helper"] = manifest.pop(
+                        "no_swap_artifacts"
+                    )["wrapper"]
+                elif case == "missing-core":
+                    manifest["no_swap_artifacts"].pop("core")
+                else:
+                    manifest["no_swap_artifacts"]["arbitrary"] = dict(
+                        manifest["no_swap_artifacts"]["core"]
+                    )
+                raw = json.dumps(
+                    manifest, sort_keys=True, separators=(",", ":")
+                ).encode() + b"\n"
+                manifest_path.write_bytes(raw)
+                manifest_path.chmod(0o600)
+                complete = transaction / "complete"
+                complete.write_text(
+                    f"manifest_sha256={hashlib.sha256(raw).hexdigest()}\n"
+                )
+                complete.chmod(0o600)
+                before_log = fixture.log()
+                before_core = fixture.installed_core.read_bytes()
+                before_wrapper = fixture.installed_helper.read_bytes()
+                rejected = fixture.run()
+                self.assertNotEqual(
+                    rejected.returncode, 0, rejected.stdout + rejected.stderr
+                )
+                after_log = fixture.log()
+                for command in ("daemon-reload", "restart ", "stop "):
+                    self.assertEqual(
+                        after_log.count(command), before_log.count(command)
+                    )
+                self.assertEqual(fixture.installed_core.read_bytes(), before_core)
+                self.assertEqual(
+                    fixture.installed_helper.read_bytes(), before_wrapper
+                )
+
+    def test_core_source_and_installed_drift_fail_closed_and_restore_pair(self) -> None:
+        for target, pause in (("source", "prepared"), ("installed", "after_restart")):
+            with self.subTest(target=target), ActivationFixture() as fixture:
+                fixture.hooks["pause_at"] = pause
+                process = fixture.spawn()
+                try:
+                    fixture.wait_for_marker()
+                    path = fixture.source_core if target == "source" else fixture.installed_core
+                    path.write_bytes(path.read_bytes() + b"# hostile core drift\n")
+                    path.chmod(0o644)
+                    fixture.release.write_text("release\n")
+                    stdout, stderr = process.communicate(timeout=15)
+                    self.assertNotEqual(process.returncode, 0, stdout + stderr)
+                    self.assert_restored(fixture)
+                finally:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.communicate(timeout=5)
+
+    def test_core_first_partial_install_rolls_back_exact_prior_pair(self) -> None:
+        with ActivationFixture() as fixture:
+            fixture.hooks["fail_at"] = "after_core_install"
+            result = fixture.run()
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assert_restored(fixture)
+
+    def test_partial_prior_core_restore_is_durable_and_recoverable(self) -> None:
+        with ActivationFixture() as fixture:
+            fixture.state["verify_status"] = 9
+            fixture.hooks["fail_at"] = "after_prior_core_restore"
+            failed = fixture.run()
+            self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+            self.assertEqual(
+                (fixture.transaction() / "phase").read_text(), "rollback_failed\n"
+            )
+            self.assertEqual(fixture.installed_core.read_bytes(), fixture.prior_core_bytes)
+            self.assertNotEqual(
+                fixture.installed_helper.read_bytes(), fixture.prior_helper_bytes
+            )
+            fixture.state["verify_status"] = 0
+            fixture.hooks["fail_at"] = ""
+            recovered = fixture.run()
+            self.assertNotEqual(
+                recovered.returncode, 0, recovered.stdout + recovered.stderr
+            )
+            self.assert_restored(fixture)
+
+    def test_no_swap_helper_source_drift_after_prepare_rolls_back_exact_prior(self) -> None:
+        with ActivationFixture() as fixture:
+            fixture.hooks["pause_at"] = "prepared"
+            process = fixture.spawn()
+            try:
+                fixture.wait_for_marker()
+                fixture.source_helper.write_bytes(
+                    fixture.source_helper.read_bytes() + b"# hostile drift\n"
+                )
+                fixture.source_helper.chmod(0o755)
+                fixture.release.write_text("release\n")
+                stdout, stderr = process.communicate(timeout=15)
+                self.assertNotEqual(process.returncode, 0, stdout + stderr)
+                self.assert_restored(fixture)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.communicate(timeout=5)
+
+    def test_no_swap_helper_prior_absence_is_restored_after_post_start_failure(self) -> None:
+        with ActivationFixture(prior_helper_present=False) as fixture:
+            fixture.state["fail_no_swap_at"] = 2
+            result = fixture.run()
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assert_restored(fixture, helper_present=False)
+            receipt = json.loads(
+                (fixture.state_root / "rollback.receipt.json").read_text()
+            )
+            self.assertFalse(receipt["restored_no_swap_helper_presence"])
+            self.assertFalse(receipt["restored_no_swap_core_presence"])
+            self.assertIn(
+                f"core={fixture.installed_core}",
+                fixture.log(),
+            )
+            for neighbor in (
+                "vllm-aeon-27b-dflash.service",
+                "vllm-querit-4b-reranker.service",
+                "vllm-qwen3-reranker-8b.service",
+            ):
+                self.assertNotIn(f"restart {neighbor}", fixture.log())
+                self.assertNotIn(f"stop {neighbor}", fixture.log())
+
     def test_verifier_authority_mutation_before_execution_is_detected(self) -> None:
         with ActivationFixture() as fixture:
             fixture.hooks["pause_at"] = "after_restart"
@@ -368,6 +646,37 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
         self.assertNotIn("os.environ.get", production)
         self.assertNotIn("os.getenv", production)
         self.assertNotIn("assert ", production)
+
+    def test_all_production_activation_authority_hashes_match_fixed_sources(self) -> None:
+        scripts = ACTIVATION_ENGINE.parent
+        launcher_match = re.search(
+            r'^expected_engine_sha256="([0-9a-f]{64})"$',
+            ACTIVATOR.read_text(),
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(launcher_match, "launcher engine authority is missing")
+        assert launcher_match is not None
+
+        engine_imports = _literal_string_map(
+            ACTIVATION_ENGINE, "EXPECTED_IMPORT_AUTHORITY"
+        )
+        storage = scripts / "gb10_embedding_activation_storage.py"
+        verifier_authorities = _literal_string_map(storage, "EXPECTED_VERIFIER_AUTHORITY")
+        no_swap_authorities = _literal_string_map(storage, "EXPECTED_NO_SWAP_SHA256")
+        self.assertIsInstance(engine_imports, dict)
+        self.assertIsInstance(verifier_authorities, dict)
+        self.assertEqual(set(no_swap_authorities), {"core", "wrapper"})
+
+        authorities = {
+            ACTIVATION_ENGINE: launcher_match.group(1),
+            **{scripts / name: digest for name, digest in engine_imports.items()},
+            **{scripts / name: digest for name, digest in verifier_authorities.items()},
+            scripts / "gb10_verify_vllm_no_swap_core.py": no_swap_authorities["core"],
+            scripts / "gb10_verify_vllm_no_swap.sh": no_swap_authorities["wrapper"],
+        }
+        for path, expected in authorities.items():
+            with self.subTest(authority=str(path)):
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), expected)
 
     def test_wrapper_rejects_engine_substitution_before_python_executes_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

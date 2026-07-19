@@ -3,13 +3,14 @@
 # Config: util=0.15, pin KV 4800M, enforce-eager, max-model-len 32768
 # ─────────────────────────────────────────────────────────────────
 [Unit]
-Description=vLLM Qwen3-Embedding-8B (AEON v0.25 GB10 image, raw backend port 18012, behind llm-guard-proxy listeners 18009/18002/18005, reliability-first, 32k contract, 64 seq)
+Description=vLLM Qwen3-Embedding-8B (AEON v0.25.1 GB10 image, raw backend port 18012, behind llm-guard-proxy listeners 18009/18002/18005, reliability-first, 32k contract, 64 seq)
 After=network.target
 StartLimitIntervalSec=600
 StartLimitBurst=5
 
 [Service]
 Type=simple
+UMask=0077
 Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
 Environment=HF_HUB_OFFLINE=1
 # Embedding is the reliability-critical service. Ideal would be oom_score_adj=0
@@ -26,8 +27,10 @@ RestartSec=30
 TimeoutStartSec=600
 TimeoutStopSec=60
 
-ExecStartPre=-/usr/bin/docker rm -f vllm-embedding
-ExecStart=/usr/bin/docker run --rm --name vllm-embedding \
+ExecCondition=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-embedding.service
+ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-vllm-cids
+ExecStartPre=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-embedding --cidfile %t/gb10-vllm-cids/vllm-embedding.cid
+ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-vllm-cids/vllm-embedding.cid --name vllm-embedding \
   --gpus all --ipc host \
   -p 100.105.4.92:18012:8000 \
   -v /home/obj/.cache/huggingface:/root/.cache/huggingface \
@@ -37,7 +40,7 @@ ExecStart=/usr/bin/docker run --rm --name vllm-embedding \
   --memory-swap 128g \
   --oom-score-adj 0 \
   --entrypoint python3 \
-  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55 \
+  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d \
   /usr/local/bin/vllm serve Qwen/Qwen3-Embedding-8B \
     --host 0.0.0.0 --port 8000 \
     --served-model-name qwen3-embedding-8b Qwen/Qwen3-Embedding-8B \
@@ -47,13 +50,17 @@ ExecStart=/usr/bin/docker run --rm --name vllm-embedding \
     --max-num-batched-tokens 8192 \
     --max-num-seqs 64 \
     --kv-cache-memory-bytes 4800M \
-    --gpu-memory-utilization 0.15 --enforce-eager
-# No docker --memory and no cgroup enforce: embedding uses --enforce-eager
-# (stable memory, no cudagraph capture peak). The v0.25 image starts slower
-# than v0.24, so cap-only cgroup enforce races with container registration.
-# Readiness is verified by polling the public metadata endpoint instead.
+    --gpu-memory-utilization 0.15 --enforce-eager \
+    --swap-space 0
+# Equal --memory 128g and --memory-swap 128g request a Docker memory cgroup
+# without imposing the obsolete 20 GiB service budget. The post-start verifier,
+# not requested Docker options, proves the exact live generation has no swap. Embedding uses
+# --enforce-eager for stable memory without a cudagraph capture peak.
+# Verify the exact Docker user scope before readiness polls the public metadata endpoint.
+ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-embedding.service --container vllm-embedding
 ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh embedding http://100.105.4.92:18012 qwen3-embedding-8b --deadline 300
-ExecStop=/usr/bin/docker stop --time 20 vllm-embedding
+ExecStop=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-embedding --cidfile %t/gb10-vllm-cids/vllm-embedding.cid
+ExecStopPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-embedding --cidfile %t/gb10-vllm-cids/vllm-embedding.cid
 StandardOutput=journal
 StandardError=journal
 

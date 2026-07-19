@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -19,9 +20,10 @@ CANONICAL_UNIT = ROOT / "systemd" / UNIT
 MODELS = ("qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B")
 NEIGHBORS = (
     "vllm-aeon-27b-dflash.service",
-    "querit-4b-reranker.service",
+    "vllm-querit-4b-reranker.service",
     "vllm-qwen3-reranker-8b.service",
 )
+CONTAINER_ID = "a" * 64
 
 
 def _tool_source() -> str:
@@ -42,6 +44,21 @@ with log_path.open("a") as sink:
 
 def save():
     state_path.write_text(json.dumps(state, sort_keys=True))
+
+if args == ["info", "--format", "{{.CgroupVersion}}"]:
+    if state.get("docker_info_fail"):
+        raise SystemExit(73)
+    print(state.get("cgroup_version", "2"))
+    raise SystemExit(0)
+
+if args == ["inspect", "--type", "container", "vllm-embedding"]:
+    print(json.dumps([state["container"]]))
+    raise SystemExit(0)
+
+scope_unit = f"docker-{state.get('container', {}).get('Id', '')}.scope"
+if args == ["show", "-p", "ControlGroup", "--value", scope_unit]:
+    print(state["docker_scope"])
+    raise SystemExit(0)
 
 if args and args[0] in {"show", "daemon-reload", "restart", "stop"}:
     action = args[0]
@@ -164,13 +181,84 @@ receipt.chmod(0o600)
 '''
 
 
+def _no_swap_core_source() -> str:
+    return r'''from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+state_path = Path(os.environ["ACTIVATION_FIXTURE_STATE"])
+log_path = Path(os.environ["ACTIVATION_COMMAND_LOG"])
+state = json.loads(state_path.read_text())
+args = sys.argv[1:]
+with log_path.open("a") as sink:
+    sink.write("no-swap " + " ".join(args) + " core=" + str(Path(__file__).resolve()) + "\n")
+if not args or args[0] != "--test-only":
+    raise SystemExit(81)
+args = args[1:]
+if args.count("--unit") != 1 or args.count("--container") != 1:
+    raise SystemExit(82)
+if args[args.index("--container") + 1] != "vllm-embedding":
+    raise SystemExit(83)
+count = int(state.get("no_swap_count", 0)) + 1
+state["no_swap_count"] = count
+state_path.write_text(json.dumps(state, sort_keys=True))
+if int(state.get("fail_no_swap_at", 0)) == count:
+    raise SystemExit(84)
+'''
+
+
+def _no_swap_helper_source(core: bytes) -> str:
+    digest = hashlib.sha256(core).hexdigest()
+    return f'''#!/usr/bin/env bash
+set -euo pipefail
+CORE_BASENAME=gb10_verify_vllm_no_swap_core.py
+EXPECTED_CORE_SHA256={digest}
+/usr/bin/python3 -I - "${{BASH_SOURCE[0]}}" "$EXPECTED_CORE_SHA256" "$@" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+from pathlib import Path
+wrapper = Path(sys.argv[1]).resolve(strict=True)
+core = wrapper.parent / "gb10_verify_vllm_no_swap_core.py"
+descriptor = os.open(core, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+try:
+    metadata = os.fstat(descriptor)
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) not in (0o600, 0o644)):
+        raise SystemExit(85)
+    payload = b""
+    while chunk := os.read(descriptor, 65536):
+        payload += chunk
+finally:
+    os.close(descriptor)
+if hashlib.sha256(payload).hexdigest() != sys.argv[2]:
+    raise SystemExit(86)
+sys.argv = [str(core), *sys.argv[3:]]
+exec(compile(payload, str(core), "exec"), {{"__name__": "__main__", "__file__": str(core)}})
+PY
+'''
+
+
 class ActivationFixture:
-    def __init__(self, *, prior_present: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        prior_present: bool = True,
+        prior_helper_present: bool = True,
+        prior_core_present: bool | None = None,
+    ) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.source_unit = self.root / "source/systemd" / UNIT
+        self.source_helper = self.root / "source/scripts/gb10_verify_vllm_no_swap.sh"
+        self.source_core = self.root / "source/scripts/gb10_verify_vllm_no_swap_core.py"
         self.unit_dir = self.root / "home/.config/systemd/user"
         self.installed_unit = self.unit_dir / UNIT
+        self.installed_helper = self.root / "home/.local/bin/gb10_verify_vllm_no_swap.sh"
+        self.installed_core = self.root / "home/.local/bin/gb10_verify_vllm_no_swap_core.py"
         self.state_root = self.root / "home/.local/state/gb10-embedding-activation"
         self.bin_dir = self.root / "bin"
         self.config = self.root / "activation-test.json"
@@ -179,17 +267,38 @@ class ActivationFixture:
         self.marker = self.root / "pause.marker"
         self.release = self.root / "pause.release"
         self.child_pid_path = self.root / "child.pid"
+        self.cgroup_root = self.root / "cgroup"
         for directory, mode in (
             (self.source_unit.parent, 0o755),
+            (self.source_helper.parent, 0o755),
             (self.unit_dir, 0o755),
+            (self.installed_helper.parent, 0o755),
             (self.state_root.parent, 0o700),
             (self.bin_dir, 0o755),
+            (self.cgroup_root, 0o755),
         ):
             directory.mkdir(parents=True, exist_ok=True)
             directory.chmod(mode)
         self.source_unit.write_bytes(CANONICAL_UNIT.read_bytes())
         self.source_unit.chmod(0o644)
-        self.prior_bytes = b"prior embedding unit\n"
+        source_core = _no_swap_core_source().encode()
+        self.source_core.write_bytes(source_core)
+        self.source_core.chmod(0o644)
+        self.source_helper.write_text(_no_swap_helper_source(source_core))
+        self.source_helper.chmod(0o755)
+        self.prior_helper_bytes = b"#!/usr/bin/python3\nraise SystemExit(77)\n"
+        self.prior_helper_mode = 0o700
+        if prior_helper_present:
+            self.installed_helper.write_bytes(self.prior_helper_bytes)
+            self.installed_helper.chmod(self.prior_helper_mode)
+        self.prior_core_bytes = b"# prior verifier core fixture\n"
+        self.prior_core_mode = 0o640
+        if prior_core_present is None:
+            prior_core_present = prior_helper_present
+        if prior_core_present:
+            self.installed_core.write_bytes(self.prior_core_bytes)
+            self.installed_core.chmod(self.prior_core_mode)
+        self.prior_bytes = CANONICAL_UNIT.read_bytes() + b"\n# prior fixture generation\n"
         self.prior_mode = 0o640
         if prior_present:
             self.installed_unit.write_bytes(self.prior_bytes)
@@ -200,6 +309,11 @@ class ActivationFixture:
         self.verifier = self.bin_dir / "verify"
         self.verifier.write_text(_verifier_source())
         self.verifier.chmod(0o755)
+        docker_scope = f"/app.slice/docker-{CONTAINER_ID}.scope"
+        docker_cgroup = self.cgroup_root / docker_scope.removeprefix("/")
+        docker_cgroup.mkdir(parents=True)
+        (docker_cgroup / "memory.swap.max").write_text("0\n")
+        (docker_cgroup / "memory.swap.current").write_text("0\n")
         neighbor_states = {}
         for index, unit in enumerate(NEIGHBORS):
             running = index != 1
@@ -216,12 +330,37 @@ class ActivationFixture:
             "active": True,
             "child_pid_path": str(self.child_pid_path),
             "daemon_reload_units": [],
+            "cgroup_version": "2",
+            "docker_info_fail": False,
             "drift_after_models": False,
             "fail_rollback_restart": False,
             "generation": 0,
+            "fail_no_swap_at": 0,
             "hang_once": "",
             "installed_unit": str(self.installed_unit),
+            "installed_no_swap_helper": str(self.installed_helper),
+            "installed_no_swap_core": str(self.installed_core),
+            "docker_scope": docker_scope,
+            "container": {
+                "Id": CONTAINER_ID,
+                "Name": "/vllm-embedding",
+                "State": {"Pid": 303, "Running": True},
+                "HostConfig": {
+                    "Memory": 128 * 1024**3,
+                    "MemorySwap": 128 * 1024**3,
+                },
+                "Config": {
+                    "Cmd": [
+                        "/usr/local/bin/vllm",
+                        "serve",
+                        "Qwen/Qwen3-Embedding-8B",
+                        "--swap-space",
+                        "0",
+                    ]
+                },
+            },
             "mutate_neighbor": False,
+            "no_swap_count": 0,
             "neighbors": neighbor_states,
             "ready_timeout": False,
             "restart_count": 0,
@@ -237,15 +376,20 @@ class ActivationFixture:
         payload = {
             "command_seconds": 2,
             "curl": str(self.tool),
+            "docker": str(self.tool),
             "deadline_seconds": 12,
             "fail_at": self.hooks["fail_at"],
             "installed_unit": str(self.installed_unit),
+            "installed_no_swap_helper": str(self.installed_helper),
+            "installed_no_swap_core": str(self.installed_core),
             "marker": str(self.marker),
             "pause_at": self.hooks["pause_at"],
             "ready_seconds": 2,
             "release": str(self.release),
             "rollback_seconds": 8,
             "source_unit": str(self.source_unit),
+            "source_no_swap_helper": str(self.source_helper),
+            "source_no_swap_core": str(self.source_core),
             "state_root": str(self.state_root),
             "systemctl": str(self.tool),
             "unit_dir": str(self.unit_dir),
@@ -261,6 +405,11 @@ class ActivationFixture:
             {
                 "ACTIVATION_COMMAND_LOG": str(self.command_log),
                 "ACTIVATION_FIXTURE_STATE": str(self.state_path),
+                "DOCKER_HOST": f"unix:///run/user/{os.getuid()}/docker.sock",
+                "GB10_VLLM_NO_SWAP_CGROUP_ROOT": str(self.cgroup_root),
+                "GB10_VLLM_NO_SWAP_DOCKER_BIN": str(self.tool),
+                "GB10_VLLM_NO_SWAP_SYSTEMCTL_BIN": str(self.tool),
+                "GB10_VLLM_NO_SWAP_WAIT_SECONDS": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",
             }
         )

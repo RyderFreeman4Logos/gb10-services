@@ -14,10 +14,28 @@ from gb10_embedding_profile_contract import EXPECTED_MODELS
 from gb10_embedding_verifier_runtime import command, json_text, remaining
 from gb10_verify_embedding_profile import CANARY_INPUTS, vectors
 
+__all__ = [
+    "ActivationCheckError",
+    "GENERATION_FIELDS",
+    "Generation",
+    "NEIGHBORS",
+    "NEIGHBOR_FIELDS",
+    "RuntimeConfig",
+    "UNIT",
+    "capture_baselines",
+    "generation_is_new",
+    "neighbors",
+    "query_generation",
+    "require_docker_cgroup_v2",
+    "run_systemctl",
+    "verify_models",
+    "wait_new_generation",
+]
+
 UNIT = "vllm-embedding.service"
 NEIGHBORS = (
     "vllm-aeon-27b-dflash.service",
-    "querit-4b-reranker.service",
+    "vllm-querit-4b-reranker.service",
     "vllm-qwen3-reranker-8b.service",
 )
 GENERATION_FIELDS = (
@@ -49,9 +67,14 @@ class ActivationCheckError(RuntimeError):
 class RuntimeConfig:
     source_unit: Path
     installed_unit: Path
+    source_no_swap_core: Path
+    installed_no_swap_core: Path
+    source_no_swap_helper: Path
+    installed_no_swap_helper: Path
     unit_dir: Path
     state_root: Path
     systemctl: str
+    docker: str
     curl: str
     verifier: str
     ready_seconds: int
@@ -97,6 +120,20 @@ class Generation:
     @property
     def running(self) -> bool:
         return self.load == "loaded" and self.active == "active" and self.sub == "running"
+
+
+def require_docker_cgroup_v2(config: RuntimeConfig, deadline: float) -> None:
+    """Reject every mutation path unless rootless Docker reports cgroup v2."""
+
+    output = command(
+        [config.docker, "info", "--format", "{{.CgroupVersion}}"],
+        timeout=config.command_seconds,
+        deadline=deadline,
+    )
+    if output not in {"2", "2\n"}:
+        raise ActivationCheckError(
+            "Docker must report cgroup version exactly 2 before activation"
+        )
 
 
 def _parse_exact_fields(text: str, expected: tuple[str, ...]) -> dict[str, str]:

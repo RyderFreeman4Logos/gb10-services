@@ -17,11 +17,10 @@ from test_embedding_service_contracts import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-QUERIT_UNIT = ROOT / "systemd" / "querit-4b-reranker.service"
+QUERIT_UNIT = ROOT / "systemd" / "vllm-querit-4b-reranker.service"
 AEON_UNIT = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
 GUARD_UNIT = ROOT / "systemd" / "llm-guard-proxy.service"
 LEGACY_UNIT = ROOT / "systemd" / "vllm-qwen3-reranker-8b.service"
-CGROUP_HELPER = ROOT / "scripts" / "gb10_enforce_docker_cgroup_limits.sh"
 MEMORY_GATE = ROOT / "scripts" / "gb10_check_mem_available.sh"
 CONFIG = ROOT / "config" / "llm-guard-proxy" / "config.toml"
 README = ROOT / "README.md"
@@ -34,25 +33,20 @@ def _live_receipt() -> dict[str, Any]:
 
 
 _RECEIPT = _live_receipt()
-# Production AEON text image digest (v0.25.0, 2026-07-14). Live receipt still records the
-# 15 GiB KV capacity proof from the prior v0.24 run; KV budget stays 15360 MiB.
+# Source-selected AEON text image digest (v0.25.1, 2026-07-16). The receipt is
+# retained as historical 15 GiB KV capacity evidence, not the AUTO-KV source profile.
 IMAGE_DIGEST = (
-    "sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55"
+    "sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d"
 )
-# Querit pins the deployed v0.25.0 offline transformers runtime image.
+# Querit pins the source-selected v0.25.1 offline transformers runtime image.
 QUERIT_IMAGE_DIGEST = (
-    "sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55"
+    "sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d"
 )
 MODEL_SNAPSHOT = "7b796de30ad8dc772d6c46c75659c1341283a665"
 SHORT_GENERATION_REQUEST_TOKENS = 8_192
 # AEON DFlash GB10 ceiling (author guidance + freeze mitigation).
 AEON_MAX_NUM_SEQS = 16
 AEON_CONTEXT_TOKENS = _RECEIPT["aeon_container"]["effective_contract"]["max_model_len"]
-AEON_KV_BUDGET_MIB = _RECEIPT["aeon_container"]["effective_contract"]["kv_cache_memory_mib"]
-MAX_AEON_KV_MIB_WITH_CURRENT_HEADROOM_EVIDENCE = AEON_KV_BUDGET_MIB
-VERIFIED_15_GIB_KV_CAPACITY_TOKENS = _RECEIPT["startup"]["kv_capacity_tokens"]
-OBSERVED_FRESH_MEM_AVAILABLE_KIB = _RECEIPT["planning_inputs"]["pre_activation_mem_available_kib"]
-OBSERVED_TEXT_GROWTH_MIB = _RECEIPT["planning_inputs"]["previously_observed_text_growth_mib"]
 
 
 def _aeon_contract(unit: str) -> dict[str, int | float]:
@@ -64,19 +58,18 @@ def _aeon_contract(unit: str) -> dict[str, int | float]:
     argv = exec_starts[0]
     image = f"ghcr.io/aeon-7/aeon-vllm-ultimate@{IMAGE_DIGEST}"
     host_argv, container_argv = _split_docker_run_argv(argv, image)
-    # Docker --memory-swap == --memory disables swap (swap=0).
-    # Without --memory, Docker creates no memory cgroup and
-    # --memory-swappiness 0 is silently ignored by the kernel.
+    # Equal Docker memory settings are an intent contract. The post-start
+    # verifier, rather than these requested options, proves live swap=0.
     # The cap is a high safety label, not a physical UMA ceiling.
     memory_values = _option_values(host_argv, "--memory")
     swap_values = _option_values(host_argv, "--memory-swap")
     if not memory_values:
         raise AssertionError("text unit must set --memory for swappiness enforcement")
     if not swap_values:
-        raise AssertionError("text unit must set --memory-swap (== --memory) for swap=0")
+        raise AssertionError("text unit must set an equal --memory-swap request")
     if swap_values[0] != memory_values[0]:
         raise AssertionError(
-            f"--memory-swap must equal --memory (swap=0): {swap_values[0]} != {memory_values[0]}"
+            f"--memory-swap must equal --memory: {swap_values[0]} != {memory_values[0]}"
         )
     for flag, expected in {
         "--memory-swappiness": "0",
@@ -190,34 +183,34 @@ class QueritServiceContractTests(unittest.TestCase):
     def test_unit_uses_pinned_offline_artifacts(self) -> None:
         unit = QUERIT_UNIT.read_text()
         self.assertIn(f"@{QUERIT_IMAGE_DIGEST}", unit)
-        self.assertIn(
-            "models--Querit--Querit-4B:/models/querit-repo:ro", unit
-        )
-        self.assertIn(f"--model /models/querit-repo/snapshots/{MODEL_SNAPSHOT}", unit)
-        self.assertIn(
-            "querit_score_contract.py:/opt/querit/querit_score_contract.py:ro", unit
-        )
-        self.assertNotIn(
-            "--score-contract current-prompt-terminal-cls-v1", unit
-        )
+        self.assertIn("/home/obj/models/querit-4b-vllm:/home/obj/models/querit-4b-vllm:ro", unit)
+        self.assertIn("/usr/local/bin/vllm serve /home/obj/models/querit-4b-vllm", unit)
+        self.assertIn("--runner pooling", unit)
+        self.assertNotIn("querit_openai_rerank_server.py", unit)
+        self.assertNotIn("querit_score_contract.py", unit)
         self.assertIn("--entrypoint python3", unit)
         self.assertNotIn("pip install", unit)
         self.assertNotIn("--dns", unit)
         self.assertNotRegex(unit, r"aeon-vllm-ultimate:[^\s\\]+(?:\s|\\)")
 
-    def test_unit_follows_text_lifecycle_for_uma_safe_restart(self) -> None:
+    def test_unit_is_independent_from_text_and_guard_admission_controls_concurrency(self) -> None:
         unit = QUERIT_UNIT.read_text()
         unit_section = unit.split("[Service]", 1)[0]
         # Reranker is independent of text lifecycle so it doesn't stop during
         # text restart (user cannot accept rr downtime).
         self.assertNotIn("Requires=vllm-aeon-27b-dflash.service", unit_section)
         self.assertNotIn("After=vllm-aeon-27b-dflash.service", unit_section)
-        self.assertIn("Conflicts=vllm-reranker.service", unit)
+        self.assertIn("Conflicts=vllm-qwen3-reranker-8b.service", unit)
         self.assertNotIn("http://100.105.4.92:18010", unit)
-        self.assertIn("gb10_check_mem_available.sh 2", unit)
         self.assertIn("--memory 18g", unit)
         self.assertIn("--memory-swap 18g", unit)
-        ready = unit.index("gb10_service_ready.sh rerank")
+        self.assertIn("--memory-swappiness 0", unit)
+        self.assertIn("--swap-space 0", unit)
+        self.assertIn("--max-num-batched-tokens 16384", unit)
+        self.assertIn("--max-num-seqs 256", unit)
+        self.assertIn("--max-num-partial-prefills 64", unit)
+        self.assertIn("--max-long-partial-prefills 64", unit)
+        self.assertIn("gb10_service_ready.sh rerank", unit)
         timeout = re.search(r"^TimeoutStartSec=(\d+)$", unit, re.MULTILINE)
         if timeout is None:
             self.fail("TimeoutStartSec missing")
@@ -225,29 +218,20 @@ class QueritServiceContractTests(unittest.TestCase):
         if deadline_match is None:
             self.fail("gb10_service_ready.sh must specify --deadline")
         readiness_deadline = int(deadline_match.group(1))
-        helper = CGROUP_HELPER.read_text()
-        helper_wait = re.search(r"GB10_CGROUP_WAIT_SECONDS:-([0-9]+)", helper)
-        docker_timeout = re.search(r"GB10_DOCKER_TIMEOUT_SECONDS:-([0-9]+)", helper)
-        systemctl_timeout = re.search(
-            r"GB10_SYSTEMCTL_TIMEOUT_SECONDS:-([0-9]+)", helper
-        )
-        if helper_wait is None or docker_timeout is None or systemctl_timeout is None:
-            self.fail("cgroup helper timeout defaults missing")
-        worst_case_seconds = (
-            readiness_deadline
-            + int(helper_wait.group(1))
-            + int(docker_timeout.group(1))
-            + int(systemctl_timeout.group(1))
-        )
-        self.assertGreaterEqual(int(timeout.group(1)), worst_case_seconds + 60)
+        self.assertGreaterEqual(int(timeout.group(1)), readiness_deadline + 60)
 
-    def test_guard_orders_after_backends_without_owning_lifecycle(self) -> None:
+    def test_guard_starts_independently_to_protect_backend_startup(self) -> None:
         unit = GUARD_UNIT.read_text()
         unit_section = unit.split("[Service]", 1)[0]
-        self.assertIn("querit-4b-reranker.service", unit_section)
-        self.assertNotIn("vllm-qwen3-reranker-8b.service", unit_section)
+        for backend in (
+            "vllm-aeon-27b-dflash.service",
+            "vllm-embedding.service",
+            "vllm-querit-4b-reranker.service",
+            "vllm-qwen3-reranker-8b.service",
+        ):
+            self.assertNotIn(backend, unit_section)
         self.assertNotRegex(unit_section, r"(?m)^Wants=.*vllm-")
-        self.assertIn("Ordering only", unit_section)
+        self.assertIn("protects backend startup", unit_section)
         for setting in (
             "MemoryHigh=1792M",
             "MemoryMax=2G",
@@ -261,58 +245,55 @@ class QueritServiceContractTests(unittest.TestCase):
     def test_aeon_unit_matches_source_memory_profile(self) -> None:
         unit = AEON_UNIT.read_text()
         for contract in (
-            "gb10_enforce_docker_cgroup_limits.sh --publish-registration "
-            "vllm-aeon-27b-dflash-n12 69",
+            "llm_guard_proxy_publish_cgroup_registration.sh",
             "GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1",
             f"@{IMAGE_DIGEST}",
             "--oom-score-adj 800",
             "OOMScoreAdjust=800",
             "--max-num-seqs 16",
             "--max-num-batched-tokens 4096",
-            "--gpu-memory-utilization 0.45",
+            "--gpu-memory-utilization 0.355",
             "FULL_DECODE_ONLY",
         ):
             self.assertIn(contract, unit)
         self.assertNotIn("--memory 69g", unit)
-        # --memory-swap == --memory is valid (swap=0). 69g is the old cap.
+        # Equal Docker caps retain the source request. 69g is the old cap.
         self.assertNotIn("--dns", unit)
         self.assertNotRegex(unit, r"aeon-vllm-ultimate:[^\s\\]+(?:\s|\\)")
 
     def test_aeon_text_uma_safe_profile(self) -> None:
         contract = _aeon_contract(AEON_UNIT.read_text())
         self.assertEqual(contract["model_len"], AEON_CONTEXT_TOKENS)
-        self.assertAlmostEqual(contract["util"], 0.45)
+        self.assertAlmostEqual(contract["util"], 0.355)
         _assert_aeon_headroom_evidence(contract)
 
     def test_aeon_unit_documents_current_headroom_evidence(self) -> None:
         unit = AEON_UNIT.read_text()
-        description = unit.splitlines()[1]
-        self.assertIn("util=0.45", description)
+        description = next(
+            line for line in unit.splitlines() if line.startswith("Description=")
+        )
+        self.assertIn("util=0.355", description)
         self.assertIn("AUTO KV", description)
+        self.assertIn("KV capacity: 286962 tokens", unit)
+        self.assertIn("MemAvail after all 3: 39.75G", unit)
+        self.assertNotIn("KV capacity: 318295 tokens", unit)
         self.assertIn("bypasses UMA", unit)
         self.assertIn("~31.6GiB MemAvailable", unit)
         self.assertNotIn("36GiB KV keeps ~2.47", unit)
 
     def test_aeon_headroom_contract_rejects_excessive_utilization(self) -> None:
         unit = AEON_UNIT.read_text().replace(
-            "--gpu-memory-utilization 0.45",
+            "--gpu-memory-utilization 0.355",
             "--gpu-memory-utilization 0.80",
             1,
         )
         with self.assertRaisesRegex(AssertionError, "updated UMA headroom evidence"):
             _assert_aeon_headroom_evidence(_aeon_contract(unit))
 
-    def test_legacy_unit_remains_canonical_fallback(self) -> None:
+    def test_retained_qwen_vllm_fallback_is_available(self) -> None:
         self.assertTrue(LEGACY_UNIT.exists())
         self.assertIn("WantedBy=default.target", LEGACY_UNIT.read_text())
 
-    def test_cgroup_helper_validates_cap_and_sets_memory_and_swap(self) -> None:
-        helper = CGROUP_HELPER.read_text()
-        self.assertRegex(helper, r"expected_gib.*=~.*\^\[1-9\]\[0-9\]\*\$")
-        self.assertIn('"MemoryMax=${expected_gib}G"', helper)
-        self.assertIn("MemorySwapMax=0", helper)
-        self.assertIn("/usr/bin/timeout", helper)
-        self.assertNotIn("$(/usr/bin/docker inspect", helper)
 
     def test_memory_gate_exact_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -404,12 +385,12 @@ class QueritServiceContractTests(unittest.TestCase):
         profiles = {profile["name"]: profile for profile in config["upstreams"]}
         self.assertLess(profiles["aeon-chat"]["max_in_flight_requests"], backend_limit)
 
-    def test_readme_disables_legacy_before_enabling_querit(self) -> None:
+    def test_readme_disables_fallback_before_enabling_canonical_querit_vllm_owner(self) -> None:
         readme = README.read_text()
         disable = readme.index(
             "systemctl --user disable --now vllm-qwen3-reranker-8b.service"
         )
-        enable = readme.index("systemctl --user enable --now querit-4b-reranker.service")
+        enable = readme.index("systemctl --user enable --now vllm-querit-4b-reranker.service")
         self.assertLess(disable, enable)
 
 

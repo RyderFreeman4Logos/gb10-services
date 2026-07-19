@@ -27,7 +27,7 @@
 set -Eeuo pipefail
 
 TEXT_UNIT="vllm-aeon-27b-dflash"
-RR_UNIT="querit-4b-reranker"
+RR_UNIT="vllm-querit-4b-reranker"
 EMB_UNIT="vllm-embedding"
 TEXT_URL="http://100.105.4.92:18010/v1/models"
 RR_URL="http://100.105.4.92:18013/v1/models"

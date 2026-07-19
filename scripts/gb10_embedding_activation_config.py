@@ -10,6 +10,8 @@ from pathlib import Path
 from gb10_embedding_activation_checks import RuntimeConfig, UNIT
 from gb10_embedding_verifier_runtime import json_file
 
+__all__ = ["ActivationConfigError", "production_config", "test_config"]
+
 
 class ActivationConfigError(RuntimeError):
     pass
@@ -22,9 +24,14 @@ def production_config(engine_path: Path) -> RuntimeConfig:
     return RuntimeConfig(
         source_unit=repository / "systemd" / UNIT,
         installed_unit=unit_dir / UNIT,
+        source_no_swap_core=repository / "scripts" / "gb10_verify_vllm_no_swap_core.py",
+        installed_no_swap_core=home / ".local/bin/gb10_verify_vllm_no_swap_core.py",
+        source_no_swap_helper=repository / "scripts" / "gb10_verify_vllm_no_swap.sh",
+        installed_no_swap_helper=home / ".local/bin/gb10_verify_vllm_no_swap.sh",
         unit_dir=unit_dir,
         state_root=home / ".local/state/gb10-embedding-activation",
         systemctl="/usr/bin/systemctl",
+        docker="/usr/bin/docker",
         curl="/usr/bin/curl",
         verifier=str(repository / "scripts/gb10_verify_embedding_profile.py"),
         ready_seconds=92,
@@ -44,9 +51,14 @@ def test_config(path: Path) -> RuntimeConfig:
     keys = {
         "source_unit",
         "installed_unit",
+        "source_no_swap_core",
+        "installed_no_swap_core",
+        "source_no_swap_helper",
+        "installed_no_swap_helper",
         "unit_dir",
         "state_root",
         "systemctl",
+        "docker",
         "curl",
         "verifier",
         "ready_seconds",
@@ -87,9 +99,14 @@ def test_config(path: Path) -> RuntimeConfig:
     for field in (
         "source_unit",
         "installed_unit",
+        "source_no_swap_core",
+        "installed_no_swap_core",
+        "source_no_swap_helper",
+        "installed_no_swap_helper",
         "unit_dir",
         "state_root",
         "systemctl",
+        "docker",
         "curl",
         "verifier",
         "marker",
@@ -100,9 +117,14 @@ def test_config(path: Path) -> RuntimeConfig:
     return RuntimeConfig(
         source_unit=Path(payload["source_unit"]),
         installed_unit=Path(payload["installed_unit"]),
+        source_no_swap_core=Path(payload["source_no_swap_core"]),
+        installed_no_swap_core=Path(payload["installed_no_swap_core"]),
+        source_no_swap_helper=Path(payload["source_no_swap_helper"]),
+        installed_no_swap_helper=Path(payload["installed_no_swap_helper"]),
         unit_dir=Path(payload["unit_dir"]),
         state_root=Path(payload["state_root"]),
         systemctl=payload["systemctl"],
+        docker=payload["docker"],
         curl=payload["curl"],
         verifier=payload["verifier"],
         ready_seconds=payload["ready_seconds"],

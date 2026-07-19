@@ -1,0 +1,74 @@
+# Canonical Querit-4B vLLM pooling reranker (AEON v0.25.1, raw Tailnet :18013).
+# The llm-guard-proxy adapter on :18009/:18003 forwards rerank requests to
+# this backend; clients (CodeSeek, mempal, verbatim) see a DeepInfra-compatible
+# contract through the adapter.
+[Unit]
+Description=Canonical Querit-4B vLLM pooling reranker (AEON v0.25.1, raw Tailnet :18013)
+After=network.target
+Conflicts=vllm-qwen3-reranker-8b.service
+StartLimitIntervalSec=600
+StartLimitBurst=1
+
+[Service]
+Type=simple
+UMask=0077
+Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+
+# Wrapper/docker-CLI only. Docker owns the 18 GiB container cap.
+MemoryMax=256M
+OOMScoreAdjust=500
+Restart=no
+TimeoutStartSec=1800
+TimeoutStopSec=60
+
+ExecCondition=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-querit-4b-reranker.service
+ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-vllm-cids
+ExecStartPre=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container querit-4b-vllm --cidfile %t/gb10-vllm-cids/vllm-querit-4b-reranker.cid
+# Backend scheduler ceilings are not production admission limits; guard owns hot-reloadable request concurrency.
+ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-vllm-cids/vllm-querit-4b-reranker.cid --name querit-4b-vllm \
+  --cgroup-parent app.slice \
+  --gpus all --ipc host \
+  -p 100.105.4.92:18013:8000 \
+  -v /home/obj/models/querit-4b-vllm:/home/obj/models/querit-4b-vllm:ro \
+  -e HF_HUB_OFFLINE=1 \
+  -e TRANSFORMERS_OFFLINE=1 \
+  --memory 18g \
+  --memory-swap 18g \
+  --memory-swappiness 0 \
+  --oom-score-adj 500 \
+  --entrypoint python3 \
+  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d \
+  /usr/local/bin/vllm serve /home/obj/models/querit-4b-vllm \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --served-model-name Querit/Querit-4B Qwen/Qwen3-Reranker-8B qwen3-reranker-8b \
+    --runner pooling \
+    --dtype bfloat16 \
+    --max-model-len 32768 \
+    --gpu-memory-utilization 0.17 \
+    --kv-cache-memory-bytes 4800M \
+    --kv-cache-dtype auto \
+    --tensor-parallel-size 1 \
+    --pipeline-parallel-size 1 \
+    --cpu-offload-gb 0 \
+    --swap-space 0 \
+    --max-num-batched-tokens 16384 \
+    --max-num-seqs 256 \
+    --enable-chunked-prefill \
+    --max-num-partial-prefills 64 \
+    --max-long-partial-prefills 64 \
+    --long-prefill-token-threshold 8192 \
+    --enforce-eager \
+    --chat-template /home/obj/models/querit-4b-vllm/querit-rerank.jinja
+ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-querit-4b-reranker.service --container querit-4b-vllm
+ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh rerank http://100.105.4.92:18013 Querit/Querit-4B --deadline 300
+ExecStop=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container querit-4b-vllm --cidfile %t/gb10-vllm-cids/vllm-querit-4b-reranker.cid
+ExecStopPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container querit-4b-vllm --cidfile %t/gb10-vllm-cids/vllm-querit-4b-reranker.cid
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,13 +1,14 @@
 [Unit]
-Description=vLLM Qwen3-Reranker-8B (AEON v0.25 GB10 image, BF16, 40k ctx, pooling reranker, util=0.22, raw backend port 18013, behind llm-guard-proxy listeners 18009/18003/18005, 64 seq, post-start swap enforcement)
+Description=vLLM Qwen3-Reranker-8B (AEON v0.25.1 GB10 image, BF16, 40k ctx, pooling reranker, util=0.22, raw backend port 18013, behind llm-guard-proxy listeners 18009/18003/18005, 64 seq)
 # lifecycle-independent from text: guardian recovery must not change reranker state.
 After=network.target
-Conflicts=querit-4b-reranker.service vllm-qwen35-hauhau.service
+Conflicts=vllm-querit-4b-reranker.service vllm-qwen35-hauhau.service
 StartLimitIntervalSec=600
 StartLimitBurst=3
 
 [Service]
 Type=simple
+UMask=0077
 Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
 Environment=HF_HUB_OFFLINE=1
 OOMScoreAdjust=800
@@ -16,8 +17,10 @@ RestartSec=30
 TimeoutStartSec=1320
 TimeoutStopSec=60
 
-ExecStartPre=-/usr/bin/docker rm -f vllm-qwen3-reranker-8b
-ExecStart=/usr/bin/docker run --rm --name vllm-qwen3-reranker-8b \
+ExecCondition=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-qwen3-reranker-8b.service
+ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-vllm-cids
+ExecStartPre=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-qwen3-reranker-8b --cidfile %t/gb10-vllm-cids/vllm-qwen3-reranker-8b.cid
+ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-vllm-cids/vllm-qwen3-reranker-8b.cid --name vllm-qwen3-reranker-8b \
   --gpus all --ipc host --dns 8.8.8.8 --dns 1.1.1.1 \
   -p 100.105.4.92:18013:8000 \
   -v /home/obj/.cache/huggingface:/root/.cache/huggingface \
@@ -27,7 +30,7 @@ ExecStart=/usr/bin/docker run --rm --name vllm-qwen3-reranker-8b \
   --memory-swappiness 0 \
   --oom-score-adj 800 \
   --entrypoint python3 \
-  ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-14-v0.25.0 \
+  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d \
   /usr/local/bin/vllm serve Qwen/Qwen3-Reranker-8B \
     --host 0.0.0.0 --port 8000 \
     --served-model-name qwen3-reranker-8b Qwen/Qwen3-Reranker-8B \
@@ -38,15 +41,16 @@ ExecStart=/usr/bin/docker run --rm --name vllm-qwen3-reranker-8b \
     --max-num-seqs 64 \
     --gpu-memory-utilization 0.22 \
     --kv-cache-memory-bytes 5820M \
+    --swap-space 0 \
     --enforce-eager \
     --chat-template /vllm-workspace/examples/pooling/score/template/qwen3_reranker.jinja \
     --hf-overrides '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}' \
     --trust-remote-code
-# Rootless Docker can accept --memory-swap while leaving memory.swap.max=max.
-# Enforce the generated docker scope directly. This disabled 24G fallback is not
-# part of the ordinary 69+20+18=107GiB AEON+embedding+Querit source profile.
-ExecStartPost=/home/obj/.local/bin/gb10_enforce_docker_cgroup_limits.sh vllm-qwen3-reranker-8b 24
-ExecStop=/usr/bin/docker stop vllm-qwen3-reranker-8b
+# This disabled 24G fallback is outside the ordinary AEON+embedding+Querit profile.
+ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-qwen3-reranker-8b.service --container vllm-qwen3-reranker-8b
+ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh rerank http://100.105.4.92:18013 qwen3-reranker-8b --deadline 300
+ExecStop=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-qwen3-reranker-8b --cidfile %t/gb10-vllm-cids/vllm-qwen3-reranker-8b.cid
+ExecStopPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-qwen3-reranker-8b --cidfile %t/gb10-vllm-cids/vllm-qwen3-reranker-8b.cid
 StandardOutput=journal
 StandardError=journal
 

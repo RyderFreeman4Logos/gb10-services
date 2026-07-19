@@ -66,7 +66,7 @@ class StrictUnitParserTests(unittest.TestCase):
         canonical = UNIT.read_text()
         mutations = {
             "host short memory alias": canonical.replace(
-                "  --memory 20g \\\n", "  --memory 20g -m 24g \\\n", 1
+                "  --memory 128g \\\n", "  --memory 128g -m 24g \\\n", 1
             ),
             "host flag after image": canonical.replace(
                 "  /usr/local/bin/vllm serve",
@@ -79,7 +79,9 @@ class StrictUnitParserTests(unittest.TestCase):
                 1,
             ),
             "unexpected model option": canonical.replace(
-                "    --enforce-eager", "    --truncate-dim 256 \\\n    --enforce-eager", 1
+                "    --gpu-memory-utilization 0.15 --enforce-eager",
+                "    --gpu-memory-utilization 0.15 \\\n    --truncate-dim 256 \\\n    --enforce-eager",
+                1,
             ),
             "neighbor lifecycle": canonical
             + "\nExecStartPost=/usr/bin/systemctl --user restart "
@@ -218,6 +220,10 @@ class CurrentGenerationVerifierTests(unittest.TestCase):
                     (fixture.evidence / "verification.receipt.json").read_text()
                 )
                 self.assertEqual(receipt["verification"], "passed")
+                self.assertEqual(
+                    receipt["profile"],
+                    "qwen3-embedding-8b-32k-4800M-128GiB",
+                )
                 serialized = json.dumps(receipt, sort_keys=True)
                 self.assertNotIn(CURRENT_INVOCATION, serialized)
                 self.assertNotIn(CONTAINER_ID, serialized)
@@ -248,7 +254,7 @@ class CurrentGenerationVerifierTests(unittest.TestCase):
         with VerifierFixture() as fixture:
             fixture.state["systemd_outputs"][0] = fixture.state[
                 "systemd_outputs"
-            ][0].replace(" --enforce-eager ;", " --enforce-eager -m 24g ;")
+            ][0].replace(" --swap-space 0 ;", " --swap-space 0 -m 24g ;")
             self.assert_fixture_rejected(fixture)
 
     def test_rejects_replaced_or_unpopulated_container_cgroup(self) -> None:
@@ -265,6 +271,26 @@ class CurrentGenerationVerifierTests(unittest.TestCase):
                 / "cgroup.events"
             )
             cgroup_events.write_text("populated 0\nfrozen 0\n")
+            self.assert_fixture_rejected(fixture)
+
+    def test_rejects_missing_malformed_or_process_mismatched_docker_scope(self) -> None:
+        malformed = (
+            "",
+            "app.slice/not-absolute",
+            "/app.slice/not-the-container.scope",
+            f"/app.slice/docker-{CONTAINER_ID}.scope\n/second",
+        )
+        for scope in malformed:
+            with self.subTest(scope=scope), VerifierFixture() as fixture:
+                fixture.state["docker_scopes"][CONTAINER_ID] = scope
+                self.assert_fixture_rejected(fixture)
+        with VerifierFixture() as fixture:
+            del fixture.state["docker_scopes"][CONTAINER_ID]
+            self.assert_fixture_rejected(fixture)
+        with VerifierFixture() as fixture:
+            (fixture.proc / "303" / "cgroup").write_text(
+                "0::/app.slice/docker-" + "b" * 64 + ".scope\n"
+            )
             self.assert_fixture_rejected(fixture)
 
     def test_rejects_ambiguous_engine_capacity_metrics(self) -> None:

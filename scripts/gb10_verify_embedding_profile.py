@@ -22,6 +22,7 @@ from gb10_embedding_profile_contract import (  # noqa: E402
     EXPECTED_CONTAINER_ARGV,
     EXPECTED_IMAGE,
     EXPECTED_MODELS,
+    EXPECTED_PROFILE,
     validate_effective_commands,
     validate_unit,
     validate_unit_text,
@@ -38,7 +39,21 @@ from gb10_embedding_verifier_runtime import (  # noqa: E402
     validate_evidence_dir as _validate_evidence_dir,
 )
 
-EXPECTED_MEMORY = 20 * 1024**3
+__all__ = [
+    "CANARY_INPUTS",
+    "ContainerState",
+    "EXPECTED_MEMORY",
+    "RuntimeConfig",
+    "SystemdState",
+    "UNIT",
+    "cosine",
+    "main",
+    "validate_unit",
+    "vectors",
+    "verify_production",
+]
+
+EXPECTED_MEMORY = 128 * 1024**3
 UNIT = "vllm-embedding.service"
 CANARY_INPUTS = (
     "gb10-embedding-canary-v1",
@@ -56,10 +71,12 @@ _SYSTEMD_FIELDS = (
     "ControlGroup",
     "InvocationID",
     "ExecMainStartTimestampMonotonic",
+    "ExecCondition",
     "ExecStart",
     "ExecStartPre",
     "ExecStartPost",
     "ExecStop",
+    "ExecStopPost",
 )
 
 
@@ -209,8 +226,37 @@ def _container_payload(config: RuntimeConfig, deadline: float) -> dict[str, Any]
     return payload[0]
 
 
+def _docker_scope(config: RuntimeConfig, identifier: str, deadline: float) -> str:
+    scope_unit = f"docker-{identifier}.scope"
+    raw = command(
+        [
+            config.systemctl,
+            "--user",
+            "show",
+            "-p",
+            "ControlGroup",
+            "--value",
+            scope_unit,
+        ],
+        timeout=10,
+        deadline=deadline,
+    )
+    rows = raw.splitlines()
+    if len(rows) != 1:
+        fail("Docker scope lookup did not return one ControlGroup")
+    scope = rows[0]
+    if (
+        not scope.startswith("/")
+        or ".." in Path(scope).parts
+        or re.fullmatch(r"/[A-Za-z0-9_.@:/-]+", scope) is None
+        or not scope.endswith(f"/{scope_unit}")
+    ):
+        fail("Docker scope ControlGroup is malformed")
+    return scope
+
+
 def _verify_container(
-    config: RuntimeConfig, payload: dict[str, Any]
+    config: RuntimeConfig, payload: dict[str, Any], deadline: float
 ) -> ContainerState:
     identifier = payload.get("Id")
     name = payload.get("Name")
@@ -255,10 +301,10 @@ def _verify_container(
     for key, expected in expected_host.items():
         if host.get(key) != expected:
             fail(f"running Docker host contract differs: {key}")
-    relative = _unified_cgroup(config.proc_root, pid)
-    expected_suffix = f"/app.slice/docker-{identifier}.scope"
-    if not relative.endswith(expected_suffix):
-        fail("container PID is outside its immutable Docker cgroup")
+    relative = _docker_scope(config, identifier, deadline)
+    process_relative = _unified_cgroup(config.proc_root, pid)
+    if process_relative != relative:
+        fail("container PID and Docker user scope cgroups disagree")
     cgroup, identity = _verify_populated(config.cgroup_root, relative)
     expected_metrics = {
         "memory.max": EXPECTED_MEMORY,
@@ -619,13 +665,13 @@ def _verify(config: RuntimeConfig, evidence: Path) -> None:
         fail("embedding service did not enter a truly new systemd generation")
     service_cgroup_identity = _verify_main_process(config, first_systemd)
     first_container = _verify_container(
-        config, _container_payload(config, deadline)
+        config, _container_payload(config, deadline), deadline
     )
     capacity = _verify_engine_capacity(config, first_systemd, deadline)
     _verify_models(config, deadline)
     minimum_cosine = _verify_quality(config, evidence, deadline)
     second_container = _verify_container(
-        config, _container_payload(config, deadline)
+        config, _container_payload(config, deadline), deadline
     )
     second_systemd = _query_systemd(config, deadline)
     second_service_cgroup = _verify_main_process(config, second_systemd)
@@ -651,7 +697,7 @@ def _verify(config: RuntimeConfig, evidence: Path) -> None:
             "generation_stable": True,
             "kv_capacity_tokens": capacity,
             "minimum_stability_cosine": minimum_cosine,
-            "profile": "qwen3-embedding-8b-32k-4800M-20GiB",
+            "profile": EXPECTED_PROFILE,
             "quality_claim": "synthetic-baseline-stability-only",
             "vector_dimensions": 4096,
             "verification": "passed",

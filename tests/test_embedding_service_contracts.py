@@ -12,13 +12,25 @@ README = ROOT / "README.md"
 AGENT_PLAYBOOK = ROOT / "docs" / "deployment" / "AGENTS.md"
 EMBEDDING_IMAGE = (
     "ghcr.io/aeon-7/aeon-vllm-ultimate@"
-    "sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55"
+    "sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d"
 )
 
 VALIDATED_KV_MIB = 5_820
 VALIDATED_KV_TOKENS = 41_376
 CONTRACT_TOKENS = 32_768
 MIN_KV_MARGIN_BPS = 400
+NO_SWAP_PREFIX = [
+    "/usr/bin/env",
+    "-i",
+    "HOME=/home/obj",
+    "PATH=/usr/bin:/bin",
+    "LC_ALL=C",
+    "DOCKER_HOST=unix:///run/user/1001/docker.sock",
+    "/usr/bin/bash",
+    "--noprofile",
+    "--norc",
+    "/home/obj/.local/bin/gb10_verify_vllm_no_swap.sh",
+]
 
 
 def _logical_directive_argv(unit: str, directive: str) -> list[list[str]]:
@@ -182,22 +194,20 @@ def _standalone_option(argv: list[str], flag: str) -> None:
 
 
 def _embedding_contract(unit: str) -> dict[str, int]:
+    exec_conditions = _logical_directive_argv(unit, "ExecCondition")
     exec_starts = _logical_directive_argv(unit, "ExecStart")
     exec_start_posts = _logical_directive_argv(unit, "ExecStartPost")
     if len(exec_starts) != 1:
         raise AssertionError(
             f"expected exactly one ExecStart, found {len(exec_starts)}"
         )
-    if len(exec_start_posts) != 1:
-        raise AssertionError(
-            f"expected exactly one ExecStartPost, found {len(exec_start_posts)}"
-        )
-
     argv = exec_starts[0]
     host_argv, container_argv = _split_docker_run_argv(argv, EMBEDDING_IMAGE)
     expected_host_options = {
         "--name": ["vllm-embedding"],
         "-p": ["100.105.4.92:18012:8000"],
+        "--memory": ["128g"],
+        "--memory-swap": ["128g"],
         "--memory-swappiness": ["0"],
         "--oom-score-adj": ["0"],
     }
@@ -225,6 +235,7 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         "--kv-cache-memory-bytes": 1,
         "--gpu-memory-utilization": 1,
         "--enforce-eager": 0,
+        "--swap-space": 1,
     }
     model_command = [
         "/usr/local/bin/vllm",
@@ -249,6 +260,7 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         "--kv-cache-memory-bytes": ["4800M"],
         "--gpu-memory-utilization": ["0.15"],
         "--enforce-eager": [],
+        "--swap-space": ["0"],
     }
     for flag, expected in expected_container_options.items():
         actual = parsed_options[flag]
@@ -262,7 +274,21 @@ def _embedding_contract(unit: str) -> dict[str, int]:
             if lowered == forbidden or lowered.startswith(f"{forbidden}="):
                 raise AssertionError(f"forbidden embedding option: {token}")
 
-    readiness = exec_start_posts[0]
+    if len(exec_start_posts) != 2:
+        raise AssertionError(
+            f"expected verifier and readiness ExecStartPost commands, found {len(exec_start_posts)}"
+        )
+    verifier, readiness = exec_start_posts
+    expected_unit = "/home/obj/.config/systemd/user/vllm-embedding.service"
+    if exec_conditions != [NO_SWAP_PREFIX + ["--unit", expected_unit]]:
+        raise AssertionError("ExecCondition must fail closed on unit and cgroup-v2 evidence")
+    if verifier != NO_SWAP_PREFIX + [
+        "--unit",
+        expected_unit,
+        "--container",
+        "vllm-embedding",
+    ]:
+        raise AssertionError("ExecStartPost must verify the exact embedding cgroup first")
     if not readiness or not readiness[0].endswith("gb10_service_ready.sh"):
         raise AssertionError(
             "ExecStartPost must use gb10_service_ready.sh"
@@ -292,6 +318,9 @@ def _embedding_contract(unit: str) -> dict[str, int]:
 
 
 class EmbeddingServiceContractTests(unittest.TestCase):
+    def test_host_memory_options_create_equal_no_swap_cgroup_ceiling(self) -> None:
+        _embedding_contract(EMBEDDING_UNIT.read_text())
+
     def test_32k_profile_has_bounded_kv_for_coresident_stability(self) -> None:
         unit = EMBEDDING_UNIT.read_text()
         contract = _embedding_contract(unit)
@@ -376,16 +405,18 @@ class HostileEmbeddingUnitMutationTests(unittest.TestCase):
     def test_rejects_duplicate_post_start_readiness_poll(self) -> None:
         unit = EMBEDDING_UNIT.read_text()
         readiness = next(
-            line for line in unit.splitlines() if line.startswith("ExecStartPost=")
+            line
+            for line in unit.splitlines()
+            if line.startswith("ExecStartPost=") and "gb10_service_ready.sh" in line
         )
         self.assert_contract_rejects(f"{unit}\n{readiness}\n")
 
-    def test_rejects_cgroup_post_start_helper(self) -> None:
+    def test_rejects_guardian_registration_from_embedding(self) -> None:
         unit = EMBEDDING_UNIT.read_text()
         unit = re.sub(
             r"(?m)^ExecStartPost=.*$",
             "ExecStartPost=/home/obj/.local/bin/"
-            "gb10_enforce_docker_cgroup_limits.sh vllm-embedding 20",
+            "llm_guard_proxy_publish_cgroup_registration.sh",
             unit,
             count=1,
         )
@@ -458,9 +489,17 @@ class HostileEmbeddingUnitMutationTests(unittest.TestCase):
 
 
 class EmbeddingDeploymentContractTests(unittest.TestCase):
+    FRESH_STACK_UNITS = {
+        "llm-guard-proxy.service",
+        "vllm-querit-4b-reranker.service",
+        "sysmon.service",
+        "vllm-aeon-27b-dflash.service",
+        "vllm-embedding.service",
+        "vllm-qwen3-reranker-8b.service",
+    }
     FORBIDDEN_NEIGHBORS = (
         "vllm-aeon-27b-dflash.service",
-        "querit-4b-reranker.service",
+        "vllm-querit-4b-reranker.service",
         "vllm-qwen3-reranker-8b.service",
     )
 
@@ -507,6 +546,66 @@ class EmbeddingDeploymentContractTests(unittest.TestCase):
                 if target.endswith(".service"):
                     mutations.append((action, target))
         return mutations
+
+    @staticmethod
+    def installed_units_before_reload(text: str, start: str) -> set[str]:
+        start_at = text.find(start)
+        if start_at < 0:
+            raise AssertionError(f"missing install section marker: {start}")
+        reload_at = text.find("systemctl --user daemon-reload", start_at)
+        if reload_at < 0:
+            raise AssertionError("missing daemon-reload after install section")
+        before_reload = text[start_at:reload_at].replace("\\\n", " ")
+        installed: set[str] = set()
+        for raw_line in before_reload.splitlines():
+            line = raw_line.strip()
+            if not line.startswith("install -m 0644 "):
+                continue
+            try:
+                argv = shlex.split(line, comments=True, posix=True)
+            except ValueError as error:
+                raise AssertionError(
+                    f"invalid documented install command: {line}"
+                ) from error
+            for token in argv[3:-1]:
+                if token.startswith("systemd/") and token.endswith(".service"):
+                    installed.add(Path(token).name)
+        return installed
+
+    def test_fresh_stack_install_blocks_stage_every_managed_unit(self) -> None:
+        documents = (
+            (README.read_text(), "### Step 2: Install Systemd Services"),
+            (
+                AGENT_PLAYBOOK.read_text(),
+                "### 5. Systemd User Services Installation",
+            ),
+        )
+        for text, marker in documents:
+            with self.subTest(marker=marker):
+                self.assertEqual(
+                    self.installed_units_before_reload(text, marker),
+                    self.FRESH_STACK_UNITS,
+                )
+
+    def test_current_embedding_memory_contract_has_no_obsolete_cap_claim(self) -> None:
+        stale_claims = (
+            "20 GiB no-swap hard cap",
+            "32,768-token / 4,800 MiB KV / 20 GiB profile",
+            "32K/4,800M/20GiB",
+            "20 GiB Docker memory/swap cap",
+        )
+        for path in (README, AGENT_PLAYBOOK):
+            text = path.read_text()
+            with self.subTest(path=path):
+                self.assertIn("equal 128 GiB Docker memory/swap caps", text)
+                self.assertIn("without imposing the obsolete 20 GiB service budget", text)
+                for stale in stale_claims:
+                    self.assertNotIn(stale, text)
+
+        unit = EMBEDDING_UNIT.read_text()
+        self.assertNotIn("No docker --memory", unit)
+        self.assertIn("Equal --memory 128g and --memory-swap 128g", unit)
+        self.assertIn("post-start verifier", unit)
 
     def test_documented_activation_and_rollback_mutate_only_embedding(self) -> None:
         sections = (

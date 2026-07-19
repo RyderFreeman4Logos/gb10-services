@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-16  
 **Author:** obj  
-**Status:** Active investigation — root cause identified
+**Status:** Historical investigation — root cause identified; the current source profile uses AUTO KV at `gpu-memory-utilization=0.355`.
 
 ---
 
