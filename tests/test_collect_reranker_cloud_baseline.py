@@ -320,6 +320,51 @@ class CloudCollectorSafetyTests(unittest.TestCase):
                     len(collector.intent_path(output).read_text().splitlines()), 1
                 )
 
+    def test_malformed_http_200_scores_are_terminal_and_never_counted_on_resume(
+        self,
+    ) -> None:
+        invalid_bodies: tuple[dict[str, object], ...] = (
+            {"input_tokens": 7},
+            {"input_tokens": 7, "scores": []},
+            {"input_tokens": 7, "scores": [True]},
+            {"input_tokens": 7, "scores": [1.000001]},
+        )
+        for body in invalid_bodies:
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as raw_tmp:
+                root = Path(raw_tmp)
+                corpus = root / "corpus.jsonl"
+                output = root / "baseline.jsonl"
+                _write_corpus(corpus, 1)
+                arguments = [
+                    "--corpus",
+                    str(corpus),
+                    "--output",
+                    str(output),
+                    "--budget-usd",
+                    "1",
+                    "--rate-delay-seconds",
+                    "0",
+                ]
+
+                result, _cloud_call, stdout = _run_main_capture(
+                    arguments,
+                    (200, body, {"http_status": 200}),
+                )
+                self.assertEqual(result, 1)
+                summary = json.loads(stdout)
+                self.assertEqual(summary["groups_completed"], 0)
+                self.assertEqual(summary["groups_failed"], 1)
+
+                resumed, cloud_call, resumed_stdout = _run_main_capture(
+                    [*arguments, "--resume"],
+                    (200, {"input_tokens": 1, "scores": [0.5]}, {"http_status": 200}),
+                )
+                self.assertEqual(resumed, 1)
+                cloud_call.assert_not_called()
+                resumed_summary = json.loads(resumed_stdout)
+                self.assertEqual(resumed_summary["groups_completed"], 0)
+                self.assertEqual(resumed_summary["groups_failed"], 1)
+
     def test_malformed_corpus_jsonl_exits_cleanly_with_line_context(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)

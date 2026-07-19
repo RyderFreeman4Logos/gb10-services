@@ -35,6 +35,28 @@ class _OversizedHTTPResponse:
 
 
 class RankingMetricTests(unittest.TestCase):
+    def test_score_normalizers_reject_boolean_indices_scores_and_domain_drift(self) -> None:
+        invalid_vllm = (
+            {"data": [{"index": False, "score": 0.0}]},
+            {"data": [{"index": 0, "score": True}]},
+            {"data": [{"index": 0, "score": -1.000001}]},
+            {"data": [{"index": 0, "score": 1.000001}]},
+        )
+        for body in invalid_vllm:
+            with self.subTest(contract="vllm", body=body), self.assertRaises(ValueError):
+                replay.normalize_vllm_score(body, 1)
+
+        invalid_public = ([True], [-0.000001], [1.000001])
+        for scores in invalid_public:
+            with self.subTest(contract="deepinfra", scores=scores), self.assertRaises(
+                ValueError
+            ):
+                replay.normalize_deepinfra({"scores": scores}, 1)
+            with self.subTest(contract="cloud", scores=scores), self.assertRaises(
+                ValueError
+            ):
+                replay.extract_cloud_scores({"response": {"scores": scores}}, 1)
+
     def test_structurally_invalid_corpus_rows_fail_without_tracebacks_or_requests(self) -> None:
         invalid_candidates = (None, [{}], [])
         for candidates in invalid_candidates:

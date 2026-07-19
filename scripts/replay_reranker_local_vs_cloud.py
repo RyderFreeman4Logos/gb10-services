@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from reranker_equivalence_metrics import rank_indices
+from reranker_score_validation import validate_scores
 
 __all__ = ["main", "top1_agreement", "top_k_overlap"]
 
@@ -115,51 +116,52 @@ def normalize_vllm_score(body: dict[str, Any], expected: int) -> tuple[float, ..
     data = body.get("data")
     if not isinstance(data, list) or len(data) != expected:
         raise ValueError("vLLM score response cardinality mismatch")
-    restored: list[float | None] = [None] * expected
+    missing = object()
+    restored: list[object] = [missing] * expected
     for row in data:
         if not isinstance(row, dict):
             raise ValueError("vLLM score row is not an object")
-        idx = row.get("index")  # type: ignore[assignment]
+        idx = row.get("index")
         score = row.get("score")
-        if not isinstance(idx, int) or not 0 <= idx < expected or restored[idx] is not None:
+        if (
+            isinstance(idx, bool)
+            or not isinstance(idx, int)
+            or not 0 <= idx < expected
+            or restored[idx] is not missing
+        ):
             raise ValueError("vLLM score index is invalid")
-        if not isinstance(score, (int, float)) or not math.isfinite(float(score)):
-            raise ValueError("vLLM score is non-finite")
-        s = float(score)
-        if not -1.0 <= s <= 1.0:
-            raise ValueError("vLLM score outside [-1, 1]")
-        restored[idx] = (s + 1.0) / 2.0
-    if any(v is None for v in restored):
-        raise ValueError("vLLM score response missing a position")
-    return tuple(float(v) for v in restored)  # type: ignore[misc]
+        restored[idx] = score
+    validated = validate_scores(
+        restored,
+        expected,
+        minimum=-1.0,
+        maximum=1.0,
+        label="vLLM scores",
+    )
+    return tuple((score + 1.0) / 2.0 for score in validated)
 
 
 def normalize_deepinfra(body: dict[str, Any], expected: int) -> tuple[float, ...]:
-    scores = body.get("scores")
-    if not isinstance(scores, list) or len(scores) != expected:
-        raise ValueError("DeepInfra response scores cardinality mismatch")
-    out: list[float] = []
-    for s in scores:
-        if not isinstance(s, (int, float)) or not math.isfinite(float(s)):
-            raise ValueError("DeepInfra score is non-finite")
-        v = float(s)
-        if not 0.0 <= v <= 1.0:
-            raise ValueError("DeepInfra score outside [0, 1]")
-        out.append(v)
-    return tuple(out)
+    return validate_scores(
+        body.get("scores"),
+        expected,
+        minimum=0.0,
+        maximum=1.0,
+        label="DeepInfra response scores",
+    )
 
 
 def extract_cloud_scores(baseline_row: dict[str, Any], expected: int) -> tuple[float, ...]:
     response = baseline_row.get("response", {})
-    scores = response.get("scores")
-    if not isinstance(scores, list) or len(scores) != expected:
-        raise ValueError("cloud baseline scores cardinality mismatch")
-    out: list[float] = []
-    for s in scores:
-        if not isinstance(s, (int, float)) or not math.isfinite(float(s)):
-            raise ValueError("cloud score is non-finite")
-        out.append(float(s))
-    return tuple(out)
+    if not isinstance(response, dict):
+        raise ValueError("cloud baseline response is not an object")
+    return validate_scores(
+        response.get("scores"),
+        expected,
+        minimum=0.0,
+        maximum=1.0,
+        label="cloud baseline scores",
+    )
 
 
 def ranks(scores: tuple[float, ...]) -> list[int]:

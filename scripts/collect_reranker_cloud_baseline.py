@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from reranker_equivalence_metrics import PROMPT_OVERHEAD_TOKENS_PER_PAIR
+from reranker_score_validation import ScoreValidationError, validate_scores
 
 __all__ = [
     "build_request",
@@ -307,8 +308,20 @@ def _load_resume_state(output: Path, planned: set[str]) -> ResumeState:
             or not isinstance(reported_tokens, int)
             or reported_tokens < 0
         )
+        score_payload_invalid = False
+        if http_status == 200:
+            try:
+                validate_scores(
+                    response.get("scores"),
+                    pair_count,
+                    minimum=0.0,
+                    maximum=1.0,
+                    label="DeepInfra response scores",
+                )
+            except ScoreValidationError:
+                score_payload_invalid = True
         completed.add(fingerprint)
-        if http_status != 200 or token_count_invalid:
+        if http_status != 200 or token_count_invalid or score_payload_invalid:
             terminal_failures.add(fingerprint)
         charged_input_tokens += charged
 
@@ -523,6 +536,18 @@ def main() -> int:
             or not isinstance(reported_tokens, int)
             or reported_tokens < 0
         )
+        score_payload_invalid = False
+        if status == 200:
+            try:
+                validate_scores(
+                    body.get("scores") if isinstance(body, dict) else None,
+                    len(request_body["queries"]),
+                    minimum=0.0,
+                    maximum=1.0,
+                    label="DeepInfra response scores",
+                )
+            except ScoreValidationError:
+                score_payload_invalid = True
         charged_tokens = (
             reported_tokens
             if isinstance(reported_tokens, int)
@@ -560,7 +585,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             break
-        if status == 200 and not token_count_invalid:
+        if status == 200 and not token_count_invalid and not score_payload_invalid:
             completed += 1
 
         remaining_estimate = sum(
@@ -581,7 +606,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             break
-        if status != 200 or token_count_invalid:
+        if status != 200 or token_count_invalid or score_payload_invalid:
             failed += 1
             print(
                 f"WARN group {index} {group.get('query_id')} http={status} "
