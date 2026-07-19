@@ -4,8 +4,11 @@ import importlib
 import io
 import json
 import os
+import stat
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -264,6 +267,94 @@ class CloudCollectorSafetyTests(unittest.TestCase):
                 redirect_stderr(io.StringIO()),
             ):
                 self.assertEqual(collector.main(), 0)
+
+    def test_two_processes_share_one_owner_and_issue_one_paid_request(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            corpus = root / "corpus.jsonl"
+            output = root / "baseline.jsonl"
+            start = root / "start"
+            paid_log = root / "paid.log"
+            _write_corpus(corpus, 1)
+            driver = root / "race_driver.py"
+            driver.write_text(
+                """import os
+import sys
+import time
+from pathlib import Path
+
+worker, scripts, corpus, output, start, paid_log = sys.argv[1:]
+sys.path.insert(0, scripts)
+import collect_reranker_cloud_baseline as collector
+
+output_path = Path(output)
+original_append = collector._append_durable
+
+def synchronized_append(path, record):
+    if path == collector.intent_path(output_path):
+        Path(output + '.intent-ready-' + worker).touch()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if len(list(Path(output).parent.glob(Path(output).name + '.intent-ready-*'))) == 2:
+                break
+            time.sleep(0.005)
+    original_append(path, record)
+
+def paid_call(*_args, **_kwargs):
+    descriptor = os.open(paid_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(descriptor, (worker + '\\n').encode())
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return 200, {'input_tokens': 1, 'scores': [0.5]}, {'http_status': 200}
+
+collector._append_durable = synchronized_append
+collector.call_deepinfra = paid_call
+while not Path(start).exists():
+    time.sleep(0.005)
+sys.argv = [
+    'collect_reranker_cloud_baseline.py',
+    '--corpus', corpus,
+    '--output', output,
+    '--budget-usd', '1',
+    '--rate-delay-seconds', '0',
+]
+raise SystemExit(collector.main())
+""",
+                encoding="utf-8",
+            )
+            processes = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(driver),
+                        str(worker),
+                        str(ROOT / "scripts"),
+                        str(corpus),
+                        str(output),
+                        str(start),
+                        str(paid_log),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env={**os.environ, "DEEPINFRA_KEY": "unit-secret"},
+                )
+                for worker in range(2)
+            ]
+            time.sleep(0.05)
+            start.touch()
+            results = [process.communicate(timeout=8) for process in processes]
+
+            self.assertEqual(sorted(process.returncode for process in processes), [0, 2], results)
+            self.assertEqual(len(paid_log.read_text().splitlines()), 1)
+            self.assertEqual(len(output.read_text().splitlines()), 1)
+            self.assertEqual(len(collector.intent_path(output).read_text().splitlines()), 1)
+            lock = output.with_name(output.name + ".lock")
+            metadata = lock.stat()
+            self.assertEqual(metadata.st_uid, os.geteuid())
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
 
     def test_ambiguous_paid_transport_blocks_automatic_resume(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:

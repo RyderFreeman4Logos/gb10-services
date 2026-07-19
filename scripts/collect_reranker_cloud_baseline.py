@@ -26,10 +26,13 @@ The script never prints credentials and writes only privacy-safe metadata
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import hashlib
 import json
 import math
 import os
+import stat
 import sys
 import time
 import urllib.error
@@ -196,6 +199,48 @@ def intent_path(output: Path) -> Path:
     """Return the append-only paid-request intent ledger beside the baseline."""
 
     return output.with_name(output.name + ".intents.jsonl")
+
+
+def _lock_path(output: Path) -> Path:
+    return output.with_name(output.name + ".lock")
+
+
+def _acquire_output_lock(output: Path) -> int:
+    """Own the output/intent pair before inspecting or spending against it."""
+
+    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = _lock_path(output)
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise CollectionStateError("cannot open output ownership lock") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise CollectionStateError("output ownership lock is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise CollectionStateError(
+                    "another collector owns this output and intent ledger"
+                ) from exc
+            raise CollectionStateError("cannot acquire output ownership lock") from exc
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _fsync_directory(path: Path) -> None:
@@ -450,7 +495,7 @@ def call_deepinfra(
     return status, body, timing
 
 
-def main() -> int:
+def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--provider", default=DEFAULT_PROVIDER, choices=[DEFAULT_PROVIDER])
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -464,7 +509,10 @@ def main() -> int:
     parser.add_argument("--max-groups", type=int, default=0, help="0 = all groups")
     parser.add_argument("--resume", action="store_true", help="skip groups already in output")
     parser.add_argument("--dry-run", action="store_true", help="build requests, estimate cost, do not call API")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def _run_owned(args: argparse.Namespace) -> int:
 
     if (
         not math.isfinite(args.budget_usd)
@@ -729,6 +777,19 @@ def main() -> int:
         )
     )
     return 0 if failed == 0 and completed + skipped == len(groups) else 1
+
+
+def main() -> int:
+    args = _parse_args()
+    try:
+        lock_descriptor = _acquire_output_lock(args.output)
+    except CollectionStateError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    try:
+        return _run_owned(args)
+    finally:
+        os.close(lock_descriptor)
 
 
 if __name__ == "__main__":
