@@ -49,6 +49,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MAX_LOCAL_RESPONSE_BYTES = 4 * 1024 * 1024
 
 
+class ReplayInputError(ValueError):
+    """A replay JSONL input cannot be interpreted safely."""
+
+
 def canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
@@ -56,10 +60,24 @@ def canonical_json(value: Any) -> bytes:
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as handle:
-        for line in handle:
+        for line_number, line in enumerate(handle, 1):
             line = line.strip()
-            if line:
-                rows.append(json.loads(line))
+            if not line:
+                continue
+            try:
+                row = json.loads(
+                    line,
+                    parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+                )
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise ReplayInputError(
+                    f"{path.name} JSONL row {line_number} is malformed"
+                ) from exc
+            if not isinstance(row, dict):
+                raise ReplayInputError(
+                    f"{path.name} JSONL row {line_number} is not an object"
+                )
+            rows.append(row)
     return rows
 
 
@@ -212,8 +230,12 @@ def main() -> int:
     parser.add_argument("--max-groups", type=int, default=0)
     args = parser.parse_args()
 
-    corpus_index = load_corpus_index(args.corpus)
-    baseline_rows = load_jsonl(args.baseline)
+    try:
+        corpus_index = load_corpus_index(args.corpus)
+        baseline_rows = load_jsonl(args.baseline)
+    except (OSError, UnicodeError, ReplayInputError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     if args.max_groups > 0:
         baseline_rows = baseline_rows[: args.max_groups]
 

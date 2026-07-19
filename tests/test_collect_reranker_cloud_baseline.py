@@ -283,6 +283,36 @@ class CloudCollectorSafetyTests(unittest.TestCase):
                     len(collector.intent_path(output).read_text().splitlines()), 1
                 )
 
+    def test_malformed_corpus_jsonl_exits_cleanly_with_line_context(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            corpus = root / "corpus.jsonl"
+            output = root / "baseline.jsonl"
+            corpus.write_text('{"query_id":\n', encoding="utf-8")
+            stderr = io.StringIO()
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "collect_reranker_cloud_baseline.py",
+                        "--corpus",
+                        str(corpus),
+                        "--output",
+                        str(output),
+                        "--dry-run",
+                    ],
+                ),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(stderr),
+            ):
+                result = collector.main()
+
+            self.assertEqual(result, 2)
+            self.assertIn("corpus JSONL row 1 is malformed", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+            self.assertFalse(output.exists())
+
     def test_resume_rejects_malformed_output_instead_of_resending(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)

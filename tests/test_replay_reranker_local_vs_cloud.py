@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import importlib
+import io
 import math
 import sys
+import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -45,6 +48,55 @@ class RankingMetricTests(unittest.TestCase):
                 1,
             )
         self.assertEqual(response.read_limit, replay.MAX_LOCAL_RESPONSE_BYTES + 1)
+
+    def test_malformed_input_jsonl_exits_cleanly_with_line_context(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            corpus = root / "corpus.jsonl"
+            baseline = root / "baseline.jsonl"
+            output = root / "replay.jsonl"
+            valid_corpus = '{"query_id":"q1"}\n'
+            valid_baseline = '{}\n'
+
+            for malformed_flag in ("--corpus", "--baseline"):
+                with self.subTest(malformed_flag=malformed_flag):
+                    corpus.write_text(
+                        '{"query_id":\n' if malformed_flag == "--corpus" else valid_corpus,
+                        encoding="utf-8",
+                    )
+                    baseline.write_text(
+                        '{"response":\n'
+                        if malformed_flag == "--baseline"
+                        else valid_baseline,
+                        encoding="utf-8",
+                    )
+                    stderr = io.StringIO()
+                    with (
+                        patch.object(
+                            sys,
+                            "argv",
+                            [
+                                "replay_reranker_local_vs_cloud.py",
+                                "--corpus",
+                                str(corpus),
+                                "--baseline",
+                                str(baseline),
+                                "--local-url",
+                                "http://127.0.0.1:18013",
+                                "--output",
+                                str(output),
+                            ],
+                        ),
+                        patch.object(replay, "call_local") as local_call,
+                        redirect_stdout(io.StringIO()),
+                        redirect_stderr(stderr),
+                    ):
+                        result = replay.main()
+
+                    self.assertEqual(result, 2)
+                    self.assertIn("JSONL row 1 is malformed", stderr.getvalue())
+                    self.assertNotIn("Traceback", stderr.getvalue())
+                    local_call.assert_not_called()
 
     def test_top1_compares_top_ranked_document_indices(self) -> None:
         self.assertTrue(replay.top1_agreement((0.0, 3.0, 2.0), (2.0, 3.0, 0.0)))

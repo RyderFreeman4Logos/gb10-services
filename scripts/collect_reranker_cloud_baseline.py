@@ -69,15 +69,27 @@ class ResumeState:
 def load_corpus(path: Path) -> list[dict[str, Any]]:
     groups: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as handle:
-        for line in handle:
+        for line_number, line in enumerate(handle, 1):
             line = line.strip()
             if not line:
                 continue
-            record = json.loads(line)
+            try:
+                record = json.loads(
+                    line,
+                    parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+                )
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise CollectionStateError(
+                    f"corpus JSONL row {line_number} is malformed"
+                ) from exc
             if not isinstance(record, dict):
-                raise ValueError("corpus line is not a JSON object")
+                raise CollectionStateError(
+                    f"corpus JSONL row {line_number} is not an object"
+                )
             if "query" not in record or "candidates" not in record:
-                raise ValueError("corpus record missing query/candidates")
+                raise CollectionStateError(
+                    f"corpus JSONL row {line_number} is missing query/candidates"
+                )
             groups.append(record)
     return groups
 
