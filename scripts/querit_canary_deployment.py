@@ -28,6 +28,16 @@ from typing import Protocol
 import querit_canary_runtime as runtime
 import querit_vllm_artifact as artifact
 
+__all__ = [
+    "Deployment",
+    "DeploymentError",
+    "ProfileError",
+    "candidate_budget_kib_for_utilization",
+    "main",
+    "validate_admission",
+    "validate_backend_unit",
+]
+
 
 BUNDLE_SCHEMA = "gb10-querit-canary-bundle-v1"
 PLAN_SCHEMA = "gb10-querit-canary-plan-v1"
@@ -1469,6 +1479,7 @@ class Deployment:
         )
         record: dict[str, object] = {
             "bundle": str(bundle.expanduser().resolve(strict=True)),
+            "lifecycle_deactivation_intent": False,
             "lifecycle_deactivated": False,
             "runtime_mask_ownership": {
                 "accepted_prestate": accepted_runtime_masks,
@@ -1487,13 +1498,14 @@ class Deployment:
             owned = ownership["owned_units"]
             assert isinstance(owned, list)
             for unit in CANDIDATE_UNITS:
+                owned.append(unit)
+                self._write(record)
                 self.host.runtime_mask(unit)
                 if (
                     self.host.unit_info(unit).get("UnitFileState") != "masked-runtime"
                     or self.host.runtime_mask_attestation(unit) is None
                 ):
                     raise DeploymentError(f"owner runtime mask was not created: {unit}")
-                owned.append(unit)
                 self._write(record)
         record["phase"] = "prepared"
         self._write(record)
@@ -1515,6 +1527,7 @@ class Deployment:
         _copy_private_tree(source_snapshot, stage)
         record["artifact_work"] = str(work_root)
         record["artifact_stage"] = str(stage)
+        record["conversion_intent"] = str(stage)
         self._write(record)
         bundle_root = Path(str(record["bundle"]))
         self.host.convert(
@@ -1522,6 +1535,9 @@ class Deployment:
             stage,
             bundle_root / "payload" / "config" / "querit" / "querit-rerank.jinja",
         )
+        record["conversion_complete"] = True
+        record.pop("conversion_intent", None)
+        self._write(record)
         try:
             new_manifest = artifact.manifest_sha256(stage)
         except artifact.ArtifactError as exc:
@@ -1544,7 +1560,7 @@ class Deployment:
             "new_manifest_sha256": new_manifest,
             "previous_backup": str(backup) if backup is not None else None,
             "rename_started": False,
-            "state": "rename-intent",
+            "state": "previous-move-intent",
         }
         self._write(record)
         _assert_artifact_prestate(self.artifact_path, previous)
@@ -1560,6 +1576,8 @@ class Deployment:
             _fsync_directory(self.artifact_path.parent)
         record["artifact_publication"]["state"] = "previous-moved"  # type: ignore[index]
         self._write(record)
+        record["artifact_publication"]["state"] = "publish-intent"  # type: ignore[index]
+        self._write(record)
         os.replace(stage, self.artifact_path)
         _fsync_directory(self.artifact_path.parent)
         record["artifact_publication"]["state"] = "published"  # type: ignore[index]
@@ -1570,17 +1588,35 @@ class Deployment:
     def _install_files(self, record: dict[str, object], manifest: Mapping[str, object]) -> None:
         bundle = Path(str(record["bundle"]))
         record["files_install_started"] = True
+        record["file_installation"] = {"installed_targets": [], "pending_target": None}
         self._write(record)
+        installation = record["file_installation"]
+        assert isinstance(installation, dict)
+        installed_targets = installation["installed_targets"]
+        assert isinstance(installed_targets, list)
         for entry in manifest["files"]:  # type: ignore[index]
             assert isinstance(entry, dict)
             source = bundle / "payload" / str(entry["path"])
             target = Path(str(entry["target"]))
+            installation["pending_target"] = str(target)
+            self._write(record)
             _copy_file(source, target, mode=int(entry["mode"]))
+            installed_targets.append(str(target))
+            installation["pending_target"] = None
+            self._write(record)
         record["files_installed"] = True
         self._write(record)
+        record["daemon_reload_intent"] = "after-file-install"
+        self._write(record)
         self.host.daemon_reload()
+        record.pop("daemon_reload_intent", None)
+        self._write(record)
         self._remove_owned_runtime_masks(record)
+        record["daemon_reload_intent"] = "after-runtime-mask-removal"
+        self._write(record)
         self.host.daemon_reload()
+        record.pop("daemon_reload_intent", None)
+        self._write(record)
         self._verify_installed(manifest)
 
     def _verify_installed(self, manifest: Mapping[str, object]) -> None:
@@ -1640,10 +1676,12 @@ class Deployment:
             if prestate.get("admission") != self.host.admission():
                 raise DeploymentError("memory/swap/PSI admission facts drifted before activation")
             record["lifecycle_started"] = True
+            record["lifecycle_activation_intent"] = True
             record["pause_text"] = pause_text
             self._write(record)
             self.host.lifecycle("activate", pause_text=pause_text)
             record["lifecycle_active"] = True
+            record["lifecycle_activation_intent"] = False
             record["phase"] = "active"
             self._write(record)
             _atomic_write(
@@ -1664,7 +1702,9 @@ class Deployment:
         state = publication.get("state")
         if state not in {
             "rename-intent",
+            "previous-move-intent",
             "previous-moved",
+            "publish-intent",
             "published",
             "rollback-old-restoring",
         }:
@@ -1744,9 +1784,19 @@ class Deployment:
                 raise DeploymentError("artifact rollback target is unexpectedly occupied")
             assert backup is not None
             _same_artifact_filesystem(backup, self.artifact_path.parent)
+            publication["state"] = "rollback-old-restoring"
+            self._write(record)
             os.replace(backup, self.artifact_path)
             _fsync_directory(self.artifact_path.parent)
             mark_restored()
+
+        def target_matches_publication() -> bool:
+            expected = publication.get("new_manifest_sha256")
+            return (
+                _path_lexists(self.artifact_path)
+                and isinstance(expected, str)
+                and artifact.manifest_sha256(self.artifact_path) == expected
+            )
 
         if record.get("artifact_restored"):
             if not _artifact_prestate_matches(self.artifact_path, previous) or (
@@ -1758,7 +1808,7 @@ class Deployment:
         target_matches_prestate = _artifact_prestate_matches(self.artifact_path, previous)
         target_exists = _path_lexists(self.artifact_path)
         backup_exists = backup is not None and _path_lexists(backup)
-        if state == "rename-intent":
+        if state in {"rename-intent", "previous-move-intent"}:
             if not previous_exists:
                 if target_matches_prestate and not backup_exists:
                     mark_restored()
@@ -1774,7 +1824,7 @@ class Deployment:
                 restore_backup()
                 return
             raise DeploymentError("artifact rename intent recovery is ambiguous")
-        if state == "previous-moved" or state == "rollback-old-restoring":
+        if state == "rollback-old-restoring":
             if target_matches_prestate and not backup_exists:
                 mark_restored()
                 return
@@ -1782,6 +1832,27 @@ class Deployment:
                 restore_backup()
                 return
             raise DeploymentError("artifact rollback recovery is ambiguous")
+        if state in {"previous-moved", "publish-intent"}:
+            if target_matches_prestate and not backup_exists:
+                mark_restored()
+                return
+            if not target_exists:
+                if previous_exists and backup_matches_prestate():
+                    restore_backup()
+                    return
+                if not previous_exists:
+                    mark_restored()
+                    return
+            if target_matches_publication() and (
+                backup_matches_prestate() if previous_exists else not backup_exists
+            ):
+                publication["state"] = "published"
+                self._write(record)
+                state = "published"
+            else:
+                raise DeploymentError("artifact publication recovery is ambiguous")
+        if state != "published":
+            raise DeploymentError("artifact publication state is invalid")
         if target_matches_prestate and not backup_exists:
             mark_restored()
             return
@@ -1845,7 +1916,7 @@ class Deployment:
         shutil.rmtree(work)
         _fsync_directory(work.parent)
 
-    def _restore_files(self, record: Mapping[str, object], manifest: Mapping[str, object]) -> None:
+    def _restore_files(self, record: dict[str, object], manifest: Mapping[str, object]) -> None:
         prestate = record.get("prestate")
         assert isinstance(prestate, dict)
         file_prestate = prestate.get("files")
@@ -1859,6 +1930,8 @@ class Deployment:
                 backup = snapshot.get("backup")
                 if not isinstance(backup, str):
                     raise DeploymentError("file backup is missing")
+                record["file_restore_pending"] = target_name
+                self._write(record)
                 _copy_file(Path(backup), target, mode=int(snapshot["mode"]))
             elif target.exists():
                 size, digest = _hash_file(target)
@@ -1869,12 +1942,17 @@ class Deployment:
                     stat.S_IMODE(target.stat().st_mode),
                 ) != (expected["size"], expected["sha256"], expected["mode"]):
                     raise DeploymentError(f"refusing to remove changed deployed file: {target}")
+                record["file_remove_pending"] = target_name
+                self._write(record)
                 target.unlink()
         for target_name, snapshot in file_prestate.items():
             if not isinstance(snapshot, dict) or not _same_snapshot(
                 snapshot, _snapshot_file(Path(target_name))
             ):
                 raise DeploymentError(f"file rollback did not restore {target_name}")
+        record.pop("file_restore_pending", None)
+        record.pop("file_remove_pending", None)
+        self._write(record)
 
     def _assert_candidate_absent(self) -> None:
         if self.host.listeners():
@@ -1978,9 +2056,10 @@ class Deployment:
             _runtime_mask_evidence(observed_mask, unit)
             if accepted and observed_mask != runtime_masks.get(unit):
                 raise DeploymentError(f"accepted runtime mask identity drifted: {unit}")
+            removed.append(unit)
+            self._write(record)
             self.host.runtime_unmask(unit)
             self._assert_runtime_mask_removed(unit)
-            removed.append(unit)
             self._write(record)
 
     def _restore_owned_runtime_masks(self, record: dict[str, object]) -> bool:
@@ -2009,10 +2088,19 @@ class Deployment:
                 _runtime_mask_evidence(expected_mask, unit)
                 if observed_mask == expected_mask:
                     continue
+                if (
+                    unit in restored
+                    and observed_mask is not None
+                    and _same_runtime_mask_layout(expected_mask, observed_mask, unit)
+                ):
+                    continue
                 if observed_mask is not None or not _quiescent_unmasked_unit_info(
                     observed_info, unit
                 ):
                     raise DeploymentError(f"candidate mask prestate drifted after owner restoration: {unit}")
+                if unit not in restored:
+                    restored.append(unit)
+                    self._write(record)
                 self.host.runtime_mask(unit)
                 restored_mask = self.host.runtime_mask_attestation(unit)
                 if (
@@ -2028,6 +2116,9 @@ class Deployment:
                         f"candidate mask prestate is invalid: owned runtime mask is absent: {unit}"
                     )
                 _runtime_mask_evidence(observed_mask, unit)
+                if unit not in restored:
+                    restored.append(unit)
+                    self._write(record)
                 self.host.runtime_unmask(unit)
                 self._assert_runtime_mask_removed(unit)
             changed = True
@@ -2069,6 +2160,22 @@ class Deployment:
                     f"candidate runtime mask did not return to its prestate: {unit}"
                 )
 
+    def _deactivate_lifecycle(self, record: dict[str, object]) -> None:
+        """Deactivate the candidate lifecycle with a durable pre-effect intent."""
+
+        if self.host.lifecycle_state_exists():
+            if record.get("lifecycle_deactivated"):
+                raise DeploymentError("lifecycle receipt reappeared after deactivation")
+            record["lifecycle_deactivation_intent"] = True
+            self._write(record)
+            self.host.lifecycle("deactivate", pause_text=False)
+        if record.get("lifecycle_deactivation_intent"):
+            if self.host.lifecycle_state_exists():
+                return
+            record["lifecycle_deactivated"] = True
+            record["lifecycle_deactivation_intent"] = False
+            self._write(record)
+
     def rollback(self) -> None:
         self.host.require_cgroup_v2()
         record = self._read()
@@ -2077,14 +2184,10 @@ class Deployment:
         self._write(record)
         errors: list[str] = []
         try:
-            if self.host.lifecycle_state_exists():
-                if record.get("lifecycle_deactivated"):
-                    raise DeploymentError("lifecycle receipt reappeared after deactivation")
-                self.host.lifecycle("deactivate", pause_text=False)
-                record["lifecycle_deactivated"] = True
-                self._write(record)
-            elif (
-                not record.get("lifecycle_deactivated")
+            self._deactivate_lifecycle(record)
+            if (
+                not self.host.lifecycle_state_exists()
+                and not record.get("lifecycle_deactivated")
                 and (record.get("lifecycle_active") or was_active)
             ):
                 raise DeploymentError("active lifecycle receipt is missing")
@@ -2095,7 +2198,11 @@ class Deployment:
             self._remove_private_artifact_work(record)
             self._restore_owned_runtime_masks(record)
             if record.get("files_install_started"):
+                record["daemon_reload_intent"] = "after-file-rollback"
+                self._write(record)
                 self.host.daemon_reload()
+                record.pop("daemon_reload_intent", None)
+                self._write(record)
             self._assert_candidate_absent()
             self._verify_restored_unit_prestate(record)
         except BaseException as exc:

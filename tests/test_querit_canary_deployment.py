@@ -840,6 +840,114 @@ class DeploymentTests(unittest.TestCase):
             ],
         )
 
+    def test_crash_after_runtime_mask_effect_recovers_from_persisted_ownership_intent(
+        self,
+    ) -> None:
+        real_mask = self.host.runtime_mask
+
+        def mask_then_die(unit: str) -> None:
+            real_mask(unit)
+            raise SystemExit("simulated process death after runtime mask")
+
+        with mock.patch.object(self.host, "runtime_mask", side_effect=mask_then_die):
+            with self.assertRaises(SystemExit):
+                self.owner.prepare(self.bundle)
+
+        record = self.owner._read()
+        ownership = record["runtime_mask_ownership"]
+        self.assertEqual(ownership["owned_units"], [runtime.BACKEND_UNIT])
+
+        self.owner.rollback()
+        self.assertFalse(self.state.exists())
+        self.assertEqual(self.host._masked, set())
+
+    def test_crash_after_artifact_publish_recovers_from_publish_intent(self) -> None:
+        original = self._write_unsealed_artifact()
+        owner = self._unsealed_artifact_owner()
+        owner.prepare(self.bundle)
+        record = owner._read()
+        real_replace = deployment.os.replace
+
+        def publish_then_die(source: str | Path, destination: str | Path) -> None:
+            real_replace(source, destination)
+            if Path(destination) == self.artifact:
+                raise SystemExit("simulated process death after artifact publication")
+
+        with mock.patch.object(deployment.os, "replace", side_effect=publish_then_die):
+            with self.assertRaises(SystemExit):
+                owner._publish_artifact(record, self.manifest, self.source_snapshot)
+
+        self.assertEqual(owner._read()["artifact_publication"]["state"], "publish-intent")
+
+        owner.rollback()
+        self.assertEqual(original.read_bytes(), b"unsealed weights")
+        self.assertFalse(self.state.exists())
+
+    def test_crash_after_runtime_mask_restoration_accepts_recreated_mask_layout(self) -> None:
+        self._set_exact_runtime_mask_prestate()
+        owner = self._runtime_mask_owner()
+        owner.prepare(self.bundle)
+        owner.install(self.source_snapshot)
+        real_mask = self.host.runtime_mask
+
+        def restore_then_die(unit: str) -> None:
+            real_mask(unit)
+            raise SystemExit("simulated process death after runtime mask restoration")
+
+        with mock.patch.object(self.host, "runtime_mask", side_effect=restore_then_die):
+            with self.assertRaises(SystemExit):
+                owner._restore_owned_runtime_masks(owner._read())
+
+        record = owner._read()
+        ownership = record["runtime_mask_ownership"]
+        self.assertEqual(ownership["restored_units"], [runtime.BACKEND_UNIT])
+
+        owner.rollback()
+        self.assertFalse(self.state.exists())
+        self._assert_exact_runtime_mask_prestate_restored()
+
+    def test_crash_after_file_install_recovers_from_per_file_intent(self) -> None:
+        self.owner.prepare(self.bundle)
+        record = self.owner._read()
+        real_copy = deployment._copy_file
+
+        def copy_then_die(source: Path, destination: Path, *, mode: int) -> None:
+            real_copy(source, destination, mode=mode)
+            raise SystemExit("simulated process death after file installation")
+
+        with mock.patch.object(deployment, "_copy_file", side_effect=copy_then_die):
+            with self.assertRaises(SystemExit):
+                self.owner._install_files(record, self.manifest)
+
+        installation = self.owner._read()["file_installation"]
+        self.assertEqual(installation["pending_target"], str(self.targets[0]["target"]))
+
+        self.owner.rollback()
+        self.assertFalse(self.state.exists())
+        self.assertFalse(Path(str(self.targets[0]["target"])).exists())
+
+    def test_crash_after_lifecycle_deactivation_recovers_from_intent(self) -> None:
+        self.owner.prepare(self.bundle)
+        self.owner.install(self.source_snapshot)
+        self.owner.activate(pause_text=False)
+        record = self.owner._read()
+        real_lifecycle = self.host.lifecycle
+
+        def deactivate_then_die(action: str, *, pause_text: bool) -> None:
+            real_lifecycle(action, pause_text=pause_text)
+            if action == "deactivate":
+                raise SystemExit("simulated process death after lifecycle deactivation")
+
+        with mock.patch.object(self.host, "lifecycle", side_effect=deactivate_then_die):
+            with self.assertRaises(SystemExit):
+                self.owner._deactivate_lifecycle(record)
+
+        self.assertTrue(self.owner._read()["lifecycle_deactivation_intent"])
+        self.assertFalse(self.host.lifecycle_state_exists())
+
+        self.owner.rollback()
+        self.assertFalse(self.state.exists())
+
     def test_rollback_refuses_a_foreign_mask_after_owner_unmasked_its_own(self) -> None:
         self.owner.prepare(self.bundle)
         self.owner.install(self.source_snapshot)
