@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import json
 import os
 import pwd
+import re
 import signal
 import subprocess
 import sys
@@ -21,6 +23,31 @@ from embedding_activation_fixtures import (  # noqa: E402
     UNIT,
     ActivationFixture,
 )
+
+
+def _literal_string_map(path: Path, name: str) -> dict[str, str]:
+    tree = ast.parse(path.read_text(), filename=str(path))
+    value: object | None = None
+    for node in tree.body:
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == name
+            and node.value is not None
+        ):
+            value = ast.literal_eval(node.value)
+            break
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name for target in node.targets
+        ):
+            value = ast.literal_eval(node.value)
+            break
+    if not isinstance(value, dict) or any(
+        not isinstance(key, str) or not isinstance(item, str)
+        for key, item in value.items()
+    ):
+        raise AssertionError(f"missing literal string-map authority {name} in {path}")
+    return value
 
 
 class EmbeddingActivationTransactionTests(unittest.TestCase):
@@ -619,6 +646,37 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
         self.assertNotIn("os.environ.get", production)
         self.assertNotIn("os.getenv", production)
         self.assertNotIn("assert ", production)
+
+    def test_all_production_activation_authority_hashes_match_fixed_sources(self) -> None:
+        scripts = ACTIVATION_ENGINE.parent
+        launcher_match = re.search(
+            r'^expected_engine_sha256="([0-9a-f]{64})"$',
+            ACTIVATOR.read_text(),
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(launcher_match, "launcher engine authority is missing")
+        assert launcher_match is not None
+
+        engine_imports = _literal_string_map(
+            ACTIVATION_ENGINE, "EXPECTED_IMPORT_AUTHORITY"
+        )
+        storage = scripts / "gb10_embedding_activation_storage.py"
+        verifier_authorities = _literal_string_map(storage, "EXPECTED_VERIFIER_AUTHORITY")
+        no_swap_authorities = _literal_string_map(storage, "EXPECTED_NO_SWAP_SHA256")
+        self.assertIsInstance(engine_imports, dict)
+        self.assertIsInstance(verifier_authorities, dict)
+        self.assertEqual(set(no_swap_authorities), {"core", "wrapper"})
+
+        authorities = {
+            ACTIVATION_ENGINE: launcher_match.group(1),
+            **{scripts / name: digest for name, digest in engine_imports.items()},
+            **{scripts / name: digest for name, digest in verifier_authorities.items()},
+            scripts / "gb10_verify_vllm_no_swap_core.py": no_swap_authorities["core"],
+            scripts / "gb10_verify_vllm_no_swap.sh": no_swap_authorities["wrapper"],
+        }
+        for path, expected in authorities.items():
+            with self.subTest(authority=str(path)):
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), expected)
 
     def test_wrapper_rejects_engine_substitution_before_python_executes_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
