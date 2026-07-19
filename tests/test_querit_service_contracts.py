@@ -33,8 +33,8 @@ def _live_receipt() -> dict[str, Any]:
 
 
 _RECEIPT = _live_receipt()
-# Source-selected AEON text image digest (v0.25.1, 2026-07-16). Live receipt still records the
-# 15 GiB KV capacity proof from the prior v0.24 run; KV budget stays 15360 MiB.
+# Source-selected AEON text image digest (v0.25.1, 2026-07-16). The receipt is
+# retained as historical 15 GiB KV capacity evidence, not the AUTO-KV source profile.
 IMAGE_DIGEST = (
     "sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d"
 )
@@ -47,11 +47,6 @@ SHORT_GENERATION_REQUEST_TOKENS = 8_192
 # AEON DFlash GB10 ceiling (author guidance + freeze mitigation).
 AEON_MAX_NUM_SEQS = 16
 AEON_CONTEXT_TOKENS = _RECEIPT["aeon_container"]["effective_contract"]["max_model_len"]
-AEON_KV_BUDGET_MIB = _RECEIPT["aeon_container"]["effective_contract"]["kv_cache_memory_mib"]
-MAX_AEON_KV_MIB_WITH_CURRENT_HEADROOM_EVIDENCE = AEON_KV_BUDGET_MIB
-VERIFIED_15_GIB_KV_CAPACITY_TOKENS = _RECEIPT["startup"]["kv_capacity_tokens"]
-OBSERVED_FRESH_MEM_AVAILABLE_KIB = _RECEIPT["planning_inputs"]["pre_activation_mem_available_kib"]
-OBSERVED_TEXT_GROWTH_MIB = _RECEIPT["planning_inputs"]["previously_observed_text_growth_mib"]
 
 
 def _aeon_contract(unit: str) -> dict[str, int | float]:

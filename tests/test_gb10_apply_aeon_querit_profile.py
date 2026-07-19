@@ -1,17 +1,47 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
+import shlex
 import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
+from test_embedding_service_contracts import _logical_directive_argv, _option_values
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOYER = ROOT / "scripts" / "gb10_apply_aeon_querit_profile.sh"
+AEON_UNIT = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
+GIB = 1024 * 1024 * 1024
+
+
+def _canonical_aeon_docker_profile() -> tuple[list[str], int, int]:
+    exec_starts = _logical_directive_argv(AEON_UNIT.read_text(), "ExecStart")
+    if len(exec_starts) != 1:
+        raise AssertionError(f"expected one AEON ExecStart, found {len(exec_starts)}")
+    argv = exec_starts[0]
+    if argv[:2] != ["/usr/bin/docker", "run"]:
+        raise AssertionError("AEON unit must use the canonical docker run command")
+    try:
+        image_index = next(
+            index
+            for index, token in enumerate(argv)
+            if token.startswith("ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:")
+        )
+    except StopIteration as error:
+        raise AssertionError("AEON unit has no immutable AEON image") from error
+    host_argv = argv[2:image_index]
+    command = argv[image_index + 1 :]
+    memory = _option_values(host_argv, "--memory")[0]
+    memory_swap = _option_values(host_argv, "--memory-swap")[0]
+    if not memory.endswith("g") or not memory_swap.endswith("g"):
+        raise AssertionError("AEON Docker memory values must use GiB units")
+    return command, int(memory[:-1]) * GIB, int(memory_swap[:-1]) * GIB
 
 
 class QueritDeployerContractTests(unittest.TestCase):
@@ -26,13 +56,33 @@ class QueritDeployerContractTests(unittest.TestCase):
         docker_mode: str = "ok",
         cgroup_version: str = "2",
         no_swap_fail_at: int = 0,
+        aeon_command: list[str] | None = None,
+        aeon_memory_bytes: int | None = None,
+        aeon_memory_swap_bytes: int | None = None,
     ) -> tuple[dict[str, str], Path, Path, Path]:
         fake_bin = tmp / "bin"
         fake_bin.mkdir()
         calls = tmp / "calls"
         rerank_active = tmp / "rerank-active"
+        rerank_enabled = tmp / "rerank-enabled"
+        fallback_enabled = tmp / "fallback-enabled"
+        fallback_enabled.touch()
         signal_marker = tmp / "guard-score-entered"
         docker_marker = tmp / "docker-entered"
+        canonical_command, canonical_memory, canonical_memory_swap = (
+            _canonical_aeon_docker_profile()
+        )
+        aeon_command = canonical_command if aeon_command is None else aeon_command
+        aeon_memory_bytes = (
+            canonical_memory if aeon_memory_bytes is None else aeon_memory_bytes
+        )
+        aeon_memory_swap_bytes = (
+            canonical_memory_swap
+            if aeon_memory_swap_bytes is None
+            else aeon_memory_swap_bytes
+        )
+        command_json = tmp / "aeon-command.json"
+        command_json.write_text(json.dumps(aeon_command))
 
         systemctl = fake_bin / "systemctl"
         systemctl.write_text(
@@ -40,8 +90,8 @@ class QueritDeployerContractTests(unittest.TestCase):
             f'printf \'systemctl %s\\n\' "$*" >> {calls}\n'
             'if [[ "$*" == *"show"* ]]; then echo loaded; exit 0; fi\n'
             'if [[ "$*" == *"is-enabled"* ]]; then\n'
-            '  [[ "$*" == *"vllm-querit-4b-reranker.service"* ]] && { echo disabled; exit 1; }\n'
-            '  [[ "$*" == *"vllm-qwen3-reranker-8b.service"* ]] && { echo enabled; exit 0; }\n'
+            f'  [[ "$*" == *"vllm-querit-4b-reranker.service"* ]] && {{ [[ -f {rerank_enabled} ]] && {{ echo enabled; exit 0; }} || {{ echo disabled; exit 1; }}; }}\n'
+            f'  [[ "$*" == *"vllm-qwen3-reranker-8b.service"* ]] && {{ [[ -f {fallback_enabled} ]] && {{ echo enabled; exit 0; }} || {{ echo disabled; exit 1; }}; }}\n'
             '  [[ "$*" == *"vllm-querit-4b-canary"* ]] && { echo disabled; exit 1; }\n'
             "fi\n"
             'if [[ "$*" == *"is-active"* ]]; then\n'
@@ -52,8 +102,20 @@ class QueritDeployerContractTests(unittest.TestCase):
             'if [[ "$*" == *"start vllm-querit-4b-reranker.service"* ]]; then\n'
             f'  : > {rerank_active}\n'
             "fi\n"
+            'if [[ "$*" == *"enable vllm-querit-4b-reranker.service"* ]]; then\n'
+            f'  : > {rerank_enabled}\n'
+            "fi\n"
             'if [[ "$*" == *"stop vllm-querit-4b-reranker.service"* ]]; then\n'
             f'  rm -f {rerank_active}\n'
+            "fi\n"
+            'if [[ "$*" == *"disable vllm-querit-4b-reranker.service"* ]]; then\n'
+            f'  rm -f {rerank_enabled}\n'
+            "fi\n"
+            'if [[ "$*" == *"enable vllm-qwen3-reranker-8b.service"* ]]; then\n'
+            f'  : > {fallback_enabled}\n'
+            "fi\n"
+            'if [[ "$*" == *"disable vllm-qwen3-reranker-8b.service"* ]]; then\n'
+            f'  rm -f {fallback_enabled}\n'
             "fi\n"
             "exit 0\n"
         )
@@ -71,9 +133,13 @@ class QueritDeployerContractTests(unittest.TestCase):
             f"  : > {docker_marker}\n"
             "  /bin/sleep 30\n"
             "fi\n"
-            'if [[ "$*" == *"Config.Cmd"* ]]; then '
-            'echo \'["--kv-cache-memory-bytes","15360M"]\'; '
-            "else echo 74088185856; fi\n"
+            'if [[ "$*" == *"Config.Cmd"* ]]; then\n'
+            f"  cat {shlex.quote(str(command_json))}\n"
+            'elif [[ "$*" == *"HostConfig.MemorySwap"* ]]; then\n'
+            f"  echo {aeon_memory_swap_bytes}\n"
+            "else\n"
+            f"  echo {aeon_memory_bytes}\n"
+            "fi\n"
         )
         docker.chmod(0o755)
 
@@ -133,16 +199,89 @@ class QueritDeployerContractTests(unittest.TestCase):
         }
         return env, calls, signal_marker, docker_marker
 
-    def test_matches_committed_production_aeon_profile(self) -> None:
-        self.assertIn(
-            "EXPECTED_AEON_MEMORY_GIB=${GB10_EXPECTED_AEON_MEMORY_GIB:-69}",
-            self.source,
-        )
-        self.assertIn(
-            "EXPECTED_AEON_KV_MIB=${GB10_EXPECTED_AEON_KV_MIB:-15360}",
-            self.source,
-        )
-        self.assertNotIn("EXPECTED_AEON_MEMORY_GIB:-64", self.source)
+    def test_validates_the_canonical_aeon_profile_before_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            env, calls, _, _ = self._make_fake_stack(
+                Path(raw_tmp), guard_mode="ok"
+            )
+            result = subprocess.run(
+                ["bash", str(DEPLOYER)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("DEPLOY_SUCCESS", result.stdout)
+            recorded = calls.read_text().splitlines()
+            aeon_no_swap = (
+                "no-swap --test-only --unit "
+                "/home/obj/.config/systemd/user/vllm-aeon-27b-dflash.service "
+                "--container vllm-aeon-27b-dflash-n12"
+            )
+            self.assertGreaterEqual(recorded.count(aeon_no_swap), 2, recorded)
+
+    def test_rejects_stale_or_noncanonical_aeon_profiles_before_mutation(self) -> None:
+        command, memory_bytes, memory_swap_bytes = _canonical_aeon_docker_profile()
+        utilization_index = command.index("--gpu-memory-utilization")
+        wrong_utilization = [*command]
+        wrong_utilization[utilization_index + 1] = "0.354"
+        profiles = {
+            "explicit KV pin": (
+                [*command, "--kv-cache-memory-bytes", "15360M"],
+                memory_bytes,
+                memory_swap_bytes,
+                "AEON_KV_PINNED",
+            ),
+            "wrong GPU utilization": (
+                wrong_utilization,
+                memory_bytes,
+                memory_swap_bytes,
+                "AEON_GPU_UTILIZATION_MISMATCH",
+            ),
+            "old 69g memory ceiling": (
+                command,
+                69 * GIB,
+                69 * GIB,
+                "AEON_MEMORY_MISMATCH",
+            ),
+            "old 69g memory swap ceiling": (
+                command,
+                memory_bytes,
+                69 * GIB,
+                "AEON_MEMORY_SWAP_MISMATCH",
+            ),
+        }
+        for label, (
+            candidate_command,
+            candidate_memory,
+            candidate_memory_swap,
+            expected_error,
+        ) in profiles.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw_tmp:
+                env, calls, _, _ = self._make_fake_stack(
+                    Path(raw_tmp),
+                    guard_mode="ok",
+                    aeon_command=candidate_command,
+                    aeon_memory_bytes=candidate_memory,
+                    aeon_memory_swap_bytes=candidate_memory_swap,
+                )
+                result = subprocess.run(
+                    ["bash", str(DEPLOYER)],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+                self.assertNotIn("PHASE switch_reranker", result.stdout)
+                self.assertNotIn(
+                    "systemctl --user stop vllm-querit-4b-canary.service",
+                    calls.read_text().splitlines(),
+                )
 
     def test_preserves_text_and_never_uses_systemctl_restart(self) -> None:
         self.assertNotIn("--restart-aeon", self.source)

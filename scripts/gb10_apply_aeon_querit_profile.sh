@@ -31,8 +31,10 @@ fi
 AEON_URL="${GB10_AEON_URL:-http://100.105.4.92:18010}"
 RERANK_URL="${GB10_RERANK_URL:-http://100.105.4.92:18013}"
 GUARD_SCORE_URL="${GB10_GUARD_SCORE_URL:-http://100.105.4.92:18003/v1/score}"
-EXPECTED_AEON_KV_MIB=${GB10_EXPECTED_AEON_KV_MIB:-15360}
-EXPECTED_AEON_MEMORY_GIB=${GB10_EXPECTED_AEON_MEMORY_GIB:-69}
+# Keep this owner aligned with the committed AEON unit: AUTO KV sizing must
+# remain enabled so the patched UMA headroom guard can size the pool.
+EXPECTED_AEON_GPU_MEMORY_UTILIZATION=0.355
+EXPECTED_AEON_MEMORY_BYTES=$((128 * 1024 * 1024 * 1024))
 MIN_AVAILABLE_GIB=${GB10_MIN_AVAILABLE_GIB:-4}
 AEON_READY_ATTEMPTS=${GB10_AEON_READY_ATTEMPTS:-120}
 RERANK_READY_ATTEMPTS=${GB10_RERANK_READY_ATTEMPTS:-180}
@@ -40,8 +42,6 @@ SYSTEMCTL_TIMEOUT_SECONDS=${GB10_SYSTEMCTL_TIMEOUT_SECONDS:-120}
 SYSTEMCTL_START_TIMEOUT_SECONDS=${GB10_SYSTEMCTL_START_TIMEOUT_SECONDS:-1900}
 DOCKER_TIMEOUT_SECONDS=${GB10_DOCKER_TIMEOUT_SECONDS:-15}
 for value in \
-    "$EXPECTED_AEON_KV_MIB" \
-    "$EXPECTED_AEON_MEMORY_GIB" \
     "$MIN_AVAILABLE_GIB" \
     "$AEON_READY_ATTEMPTS" \
     "$RERANK_READY_ATTEMPTS" \
@@ -49,7 +49,7 @@ for value in \
     "$SYSTEMCTL_START_TIMEOUT_SECONDS" \
     "$DOCKER_TIMEOUT_SECONDS"; do
     if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
-        echo "profile and timeout values must be positive integers: $value" >&2
+        echo "headroom and timeout values must be positive integers: $value" >&2
         exit 2
     fi
 done
@@ -317,22 +317,82 @@ wait_for_url() {
 }
 
 verify_aeon_profile() {
-    local command_json memory_limit expected_memory_limit
+    local command_json memory_limit memory_swap_limit
     if ! command_json="$(run_docker inspect "$AEON_CONTAINER" --format '{{json .Config.Cmd}}')"; then
         echo "AEON_INSPECT_FAILED field=command" >&2
         return 44
     fi
-    if [[ "$command_json" != *"--kv-cache-memory-bytes\",\"${EXPECTED_AEON_KV_MIB}M"* ]]; then
-        echo "AEON_KV_MISMATCH expected_mib=$EXPECTED_AEON_KV_MIB" >&2
+    if ! /usr/bin/python3 - "$command_json" "$EXPECTED_AEON_GPU_MEMORY_UTILIZATION" <<'PY'
+import json
+import sys
+
+
+command_json, expected_utilization = sys.argv[1:]
+try:
+    command = json.loads(command_json)
+except json.JSONDecodeError as error:
+    print(f"AEON_COMMAND_MALFORMED error={error.msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+if not isinstance(command, list) or not all(isinstance(token, str) for token in command):
+    print("AEON_COMMAND_MALFORMED expected_json_string_array", file=sys.stderr)
+    raise SystemExit(1)
+
+if any(
+    token == "--kv-cache-memory-bytes"
+    or token.startswith("--kv-cache-memory-bytes=")
+    for token in command
+):
+    print("AEON_KV_PINNED expected_auto_sizing", file=sys.stderr)
+    raise SystemExit(1)
+
+utilization_indices = [
+    index
+    for index, token in enumerate(command)
+    if token == "--gpu-memory-utilization"
+]
+if len(utilization_indices) != 1:
+    print(
+        "AEON_GPU_UTILIZATION_MISMATCH "
+        f"expected={expected_utilization} count={len(utilization_indices)}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+utilization_index = utilization_indices[0]
+if utilization_index + 1 >= len(command):
+    print(
+        f"AEON_GPU_UTILIZATION_MISMATCH expected={expected_utilization} missing_value",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+if command[utilization_index + 1] != expected_utilization:
+    print(
+        "AEON_GPU_UTILIZATION_MISMATCH "
+        f"expected={expected_utilization} actual={command[utilization_index + 1]}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+    then
         return 44
     fi
     if ! memory_limit="$(run_docker inspect "$AEON_CONTAINER" --format '{{.HostConfig.Memory}}')"; then
         echo "AEON_INSPECT_FAILED field=memory" >&2
         return 44
     fi
-    expected_memory_limit=$((EXPECTED_AEON_MEMORY_GIB * 1024 * 1024 * 1024))
-    if (( memory_limit != expected_memory_limit )); then
-        echo "AEON_MEMORY_MISMATCH actual=$memory_limit expected=$expected_memory_limit" >&2
+    if [[ ! "$memory_limit" =~ ^[0-9]+$ ]] \
+        || (( 10#$memory_limit != EXPECTED_AEON_MEMORY_BYTES )); then
+        echo "AEON_MEMORY_MISMATCH actual=$memory_limit expected=$EXPECTED_AEON_MEMORY_BYTES" >&2
+        return 44
+    fi
+    if ! memory_swap_limit="$(run_docker inspect "$AEON_CONTAINER" --format '{{.HostConfig.MemorySwap}}')"; then
+        echo "AEON_INSPECT_FAILED field=memory_swap" >&2
+        return 44
+    fi
+    if [[ ! "$memory_swap_limit" =~ ^[0-9]+$ ]] \
+        || (( 10#$memory_swap_limit != EXPECTED_AEON_MEMORY_BYTES )); then
+        echo "AEON_MEMORY_SWAP_MISMATCH actual=$memory_swap_limit expected=$EXPECTED_AEON_MEMORY_BYTES" >&2
         return 44
     fi
 }
