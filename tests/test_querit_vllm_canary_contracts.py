@@ -419,8 +419,7 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
             "stop then start",
             "No production cutover",
             "127.0.0.1:18015",
-            "100.105.4.92:18015",
-            "without a wildcard bind",
+            "loopback-only",
             "--gpu-memory-utilization 0.17",
             "32.595 GiB",
             "20 GiB reserve",
@@ -431,6 +430,7 @@ class QueritVllmCanaryContractTests(unittest.TestCase):
             "scripts/querit_replay_trust.py",
         ):
             self.assertIn(required, note)
+        self.assertNotIn("100.105.4.92:18015", note)
         self.assertNotIn("--gpu-memory-utilization 0.22", note)
 
 

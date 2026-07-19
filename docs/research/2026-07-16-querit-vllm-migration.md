@@ -83,11 +83,9 @@ This is an improvement, not a regression. The new contract should be named `quer
 ### DeepInfra wire compatibility adapter
 
 vLLM 0.25 exposes native `/v1/score`, but that endpoint is not the public
-DeepInfra contract. The raw backend retains its loopback publish at
-`127.0.0.1:18015` for the local adapter and additionally publishes the same
-container port at `100.105.4.92:18015` for direct Tailnet CodeSeek
-`/v1/rerank` access, without a wildcard bind. A separately tested adapter
-continues to own the DeepInfra-native canary port `100.105.4.92:18014` and
+DeepInfra contract. The raw backend is loopback-only at `127.0.0.1:18015` for
+the local adapter; it has no Tailnet or wildcard publication. A separately
+tested adapter owns the DeepInfra-native canary port `100.105.4.92:18014` and
 accepts only the version-pinned target
 `/v1/inference/Qwen/Qwen3-Reranker-8B?version=5fa94080caafeaa45a15d11f969d7978e087a3db`.
 It requires canonical equal-length `queries[]` and `documents[]`, sends the
@@ -191,7 +189,7 @@ parameters.
 1. Install the two tracked canary units, adapter, lifecycle modules, and two
    `gb10_querit_canary_*.py` entry points. Do not enable either unit.
 2. Run `gb10_querit_canary_lifecycle.py activate`. The activator alone may
-   start the dual-published raw vLLM backend and the DeepInfra-native adapter.
+   start the loopback-only raw vLLM backend and the DeepInfra-native adapter.
 3. Require the public DeepInfra probe, a native 32,768-token `/score` peak
    allocation, and a 16-pair chunked-prefill probe. Reject any unit/container/PID
    identity change, OOM event, or insufficient post-warm host headroom.
@@ -308,11 +306,10 @@ vllm serve /home/obj/models/querit-4b-vllm \
   --chat-template /home/obj/models/querit-4b-vllm/querit-rerank.jinja
 ```
 
-The tracked backend publishes container port 8000 exactly once to each of
-`127.0.0.1:18015` and `100.105.4.92:18015`, both targeting container port
-8000, without a wildcard bind. The loopback publish remains the adapter's
-backend path; the Tailnet publish is direct native `/v1/rerank` access. The
-adapter publishes the exact DeepInfra-native API only on Tailscale port 18014.
+The tracked backend publishes container port 8000 exactly once, to
+`127.0.0.1:18015`; it is loopback-only and has no direct Tailnet or wildcard
+bind. This loopback publish is the adapter's backend path. The adapter publishes
+the exact DeepInfra-native API only on Tailscale port 18014.
 Docker bounds the backend to 18 GiB memory and swap with swappiness 0; both
 systemd and the container use OOM score adjustment 500. The canary explicitly
 sets the model dtype, context, GPU utilization, KV allocation/dtype,

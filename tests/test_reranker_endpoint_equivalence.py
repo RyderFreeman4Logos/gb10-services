@@ -19,6 +19,7 @@ reranker = importlib.import_module("reranker_endpoint_equivalence")
 
 CORPUS = ROOT / "data" / "reranker-equivalence" / "miracl-reranking-en-zh-dev.jsonl"
 METADATA = ROOT / "data" / "reranker-equivalence" / "metadata.json"
+README = ROOT / "data" / "reranker-equivalence" / "README.md"
 
 SOURCE_SHA256 = {
     "en-corpus/dev-00000-of-00001.parquet": "cf0679ffc34fd67a14c68554b446618c353e7f0a8c3cb6ce1c31b14f9b765416",
@@ -379,6 +380,13 @@ class EndpointEvidenceCacheTests(unittest.TestCase):
 
 
 class OfflineMainTests(unittest.TestCase):
+    def test_readme_says_cache_only_reads_both_endpoint_caches_offline(self) -> None:
+        readme = README.read_text()
+        prose = " ".join(readme.split())
+        self.assertIn("loads both cloud and local responses from their evidence caches", prose)
+        self.assertIn("performs no DNS, socket, or endpoint operation", prose)
+        self.assertNotIn("allowing the configured local endpoint to be evaluated", readme)
+
     def test_cache_only_main_reads_both_caches_without_env_dns_socket_or_transport(
         self,
     ) -> None:
