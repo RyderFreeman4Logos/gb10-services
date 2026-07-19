@@ -60,6 +60,11 @@ def _backend_response(scores: list[float]) -> bytes:
 
 
 class QueritDeepinfraAdapterTests(unittest.TestCase):
+    def test_unpaired_surrogate_is_a_bounded_adapter_error(self) -> None:
+        body = b'{"documents":["\\ud800"],"queries":["q"]}'
+        with self.assertRaisesRegex(adapter.AdapterError, "unpaired surrogate"):
+            adapter.parse_public_request(body)
+
     def test_default_peak_request_memory_fits_adapter_unit_envelope(self) -> None:
         self.assertLessEqual(adapter.MAX_REQUEST_BYTES, 8 * 1024 * 1024)
         self.assertEqual(adapter.DEFAULT_MAX_CONCURRENCY, 1)

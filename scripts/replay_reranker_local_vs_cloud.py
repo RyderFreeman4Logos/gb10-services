@@ -85,9 +85,30 @@ def load_corpus_index(path: Path) -> dict[str, dict[str, Any]]:
     index: dict[str, dict[str, Any]] = {}
     for group in load_jsonl(path):
         qid = group.get("query_id")
-        if qid:
-            index[qid] = group
+        if not isinstance(qid, str) or not qid:
+            raise ReplayInputError("corpus query_id must be non-empty text")
+        if qid in index:
+            raise ReplayInputError("corpus contains duplicate query_id")
+        index[qid] = group
     return index
+
+
+def prepare_group(group: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[str]]:
+    query = group.get("query")
+    candidates = group.get("candidates")
+    if not isinstance(query, str) or not query:
+        raise ReplayInputError("corpus query must be non-empty text")
+    if not isinstance(candidates, list) or not candidates:
+        raise ReplayInputError("corpus candidates must be a non-empty array")
+    documents: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise ReplayInputError("corpus candidate must be an object")
+        document = candidate.get("document")
+        if not isinstance(document, str) or not document:
+            raise ReplayInputError("corpus candidate document must be non-empty text")
+        documents.append(document)
+    return query, candidates, documents
 
 
 def normalize_vllm_score(body: dict[str, Any], expected: int) -> tuple[float, ...]:
@@ -252,51 +273,49 @@ def main() -> int:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     per_group_path = args.output.with_suffix(".groups.jsonl")
-    per_group_handle = per_group_path.open("w", encoding="utf-8")
+    per_group_path.write_text("", encoding="utf-8")
 
     for row in baseline_rows:
-        qid = row.get("query_id")
-        group = corpus_index.get(qid)
-        if not group:
-            failed += 1
-            continue
-        candidates = group["candidates"]
-        expected = len(candidates)
-        query = group["query"]
-        documents = [c["document"] for c in candidates]
-        if args.local_contract == "deepinfra":
-            request_body = {
-                "queries": [query] * expected,
-                "documents": documents,
-            }
-        else:
-            request_body = {
-                "model": args.local_model,
-                "text_1": [query] * expected,
-                "text_2": documents,
-            }
         try:
+            qid = row.get("query_id")
+            if not isinstance(qid, str) or not qid:
+                raise ReplayInputError("baseline query_id must be non-empty text")
+            group = corpus_index.get(qid)
+            if group is None:
+                raise ReplayInputError("baseline query_id is absent from corpus")
+            query, candidates, documents = prepare_group(group)
+            expected = len(candidates)
+            if args.local_contract == "deepinfra":
+                request_body = {
+                    "queries": [query] * expected,
+                    "documents": documents,
+                }
+            else:
+                request_body = {
+                    "model": args.local_model,
+                    "text_1": [query] * expected,
+                    "text_2": documents,
+                }
             status, body = call_local(
                 args.local_url, args.local_path, args.local_model, request_body, args.timeout
             )
+            if status != 200:
+                raise ReplayInputError(f"local endpoint returned HTTP {status}")
             local_scores = normalizer(body, expected)
             cloud_scores = extract_cloud_scores(row, expected)
+            relevance = [
+                int(candidate.get("relevance", 0)) for candidate in candidates
+            ]
+            sp = spearman(local_scores, cloud_scores)
+            t1 = top1_agreement(local_scores, cloud_scores)
+            t3 = top_k_overlap(local_scores, cloud_scores, 3)
+            t5 = top_k_overlap(local_scores, cloud_scores, 5)
+            l_ndcg = ndcg_at_k(local_scores, relevance, 10)
+            c_ndcg = ndcg_at_k(cloud_scores, relevance, 10)
         except Exception as exc:
             failed += 1
-            print(f"ERROR {qid}: {exc}", file=sys.stderr)
+            print(f"ERROR {row.get('query_id')}: {exc}", file=sys.stderr)
             continue
-
-        if status != 200:
-            failed += 1
-            continue
-
-        relevance = [int(c.get("relevance", 0)) for c in candidates]
-        sp = spearman(local_scores, cloud_scores)
-        t1 = top1_agreement(local_scores, cloud_scores)
-        t3 = top_k_overlap(local_scores, cloud_scores, 3)
-        t5 = top_k_overlap(local_scores, cloud_scores, 5)
-        l_ndcg = ndcg_at_k(local_scores, relevance, 10)
-        c_ndcg = ndcg_at_k(cloud_scores, relevance, 10)
 
         spearman_values.append(sp)
         top3_overlaps.append(t3)
@@ -318,13 +337,12 @@ def main() -> int:
             "local_ndcg10": round(l_ndcg, 6),
             "cloud_ndcg10": round(c_ndcg, 6),
         }
-        per_group_handle.write(canonical_json(per_group).decode("utf-8") + "\n")
-        per_group_handle.flush()
+        with per_group_path.open("a", encoding="utf-8") as per_group_handle:
+            per_group_handle.write(canonical_json(per_group).decode("utf-8") + "\n")
+            per_group_handle.flush()
 
         if args.rate_delay_seconds > 0:
             time.sleep(args.rate_delay_seconds)
-
-    per_group_handle.close()
 
     def mean(values: list[float]) -> float:
         return sum(values) / len(values) if values else float("nan")

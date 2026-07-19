@@ -107,6 +107,43 @@ def _run_main(
 
 
 class CloudCollectorSafetyTests(unittest.TestCase):
+    def test_structurally_invalid_corpus_rows_exit_cleanly_before_planning(self) -> None:
+        invalid_rows = (
+            {"query": "q", "candidates": None},
+            {"query": "q", "candidates": [{}]},
+            {"query": ["q"], "candidates": [{"document": "d"}]},
+            {"query": "q", "candidates": []},
+        )
+        for row in invalid_rows:
+            with self.subTest(row=row), tempfile.TemporaryDirectory() as raw_tmp:
+                root = Path(raw_tmp)
+                corpus = root / "corpus.jsonl"
+                output = root / "baseline.jsonl"
+                corpus.write_text(json.dumps(row) + "\n", encoding="utf-8")
+                stderr = io.StringIO()
+                with (
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "collect_reranker_cloud_baseline.py",
+                            "--corpus",
+                            str(corpus),
+                            "--output",
+                            str(output),
+                            "--dry-run",
+                        ],
+                    ),
+                    redirect_stdout(io.StringIO()),
+                    redirect_stderr(stderr),
+                ):
+                    result = collector.main()
+
+                self.assertEqual(result, 2)
+                self.assertIn("corpus JSONL row 1", stderr.getvalue())
+                self.assertNotIn("Traceback", stderr.getvalue())
+                self.assertFalse(output.exists())
+
     def test_cloud_response_body_is_read_with_a_hard_limit(self) -> None:
         response = _OversizedHTTPResponse()
         with (

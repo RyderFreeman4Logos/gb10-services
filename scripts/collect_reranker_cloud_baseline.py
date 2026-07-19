@@ -66,6 +66,18 @@ class ResumeState:
     terminal_failures: frozenset[str]
 
 
+def _corpus_text(value: object, label: str, line_number: int) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(0xD800 <= ord(character) <= 0xDFFF for character in value)
+    ):
+        raise CollectionStateError(
+            f"corpus JSONL row {line_number} has invalid {label}"
+        )
+    return value
+
+
 def load_corpus(path: Path) -> list[dict[str, Any]]:
     groups: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as handle:
@@ -90,6 +102,18 @@ def load_corpus(path: Path) -> list[dict[str, Any]]:
                 raise CollectionStateError(
                     f"corpus JSONL row {line_number} is missing query/candidates"
                 )
+            _corpus_text(record["query"], "query", line_number)
+            candidates = record["candidates"]
+            if not isinstance(candidates, list) or not candidates:
+                raise CollectionStateError(
+                    f"corpus JSONL row {line_number} has invalid candidates"
+                )
+            for candidate in candidates:
+                if not isinstance(candidate, dict) or "document" not in candidate:
+                    raise CollectionStateError(
+                        f"corpus JSONL row {line_number} has invalid candidate structure"
+                    )
+                _corpus_text(candidate["document"], "candidate document", line_number)
             groups.append(record)
     return groups
 
@@ -404,7 +428,14 @@ def main() -> int:
                     "output or request intent ledger already exists; use --resume"
                 )
             resume = ResumeState(frozenset(), 0, frozenset())
-    except (CollectionStateError, OSError, UnicodeError, ValueError) as exc:
+    except (
+        CollectionStateError,
+        KeyError,
+        OSError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 

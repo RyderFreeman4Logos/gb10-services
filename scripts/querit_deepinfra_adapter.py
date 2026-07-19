@@ -134,8 +134,6 @@ def parse_public_request(body: bytes) -> PublicRequest:
     allowed = required | {"instruction", "service_tier"}
     if not required.issubset(payload) or not set(payload).issubset(allowed):
         raise AdapterError("public request fields do not match the pinned schema")
-    if _json_bytes(payload) != body:
-        raise AdapterError("public request is not the canonical byte serialization")
     queries = payload["queries"]
     documents = payload["documents"]
     if (
@@ -154,6 +152,8 @@ def parse_public_request(body: bytes) -> PublicRequest:
         instruction = _text(instruction, "instruction")
     if service_tier is not None:
         service_tier = _text(service_tier, "service_tier")
+    if _json_bytes(payload) != body:
+        raise AdapterError("public request is not the canonical byte serialization")
     return PublicRequest(
         queries=parsed_queries,
         documents=parsed_documents,

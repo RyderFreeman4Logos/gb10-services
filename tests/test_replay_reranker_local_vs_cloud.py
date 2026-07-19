@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import io
+import json
 import math
 import sys
 import tempfile
@@ -34,6 +35,58 @@ class _OversizedHTTPResponse:
 
 
 class RankingMetricTests(unittest.TestCase):
+    def test_structurally_invalid_corpus_rows_fail_without_tracebacks_or_requests(self) -> None:
+        invalid_candidates = (None, [{}], [])
+        for candidates in invalid_candidates:
+            with (
+                self.subTest(candidates=candidates),
+                tempfile.TemporaryDirectory() as raw_tmp,
+            ):
+                root = Path(raw_tmp)
+                corpus = root / "corpus.jsonl"
+                baseline = root / "baseline.jsonl"
+                output = root / "replay.json"
+                corpus.write_text(
+                    json.dumps(
+                        {"query_id": "q1", "query": "q", "candidates": candidates}
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                baseline.write_text(
+                    json.dumps(
+                        {"query_id": "q1", "response": {"scores": [0.5]}}
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                stderr = io.StringIO()
+                with (
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "replay_reranker_local_vs_cloud.py",
+                            "--corpus",
+                            str(corpus),
+                            "--baseline",
+                            str(baseline),
+                            "--local-url",
+                            "http://127.0.0.1:18013",
+                            "--output",
+                            str(output),
+                        ],
+                    ),
+                    patch.object(replay, "call_local") as local_call,
+                    redirect_stdout(io.StringIO()),
+                    redirect_stderr(stderr),
+                ):
+                    result = replay.main()
+
+                self.assertNotEqual(result, 0)
+                self.assertNotIn("Traceback", stderr.getvalue())
+                local_call.assert_not_called()
+
     def test_local_response_body_is_read_with_a_hard_limit(self) -> None:
         response = _OversizedHTTPResponse()
         with (
