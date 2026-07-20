@@ -172,6 +172,13 @@ class QueritVllmProductionContractTests(unittest.TestCase):
             _logical_argv(unit, "ExecStartPost"),
             [
                 ["/home/obj/.local/bin/gb10_service_ready.sh", "rerank", "http://100.105.4.92:18013", "Querit/Querit-4B", "--deadline", "1800"],
+                NO_SWAP_PREFIX
+                + [
+                    "--unit",
+                    expected_unit,
+                    "--container",
+                    "querit-4b-vllm",
+                ],
             ],
         )
         self.assertIn("[Install]", unit)

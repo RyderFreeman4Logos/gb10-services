@@ -62,6 +62,7 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-vllm-cids/vllm-querit-4b-re
     --enforce-eager \
     --chat-template /home/obj/models/querit-4b-vllm/querit-rerank.jinja
 ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh rerank http://100.105.4.92:18013 Querit/Querit-4B --deadline 1800
+ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-querit-4b-reranker.service --container querit-4b-vllm
 ExecStop=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container querit-4b-vllm --cidfile %t/gb10-vllm-cids/vllm-querit-4b-reranker.cid
 ExecStopPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container querit-4b-vllm --cidfile %t/gb10-vllm-cids/vllm-querit-4b-reranker.cid
 

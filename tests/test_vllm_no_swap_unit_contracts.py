@@ -138,7 +138,20 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                     container,
                 ]
                 if name == "vllm-querit-4b-reranker.service":
-                    self.assertNotIn(generation_verifier, posts)
+                    self.assertEqual(
+                        posts,
+                        [
+                            [
+                                "/home/obj/.local/bin/gb10_service_ready.sh",
+                                "rerank",
+                                "http://100.105.4.92:18013",
+                                "Querit/Querit-4B",
+                                "--deadline",
+                                "1800",
+                            ],
+                            generation_verifier,
+                        ],
+                    )
                 else:
                     self.assertEqual(posts[0], generation_verifier)
                 cleanup = PRODUCTION_PREFIX + [
@@ -165,6 +178,13 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                             for argv in commands
                         )
                     )
+
+    def test_generation_verifier_does_not_query_type_simple_service_state(self) -> None:
+        source = VERIFIER_CORE.read_text()
+        self.assertNotIn('SYSTEMCTL_BIN, "--user", "is-active"', source)
+        self.assertNotIn('SYSTEMCTL_BIN, "is-active"', source)
+        self.assertEqual(source.count("SYSTEMCTL_BIN,"), 2)
+        self.assertIn('f"docker-{identifier}.scope",', source)
 
     def test_production_entry_is_ambient_environment_independent(self) -> None:
         for name in SERVICE_CONTRACTS:
