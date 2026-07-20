@@ -205,11 +205,13 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertIn("--memory 18g", unit)
         self.assertIn("--memory-swap 18g", unit)
         self.assertIn("--memory-swappiness 0", unit)
-        self.assertIn("--swap-space 0", unit)
+        self.assertNotIn("--swap-space", unit)
         self.assertIn("--max-num-batched-tokens 16384", unit)
-        self.assertIn("--max-num-seqs 256", unit)
-        self.assertIn("--max-num-partial-prefills 64", unit)
-        self.assertIn("--max-long-partial-prefills 64", unit)
+        self.assertIn("--max-num-seqs 32", unit)
+        self.assertIn("--max-num-partial-prefills 1", unit)
+        self.assertIn("--max-long-partial-prefills 1", unit)
+        self.assertNotIn("--max-num-partial-prefills 64", unit)
+        self.assertNotIn("--max-long-partial-prefills 64", unit)
         self.assertIn("gb10_service_ready.sh rerank", unit)
         timeout = re.search(r"^TimeoutStartSec=(\d+)$", unit, re.MULTILINE)
         if timeout is None:
@@ -218,7 +220,8 @@ class QueritServiceContractTests(unittest.TestCase):
         if deadline_match is None:
             self.fail("gb10_service_ready.sh must specify --deadline")
         readiness_deadline = int(deadline_match.group(1))
-        self.assertGreaterEqual(int(timeout.group(1)), readiness_deadline + 60)
+        self.assertEqual(int(timeout.group(1)), 1800)
+        self.assertEqual(readiness_deadline, 1800)
 
     def test_guard_starts_independently_to_protect_backend_startup(self) -> None:
         unit = GUARD_UNIT.read_text()

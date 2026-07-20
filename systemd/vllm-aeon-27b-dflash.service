@@ -105,7 +105,6 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
     --tool-call-parser qwen3_coder \
     --default-chat-template-kwargs "{\"enable_thinking\":false}" \
     --override-generation-config "{\"temperature\":0.6,\"top_p\":0.95,\"top_k\":20}" \
-    --swap-space 0 \
     --trust-remote-code
 # Multimodal retained: no --language-model-only
 # Verify the immutable vLLM command and this Docker generation's exact user scope first.

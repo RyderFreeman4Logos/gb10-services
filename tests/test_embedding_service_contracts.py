@@ -235,7 +235,6 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         "--kv-cache-memory-bytes": 1,
         "--gpu-memory-utilization": 1,
         "--enforce-eager": 0,
-        "--swap-space": 1,
     }
     model_command = [
         "/usr/local/bin/vllm",
@@ -260,14 +259,18 @@ def _embedding_contract(unit: str) -> dict[str, int]:
         "--kv-cache-memory-bytes": ["4800M"],
         "--gpu-memory-utilization": ["0.15"],
         "--enforce-eager": [],
-        "--swap-space": ["0"],
     }
     for flag, expected in expected_container_options.items():
         actual = parsed_options[flag]
         if actual != expected:
             raise AssertionError(f"{flag} must be {expected}, found {actual}")
 
-    forbidden_options = ("--quantization", "--kv-cache-dtype", "--truncate-dim")
+    forbidden_options = (
+        "--quantization",
+        "--kv-cache-dtype",
+        "--truncate-dim",
+        "--swap-space",
+    )
     for token in container_argv:
         lowered = token.lower()
         for forbidden in forbidden_options:

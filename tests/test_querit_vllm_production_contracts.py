@@ -7,9 +7,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION_UNIT = ROOT / "systemd" / "vllm-querit-4b-reranker.service"
-CANARY_UNIT = ROOT / "systemd" / "vllm-querit-4b-canary-backend.service"
 LEGACY_TRANSFORMERS_UNIT = ROOT / "systemd" / "querit-4b-reranker.service"
 LEGACY_QWEN_UNIT = ROOT / "systemd" / "vllm-qwen3-reranker-8b.service"
+README = ROOT / "README.md"
+DEPLOYMENT_AGENTS = ROOT / "docs" / "deployment" / "AGENTS.md"
 MODEL_DIR = "/home/obj/models/querit-4b-vllm"
 NO_SWAP_PREFIX = [
     "/usr/bin/env",
@@ -93,7 +94,6 @@ def _docker_host_and_vllm_options(unit: str) -> tuple[list[str], dict[str, list[
         "--tensor-parallel-size": 1,
         "--pipeline-parallel-size": 1,
         "--cpu-offload-gb": 1,
-        "--swap-space": 1,
         "--max-num-batched-tokens": 1,
         "--max-num-seqs": 1,
         "--enable-chunked-prefill": 0,
@@ -145,10 +145,10 @@ class QueritVllmProductionContractTests(unittest.TestCase):
                 "--max-model-len": ["32768"], "--gpu-memory-utilization": ["0.17"],
                 "--kv-cache-memory-bytes": ["4800M"], "--kv-cache-dtype": ["auto"],
                 "--tensor-parallel-size": ["1"], "--pipeline-parallel-size": ["1"],
-                "--cpu-offload-gb": ["0"], "--swap-space": ["0"],
-                "--max-num-batched-tokens": ["16384"], "--max-num-seqs": ["256"],
+                "--cpu-offload-gb": ["0"],
+                "--max-num-batched-tokens": ["16384"], "--max-num-seqs": ["32"],
                 "--enable-chunked-prefill": [],
-                "--max-num-partial-prefills": ["64"], "--max-long-partial-prefills": ["64"],
+                "--max-num-partial-prefills": ["1"], "--max-long-partial-prefills": ["1"],
                 "--long-prefill-token-threshold": ["8192"], "--enforce-eager": [],
                 "--chat-template": [f"{MODEL_DIR}/querit-rerank.jinja"],
             },
@@ -156,8 +156,7 @@ class QueritVllmProductionContractTests(unittest.TestCase):
         self.assertIn("MemoryMax=256M", unit)
         self.assertNotIn("MemorySwapMax=0", unit)
         self.assertIn("Restart=no", unit)
-        self.assertIn("Backend scheduler ceilings", unit)
-        self.assertIn("guard owns hot-reloadable request concurrency", unit)
+        self.assertEqual(_unit_directive_values(unit, "TimeoutStartSec"), ["1800"])
 
     def test_legacy_transformers_production_unit_is_deleted(self) -> None:
         self.assertFalse(LEGACY_TRANSFORMERS_UNIT.exists())
@@ -172,29 +171,90 @@ class QueritVllmProductionContractTests(unittest.TestCase):
         self.assertEqual(
             _logical_argv(unit, "ExecStartPost"),
             [
+                ["/home/obj/.local/bin/gb10_service_ready.sh", "rerank", "http://100.105.4.92:18013", "Querit/Querit-4B", "--deadline", "1800"],
                 NO_SWAP_PREFIX
-                + ["--unit", expected_unit, "--container", "querit-4b-vllm"],
-                ["/home/obj/.local/bin/gb10_service_ready.sh", "rerank", "http://100.105.4.92:18013", "Querit/Querit-4B", "--deadline", "300"],
+                + [
+                    "--unit",
+                    expected_unit,
+                    "--container",
+                    "querit-4b-vllm",
+                ],
             ],
         )
         self.assertIn("[Install]", unit)
         self.assertIn("WantedBy=default.target", unit)
 
-    def test_production_and_canary_owners_use_distinct_names_and_ports(self) -> None:
-        production_start = _logical_argv(PRODUCTION_UNIT.read_text(), "ExecStart")[0]
-        canary_start = _logical_argv(CANARY_UNIT.read_text(), "ExecStart")[0]
-        production_name = production_start[production_start.index("--name") + 1]
-        canary_name = canary_start[canary_start.index("--name") + 1]
-        production_publish = production_start[production_start.index("-p") + 1]
-        canary_publish = canary_start[canary_start.index("-p") + 1]
-        self.assertEqual(production_name, "querit-4b-vllm")
-        self.assertEqual(canary_name, "vllm-querit-4b-canary")
-        self.assertNotEqual(production_name, canary_name)
-        self.assertEqual(production_publish, "100.105.4.92:18013:8000")
-        self.assertEqual(canary_publish, "127.0.0.1:18015:8000")
-        self.assertNotEqual(production_publish, canary_publish)
+    def test_operational_docs_derive_scheduler_values_from_production_unit(self) -> None:
+        _host, options = _docker_host_and_vllm_options(PRODUCTION_UNIT.read_text())
+        scheduler_literals = {
+            option: f"{option} {options[option][0]}"
+            for option in (
+                "--max-num-batched-tokens",
+                "--max-num-seqs",
+                "--max-num-partial-prefills",
+                "--max-long-partial-prefills",
+            )
+        }
+        expected_counts = {
+            README: {
+                "--max-num-batched-tokens": 2,
+                "--max-num-seqs": 2,
+                "--max-num-partial-prefills": 1,
+                "--max-long-partial-prefills": 1,
+            },
+            DEPLOYMENT_AGENTS: {option: 1 for option in scheduler_literals},
+        }
+        for path, option_counts in expected_counts.items():
+            text = path.read_text()
+            for option, expected_count in option_counts.items():
+                with self.subTest(path=path.name, option=option):
+                    self.assertEqual(
+                        text.count(scheduler_literals[option]), expected_count
+                    )
 
-    def test_production_reranker_conflicts_are_symmetric_but_canary_coexists(self) -> None:
+    def test_production_start_pre_removes_stale_cidfile_after_generation_cleanup(self) -> None:
+        unit = PRODUCTION_UNIT.read_text()
+        self.assertEqual(
+            _logical_argv(unit, "ExecStartPre")[-1],
+            [
+                "-/bin/rm",
+                "-f",
+                "%t/gb10-vllm-cids/vllm-querit-4b-reranker.cid",
+            ],
+        )
+
+    def test_canary_units_and_lifecycle_machinery_are_deleted(self) -> None:
+        retired_paths = (
+            "systemd/vllm-querit-4b-canary-backend.service",
+            "systemd/vllm-querit-4b-canary.service",
+            "scripts/gb10_querit_canary_deploy.py",
+            "scripts/gb10_querit_canary_lifecycle.py",
+            "scripts/gb10_querit_canary_preflight.py",
+            "scripts/querit_canary_deployment.py",
+            "scripts/querit_canary_lifecycle.py",
+            "scripts/querit_canary_runtime.py",
+            "scripts/querit_canary_transaction.py",
+        )
+        for relative_path in retired_paths:
+            with self.subTest(path=relative_path):
+                self.assertFalse((ROOT / relative_path).exists())
+
+    def test_current_production_paths_do_not_reference_canary_units(self) -> None:
+        for path in (
+            ROOT / "README.md",
+            ROOT / "docs" / "deployment" / "AGENTS.md",
+        ):
+            with self.subTest(path=path.name):
+                self.assertNotIn("vllm-querit-4b-canary", path.read_text())
+
+    def test_production_owner_uses_the_canonical_name_and_port(self) -> None:
+        production_start = _logical_argv(PRODUCTION_UNIT.read_text(), "ExecStart")[0]
+        production_name = production_start[production_start.index("--name") + 1]
+        production_publish = production_start[production_start.index("-p") + 1]
+        self.assertEqual(production_name, "querit-4b-vllm")
+        self.assertEqual(production_publish, "100.105.4.92:18013:8000")
+
+    def test_production_reranker_conflicts_are_symmetric(self) -> None:
         units = {
             "vllm-querit-4b-reranker.service": PRODUCTION_UNIT.read_text(),
             "vllm-qwen3-reranker-8b.service": LEGACY_QWEN_UNIT.read_text(),
@@ -202,11 +262,9 @@ class QueritVllmProductionContractTests(unittest.TestCase):
         for name, unit in units.items():
             conflicts = set(" ".join(_unit_directive_values(unit, "Conflicts")).split())
             self.assertTrue(EXCLUSIVE_PRODUCTION_OWNERS - {name} <= conflicts, name)
-            self.assertNotIn("vllm-querit-4b-canary-backend.service", conflicts, name)
-        self.assertEqual(_unit_directive_values(CANARY_UNIT.read_text(), "Conflicts"), [])
 
     def test_all_reranker_publishes_are_single_address_bindings(self) -> None:
-        for path in (PRODUCTION_UNIT, CANARY_UNIT, LEGACY_QWEN_UNIT):
+        for path in (PRODUCTION_UNIT, LEGACY_QWEN_UNIT):
             publishes = [
                 argv[index + 1]
                 for argv in _logical_argv(path.read_text(), "ExecStart")
@@ -220,13 +278,16 @@ class QueritVllmProductionContractTests(unittest.TestCase):
                 self.assertIn(address, {"100.105.4.92", "127.0.0.1"}, path.name)
                 self.assertEqual(container_port, "8000", path.name)
 
-    def test_every_reranker_vllm_unit_disables_vllm_cpu_swap_buffer(self) -> None:
-        for path in (PRODUCTION_UNIT, CANARY_UNIT, LEGACY_QWEN_UNIT):
+    def test_every_reranker_vllm_unit_omits_unsupported_swap_space_flag(self) -> None:
+        for path in (PRODUCTION_UNIT, LEGACY_QWEN_UNIT):
             argv = _logical_argv(path.read_text(), "ExecStart")
             self.assertEqual(len(argv), 1, path.name)
-            self.assertEqual(argv[0].count("--swap-space"), 1, path.name)
-            swap_at = argv[0].index("--swap-space")
-            self.assertEqual(argv[0][swap_at + 1], "0", path.name)
+            normalized_swap = [
+                token
+                for token in argv[0]
+                if token.split("=", 1)[0].replace("_", "-") == "--swap-space"
+            ]
+            self.assertEqual(normalized_swap, [], path.name)
 
 
 if __name__ == "__main__":

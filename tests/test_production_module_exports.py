@@ -55,9 +55,6 @@ EXPECTED_EXPORTS = {
         "secure_directory",
         "secure_regular",
     ),
-    "scripts/gb10_querit_canary_deploy.py": ("main",),
-    "scripts/gb10_querit_canary_lifecycle.py": ("main",),
-    "scripts/gb10_querit_canary_preflight.py": (),
     "scripts/gb10_verify_embedding_profile.py": (
         "CANARY_INPUTS",
         "ContainerState",
@@ -73,32 +70,6 @@ EXPECTED_EXPORTS = {
     ),
     "scripts/gb10_verify_vllm_no_swap_core.py": ("main",),
     "scripts/hooks/receipt-store.py": ("StoreError", "main", "run"),
-    "scripts/querit_canary_lifecycle.py": (
-        "LifecycleCancelled",
-        "main",
-        "preflight",
-    ),
-    "scripts/querit_canary_runtime.py": (
-        "ADAPTER_UNIT",
-        "BACKEND_UNIT",
-        "DEFAULT_MODEL",
-        "EMBEDDING_UNIT",
-        "GUARD_UNIT",
-        "IMMUTABLE_NEIGHBORS",
-        "LEGACY_RERANKER_UNIT",
-        "LifecycleError",
-        "MINIMUM_HEADROOM_GIB",
-        "PRODUCTION_RERANKER_UNIT",
-        "ServiceState",
-        "SystemHost",
-        "TEXT_UNIT",
-    ),
-    "scripts/querit_canary_transaction.py": (
-        "Host",
-        "activate",
-        "deactivate",
-        "restoring_original",
-    ),
     "scripts/querit_checkpoint_convert.py": (
         "convert_snapshot",
         "main",
@@ -158,7 +129,7 @@ EXPECTED_EXPORTS = {
 
 class ProductionModuleExportContractTests(unittest.TestCase):
     def test_new_production_modules_declare_exact_public_api(self) -> None:
-        self.assertEqual(len(EXPECTED_EXPORTS), 19)
+        self.assertEqual(len(EXPECTED_EXPORTS), 13)
         for relative_path, expected in EXPECTED_EXPORTS.items():
             with self.subTest(module=relative_path):
                 tree = ast.parse((ROOT / relative_path).read_text(), filename=relative_path)

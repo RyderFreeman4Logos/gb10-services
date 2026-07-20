@@ -312,42 +312,54 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
                 self.assertNotIn("docker inspect", log)
                 self.assertFalse(self.inspect_state.exists())
 
-    def test_rejects_every_noncanonical_swap_space_spelling_or_placement(self) -> None:
-        mutations = (
-            ["/usr/local/bin/vllm", "serve", "model"],
-            ["/usr/local/bin/vllm", "serve", "model", "--swap-space", "1"],
-            [
-                "/usr/local/bin/vllm",
-                "serve",
-                "model",
-                "--swap-space",
-                "0",
-                "--swap-space",
-                "0",
-            ],
-            ["/usr/local/bin/vllm", "serve", "model", "--swap-space=0"],
-            ["/usr/local/bin/vllm", "serve", "model", "--swap_space", "0"],
-            ["/bin/sh", "-c", "vllm serve model --swap-space 0"],
-        )
-        for command in mutations:
-            with self.subTest(command=command):
-                self._write_unit(
-                    self.unit,
-                    "vllm-test",
-                    "/run/user/1001/gb10-vllm-cids/test.cid",
-                    application=command,
-                )
-                self.assert_rejected(containers=())
-
+    def test_vllm_argv_without_swap_space_uses_cgroup_evidence(self) -> None:
+        command = ["/usr/local/bin/vllm", "serve", "model"]
         self._write_unit(
             self.unit,
             "vllm-test",
             "/run/user/1001/gb10-vllm-cids/test.cid",
+            application=command,
         )
-        text = self.unit.read_text().replace(
-            "--memory 18g", "--swap-space 0 --memory 18g", 1
+        payload = self._inspect("vllm-test", command=command)
+        result = self._run(inspect_sequences={"vllm-test": [payload]})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_static_preflight_rejects_every_normalized_swap_space_form(self) -> None:
+        hostile_suffixes = (
+            ["--swap-space", "0"],
+            ["--swap-space=0"],
+            ["--swap_space", "0"],
+            ["--swap_space=0"],
+            ["--swap-space", "1"],
+            ["--swap-space", "0", "--swap_space=0"],
         )
-        self.unit.write_text(text)
+        for suffix in hostile_suffixes:
+            with self.subTest(suffix=suffix):
+                self._write_unit(
+                    self.unit,
+                    "vllm-test",
+                    "/run/user/1001/gb10-vllm-cids/test.cid",
+                    application=["/usr/local/bin/vllm", "serve", "model", *suffix],
+                )
+                self.assert_rejected(containers=())
+
+    def test_rejects_nonzero_docker_memory_swappiness_intent(self) -> None:
+        self._write_unit(
+            self.unit,
+            "vllm-test",
+            "/run/user/1001/gb10-vllm-cids/test.cid",
+            application=[
+                "/usr/local/bin/vllm",
+                "serve",
+                "model",
+            ],
+        )
+        self.unit.write_text(
+            self.unit.read_text().replace(
+                "--memory-swappiness 0",
+                "--memory-swappiness 1",
+            )
+        )
         self.assert_rejected(containers=())
 
     def test_rejects_unit_memory_intent_or_container_identity_drift(self) -> None:
@@ -364,7 +376,7 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
             self._inspect("vllm-test", entrypoint=["/bin/sh", "-c"]),
             self._inspect(
                 "vllm-test",
-                command=["/usr/local/bin/vllm", "serve", "model", "--swap-space=0"],
+                command=["/usr/local/bin/vllm", "serve", "model", "--unexpected"],
             ),
             self._inspect("vllm-test", started_at=""),
         )

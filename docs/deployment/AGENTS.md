@@ -23,9 +23,8 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 * The 0.25.1 AEON build ports the MRv2 `lm_head` sharing fix across DFlash, Eagle, and DSpark, includes vLLM #47888 for torchcodec startup without FFmpeg, and guards the mixed-dtype FlashInfer TP>1 fusion via #48330. AEON calls the DSpark loader fix-covered and TP=2-ready but explicitly leaves TP>1 unvalidated; do not present this source migration as a multi-Spark hardware result.
 * `vllm-embedding.service` tracked source contract: BF16 Qwen3-Embedding-8B with 4,096-dimensional output, `max-model-len=32768`, `max-num-batched-tokens=8192`, `max-num-seqs=64`, and `kv-cache-memory-bytes=4800M`. It requests equal 128 GiB Docker memory/swap caps without imposing the obsolete 20 GiB service budget. Its post-start verifier binds full Docker ID/PID/`StartedAt`, `/proc` starttime and canonical Docker scope, scope dev/inode, and authoritative `cgroup.events`, then re-reads the unchanged identity and proves exact `memory.max`, zero `memory.swap.max`, and zero activation-time `memory.swap.current`. The validated 5,820 MiB baseline yielded 41,376 KV tokens; 4,800 MiB projects about 34,124 tokens (4.14% above 32,768) but is not production-verified until an authorized live restart prints at least 32,768 tokens.
 * `vllm-aeon-27b-dflash.service`: tracked clean-start v0.25.1 reference (not a live-production activation claim): DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-seqs=16`, `max-num-batched-tokens=4096`, AUTO KV sizing via `gpu-memory-utilization=0.355` with no explicit `kv-cache-memory-bytes`; clean-start capacity 286,962 KV tokens.
-* `vllm-querit-4b-reranker.service`: canonical BF16 pooling production owner on `18013`, with a 32,768-token context, 4,800 MiB KV cache, equal 18 GiB Docker memory/swap caps verified by the same generation-bound contract, and backend scheduler ceilings of 16,384 batched tokens / 256 sequences. Guard owns hot-reloadable request admission and concurrency; these scheduler ceilings are not a live-validation claim.
+* `vllm-querit-4b-reranker.service`: single canonical BF16 pooling production owner on `18013`, with a 32,768-token context, 4,800 MiB KV cache, equal 18 GiB Docker memory/swap caps, and the live-proven AEON scheduler profile `--max-num-batched-tokens 16384`, `--max-num-seqs 32`, `--max-num-partial-prefills 1`, and `--max-long-partial-prefills 1`. Every startup completes the bounded rerank-readiness probe before its unit-owned generation verifier runs; that verifier binds the exact Docker generation without querying the still-starting `Type=simple` service's active state.
 * `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
-* `vllm-querit-4b-canary-backend.service` remains loopback-only on `127.0.0.1:18015`; its optional Tailnet adapter is on `18014`. Neither canary unit is boot-enabled.
 * `llm-guard-proxy` routes by request `model` to AEON chat (`aeon-ultimate`, `qwen3.6-27b-decensor-by-aeon`), embedding (`qwen3-embedding-8b`, `Qwen/Qwen3-Embedding-8B`), or reranker (`qwen3-reranker-8b`, `Qwen/Qwen3-Reranker-8B`).
 * `llm-guard-proxy` uses a shielded AEON retry ladder for chat: max thinking, bounded thinking, then no-thinking direct streaming relay if prior streaming attempts trip the loop guard. The legacy 18002/18003 ports are guard-owned downstream listeners, not raw vLLM publishes.
 * `llm-guard-proxy` also hot-reloads `config.toml`. Use `[server]` to change default/chat request parallelism and per-`[[upstreams]]` `max_in_flight_requests` / `max_queued_generation_requests` to tune embedding/reranker independently without restarting vLLM, trading total throughput against single-stream latency.
@@ -187,9 +186,10 @@ systemctl --user enable --now llm-guard-proxy.service
 
 ### Generation-bound vLLM no-swap authority
 
-Every tracked vLLM backend must contain exactly one direct `--swap-space 0`
-pair and equal Docker `--memory` / `--memory-swap` values. Those source args
-are intent, not runtime proof. The public `gb10_verify_vllm_no_swap.sh` wrapper
+Every tracked vLLM backend must omit the unsupported vLLM `--swap-space` flag,
+contain Docker `--memory-swappiness 0`, and use equal Docker `--memory` /
+`--memory-swap` values. Those Docker source args are intent, not runtime proof.
+The public `gb10_verify_vllm_no_swap.sh` wrapper
 opens its fixed non-executable `gb10_verify_vllm_no_swap_core.py` companion with
 `O_NOFOLLOW`, verifies owner/link/mode/identity and its embedded SHA-256, then
 executes the exact bytes read from that descriptor. The verifier accepts the
@@ -197,9 +197,10 @@ tracked unit plus the exact container name and binds the full CID, PID, Docker
 `StartedAt`, `/proc/<pid>/stat` starttime, the single canonical unified
 `/proc/<pid>/cgroup` path ending in `docker-<full-cid>.scope`, the cgroup
 directory device/inode, and authoritative `cgroup.events` population. It then
-requires the exact expected `HostConfig.Memory`, `MemorySwap == Memory`, direct
-process argv, `memory.max`, `memory.swap.max == 0`, and activation-time
-`memory.swap.current == 0`, and rejects any identity change on re-read.
+requires the exact expected `HostConfig.Memory`, `MemorySwap == Memory`, exact
+unit/container process argv identity, `memory.max`, `memory.swap.max == 0`, and
+activation-time `memory.swap.current == 0`, and rejects any identity change on
+re-read.
 `systemctl --user show ... ControlGroup` is only a cross-check; neither it nor a
 parent-service `MemorySwapMax=0` substitutes for Docker-generation attribution.
 

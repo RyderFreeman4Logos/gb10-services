@@ -314,7 +314,7 @@ def parse_unit(path_raw: str) -> UnitContract:
     command = argv[index + 1 :]
     if re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image) is None:
         reject("Docker image is not immutable by sha256 digest")
-    if len(command) < 4:
+    if len(command) < 3:
         reject("container command is incomplete")
 
     def exactly_one(option: str) -> str:
@@ -338,20 +338,17 @@ def parse_unit(path_raw: str) -> UnitContract:
     if memory_raw != memory_swap_raw:
         reject("Docker MemorySwap intent does not exactly equal Memory")
     memory = parse_memory(memory_raw)
+    if exactly_one("--memory-swappiness") != "0":
+        reject("Docker memory swappiness intent is not exactly zero")
+    if any(
+        token.split("=", 1)[0].replace("_", "-") == "--swap-space"
+        for token in command
+    ):
+        reject("unsupported vLLM --swap-space option is forbidden")
     entrypoint_value = exactly_one("--entrypoint")
     if entrypoint_value != "python3":
         reject("container entrypoint is not the direct pinned Python launcher")
 
-    normalized_swap_tokens = [
-        token
-        for token in argv
-        if token.split("=", 1)[0].replace("_", "-") == "--swap-space"
-    ]
-    if normalized_swap_tokens != ["--swap-space"]:
-        reject("unit does not contain exactly one canonical --swap-space token")
-    swap_index = command.index("--swap-space") if "--swap-space" in command else -1
-    if swap_index < 0 or swap_index + 1 >= len(command) or command[swap_index + 1] != "0":
-        reject("unit lacks the direct --swap-space 0 argv pair after the image")
     if command[0] not in {
         "/usr/local/bin/vllm",
         "/opt/hang_guard/aeon_vllm_wrapper.py",

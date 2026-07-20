@@ -37,10 +37,6 @@ SERVICE_CONTRACTS = {
         "querit-4b-vllm",
         "%t/gb10-vllm-cids/vllm-querit-4b-reranker.cid",
     ),
-    "vllm-querit-4b-canary-backend.service": (
-        "vllm-querit-4b-canary",
-        "%t/gb10-vllm-cids/vllm-querit-4b-canary-backend.cid",
-    ),
     "vllm-qwen3-reranker-8b.service": (
         "vllm-qwen3-reranker-8b",
         "%t/gb10-vllm-cids/vllm-qwen3-reranker-8b.cid",
@@ -119,11 +115,11 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                     for token in application
                     if token.split("=", 1)[0].replace("_", "-") == "--swap-space"
                 ]
-                self.assertEqual(normalized_swap, ["--swap-space"])
-                swap_at = application.index("--swap-space")
-                self.assertEqual(application[swap_at : swap_at + 2], ["--swap-space", "0"])
+                self.assertEqual(normalized_swap, [])
                 self.assertEqual(argv.count("--memory"), 1)
                 self.assertEqual(argv.count("--memory-swap"), 1)
+                self.assertEqual(argv.count("--memory-swappiness"), 1)
+                self.assertEqual(argv[argv.index("--memory-swappiness") + 1], "0")
                 self.assertEqual(
                     argv[argv.index("--memory") + 1],
                     argv[argv.index("--memory-swap") + 1],
@@ -135,11 +131,29 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                 condition = PRODUCTION_PREFIX + ["--unit", unit_path]
                 self.assertEqual(_logical_argv(unit, "ExecCondition")[0], condition)
                 posts = _logical_argv(unit, "ExecStartPost")
-                self.assertEqual(
-                    posts[0],
-                    PRODUCTION_PREFIX
-                    + ["--unit", unit_path, "--container", container],
-                )
+                generation_verifier = PRODUCTION_PREFIX + [
+                    "--unit",
+                    unit_path,
+                    "--container",
+                    container,
+                ]
+                if name == "vllm-querit-4b-reranker.service":
+                    self.assertEqual(
+                        posts,
+                        [
+                            [
+                                "/home/obj/.local/bin/gb10_service_ready.sh",
+                                "rerank",
+                                "http://100.105.4.92:18013",
+                                "Querit/Querit-4B",
+                                "--deadline",
+                                "1800",
+                            ],
+                            generation_verifier,
+                        ],
+                    )
+                else:
+                    self.assertEqual(posts[0], generation_verifier)
                 cleanup = PRODUCTION_PREFIX + [
                     "--cleanup",
                     "--container",
@@ -164,6 +178,13 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                             for argv in commands
                         )
                     )
+
+    def test_generation_verifier_does_not_query_type_simple_service_state(self) -> None:
+        source = VERIFIER_CORE.read_text()
+        self.assertNotIn('SYSTEMCTL_BIN, "--user", "is-active"', source)
+        self.assertNotIn('SYSTEMCTL_BIN, "is-active"', source)
+        self.assertEqual(source.count("SYSTEMCTL_BIN,"), 2)
+        self.assertIn('f"docker-{identifier}.scope",', source)
 
     def test_production_entry_is_ambient_environment_independent(self) -> None:
         for name in SERVICE_CONTRACTS:
@@ -208,12 +229,6 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
             text = path.read_text()
             self.assertIn("scripts/gb10_verify_vllm_no_swap_core.py", text)
             self.assertIn("scripts/gb10_verify_vllm_no_swap.sh", text)
-        source = (ROOT / "scripts" / "querit_canary_deployment.py").read_text()
-        core = '"scripts/gb10_verify_vllm_no_swap_core.py"'
-        wrapper = '"scripts/gb10_verify_vllm_no_swap.sh"'
-        self.assertIn(core, source)
-        self.assertIn(wrapper, source)
-        self.assertLess(source.index(core), source.index(wrapper))
         storage = (ROOT / "scripts" / "gb10_embedding_activation_storage.py").read_text()
         self.assertIn('NO_SWAP_KEYS = ("core", "wrapper")', storage)
         self.assertIn('"core": "no_swap_core.before"', storage)
