@@ -9,6 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION_UNIT = ROOT / "systemd" / "vllm-querit-4b-reranker.service"
 LEGACY_TRANSFORMERS_UNIT = ROOT / "systemd" / "querit-4b-reranker.service"
 LEGACY_QWEN_UNIT = ROOT / "systemd" / "vllm-qwen3-reranker-8b.service"
+README = ROOT / "README.md"
+DEPLOYMENT_AGENTS = ROOT / "docs" / "deployment" / "AGENTS.md"
 MODEL_DIR = "/home/obj/models/querit-4b-vllm"
 NO_SWAP_PREFIX = [
     "/usr/bin/env",
@@ -174,6 +176,34 @@ class QueritVllmProductionContractTests(unittest.TestCase):
         )
         self.assertIn("[Install]", unit)
         self.assertIn("WantedBy=default.target", unit)
+
+    def test_operational_docs_derive_scheduler_values_from_production_unit(self) -> None:
+        _host, options = _docker_host_and_vllm_options(PRODUCTION_UNIT.read_text())
+        scheduler_literals = {
+            option: f"{option} {options[option][0]}"
+            for option in (
+                "--max-num-batched-tokens",
+                "--max-num-seqs",
+                "--max-num-partial-prefills",
+                "--max-long-partial-prefills",
+            )
+        }
+        expected_counts = {
+            README: {
+                "--max-num-batched-tokens": 2,
+                "--max-num-seqs": 2,
+                "--max-num-partial-prefills": 1,
+                "--max-long-partial-prefills": 1,
+            },
+            DEPLOYMENT_AGENTS: {option: 1 for option in scheduler_literals},
+        }
+        for path, option_counts in expected_counts.items():
+            text = path.read_text()
+            for option, expected_count in option_counts.items():
+                with self.subTest(path=path.name, option=option):
+                    self.assertEqual(
+                        text.count(scheduler_literals[option]), expected_count
+                    )
 
     def test_production_start_pre_removes_stale_cidfile_after_generation_cleanup(self) -> None:
         unit = PRODUCTION_UNIT.read_text()
