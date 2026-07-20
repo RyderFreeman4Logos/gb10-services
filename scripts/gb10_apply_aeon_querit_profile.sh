@@ -7,6 +7,8 @@ export DOCKER_HOST="${DOCKER_HOST:-unix:///run/user/1001/docker.sock}"
 AEON_UNIT=vllm-aeon-27b-dflash.service
 RERANK_UNIT=vllm-querit-4b-reranker.service
 FALLBACK_UNIT=vllm-qwen3-reranker-8b.service
+RETIRED_CANARY_ADAPTER_UNIT=vllm-querit-4b-canary.service
+RETIRED_CANARY_BACKEND_UNIT=vllm-querit-4b-canary-backend.service
 GUARD_UNIT=llm-guard-proxy.service
 EMBEDDING_UNIT=vllm-embedding.service
 AEON_CONTAINER=vllm-aeon-27b-dflash-n12
@@ -126,6 +128,45 @@ unit_active_state() {
     printf '%s' "$state"
 }
 
+unit_load_state() {
+    local state
+    if ! state="$(run_systemctl show --property LoadState --value "$1")" \
+        || [[ -z "$state" ]]; then
+        echo "cannot determine load state for $1" >&2
+        return 50
+    fi
+    case "$state" in
+        loaded|masked|not-found) printf '%s' "$state" ;;
+        *)
+            echo "unsupported load state for $1: $state" >&2
+            return 50
+            ;;
+    esac
+}
+
+retire_canary_unit() {
+    local unit="$1" load_state active_state enabled_state
+    load_state="$(unit_load_state "$unit")"
+    if [[ "$load_state" == "not-found" ]]; then
+        return 0
+    fi
+    run_systemctl stop "$unit"
+    run_systemctl disable "$unit"
+    active_state="$(unit_active_state "$unit")"
+    if [[ "$active_state" == "active" ]]; then
+        echo "retired canary unit remains active: $unit" >&2
+        return 51
+    fi
+    enabled_state="$(unit_enabled_state "$unit")"
+    case "$enabled_state" in
+        disabled|masked|masked-runtime) ;;
+        *)
+            echo "retired canary unit remains enabled: $unit state=$enabled_state" >&2
+            return 52
+            ;;
+    esac
+}
+
 restore_unit_enablement() {
     local unit="$1" state="$2"
     case "$state" in
@@ -193,7 +234,9 @@ cleanup_failure() {
         fi
     fi
     run_systemctl status \
-        "$AEON_UNIT" "$RERANK_UNIT" "$FALLBACK_UNIT" "$GUARD_UNIT" \
+        "$AEON_UNIT" "$RERANK_UNIT" "$FALLBACK_UNIT" \
+        "$RETIRED_CANARY_ADAPTER_UNIT" "$RETIRED_CANARY_BACKEND_UNIT" \
+        "$GUARD_UNIT" \
         --no-pager -l || true
     exit "$final_rc"
 }
@@ -359,6 +402,8 @@ require_memory_headroom
 
 echo "PHASE switch_reranker"
 MIGRATION_STARTED=1
+retire_canary_unit "$RETIRED_CANARY_ADAPTER_UNIT"
+retire_canary_unit "$RETIRED_CANARY_BACKEND_UNIT"
 run_systemctl stop "$FALLBACK_UNIT"
 run_systemctl disable "$FALLBACK_UNIT"
 run_systemctl stop "$RERANK_UNIT"

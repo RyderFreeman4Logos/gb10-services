@@ -206,7 +206,6 @@ class QueritVllmProductionContractTests(unittest.TestCase):
         for path in (
             ROOT / "README.md",
             ROOT / "docs" / "deployment" / "AGENTS.md",
-            ROOT / "scripts" / "gb10_apply_aeon_querit_profile.sh",
         ):
             with self.subTest(path=path.name):
                 self.assertNotIn("vllm-querit-4b-canary", path.read_text())

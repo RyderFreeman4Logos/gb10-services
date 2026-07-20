@@ -60,6 +60,9 @@ class QueritDeployerContractTests(unittest.TestCase):
         aeon_memory_bytes: int | None = None,
         aeon_memory_swap_bytes: int | None = None,
         initial_reranker: str = "fallback",
+        initial_canaries: bool = False,
+        canary_stop_effective: bool = True,
+        canary_stop_fails: bool = False,
     ) -> tuple[dict[str, str], Path, Path, Path]:
         fake_bin = tmp / "bin"
         fake_bin.mkdir()
@@ -68,6 +71,12 @@ class QueritDeployerContractTests(unittest.TestCase):
         fallback_active = tmp / "fallback-active"
         rerank_enabled = tmp / "rerank-enabled"
         fallback_enabled = tmp / "fallback-enabled"
+        canary_adapter_installed = tmp / "canary-adapter-installed"
+        canary_adapter_active = tmp / "canary-adapter-active"
+        canary_adapter_enabled = tmp / "canary-adapter-enabled"
+        canary_backend_installed = tmp / "canary-backend-installed"
+        canary_backend_active = tmp / "canary-backend-active"
+        canary_backend_enabled = tmp / "canary-backend-enabled"
         if initial_reranker == "canonical":
             rerank_active.touch()
             rerank_enabled.touch()
@@ -76,6 +85,16 @@ class QueritDeployerContractTests(unittest.TestCase):
             fallback_enabled.touch()
         else:
             raise ValueError(f"unsupported initial reranker: {initial_reranker}")
+        if initial_canaries:
+            for marker in (
+                canary_adapter_installed,
+                canary_adapter_active,
+                canary_adapter_enabled,
+                canary_backend_installed,
+                canary_backend_active,
+                canary_backend_enabled,
+            ):
+                marker.touch()
         signal_marker = tmp / "guard-score-entered"
         docker_marker = tmp / "docker-entered"
         canonical_command, canonical_memory, canonical_memory_swap = (
@@ -97,12 +116,20 @@ class QueritDeployerContractTests(unittest.TestCase):
         systemctl.write_text(
             "#!/usr/bin/env bash\n"
             f'printf \'systemctl %s\\n\' "$*" >> {calls}\n'
-            'if [[ "$*" == *"show"* ]]; then echo loaded; exit 0; fi\n'
+            'if [[ "$*" == *"show"* ]]; then\n'
+            f'  if [[ "$*" == *"vllm-querit-4b-canary-backend.service"* ]]; then [[ -f {canary_backend_installed} ]] && echo loaded || echo not-found; exit 0; fi\n'
+            f'  if [[ "$*" == *"vllm-querit-4b-canary.service"* ]]; then [[ -f {canary_adapter_installed} ]] && echo loaded || echo not-found; exit 0; fi\n'
+            "  echo loaded; exit 0\n"
+            "fi\n"
             'if [[ "$*" == *"is-enabled"* ]]; then\n'
+            f'  [[ "$*" == *"vllm-querit-4b-canary-backend.service"* ]] && {{ [[ -f {canary_backend_enabled} ]] && {{ echo enabled; exit 0; }} || {{ echo disabled; exit 1; }}; }}\n'
+            f'  [[ "$*" == *"vllm-querit-4b-canary.service"* ]] && {{ [[ -f {canary_adapter_enabled} ]] && {{ echo enabled; exit 0; }} || {{ echo disabled; exit 1; }}; }}\n'
             f'  [[ "$*" == *"vllm-querit-4b-reranker.service"* ]] && {{ [[ -f {rerank_enabled} ]] && {{ echo enabled; exit 0; }} || {{ echo disabled; exit 1; }}; }}\n'
             f'  [[ "$*" == *"vllm-qwen3-reranker-8b.service"* ]] && {{ [[ -f {fallback_enabled} ]] && {{ echo enabled; exit 0; }} || {{ echo disabled; exit 1; }}; }}\n'
             "fi\n"
             'if [[ "$*" == *"is-active"* ]]; then\n'
+            f'  if [[ "$*" == *"vllm-querit-4b-canary-backend.service"* ]]; then [[ -f {canary_backend_active} ]] && {{ echo active; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
+            f'  if [[ "$*" == *"vllm-querit-4b-canary.service"* ]]; then [[ -f {canary_adapter_active} ]] && {{ echo active; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
             f'  if [[ "$*" == *"vllm-querit-4b-reranker.service"* ]]; then [[ -f {rerank_active} ]] && {{ echo active; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
             f'  if [[ "$*" == *"vllm-qwen3-reranker-8b.service"* ]]; then [[ -f {fallback_active} ]] && {{ echo active; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
             "  echo active; exit 0\n"
@@ -122,6 +149,14 @@ class QueritDeployerContractTests(unittest.TestCase):
             'if [[ "$*" == *"stop vllm-qwen3-reranker-8b.service"* ]]; then\n'
             f'  rm -f {fallback_active}\n'
             "fi\n"
+            'if [[ "$*" == *"stop vllm-querit-4b-canary.service"* ]]; then\n'
+            '  [[ "${FAKE_CANARY_STOP_FAILS:-0}" == 1 ]] && exit 9\n'
+            f'  [[ "${{FAKE_CANARY_STOP_EFFECTIVE:-1}}" == 1 ]] && rm -f {canary_adapter_active}\n'
+            "fi\n"
+            'if [[ "$*" == *"stop vllm-querit-4b-canary-backend.service"* ]]; then\n'
+            '  [[ "${FAKE_CANARY_STOP_FAILS:-0}" == 1 ]] && exit 9\n'
+            f'  [[ "${{FAKE_CANARY_STOP_EFFECTIVE:-1}}" == 1 ]] && rm -f {canary_backend_active}\n'
+            "fi\n"
             'if [[ "$*" == *"disable vllm-querit-4b-reranker.service"* ]]; then\n'
             f'  rm -f {rerank_enabled}\n'
             "fi\n"
@@ -130,6 +165,12 @@ class QueritDeployerContractTests(unittest.TestCase):
             "fi\n"
             'if [[ "$*" == *"disable vllm-qwen3-reranker-8b.service"* ]]; then\n'
             f'  rm -f {fallback_enabled}\n'
+            "fi\n"
+            'if [[ "$*" == *"disable vllm-querit-4b-canary.service"* ]]; then\n'
+            f'  rm -f {canary_adapter_enabled}\n'
+            "fi\n"
+            'if [[ "$*" == *"disable vllm-querit-4b-canary-backend.service"* ]]; then\n'
+            f'  rm -f {canary_backend_enabled}\n'
             "fi\n"
             "exit 0\n"
         )
@@ -208,6 +249,8 @@ class QueritDeployerContractTests(unittest.TestCase):
             "FAKE_DOCKER_MODE": docker_mode,
             "FAKE_CGROUP_VERSION": cgroup_version,
             "FAKE_NO_SWAP_FAIL_AT": str(no_swap_fail_at),
+            "FAKE_CANARY_STOP_EFFECTIVE": "1" if canary_stop_effective else "0",
+            "FAKE_CANARY_STOP_FAILS": "1" if canary_stop_fails else "0",
             "GB10_NO_SWAP_HELPER_TEST_PATH": str(no_swap),
             "GB10_QUERIT_PROFILE_TEST_ONLY": "1",
         }
@@ -301,9 +344,87 @@ class QueritDeployerContractTests(unittest.TestCase):
         self.assertNotIn("--restart-aeon", self.source)
         self.assertNotIn('restart "$AEON_UNIT"', self.source)
 
-    def test_production_owner_has_no_canary_lifecycle(self) -> None:
-        self.assertNotIn("CANARY_", self.source)
-        self.assertNotIn("vllm-querit-4b-canary", self.source)
+    def test_production_owner_does_not_restore_canary_deploy_lifecycle(self) -> None:
+        for retired_feature in (
+            "gb10_querit_canary_deploy.py",
+            "gb10_querit_canary_lifecycle.py",
+            "querit_canary_transaction.py",
+            "18014",
+        ):
+            self.assertNotIn(retired_feature, self.source)
+
+    def test_upgrade_retires_installed_active_canary_units(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            env, calls, _, _ = self._make_fake_stack(
+                Path(raw_tmp), guard_mode="ok", initial_canaries=True
+            )
+            result = subprocess.run(
+                ["bash", str(DEPLOYER)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("DEPLOY_SUCCESS", result.stdout)
+            recorded = calls.read_text().splitlines()
+            for unit in (
+                "vllm-querit-4b-canary.service",
+                "vllm-querit-4b-canary-backend.service",
+            ):
+                with self.subTest(unit=unit):
+                    self.assertIn(f"systemctl --user stop {unit}", recorded)
+                    self.assertIn(f"systemctl --user disable {unit}", recorded)
+                    self.assertIn(f"systemctl --user is-active {unit}", recorded)
+                    self.assertIn(f"systemctl --user is-enabled {unit}", recorded)
+
+    def test_upgrade_fails_closed_when_a_canary_remains_active(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            env, calls, _, _ = self._make_fake_stack(
+                Path(raw_tmp),
+                guard_mode="ok",
+                initial_canaries=True,
+                canary_stop_effective=False,
+            )
+            result = subprocess.run(
+                ["bash", str(DEPLOYER)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("retired canary unit remains active", result.stderr)
+            self.assertNotIn("DEPLOY_SUCCESS", result.stdout)
+            recorded = calls.read_text().splitlines()
+            self.assertNotIn(
+                "systemctl --user start vllm-querit-4b-reranker.service", recorded
+            )
+
+    def test_upgrade_fails_closed_when_canary_stop_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            env, calls, _, _ = self._make_fake_stack(
+                Path(raw_tmp),
+                guard_mode="ok",
+                initial_canaries=True,
+                canary_stop_fails=True,
+            )
+            result = subprocess.run(
+                ["bash", str(DEPLOYER)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("DEPLOY_FAILED", result.stderr)
+            recorded = calls.read_text().splitlines()
+            self.assertNotIn(
+                "systemctl --user start vllm-querit-4b-reranker.service", recorded
+            )
 
     def test_snapshots_and_restores_reranker_state(self) -> None:
         for contract in (
