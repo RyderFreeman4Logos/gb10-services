@@ -340,6 +340,11 @@ def parse_unit(path_raw: str) -> UnitContract:
     memory = parse_memory(memory_raw)
     if exactly_one("--memory-swappiness") != "0":
         reject("Docker memory swappiness intent is not exactly zero")
+    if any(
+        token.split("=", 1)[0].replace("_", "-") == "--swap-space"
+        for token in command
+    ):
+        reject("unsupported vLLM --swap-space option is forbidden")
     entrypoint_value = exactly_one("--entrypoint")
     if entrypoint_value != "python3":
         reject("container entrypoint is not the direct pinned Python launcher")
