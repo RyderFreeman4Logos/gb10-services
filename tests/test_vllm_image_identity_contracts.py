@@ -59,7 +59,15 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         aeon_units = [
             path for path in units if "aeon-vllm-ultimate" in path.read_text()
         ]
-        self.assertGreaterEqual(len(aeon_units), 5)
+        self.assertEqual(
+            {path.name for path in aeon_units},
+            {
+                "vllm-aeon-27b-dflash.service",
+                "vllm-embedding.service",
+                "vllm-qwen3-reranker-8b.service",
+                "vllm-querit-4b-reranker.service",
+            },
+        )
         for path in aeon_units:
             text = path.read_text()
             with self.subTest(path=path.relative_to(ROOT)):

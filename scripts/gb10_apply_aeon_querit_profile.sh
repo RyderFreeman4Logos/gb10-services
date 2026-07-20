@@ -7,8 +7,6 @@ export DOCKER_HOST="${DOCKER_HOST:-unix:///run/user/1001/docker.sock}"
 AEON_UNIT=vllm-aeon-27b-dflash.service
 RERANK_UNIT=vllm-querit-4b-reranker.service
 FALLBACK_UNIT=vllm-qwen3-reranker-8b.service
-CANARY_BACKEND_UNIT=vllm-querit-4b-canary-backend.service
-CANARY_ADAPTER_UNIT=vllm-querit-4b-canary.service
 GUARD_UNIT=llm-guard-proxy.service
 EMBEDDING_UNIT=vllm-embedding.service
 AEON_CONTAINER=vllm-aeon-27b-dflash-n12
@@ -128,19 +126,6 @@ unit_active_state() {
     printf '%s' "$state"
 }
 
-unit_is_present() {
-    local state rc=0
-    state="$(run_systemctl show "$1" --property=LoadState --value 2>/dev/null)" || rc=$?
-    if [[ "$state" == "not-found" || $rc -eq 4 ]]; then
-        return 1
-    fi
-    if (( rc != 0 )) || [[ "$state" != "loaded" ]]; then
-        echo "cannot determine load state for $1 rc=$rc state=$state" >&2
-        return 48
-    fi
-    return 0
-}
-
 restore_unit_enablement() {
     local unit="$1" state="$2"
     case "$state" in
@@ -161,12 +146,6 @@ PREV_RERANK_ENABLED=""
 PREV_RERANK_ACTIVE=""
 PREV_FALLBACK_ENABLED=""
 PREV_FALLBACK_ACTIVE=""
-PREV_CANARY_BACKEND_ENABLED=""
-PREV_CANARY_BACKEND_ACTIVE=""
-PREV_CANARY_ADAPTER_ENABLED=""
-PREV_CANARY_ADAPTER_ACTIVE=""
-CANARY_BACKEND_PRESENT=0
-CANARY_ADAPTER_PRESENT=0
 MIGRATION_STARTED=0
 DEPLOY_SUCCESS=0
 CLEANUP_STARTED=0
@@ -178,28 +157,9 @@ rollback_runtime_state() {
     fi
     local rollback_failed=0
     run_systemctl stop "$RERANK_UNIT" || rollback_failed=1
-    if (( CANARY_ADAPTER_PRESENT == 1 )); then
-        run_systemctl stop "$CANARY_ADAPTER_UNIT" || rollback_failed=1
-    fi
-    if (( CANARY_BACKEND_PRESENT == 1 )); then
-        run_systemctl stop "$CANARY_BACKEND_UNIT" || rollback_failed=1
-    fi
     run_systemctl stop "$FALLBACK_UNIT" || rollback_failed=1
     restore_unit_enablement "$RERANK_UNIT" "$PREV_RERANK_ENABLED" || rollback_failed=1
     restore_unit_enablement "$FALLBACK_UNIT" "$PREV_FALLBACK_ENABLED" || rollback_failed=1
-    if (( CANARY_BACKEND_PRESENT == 1 )); then
-        restore_unit_enablement "$CANARY_BACKEND_UNIT" "$PREV_CANARY_BACKEND_ENABLED" || rollback_failed=1
-    fi
-    if (( CANARY_ADAPTER_PRESENT == 1 )); then
-        restore_unit_enablement "$CANARY_ADAPTER_UNIT" "$PREV_CANARY_ADAPTER_ENABLED" || rollback_failed=1
-    fi
-
-    if (( CANARY_BACKEND_PRESENT == 1 )) && [[ "$PREV_CANARY_BACKEND_ACTIVE" == "active" ]]; then
-        run_systemctl_start start "$CANARY_BACKEND_UNIT" || rollback_failed=1
-    fi
-    if (( CANARY_ADAPTER_PRESENT == 1 )) && [[ "$PREV_CANARY_ADAPTER_ACTIVE" == "active" ]]; then
-        run_systemctl_start start "$CANARY_ADAPTER_UNIT" || rollback_failed=1
-    fi
     if [[ "$PREV_FALLBACK_ACTIVE" == "active" ]]; then
         run_systemctl_start start "$FALLBACK_UNIT" || rollback_failed=1
     elif [[ "$PREV_RERANK_ACTIVE" == "active" ]]; then
@@ -265,16 +225,6 @@ PREV_RERANK_ENABLED="$(unit_enabled_state "$RERANK_UNIT")"
 PREV_RERANK_ACTIVE="$(unit_active_state "$RERANK_UNIT")"
 PREV_FALLBACK_ENABLED="$(unit_enabled_state "$FALLBACK_UNIT")"
 PREV_FALLBACK_ACTIVE="$(unit_active_state "$FALLBACK_UNIT")"
-if unit_is_present "$CANARY_BACKEND_UNIT"; then
-    CANARY_BACKEND_PRESENT=1
-    PREV_CANARY_BACKEND_ENABLED="$(unit_enabled_state "$CANARY_BACKEND_UNIT")"
-    PREV_CANARY_BACKEND_ACTIVE="$(unit_active_state "$CANARY_BACKEND_UNIT")"
-fi
-if unit_is_present "$CANARY_ADAPTER_UNIT"; then
-    CANARY_ADAPTER_PRESENT=1
-    PREV_CANARY_ADAPTER_ENABLED="$(unit_enabled_state "$CANARY_ADAPTER_UNIT")"
-    PREV_CANARY_ADAPTER_ACTIVE="$(unit_active_state "$CANARY_ADAPTER_UNIT")"
-fi
 run_systemctl is-active --quiet "$EMBEDDING_UNIT"
 verify_no_swap "$AEON_UNIT" "$AEON_CONTAINER"
 verify_no_swap "$EMBEDDING_UNIT" "$EMBEDDING_CONTAINER"
@@ -409,12 +359,6 @@ require_memory_headroom
 
 echo "PHASE switch_reranker"
 MIGRATION_STARTED=1
-if (( CANARY_ADAPTER_PRESENT == 1 )); then
-    run_systemctl stop "$CANARY_ADAPTER_UNIT"
-fi
-if (( CANARY_BACKEND_PRESENT == 1 )); then
-    run_systemctl stop "$CANARY_BACKEND_UNIT"
-fi
 run_systemctl stop "$FALLBACK_UNIT"
 run_systemctl disable "$FALLBACK_UNIT"
 run_systemctl stop "$RERANK_UNIT"

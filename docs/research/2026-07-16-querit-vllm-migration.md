@@ -1,7 +1,12 @@
 # Querit vLLM Migration — Research and Implementation Plan
 
 **Date:** 2026-07-16
-**Status:** Source-controlled canary ready; live probing pending
+**Status:** Historical canary experiment record; canary units retired
+
+> The current source of truth maintains only
+> `systemd/vllm-querit-4b-reranker.service` on port 18013. The canary units and
+> their deploy/lifecycle machinery described below no longer exist and must not
+> be treated as a production deployment path.
 
 ## Background
 

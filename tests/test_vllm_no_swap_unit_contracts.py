@@ -37,10 +37,6 @@ SERVICE_CONTRACTS = {
         "querit-4b-vllm",
         "%t/gb10-vllm-cids/vllm-querit-4b-reranker.cid",
     ),
-    "vllm-querit-4b-canary-backend.service": (
-        "vllm-querit-4b-canary",
-        "%t/gb10-vllm-cids/vllm-querit-4b-canary-backend.cid",
-    ),
     "vllm-qwen3-reranker-8b.service": (
         "vllm-qwen3-reranker-8b",
         "%t/gb10-vllm-cids/vllm-qwen3-reranker-8b.cid",
@@ -135,11 +131,16 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                 condition = PRODUCTION_PREFIX + ["--unit", unit_path]
                 self.assertEqual(_logical_argv(unit, "ExecCondition")[0], condition)
                 posts = _logical_argv(unit, "ExecStartPost")
-                self.assertEqual(
-                    posts[0],
-                    PRODUCTION_PREFIX
-                    + ["--unit", unit_path, "--container", container],
-                )
+                generation_verifier = PRODUCTION_PREFIX + [
+                    "--unit",
+                    unit_path,
+                    "--container",
+                    container,
+                ]
+                if name == "vllm-querit-4b-reranker.service":
+                    self.assertNotIn(generation_verifier, posts)
+                else:
+                    self.assertEqual(posts[0], generation_verifier)
                 cleanup = PRODUCTION_PREFIX + [
                     "--cleanup",
                     "--container",
@@ -208,12 +209,6 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
             text = path.read_text()
             self.assertIn("scripts/gb10_verify_vllm_no_swap_core.py", text)
             self.assertIn("scripts/gb10_verify_vllm_no_swap.sh", text)
-        source = (ROOT / "scripts" / "querit_canary_deployment.py").read_text()
-        core = '"scripts/gb10_verify_vllm_no_swap_core.py"'
-        wrapper = '"scripts/gb10_verify_vllm_no_swap.sh"'
-        self.assertIn(core, source)
-        self.assertIn(wrapper, source)
-        self.assertLess(source.index(core), source.index(wrapper))
         storage = (ROOT / "scripts" / "gb10_embedding_activation_storage.py").read_text()
         self.assertIn('NO_SWAP_KEYS = ("core", "wrapper")', storage)
         self.assertIn('"core": "no_swap_core.before"', storage)

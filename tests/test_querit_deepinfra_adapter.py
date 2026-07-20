@@ -4,7 +4,6 @@ import importlib
 import http.client
 import json
 import math
-import re
 import socket
 import sys
 import threading
@@ -65,7 +64,7 @@ class QueritDeepinfraAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(adapter.AdapterError, "unpaired surrogate"):
             adapter.parse_public_request(body)
 
-    def test_default_peak_request_memory_fits_adapter_unit_envelope(self) -> None:
+    def test_default_peak_request_memory_is_bounded(self) -> None:
         self.assertLessEqual(adapter.MAX_REQUEST_BYTES, 8 * 1024 * 1024)
         self.assertEqual(adapter.DEFAULT_MAX_CONCURRENCY, 1)
 
@@ -88,14 +87,9 @@ class QueritDeepinfraAdapterTests(unittest.TestCase):
             tracemalloc.stop()
         self.assertTrue(backend_body)
 
-        unit = (ROOT / "systemd" / "vllm-querit-4b-canary.service").read_text()
-        memory_match = re.search(r"^MemoryMax=(\d+)M$", unit, re.MULTILINE)
-        self.assertIsNotNone(memory_match)
-        assert memory_match is not None
-        memory_max = int(memory_match.group(1)) * 1024 * 1024
         interpreter_and_server_reserve = 128 * 1024 * 1024
         measured_envelope = len(body) + peak + interpreter_and_server_reserve
-        self.assertLess(measured_envelope, memory_max)
+        self.assertLess(measured_envelope, 256 * 1024 * 1024)
 
     def test_handler_threads_and_large_body_allocations_are_bounded(self) -> None:
         handler = adapter._handler("http://unused.invalid/v1/score", 0.5)
