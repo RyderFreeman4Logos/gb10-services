@@ -145,25 +145,38 @@ unit_load_state() {
 }
 
 retire_canary_unit() {
-    local unit="$1" load_state active_state enabled_state
-    load_state="$(unit_load_state "$unit")"
+    local unit="$1" active_state enabled_state
+    unit_load_state "$unit" >/dev/null
     active_state="$(unit_active_state "$unit")"
-    if [[ "$load_state" == "not-found" && "$active_state" != "active" ]]; then
-        return 0
-    fi
-    run_systemctl stop "$unit"
-    active_state="$(unit_active_state "$unit")"
-    if [[ "$active_state" == "active" ]]; then
-        echo "retired canary unit remains active: $unit" >&2
-        return 51
-    fi
-    if [[ "$load_state" == "not-found" ]]; then
-        return 0
-    fi
-    run_systemctl disable "$unit"
+    case "$active_state" in
+        inactive|failed) ;;
+        *)
+            run_systemctl stop "$unit"
+            active_state="$(unit_active_state "$unit")"
+            case "$active_state" in
+                inactive|failed) ;;
+                *)
+                    echo "retired canary unit remains active/non-quiescent: $unit state=$active_state" >&2
+                    return 51
+                    ;;
+            esac
+            ;;
+    esac
+
     enabled_state="$(unit_enabled_state "$unit")"
     case "$enabled_state" in
-        disabled|masked|masked-runtime) ;;
+        enabled|enabled-runtime|linked|linked-runtime)
+            run_systemctl disable "$unit"
+            enabled_state="$(unit_enabled_state "$unit")"
+            ;;
+        disabled|masked|masked-runtime|static|indirect|generated|transient|not-found) ;;
+        *)
+            echo "unsupported enablement state for retired canary unit: $unit state=$enabled_state" >&2
+            return 52
+            ;;
+    esac
+    case "$enabled_state" in
+        disabled|masked|masked-runtime|static|indirect|generated|transient|not-found) ;;
         *)
             echo "retired canary unit remains enabled: $unit state=$enabled_state" >&2
             return 52

@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 
 from test_embedding_service_contracts import _logical_directive_argv, _option_values
 
@@ -62,8 +63,11 @@ class QueritDeployerContractTests(unittest.TestCase):
         initial_reranker: str = "fallback",
         initial_canaries: bool = False,
         active_canary_without_fragment: str | None = None,
+        fragmentless_canary_state: str = "active",
+        enabled_canary_without_fragment: str | None = None,
         canary_stop_effective: bool = True,
         canary_stop_fails: bool = False,
+        canary_disable_effective: bool = True,
     ) -> tuple[dict[str, str], Path, Path, Path]:
         fake_bin = tmp / "bin"
         fake_bin.mkdir()
@@ -102,11 +106,25 @@ class QueritDeployerContractTests(unittest.TestCase):
                 "vllm-querit-4b-canary-backend.service": canary_backend_active,
             }
             try:
-                fragmentless_canary_markers[active_canary_without_fragment].touch()
+                fragmentless_canary_markers[active_canary_without_fragment].write_text(
+                    fragmentless_canary_state
+                )
             except KeyError as error:
                 raise ValueError(
                     "unsupported fragmentless canary: "
                     f"{active_canary_without_fragment}"
+                ) from error
+        if enabled_canary_without_fragment is not None:
+            fragmentless_enabled_markers = {
+                "vllm-querit-4b-canary.service": canary_adapter_enabled,
+                "vllm-querit-4b-canary-backend.service": canary_backend_enabled,
+            }
+            try:
+                fragmentless_enabled_markers[enabled_canary_without_fragment].touch()
+            except KeyError as error:
+                raise ValueError(
+                    "unsupported fragmentless enabled canary: "
+                    f"{enabled_canary_without_fragment}"
                 ) from error
         signal_marker = tmp / "guard-score-entered"
         docker_marker = tmp / "docker-entered"
@@ -141,8 +159,8 @@ class QueritDeployerContractTests(unittest.TestCase):
             f'  [[ "$*" == *"vllm-qwen3-reranker-8b.service"* ]] && {{ [[ -f {fallback_enabled} ]] && {{ echo enabled; exit 0; }} || {{ echo disabled; exit 1; }}; }}\n'
             "fi\n"
             'if [[ "$*" == *"is-active"* ]]; then\n'
-            f'  if [[ "$*" == *"vllm-querit-4b-canary-backend.service"* ]]; then [[ -f {canary_backend_active} ]] && {{ echo active; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
-            f'  if [[ "$*" == *"vllm-querit-4b-canary.service"* ]]; then [[ -f {canary_adapter_active} ]] && {{ echo active; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
+            f'  if [[ "$*" == *"vllm-querit-4b-canary-backend.service"* ]]; then [[ -f {canary_backend_active} ]] && {{ state=$(cat {canary_backend_active}); echo "${{state:-active}}"; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
+            f'  if [[ "$*" == *"vllm-querit-4b-canary.service"* ]]; then [[ -f {canary_adapter_active} ]] && {{ state=$(cat {canary_adapter_active}); echo "${{state:-active}}"; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
             f'  if [[ "$*" == *"vllm-querit-4b-reranker.service"* ]]; then [[ -f {rerank_active} ]] && {{ echo active; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
             f'  if [[ "$*" == *"vllm-qwen3-reranker-8b.service"* ]]; then [[ -f {fallback_active} ]] && {{ echo active; exit 0; }} || {{ echo inactive; exit 3; }}; fi\n'
             "  echo active; exit 0\n"
@@ -180,10 +198,10 @@ class QueritDeployerContractTests(unittest.TestCase):
             f'  rm -f {fallback_enabled}\n'
             "fi\n"
             'if [[ "$*" == *"disable vllm-querit-4b-canary.service"* ]]; then\n'
-            f'  rm -f {canary_adapter_enabled}\n'
+            f'  [[ "${{FAKE_CANARY_DISABLE_EFFECTIVE:-1}}" == 1 ]] && rm -f {canary_adapter_enabled}\n'
             "fi\n"
             'if [[ "$*" == *"disable vllm-querit-4b-canary-backend.service"* ]]; then\n'
-            f'  rm -f {canary_backend_enabled}\n'
+            f'  [[ "${{FAKE_CANARY_DISABLE_EFFECTIVE:-1}}" == 1 ]] && rm -f {canary_backend_enabled}\n'
             "fi\n"
             "exit 0\n"
         )
@@ -264,6 +282,9 @@ class QueritDeployerContractTests(unittest.TestCase):
             "FAKE_NO_SWAP_FAIL_AT": str(no_swap_fail_at),
             "FAKE_CANARY_STOP_EFFECTIVE": "1" if canary_stop_effective else "0",
             "FAKE_CANARY_STOP_FAILS": "1" if canary_stop_fails else "0",
+            "FAKE_CANARY_DISABLE_EFFECTIVE": (
+                "1" if canary_disable_effective else "0"
+            ),
             "GB10_NO_SWAP_HELPER_TEST_PATH": str(no_swap),
             "GB10_QUERIT_PROFILE_TEST_ONLY": "1",
         }
@@ -416,6 +437,56 @@ class QueritDeployerContractTests(unittest.TestCase):
                 recorded = calls.read_text().splitlines()
                 self.assertIn(f"systemctl --user is-active {unit}", recorded)
                 self.assertIn(f"systemctl --user stop {unit}", recorded)
+
+    def test_fragmentless_retirement_covers_state_and_enablement_axes(self) -> None:
+        units = (
+            "vllm-querit-4b-canary.service",
+            "vllm-querit-4b-canary-backend.service",
+        )
+
+        def run_case(**kwargs: Any) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+            temporary = tempfile.TemporaryDirectory()
+            self.addCleanup(temporary.cleanup)
+            env, calls, _, _ = self._make_fake_stack(
+                Path(temporary.name), guard_mode="ok", **kwargs
+            )
+            result = subprocess.run(
+                ["bash", str(DEPLOYER)], env=env, text=True,
+                capture_output=True, timeout=5, check=False,
+            )
+            return result, calls.read_text().splitlines()
+
+        for unit in units:
+            for state in ("activating", "reloading", "deactivating"):
+                with self.subTest(unit=unit, state=state):
+                    result, calls = run_case(
+                        active_canary_without_fragment=unit,
+                        fragmentless_canary_state=state,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f"systemctl --user stop {unit}", calls)
+            with self.subTest(unit=unit, state="fragmentless-enabled"):
+                result, calls = run_case(enabled_canary_without_fragment=unit)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"systemctl --user is-enabled {unit}", calls)
+                self.assertIn(f"systemctl --user disable {unit}", calls)
+
+        failure_cases = (
+            ({"active_canary_without_fragment": units[1],
+              "fragmentless_canary_state": "activating",
+              "canary_stop_effective": False}, "remains active/non-quiescent"),
+            ({"enabled_canary_without_fragment": units[0],
+              "canary_disable_effective": False}, "remains enabled"),
+        )
+        for kwargs, expected_error in failure_cases:
+            with self.subTest(expected_error=expected_error):
+                result, calls = run_case(**kwargs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+                self.assertNotIn("DEPLOY_SUCCESS", result.stdout)
+                self.assertNotIn(
+                    "systemctl --user start vllm-querit-4b-reranker.service", calls
+                )
 
     def test_upgrade_fails_closed_when_each_fragmentless_canary_stays_active(
         self,
