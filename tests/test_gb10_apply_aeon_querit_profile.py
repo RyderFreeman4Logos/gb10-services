@@ -61,6 +61,7 @@ class QueritDeployerContractTests(unittest.TestCase):
         aeon_memory_swap_bytes: int | None = None,
         initial_reranker: str = "fallback",
         initial_canaries: bool = False,
+        active_canary_without_fragment: str | None = None,
         canary_stop_effective: bool = True,
         canary_stop_fails: bool = False,
     ) -> tuple[dict[str, str], Path, Path, Path]:
@@ -95,6 +96,18 @@ class QueritDeployerContractTests(unittest.TestCase):
                 canary_backend_enabled,
             ):
                 marker.touch()
+        if active_canary_without_fragment is not None:
+            fragmentless_canary_markers = {
+                "vllm-querit-4b-canary.service": canary_adapter_active,
+                "vllm-querit-4b-canary-backend.service": canary_backend_active,
+            }
+            try:
+                fragmentless_canary_markers[active_canary_without_fragment].touch()
+            except KeyError as error:
+                raise ValueError(
+                    "unsupported fragmentless canary: "
+                    f"{active_canary_without_fragment}"
+                ) from error
         signal_marker = tmp / "guard-score-entered"
         docker_marker = tmp / "docker-entered"
         canonical_command, canonical_memory, canonical_memory_swap = (
@@ -378,6 +391,64 @@ class QueritDeployerContractTests(unittest.TestCase):
                     self.assertIn(f"systemctl --user disable {unit}", recorded)
                     self.assertIn(f"systemctl --user is-active {unit}", recorded)
                     self.assertIn(f"systemctl --user is-enabled {unit}", recorded)
+
+    def test_upgrade_stops_each_active_canary_when_fragment_is_missing(self) -> None:
+        for unit in (
+            "vllm-querit-4b-canary.service",
+            "vllm-querit-4b-canary-backend.service",
+        ):
+            with self.subTest(unit=unit), tempfile.TemporaryDirectory() as raw_tmp:
+                env, calls, _, _ = self._make_fake_stack(
+                    Path(raw_tmp),
+                    guard_mode="ok",
+                    active_canary_without_fragment=unit,
+                )
+                result = subprocess.run(
+                    ["bash", str(DEPLOYER)],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("DEPLOY_SUCCESS", result.stdout)
+                recorded = calls.read_text().splitlines()
+                self.assertIn(f"systemctl --user is-active {unit}", recorded)
+                self.assertIn(f"systemctl --user stop {unit}", recorded)
+
+    def test_upgrade_fails_closed_when_each_fragmentless_canary_stays_active(
+        self,
+    ) -> None:
+        for unit in (
+            "vllm-querit-4b-canary.service",
+            "vllm-querit-4b-canary-backend.service",
+        ):
+            with self.subTest(unit=unit), tempfile.TemporaryDirectory() as raw_tmp:
+                env, calls, _, _ = self._make_fake_stack(
+                    Path(raw_tmp),
+                    guard_mode="ok",
+                    active_canary_without_fragment=unit,
+                    canary_stop_effective=False,
+                )
+                result = subprocess.run(
+                    ["bash", str(DEPLOYER)],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("retired canary unit remains active", result.stderr)
+                self.assertNotIn("DEPLOY_SUCCESS", result.stdout)
+                recorded = calls.read_text().splitlines()
+                self.assertIn(f"systemctl --user is-active {unit}", recorded)
+                self.assertIn(f"systemctl --user stop {unit}", recorded)
+                self.assertNotIn(
+                    "systemctl --user start vllm-querit-4b-reranker.service",
+                    recorded,
+                )
 
     def test_upgrade_fails_closed_when_a_canary_remains_active(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
