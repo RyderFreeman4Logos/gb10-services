@@ -254,7 +254,10 @@ class CurrentGenerationVerifierTests(unittest.TestCase):
         with VerifierFixture() as fixture:
             fixture.state["systemd_outputs"][0] = fixture.state[
                 "systemd_outputs"
-            ][0].replace(" --swap-space 0 ;", " --swap-space 0 -m 24g ;")
+            ][0].replace(
+                " --gpu-memory-utilization 0.15 --enforce-eager ;",
+                " --gpu-memory-utilization 0.15 --enforce-eager -m 24g ;",
+            )
             self.assert_fixture_rejected(fixture)
 
     def test_rejects_replaced_or_unpopulated_container_cgroup(self) -> None:

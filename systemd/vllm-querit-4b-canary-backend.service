@@ -50,7 +50,6 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-vllm-cids/vllm-querit-4b-ca
     --kv-cache-dtype auto \
     --tensor-parallel-size 1 \
     --pipeline-parallel-size 1 \
-    --swap-space 0 \
     --cpu-offload-gb 0 \
     --max-num-batched-tokens 1024 \
     --max-num-seqs 1 \

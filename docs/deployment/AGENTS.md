@@ -187,9 +187,10 @@ systemctl --user enable --now llm-guard-proxy.service
 
 ### Generation-bound vLLM no-swap authority
 
-Every tracked vLLM backend must contain exactly one direct `--swap-space 0`
-pair and equal Docker `--memory` / `--memory-swap` values. Those source args
-are intent, not runtime proof. The public `gb10_verify_vllm_no_swap.sh` wrapper
+Every tracked vLLM backend must omit the unsupported vLLM `--swap-space` flag,
+contain Docker `--memory-swappiness 0`, and use equal Docker `--memory` /
+`--memory-swap` values. Those Docker source args are intent, not runtime proof.
+The public `gb10_verify_vllm_no_swap.sh` wrapper
 opens its fixed non-executable `gb10_verify_vllm_no_swap_core.py` companion with
 `O_NOFOLLOW`, verifies owner/link/mode/identity and its embedded SHA-256, then
 executes the exact bytes read from that descriptor. The verifier accepts the
@@ -197,9 +198,10 @@ tracked unit plus the exact container name and binds the full CID, PID, Docker
 `StartedAt`, `/proc/<pid>/stat` starttime, the single canonical unified
 `/proc/<pid>/cgroup` path ending in `docker-<full-cid>.scope`, the cgroup
 directory device/inode, and authoritative `cgroup.events` population. It then
-requires the exact expected `HostConfig.Memory`, `MemorySwap == Memory`, direct
-process argv, `memory.max`, `memory.swap.max == 0`, and activation-time
-`memory.swap.current == 0`, and rejects any identity change on re-read.
+requires the exact expected `HostConfig.Memory`, `MemorySwap == Memory`, exact
+unit/container process argv identity, `memory.max`, `memory.swap.max == 0`, and
+activation-time `memory.swap.current == 0`, and rejects any identity change on
+re-read.
 `systemctl --user show ... ControlGroup` is only a cross-check; neither it nor a
 parent-service `MemorySwapMax=0` substitutes for Docker-generation attribution.
 

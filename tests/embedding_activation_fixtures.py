@@ -354,8 +354,6 @@ class ActivationFixture:
                         "/usr/local/bin/vllm",
                         "serve",
                         "Qwen/Qwen3-Embedding-8B",
-                        "--swap-space",
-                        "0",
                     ]
                 },
             },

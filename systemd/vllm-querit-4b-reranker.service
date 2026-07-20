@@ -53,7 +53,6 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-vllm-cids/vllm-querit-4b-re
     --tensor-parallel-size 1 \
     --pipeline-parallel-size 1 \
     --cpu-offload-gb 0 \
-    --swap-space 0 \
     --max-num-batched-tokens 16384 \
     --max-num-seqs 256 \
     --enable-chunked-prefill \

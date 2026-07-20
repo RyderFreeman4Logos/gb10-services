@@ -119,11 +119,11 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                     for token in application
                     if token.split("=", 1)[0].replace("_", "-") == "--swap-space"
                 ]
-                self.assertEqual(normalized_swap, ["--swap-space"])
-                swap_at = application.index("--swap-space")
-                self.assertEqual(application[swap_at : swap_at + 2], ["--swap-space", "0"])
+                self.assertEqual(normalized_swap, [])
                 self.assertEqual(argv.count("--memory"), 1)
                 self.assertEqual(argv.count("--memory-swap"), 1)
+                self.assertEqual(argv.count("--memory-swappiness"), 1)
+                self.assertEqual(argv[argv.index("--memory-swappiness") + 1], "0")
                 self.assertEqual(
                     argv[argv.index("--memory") + 1],
                     argv[argv.index("--memory-swap") + 1],

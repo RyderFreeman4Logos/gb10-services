@@ -136,8 +136,9 @@ image with pulls and networking disabled, a read-only container root and
 source mounts, equal 12 GiB Docker memory/swap caps for the disposable
 conversion process, and only the disposable copied snapshot mounted writable.
 This conversion-container limit is not the vLLM runtime no-swap attestation.
-Every tracked production/canary vLLM backend instead has one direct
-`--swap-space 0` pair and equal Docker memory/swap intent; before readiness the
+Every tracked production/canary vLLM backend omits the unsupported vLLM
+`--swap-space` flag and uses zero Docker swappiness plus equal memory/swap
+intent; before readiness the
 canonical helper binds full CID/PID/`StartedAt`, `/proc` starttime and exact
 Docker scope, scope inode/population, then proves exact `memory.max`, zero
 `memory.swap.max`, and zero activation-time `memory.swap.current` across an
@@ -294,7 +295,6 @@ vllm serve /home/obj/models/querit-4b-vllm \
   --kv-cache-dtype auto \
   --tensor-parallel-size 1 \
   --pipeline-parallel-size 1 \
-  --swap-space 0 \
   --cpu-offload-gb 0 \
   --max-num-batched-tokens 1024 \
   --max-num-seqs 1 \

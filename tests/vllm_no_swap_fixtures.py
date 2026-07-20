@@ -82,14 +82,12 @@ class VllmNoSwapFixture(unittest.TestCase):
             "/usr/local/bin/vllm",
             "serve",
             "model",
-            "--swap-space",
-            "0",
         ]
         path.write_text(
             "[Service]\n"
             "ExecStart=/usr/bin/docker run --rm "
             f"--cidfile={cidfile} --name {name} "
-            "--memory 18g --memory-swap 18g --entrypoint python3 "
+            "--memory 18g --memory-swap 18g --memory-swappiness 0 --entrypoint python3 "
             f"{self.image} "
             + " ".join(shlex.quote(token) for token in command)
             + "\n"
@@ -143,8 +141,6 @@ class VllmNoSwapFixture(unittest.TestCase):
                     "/usr/local/bin/vllm",
                     "serve",
                     "model",
-                    "--swap-space",
-                    "0",
                 ],
             },
         }

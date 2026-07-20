@@ -205,7 +205,7 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertIn("--memory 18g", unit)
         self.assertIn("--memory-swap 18g", unit)
         self.assertIn("--memory-swappiness 0", unit)
-        self.assertIn("--swap-space 0", unit)
+        self.assertNotIn("--swap-space", unit)
         self.assertIn("--max-num-batched-tokens 16384", unit)
         self.assertIn("--max-num-seqs 256", unit)
         self.assertIn("--max-num-partial-prefills 64", unit)
