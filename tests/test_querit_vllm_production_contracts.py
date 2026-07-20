@@ -144,7 +144,7 @@ class QueritVllmProductionContractTests(unittest.TestCase):
                 "--kv-cache-memory-bytes": ["4800M"], "--kv-cache-dtype": ["auto"],
                 "--tensor-parallel-size": ["1"], "--pipeline-parallel-size": ["1"],
                 "--cpu-offload-gb": ["0"],
-                "--max-num-batched-tokens": ["4096"], "--max-num-seqs": ["16"],
+                "--max-num-batched-tokens": ["16384"], "--max-num-seqs": ["32"],
                 "--enable-chunked-prefill": [],
                 "--max-num-partial-prefills": ["1"], "--max-long-partial-prefills": ["1"],
                 "--long-prefill-token-threshold": ["8192"], "--enforce-eager": [],
@@ -154,7 +154,7 @@ class QueritVllmProductionContractTests(unittest.TestCase):
         self.assertIn("MemoryMax=256M", unit)
         self.assertNotIn("MemorySwapMax=0", unit)
         self.assertIn("Restart=no", unit)
-        self.assertIn("TimeoutStartSec=600", unit)
+        self.assertEqual(_unit_directive_values(unit, "TimeoutStartSec"), ["1800"])
 
     def test_legacy_transformers_production_unit_is_deleted(self) -> None:
         self.assertFalse(LEGACY_TRANSFORMERS_UNIT.exists())
@@ -169,11 +169,22 @@ class QueritVllmProductionContractTests(unittest.TestCase):
         self.assertEqual(
             _logical_argv(unit, "ExecStartPost"),
             [
-                ["/home/obj/.local/bin/gb10_service_ready.sh", "rerank", "http://100.105.4.92:18013", "Querit/Querit-4B", "--deadline", "300"],
+                ["/home/obj/.local/bin/gb10_service_ready.sh", "rerank", "http://100.105.4.92:18013", "Querit/Querit-4B", "--deadline", "1800"],
             ],
         )
         self.assertIn("[Install]", unit)
         self.assertIn("WantedBy=default.target", unit)
+
+    def test_production_start_pre_removes_stale_cidfile_after_generation_cleanup(self) -> None:
+        unit = PRODUCTION_UNIT.read_text()
+        self.assertEqual(
+            _logical_argv(unit, "ExecStartPre")[-1],
+            [
+                "-/bin/rm",
+                "-f",
+                "%t/gb10-vllm-cids/vllm-querit-4b-reranker.cid",
+            ],
+        )
 
     def test_canary_units_and_lifecycle_machinery_are_deleted(self) -> None:
         retired_paths = (

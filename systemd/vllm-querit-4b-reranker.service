@@ -20,12 +20,13 @@ Environment=TRANSFORMERS_OFFLINE=1
 MemoryMax=256M
 OOMScoreAdjust=500
 Restart=no
-TimeoutStartSec=600
+TimeoutStartSec=1800
 TimeoutStopSec=60
 
 ExecCondition=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-querit-4b-reranker.service
 ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-vllm-cids
 ExecStartPre=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container querit-4b-vllm --cidfile %t/gb10-vllm-cids/vllm-querit-4b-reranker.cid
+ExecStartPre=-/bin/rm -f %t/gb10-vllm-cids/vllm-querit-4b-reranker.cid
 ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-vllm-cids/vllm-querit-4b-reranker.cid --name querit-4b-vllm \
   --cgroup-parent app.slice \
   --gpus all --ipc host \
@@ -52,15 +53,15 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-vllm-cids/vllm-querit-4b-re
     --tensor-parallel-size 1 \
     --pipeline-parallel-size 1 \
     --cpu-offload-gb 0 \
-    --max-num-batched-tokens 4096 \
-    --max-num-seqs 16 \
+    --max-num-batched-tokens 16384 \
+    --max-num-seqs 32 \
     --enable-chunked-prefill \
     --max-num-partial-prefills 1 \
     --max-long-partial-prefills 1 \
     --long-prefill-token-threshold 8192 \
     --enforce-eager \
     --chat-template /home/obj/models/querit-4b-vllm/querit-rerank.jinja
-ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh rerank http://100.105.4.92:18013 Querit/Querit-4B --deadline 300
+ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh rerank http://100.105.4.92:18013 Querit/Querit-4B --deadline 1800
 ExecStop=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container querit-4b-vllm --cidfile %t/gb10-vllm-cids/vllm-querit-4b-reranker.cid
 ExecStopPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container querit-4b-vllm --cidfile %t/gb10-vllm-cids/vllm-querit-4b-reranker.cid
 
