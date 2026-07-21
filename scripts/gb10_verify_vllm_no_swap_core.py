@@ -760,6 +760,9 @@ def parse_cli(arguments: Sequence[str]) -> tuple[bool, list[str], list[str], str
 
 
 def main() -> None:
+    if "XDG_RUNTIME_DIR" not in os.environ:
+        os.environ["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
+
     cleanup_mode, unit_paths, containers, cidfile = parse_cli(ARGUMENTS)
     if cleanup_mode:
         assert cidfile is not None
