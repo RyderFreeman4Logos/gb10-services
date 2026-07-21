@@ -445,6 +445,10 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
         self.scopes["vllm-test"] = "/app.slice/docker-" + "a" * 64 + ".scope"
         self.assert_rejected()
 
+    def test_env_i_derives_xdg_runtime_dir_for_systemctl_user(self) -> None:
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_rejects_cgroup_inode_populated_or_metric_churn(self) -> None:
         scope = self.cgroup_root / self.scopes["vllm-test"].removeprefix("/")
         replacement_files = {
