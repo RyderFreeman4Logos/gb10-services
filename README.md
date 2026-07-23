@@ -205,6 +205,7 @@ mkdir -p ~/scripts ~/.local/bin ~/.config/llm-guard-proxy ~/log
 # Copy scripts
 cp scripts/aeon_vllm_wrapper.py ~/scripts/
 cp scripts/aeon_hang_guard.py ~/scripts/
+install -m 0755 scripts/aeon_text_stop_start.sh /home/obj/scripts/aeon_text_stop_start.sh
 cp scripts/aeon_chat_ready.py ~/.local/bin/
 cp scripts/gb10_apply_aeon_querit_profile.sh ~/.local/bin/
 cp scripts/gb10_check_mem_available.sh ~/.local/bin/
@@ -213,6 +214,7 @@ cp scripts/llm_guard_proxy_publish_cgroup_registration.sh ~/.local/bin/
 install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py ~/.local/bin/gb10_verify_vllm_no_swap_core.py
 install -m 0755 scripts/gb10_verify_vllm_no_swap.sh ~/.local/bin/gb10_verify_vllm_no_swap.sh
 install -m 0755 scripts/gb10_lifecycle.sh ~/.local/bin/gb10_lifecycle.sh
+install -m 0755 scripts/gb10_restart_text_safe.sh ~/.local/bin/gb10_restart_text_safe.sh
 cp scripts/sysmon.sh ~/.local/bin/
 
 

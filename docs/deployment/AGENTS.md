@@ -116,6 +116,7 @@ cp scripts/llm_guard_proxy_publish_cgroup_registration.sh /home/obj/.local/bin/
 install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py /home/obj/.local/bin/gb10_verify_vllm_no_swap_core.py
 install -m 0755 scripts/gb10_verify_vllm_no_swap.sh /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh
 install -m 0755 scripts/gb10_lifecycle.sh /home/obj/.local/bin/gb10_lifecycle.sh
+install -m 0755 scripts/gb10_restart_text_safe.sh /home/obj/.local/bin/gb10_restart_text_safe.sh
 cp scripts/sysmon.sh /home/obj/.local/bin/
 
 # Make executable
@@ -199,7 +200,9 @@ contains UTC and monotonic timestamps, UID, PID, event, actor, reason, and
 outcome. Lifecycle request/result records also contain action and unit; failed
 results and failed investigation closes include `exit_status`, and blocked
 requests identify the active investigation. The accepted request is written
-before `systemctl` executes.
+before `systemctl` executes. A successful start result is `submitted`: it means
+`systemctl --user start --no-block` accepted the submission, not that the unit
+is ready. The calling helpers retain their existing readiness deadlines.
 
 Before a benchmark investigation or other evidence-preserving diagnosis, create
 the durable marker first:
@@ -219,6 +222,11 @@ not delete the marker by hand:
   --actor benchmark-forensics --reason evidence-captured
 ```
 
+The durable investigation-end `requested` event records authorization and
+intent before marker removal; it is not a claim that removal completed. A
+successful command and the marker's absence are the close outcome. If the
+pre-removal audit or the removal itself fails, the marker remains.
+
 An authorized maintenance cycle must use two separately auditable operations;
 `restart` is deliberately rejected:
 
@@ -230,6 +238,11 @@ An authorized maintenance cycle must use two separately auditable operations;
   --unit vllm-aeon-27b-dflash.service \
   --actor maintenance-agent --reason approved-maintenance
 ```
+
+The stop and start are intentionally independent audited commands. If an
+investigation marker is created between them, start fails closed and the service
+remains stopped. This preserves evidence intentionally; do not add an unbounded
+cross-process transaction or lock protocol around the pair.
 
 `aeon_text_stop_start.sh` and `gb10_restart_text_safe.sh` route their AEON and
 reranker stop/start calls through this wrapper. The independently locked,

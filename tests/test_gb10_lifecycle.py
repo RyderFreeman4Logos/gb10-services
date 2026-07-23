@@ -14,6 +14,8 @@ SCRIPT = ROOT / "scripts" / "gb10_lifecycle.sh"
 GUARD_HELPER = ROOT / "scripts" / "aeon_text_stop_start.sh"
 RESTART_HELPER = ROOT / "scripts" / "gb10_restart_text_safe.sh"
 RUNBOOK = ROOT / "docs" / "deployment" / "AGENTS.md"
+README = ROOT / "README.md"
+GUARD_CONFIG = ROOT / "config" / "llm-guard-proxy" / "config.toml"
 PRODUCTION_STATE = "/home/obj/.local/state/gb10-lifecycle"
 UNIT = "vllm-aeon-27b-dflash.service"
 
@@ -38,6 +40,10 @@ class LifecycleAuditScriptTests(unittest.TestCase):
         self.systemctl.write_text(
             "#!/bin/sh\n"
             'printf "%s\\n" "$*" >> "$GB10_LIFECYCLE_TEST_SYSTEMCTL_LOG"\n'
+            'if [ -n "${GB10_LIFECYCLE_TEST_REQUIRE_NO_BLOCK:-}" ] '
+            '&& [ "${3:-}" != "--no-block" ]; then\n'
+            "    exit 91\n"
+            "fi\n"
             'if [ -n "${GB10_LIFECYCLE_TEST_SYSTEMCTL_ENTERED:-}" ]; then\n'
             '    : > "$GB10_LIFECYCLE_TEST_SYSTEMCTL_ENTERED"\n'
             '    while [ ! -e "$GB10_LIFECYCLE_TEST_SYSTEMCTL_RELEASE" ]; do\n'
@@ -104,6 +110,24 @@ class LifecycleAuditScriptTests(unittest.TestCase):
             reason,
         )
 
+    def environment_with_audit_failure_after_chmod(
+        self,
+        target_name: str,
+    ) -> dict[str, str]:
+        fake_bin = self.root / f"fake-chmod-{target_name}"
+        fake_bin.mkdir()
+        fake_chmod = fake_bin / "chmod"
+        fake_chmod.write_text(
+            "#!/bin/sh\n"
+            '/usr/bin/chmod "$@"\n'
+            f'case "$2" in *{target_name}) '
+            f'/usr/bin/chmod 0400 "{self.state / "lifecycle-audit.log"}" ;; esac\n'
+        )
+        fake_chmod.chmod(fake_chmod.stat().st_mode | stat.S_IXUSR)
+        environment = self.environment.copy()
+        environment["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+        return environment
+
     def test_production_script_uses_only_the_canonical_state_directory(self) -> None:
         source = SCRIPT.read_text()
 
@@ -157,7 +181,10 @@ class LifecycleAuditScriptTests(unittest.TestCase):
         self.assertIn("active investigation lock", blocked.stderr)
         self.assertEqual(end.returncode, 0, end.stdout + end.stderr)
         self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
-        self.assertEqual(self.systemctl_log.read_text(), f"--user start {UNIT}\n")
+        self.assertEqual(
+            self.systemctl_log.read_text(),
+            f"--user start --no-block {UNIT}\n",
+        )
         audit = (self.state / "lifecycle-audit.log").read_text()
         self.assertIn(
             "event=investigation-begin actor=benchmark-forensics "
@@ -178,8 +205,44 @@ class LifecycleAuditScriptTests(unittest.TestCase):
             "reason=forensics-complete outcome=closed"
         )
         self.assertIn(requested, audit)
-        self.assertIn(closed, audit)
-        self.assertLess(audit.index(requested), audit.index(closed))
+        self.assertNotIn(closed, audit)
+
+    def test_investigation_begin_request_audit_failure_creates_no_marker(self) -> None:
+        begin = self.execute(
+            "investigation-begin",
+            "--actor",
+            "benchmark-forensics",
+            "--reason",
+            "incident-26",
+            environment=self.environment_with_audit_failure_after_chmod(
+                "lifecycle.mutex"
+            ),
+        )
+
+        self.assertNotEqual(begin.returncode, 0)
+        self.assertFalse((self.state / "investigation.lock").exists())
+
+    def test_investigation_begin_created_audit_failure_keeps_attribution(self) -> None:
+        begin = self.execute(
+            "investigation-begin",
+            "--actor",
+            "benchmark-forensics",
+            "--reason",
+            "incident-26",
+            environment=self.environment_with_audit_failure_after_chmod(
+                "investigation.lock"
+            ),
+        )
+
+        self.assertNotEqual(begin.returncode, 0)
+        self.assertTrue((self.state / "investigation.lock").is_file())
+        audit = (self.state / "lifecycle-audit.log").read_text()
+        self.assertIn(
+            "event=investigation-begin actor=benchmark-forensics "
+            "reason=incident-26 outcome=requested",
+            audit,
+        )
+        self.assertNotIn("outcome=created", audit)
 
     def test_investigation_end_keeps_marker_when_request_audit_fails(self) -> None:
         begin = self.execute(
@@ -193,32 +256,15 @@ class LifecycleAuditScriptTests(unittest.TestCase):
         marker = self.state / "investigation.lock"
         self.assertTrue(marker.is_file())
 
-        audit_log = self.state / "lifecycle-audit.log"
-        audit_log.unlink()
-        self.addCleanup(
-            lambda: audit_log.chmod(0o700) if audit_log.is_dir() else None
-        )
-        fake_bin = self.root / "fake-bin"
-        fake_bin.mkdir()
-        fake_touch = fake_bin / "touch"
-        fake_touch.write_text(
-            "#!/bin/sh\n"
-            'case "$1" in\n'
-            "    *lifecycle-audit.log) /usr/bin/mkdir -p -- \"$1\" ;;\n"
-            '    *) /usr/bin/touch "$@" ;;\n'
-            "esac\n"
-        )
-        fake_touch.chmod(fake_touch.stat().st_mode | stat.S_IXUSR)
-        environment = self.environment.copy()
-        environment["PATH"] = f"{fake_bin}:/usr/bin:/bin"
-
         end = self.execute(
             "investigation-end",
             "--actor",
             "benchmark-forensics",
             "--reason",
             "forensics-complete",
-            environment=environment,
+            environment=self.environment_with_audit_failure_after_chmod(
+                "lifecycle.mutex"
+            ),
         )
 
         self.assertNotEqual(end.returncode, 0)
@@ -291,6 +337,43 @@ class LifecycleAuditScriptTests(unittest.TestCase):
         self.assertEqual(owner.returncode, 0, stdout + stderr)
         self.assertEqual(self.systemctl_log.read_text(), f"--user stop {UNIT}\n")
 
+    def test_start_submits_no_block_and_audits_attribution(self) -> None:
+        environment = self.environment.copy()
+        environment["GB10_LIFECYCLE_TEST_REQUIRE_NO_BLOCK"] = "1"
+        result = self.execute(*self.arguments("start"), environment=environment)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            self.systemctl_log.read_text(),
+            f"--user start --no-block {UNIT}\n",
+        )
+        audit = (self.state / "lifecycle-audit.log").read_text()
+        self.assertIn(
+            "event=result action=start unit=vllm-aeon-27b-dflash.service "
+            "actor=test-operator reason=approved-maintenance outcome=submitted",
+            audit,
+        )
+        self.assertNotIn(
+            "action=start unit=vllm-aeon-27b-dflash.service "
+            "actor=test-operator reason=approved-maintenance outcome=success",
+            audit,
+        )
+
+    def test_failed_start_submission_keeps_reason_and_exit_status(self) -> None:
+        environment = self.environment.copy()
+        environment["GB10_LIFECYCLE_TEST_SYSTEMCTL_STATUS"] = "7"
+
+        result = self.execute(*self.arguments("start"), environment=environment)
+
+        self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+        audit = (self.state / "lifecycle-audit.log").read_text()
+        self.assertIn(
+            "event=result action=start unit=vllm-aeon-27b-dflash.service "
+            "actor=test-operator reason=approved-maintenance "
+            "outcome=failure exit_status=7",
+            audit,
+        )
+
     def test_failed_result_keeps_reason_and_exit_status(self) -> None:
         environment = self.environment.copy()
         environment["GB10_LIFECYCLE_TEST_SYSTEMCTL_STATUS"] = "7"
@@ -319,16 +402,46 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
         path.write_text(content)
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
-    def test_runbook_installs_guard_helper_and_documents_the_event_schema(self) -> None:
+    def test_deployment_docs_install_all_lifecycle_helpers(self) -> None:
+        runbook = " ".join(RUNBOOK.read_text().split())
+        readme = " ".join(README.read_text().split())
+        destinations = (
+            "install -m 0755 scripts/gb10_lifecycle.sh "
+            "/home/obj/.local/bin/gb10_lifecycle.sh",
+            "install -m 0755 scripts/aeon_text_stop_start.sh "
+            "/home/obj/scripts/aeon_text_stop_start.sh",
+            "install -m 0755 scripts/gb10_restart_text_safe.sh "
+            "/home/obj/.local/bin/gb10_restart_text_safe.sh",
+        )
+
+        for destination in destinations:
+            self.assertIn(destination, runbook)
+            self.assertIn(destination, readme.replace("~/.local", "/home/obj/.local"))
+
+        guard_config = GUARD_CONFIG.read_text()
+        self.assertEqual(
+            guard_config.count(
+                'restart_command = ["/home/obj/scripts/aeon_text_stop_start.sh"]'
+            ),
+            2,
+        )
+
+    def test_runbook_documents_actual_event_outcomes(self) -> None:
         runbook = " ".join(RUNBOOK.read_text().split())
 
         self.assertIn(
-            "install -m 0755 scripts/aeon_text_stop_start.sh "
-            "/home/obj/scripts/aeon_text_stop_start.sh",
+            f"fixed production path `{PRODUCTION_STATE}/lifecycle-audit.log`",
+            runbook,
+        )
+        self.assertIn("A successful start result is `submitted`", runbook)
+        self.assertIn("it is not a claim that removal completed", runbook)
+        self.assertIn(
+            "If an investigation marker is created between them, start fails "
+            "closed and the service remains stopped",
             runbook,
         )
         self.assertIn(
-            f"fixed production path `{PRODUCTION_STATE}/lifecycle-audit.log`",
+            "do not add an unbounded cross-process transaction or lock protocol",
             runbook,
         )
         self.assertIn(

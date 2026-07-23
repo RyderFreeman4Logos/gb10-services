@@ -162,6 +162,7 @@ case "$ACTION" in
             audit investigation-begin actor="$ACTOR" reason="$REASON" outcome=already-active
             fail "an investigation lock is already active"
         fi
+        audit investigation-begin actor="$ACTOR" reason="$REASON" outcome=requested
         printf 'actor=%s\nreason=%s\ncreated_at=%s\n' \
             "$ACTOR" "$REASON" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$INVESTIGATION_LOCK"
         chmod 0600 "$INVESTIGATION_LOCK"
@@ -174,7 +175,7 @@ case "$ACTION" in
         fi
         audit investigation-end actor="$ACTOR" reason="$REASON" outcome=requested
         if rm -f -- "$INVESTIGATION_LOCK"; then
-            audit investigation-end actor="$ACTOR" reason="$REASON" outcome=closed
+            :
         else
             status=$?
             audit investigation-end actor="$ACTOR" reason="$REASON" outcome=failure exit_status="$status"
@@ -185,17 +186,31 @@ case "$ACTION" in
         audit request action=restart unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=rejected
         fail "restart is forbidden; use separate audited stop and start operations"
         ;;
-    stop|start)
+    stop)
         if [[ -e "$INVESTIGATION_LOCK" || -L "$INVESTIGATION_LOCK" ]]; then
-            audit request action="$ACTION" unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=blocked investigation=active
+            audit request action=stop unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=blocked investigation=active
             fail "active investigation lock blocks lifecycle operation"
         fi
-        audit request action="$ACTION" unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=accepted
-        if "$SYSTEMCTL_BIN" --user "$ACTION" "$UNIT"; then
-            audit result action="$ACTION" unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=success
+        audit request action=stop unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=accepted
+        if "$SYSTEMCTL_BIN" --user stop "$UNIT"; then
+            audit result action=stop unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=success
         else
             status=$?
-            audit result action="$ACTION" unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=failure exit_status="$status"
+            audit result action=stop unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=failure exit_status="$status"
+            exit "$status"
+        fi
+        ;;
+    start)
+        if [[ -e "$INVESTIGATION_LOCK" || -L "$INVESTIGATION_LOCK" ]]; then
+            audit request action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=blocked investigation=active
+            fail "active investigation lock blocks lifecycle operation"
+        fi
+        audit request action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=accepted
+        if "$SYSTEMCTL_BIN" --user start --no-block "$UNIT"; then
+            audit result action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=submitted
+        else
+            status=$?
+            audit result action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=failure exit_status="$status"
             exit "$status"
         fi
         ;;
