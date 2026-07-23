@@ -89,7 +89,7 @@ input_token_safety_margin = 512
 [[upstreams]]
 name = "aeon-chat"
 base_url = "http://100.105.4.92:18010/v1"
-match_models = ["aeon-ultimate", "qwen3.6-27b-decensor-by-aeon"]
+match_models = ["aeon-ultimate", "qwen3.6-27b-decensor-by-aeon", "qwen3.6-27b-decensored"]
 request_timeout_ms = 1800000
 max_in_flight_requests = 4
 max_queued_generation_requests = 64
