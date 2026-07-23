@@ -43,7 +43,7 @@ OOMScoreAdjust=800
 # only cold long-prompt prefill TTFT increases via more chunked-prefill iterations.
 # Prefix-cache/KV-cache hit rate is unaffected (lives inside the pool, not batch-sized).
 # util=0.355 is the tracked co-resident target; 0.6 is the too-fat upstream baseline.
-# Restart via gb10_restart_text_safe.sh (stops rr first, never emb).
+# Manual lifecycle changes must use gb10_lifecycle.sh; the text helper routes through it.
 MemoryMax=256M
 # Recover from any stop cause (crash, OOM kill, guardian cgroup.kill).
 # Manual `systemctl --user stop` is NOT restarted because systemd treats

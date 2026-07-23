@@ -114,6 +114,7 @@ cp scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/
 cp scripts/llm_guard_proxy_publish_cgroup_registration.sh /home/obj/.local/bin/
 install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py /home/obj/.local/bin/gb10_verify_vllm_no_swap_core.py
 install -m 0755 scripts/gb10_verify_vllm_no_swap.sh /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh
+install -m 0755 scripts/gb10_lifecycle.sh /home/obj/.local/bin/gb10_lifecycle.sh
 cp scripts/sysmon.sh /home/obj/.local/bin/
 
 # Make executable
@@ -183,6 +184,53 @@ systemctl --user disable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now vllm-querit-4b-reranker.service
 systemctl --user enable --now llm-guard-proxy.service
 ```
+
+### Model lifecycle audit and investigation lock
+
+For an already-running model service, do **not** call `systemctl --user stop`,
+`restart`, or a stack-cycle helper directly. Use the installed
+`/home/obj/.local/bin/gb10_lifecycle.sh` wrapper for every manual model
+stop/start. It accepts only the tracked AEON, embedding, and reranker units,
+requires a content-free `--actor` and `--reason` token, serializes operations,
+and writes an owner-only record to
+`$HOME/.local/state/gb10-lifecycle/lifecycle-audit.log`. Each record contains
+UTC and monotonic timestamps, UID/PID, actor, reason, unit, action, and outcome;
+the accepted request is written before `systemctl` executes.
+
+Before a benchmark investigation or other evidence-preserving diagnosis, create
+the durable marker first:
+
+```bash
+/home/obj/.local/bin/gb10_lifecycle.sh investigation-begin \
+  --actor benchmark-forensics --reason incident-26
+```
+
+While that investigation marker exists, the wrapper rejects **both** model stops
+and starts, including the Guard-configured AEON local-recovery helper. End the
+investigation explicitly only after recording the conclusion/authorization; do
+not delete the marker by hand:
+
+```bash
+/home/obj/.local/bin/gb10_lifecycle.sh investigation-end \
+  --actor benchmark-forensics --reason evidence-captured
+```
+
+An authorized maintenance cycle must use two separately auditable operations;
+`restart` is deliberately rejected:
+
+```bash
+/home/obj/.local/bin/gb10_lifecycle.sh stop \
+  --unit vllm-aeon-27b-dflash.service \
+  --actor maintenance-agent --reason approved-maintenance
+/home/obj/.local/bin/gb10_lifecycle.sh start \
+  --unit vllm-aeon-27b-dflash.service \
+  --actor maintenance-agent --reason approved-maintenance
+```
+
+`aeon_text_stop_start.sh` and `gb10_restart_text_safe.sh` route their AEON and
+reranker stop/start calls through this wrapper. The independently locked,
+no-argument embedding activation transaction retains its own durable receipts;
+do not replace that transaction with manual lifecycle commands.
 
 ### Generation-bound vLLM no-swap authority
 
@@ -364,11 +412,19 @@ and enforces the configured 5 GiB `MemAvailable` threshold during startup;
 serialized compilation is pressure reduction, not an exemption from that guard.
 
 ### 1. CUDA Hang or Service Crash
-If `vllm-aeon-27b-dflash.service` hangs or refuses to respond, use the tracked
-unit lifecycle so its generation-bound cleanup authority remains in control:
+If `vllm-aeon-27b-dflash.service` hangs or refuses to respond, preserve
+content-free evidence first. After explicit authorization and only when no
+investigation marker is active, use the audited tracked lifecycle so its
+generation-bound cleanup authority remains in control:
 ```bash
-systemctl --user restart vllm-aeon-27b-dflash.service
+/home/obj/.local/bin/gb10_lifecycle.sh stop \
+  --unit vllm-aeon-27b-dflash.service \
+  --actor recovery-operator --reason authorized-hang-recovery
+/home/obj/.local/bin/gb10_lifecycle.sh start \
+  --unit vllm-aeon-27b-dflash.service \
+  --actor recovery-operator --reason authorized-hang-recovery
 ```
+Do not use `systemctl restart`.
 
 ### 2. Generation-bound cleanup failures
 

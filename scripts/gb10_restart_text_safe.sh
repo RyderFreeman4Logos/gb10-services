@@ -34,6 +34,9 @@ RR_URL="http://100.105.4.92:18013/v1/models"
 TEXT_DEADLINE="${TEXT_START_DEADLINE:-2400}"
 RR_DEADLINE="${RR_START_DEADLINE:-600}"
 POLL_INTERVAL="${POLL_INTERVAL:-10}"
+LIFECYCLE="${GB10_LIFECYCLE_BIN:-/home/obj/.local/bin/gb10_lifecycle.sh}"
+LIFECYCLE_ACTOR="${GB10_LIFECYCLE_ACTOR:-gb10_restart_text_safe}"
+LIFECYCLE_REASON="${GB10_LIFECYCLE_REASON:-authorized-text-maintenance}"
 
 MODE="full"
 
@@ -70,7 +73,8 @@ stop_unit() {
   local unit="$1"
   if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
     log "Stopping $unit ..."
-    systemctl --user stop "$unit"
+    "$LIFECYCLE" stop --unit "${unit}.service" \
+      --actor "$LIFECYCLE_ACTOR" --reason "$LIFECYCLE_REASON"
     # Kill any orphaned readiness scripts
     pkill -f "${unit}.*ready" 2>/dev/null || true
   else
@@ -82,7 +86,8 @@ start_unit() {
   local unit="$1"
   log "Starting $unit ..."
   systemctl --user reset-failed "$unit" 2>/dev/null || true
-  systemctl --user start --no-block "$unit"
+  "$LIFECYCLE" start --unit "${unit}.service" \
+    --actor "$LIFECYCLE_ACTOR" --reason "$LIFECYCLE_REASON"
 }
 
 # ------------------------------------------------------------------- rr-only --
