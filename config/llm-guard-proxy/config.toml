@@ -56,6 +56,30 @@ recovery_cooldown_ms = 300000
 recovery_budget_window_ms = 900000
 recovery_max_per_window = 2
 
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/home/obj/scripts/aeon_text_stop_start.sh"]
+restart_timeout_ms = 300000
+readiness_endpoint = "/v1/chat/completions"
+readiness_request_timeout_ms = 30000
+readiness_deadline_ms = 600000
+readiness_interval_ms = 5000
+max_attempts_per_request = 1
+cooldown_ms = 300000
+budget_window_ms = 900000
+max_per_window = 2
+
+[upstream.stuck_watchdog]
+enabled = true
+check_interval_secs = 30
+detection_window_secs = 180
+min_output_progress_units_in_window = 1
+
+[upstream.restart_queue]
+enabled = true
+queue_deadline_secs = 300
+restart_timeout_secs = 300
+
 [upstream.metadata]
 discovery_enabled = true
 enrich_responses = true
@@ -81,6 +105,30 @@ enabled = true
 probe_max_tokens = 1
 probe_interval_secs = 5
 probe_timeout_secs = 600
+
+[upstreams.local_recovery]
+enabled = true
+restart_command = ["/home/obj/scripts/aeon_text_stop_start.sh"]
+restart_timeout_ms = 300000
+readiness_endpoint = "/v1/chat/completions"
+readiness_request_timeout_ms = 30000
+readiness_deadline_ms = 600000
+readiness_interval_ms = 5000
+max_attempts_per_request = 1
+cooldown_ms = 300000
+budget_window_ms = 900000
+max_per_window = 2
+
+[upstreams.stuck_watchdog]
+enabled = true
+check_interval_secs = 30
+detection_window_secs = 180
+min_output_progress_units_in_window = 1
+
+[upstreams.restart_queue]
+enabled = true
+queue_deadline_secs = 300
+restart_timeout_secs = 300
 
 [upstreams.thinking]
 mode = "bounded_thinking"
