@@ -108,6 +108,15 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         self.assertEqual(option_value("--gpu-memory-utilization"), "0.355")
         self.assertEqual(option_value("--kv-cache-dtype"), "fp8_e4m3")
         self.assertEqual(option_value("--attention-backend"), "TRITON_ATTN")
+        served_name_index = runtime_argv.index("--served-model-name")
+        self.assertEqual(
+            runtime_argv[served_name_index + 1 : served_name_index + 4],
+            [
+                "aeon-ultimate",
+                "qwen3.6-27b-decensor-by-aeon",
+                "qwen3.6-27b-decensored",
+            ],
+        )
         speculative = json.loads(option_value("--speculative-config"))
         self.assertEqual(speculative["method"], "dflash")
         self.assertEqual(speculative["num_speculative_tokens"], 10)
@@ -142,6 +151,13 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         self.assertNotIn("269,589 KV tokens", reference_row)
         self.assertNotIn("pinned KV 15G", unit_text)
         self.assertNotIn("15GiB KV verified 269589", unit_text)
+        for alias in (
+            "aeon-ultimate",
+            "qwen3.6-27b-decensor-by-aeon",
+            "qwen3.6-27b-decensored",
+        ):
+            with self.subTest(alias=alias):
+                self.assertIn(alias, guide)
 
     def test_current_docs_publish_friendly_tag_and_immutable_digest(self) -> None:
         for path in CURRENT_DOCS:

@@ -82,7 +82,7 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
   /opt/hang_guard/aeon_vllm_wrapper.py serve \
     /models/aeon-cache/snapshots/6394b93fa092dcbfbf09e952f56f30337509d17c \
     --host 0.0.0.0 --port 8000 \
-    --served-model-name "aeon-ultimate" "qwen3.6-27b-decensor-by-aeon" \
+    --served-model-name "aeon-ultimate" "qwen3.6-27b-decensor-by-aeon" "qwen3.6-27b-decensored" \
     --quantization modelopt \
     --kv-cache-dtype fp8_e4m3 \
     --attention-backend TRITON_ATTN \
