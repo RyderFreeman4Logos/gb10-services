@@ -170,7 +170,7 @@ case "$ACTION" in
         ;;
     investigation-end)
         if [[ -L "$INVESTIGATION_LOCK" || ! -f "$INVESTIGATION_LOCK" ]]; then
-            audit investigation-end actor="$ACTOR" reason="$REASON" outcome=missing
+            audit investigation-end actor="$ACTOR" reason="$REASON" outcome=missing exit_status=1
             fail "there is no active investigation lock"
         fi
         audit investigation-end actor="$ACTOR" reason="$REASON" outcome=requested

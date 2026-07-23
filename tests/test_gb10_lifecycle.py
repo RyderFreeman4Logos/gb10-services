@@ -271,6 +271,24 @@ class LifecycleAuditScriptTests(unittest.TestCase):
         self.assertNotEqual(end.returncode, 0)
         self.assertTrue(marker.is_file())
 
+    def test_investigation_end_missing_marker_records_failed_close_exit_status(self) -> None:
+        end = self.execute(
+            "investigation-end",
+            "--actor",
+            "benchmark-forensics",
+            "--reason",
+            "forensics-complete",
+        )
+
+        self.assertEqual(end.returncode, 1, end.stdout + end.stderr)
+        self.assertIn("there is no active investigation lock", end.stderr)
+        audit = (self.state / "lifecycle-audit.log").read_text()
+        self.assertIn(
+            "event=investigation-end actor=benchmark-forensics "
+            "reason=forensics-complete outcome=missing exit_status=1",
+            audit,
+        )
+
     def test_investigation_end_records_unlink_failure_outcome(self) -> None:
         begin = self.execute(
             "investigation-begin",
