@@ -7,14 +7,16 @@ set -euo pipefail
 
 readonly UNIT="vllm-aeon-27b-dflash.service"
 readonly SYSTEMCTL="/usr/bin/systemctl"
-readonly TIMEOUT="/usr/bin/timeout"
 readonly SLEEP="/usr/bin/sleep"
-readonly STOP_TIMEOUT_SECS=90
-readonly START_TIMEOUT_SECS=30
 readonly ACTIVE_WAIT_SECS=30
+readonly LIFECYCLE="${GB10_LIFECYCLE_BIN:-/home/obj/.local/bin/gb10_lifecycle.sh}"
+readonly LIFECYCLE_ACTOR="llm-guard-proxy.local-recovery"
+readonly LIFECYCLE_REASON="automatic-local-recovery"
 
-"${TIMEOUT}" "${STOP_TIMEOUT_SECS}" "${SYSTEMCTL}" --user stop "${UNIT}"
-"${TIMEOUT}" "${START_TIMEOUT_SECS}" "${SYSTEMCTL}" --user start "${UNIT}"
+"$LIFECYCLE" stop --unit "$UNIT" \
+    --actor "$LIFECYCLE_ACTOR" --reason "$LIFECYCLE_REASON"
+"$LIFECYCLE" start --unit "$UNIT" \
+    --actor "$LIFECYCLE_ACTOR" --reason "$LIFECYCLE_REASON"
 
 deadline=$((SECONDS + ACTIVE_WAIT_SECS))
 while (( SECONDS < deadline )); do
