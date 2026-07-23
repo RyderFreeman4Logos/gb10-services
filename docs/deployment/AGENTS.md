@@ -108,6 +108,7 @@ mkdir -p /home/obj/scripts /home/obj/.local/bin /home/obj/.config/llm-guard-prox
 # Copy all scripts
 cp scripts/aeon_vllm_wrapper.py /home/obj/scripts/
 cp scripts/aeon_hang_guard.py /home/obj/scripts/
+install -m 0755 scripts/aeon_text_stop_start.sh /home/obj/scripts/aeon_text_stop_start.sh
 cp scripts/aeon_chat_ready.py /home/obj/.local/bin/
 cp scripts/gb10_check_mem_available.sh /home/obj/.local/bin/
 cp scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/
@@ -192,10 +193,13 @@ For an already-running model service, do **not** call `systemctl --user stop`,
 `/home/obj/.local/bin/gb10_lifecycle.sh` wrapper for every manual model
 stop/start. It accepts only the tracked AEON, embedding, and reranker units,
 requires a content-free `--actor` and `--reason` token, serializes operations,
-and writes an owner-only record to
-`$HOME/.local/state/gb10-lifecycle/lifecycle-audit.log`. Each record contains
-UTC and monotonic timestamps, UID/PID, actor, reason, unit, action, and outcome;
-the accepted request is written before `systemctl` executes.
+and writes owner-only records to the fixed production path
+`/home/obj/.local/state/gb10-lifecycle/lifecycle-audit.log`. Every record
+contains UTC and monotonic timestamps, UID, PID, event, actor, reason, and
+outcome. Lifecycle request/result records also contain action and unit; failed
+results and failed investigation closes include `exit_status`, and blocked
+requests identify the active investigation. The accepted request is written
+before `systemctl` executes.
 
 Before a benchmark investigation or other evidence-preserving diagnosis, create
 the durable marker first:

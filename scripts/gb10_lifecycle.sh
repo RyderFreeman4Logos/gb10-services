@@ -28,17 +28,7 @@ fail() {
     exit 1
 }
 
-if [[ -n "${GB10_LIFECYCLE_STATE_DIR:-}" ]]; then
-    STATE_DIR="${GB10_LIFECYCLE_STATE_DIR}"
-elif [[ -n "${XDG_STATE_HOME:-}" ]]; then
-    STATE_DIR="${XDG_STATE_HOME}/gb10-lifecycle"
-elif [[ -n "${HOME:-}" ]]; then
-    STATE_DIR="${HOME}/.local/state/gb10-lifecycle"
-else
-    fail "HOME or XDG_STATE_HOME is required"
-fi
-
-readonly STATE_DIR
+readonly STATE_DIR="/home/obj/.local/state/gb10-lifecycle"
 readonly AUDIT_LOG="${STATE_DIR}/lifecycle-audit.log"
 readonly INVESTIGATION_LOCK="${STATE_DIR}/investigation.lock"
 readonly MUTEX_LOCK="${STATE_DIR}/lifecycle.mutex"
@@ -182,8 +172,14 @@ case "$ACTION" in
             audit investigation-end actor="$ACTOR" reason="$REASON" outcome=missing
             fail "there is no active investigation lock"
         fi
-        rm -f -- "$INVESTIGATION_LOCK"
-        audit investigation-end actor="$ACTOR" reason="$REASON" outcome=closed
+        audit investigation-end actor="$ACTOR" reason="$REASON" outcome=requested
+        if rm -f -- "$INVESTIGATION_LOCK"; then
+            audit investigation-end actor="$ACTOR" reason="$REASON" outcome=closed
+        else
+            status=$?
+            audit investigation-end actor="$ACTOR" reason="$REASON" outcome=failure exit_status="$status"
+            exit "$status"
+        fi
         ;;
     restart)
         audit request action=restart unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=rejected
@@ -196,10 +192,10 @@ case "$ACTION" in
         fi
         audit request action="$ACTION" unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=accepted
         if "$SYSTEMCTL_BIN" --user "$ACTION" "$UNIT"; then
-            audit result action="$ACTION" unit="$UNIT" actor="$ACTOR" outcome=success
+            audit result action="$ACTION" unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=success
         else
             status=$?
-            audit result action="$ACTION" unit="$UNIT" actor="$ACTOR" outcome=failure exit_status="$status"
+            audit result action="$ACTION" unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=failure exit_status="$status"
             exit "$status"
         fi
         ;;

@@ -85,7 +85,6 @@ stop_unit() {
 start_unit() {
   local unit="$1"
   log "Starting $unit ..."
-  systemctl --user reset-failed "$unit" 2>/dev/null || true
   "$LIFECYCLE" start --unit "${unit}.service" \
     --actor "$LIFECYCLE_ACTOR" --reason "$LIFECYCLE_REASON"
 }
