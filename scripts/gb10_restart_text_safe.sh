@@ -85,7 +85,7 @@ stop_unit() {
 start_unit() {
   local unit="$1"
   log "Starting $unit ..."
-  "$LIFECYCLE" start --unit "${unit}.service" \
+  "$LIFECYCLE" start --reset-failed --unit "${unit}.service" \
     --actor "$LIFECYCLE_ACTOR" --reason "$LIFECYCLE_REASON"
 }
 

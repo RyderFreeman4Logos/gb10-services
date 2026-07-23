@@ -16,10 +16,12 @@ usage() {
 Usage:
   gb10_lifecycle.sh investigation-begin --actor ACTOR --reason REASON
   gb10_lifecycle.sh investigation-end --actor ACTOR --reason REASON
-  gb10_lifecycle.sh stop|start --unit UNIT --actor ACTOR --reason REASON
+  gb10_lifecycle.sh stop --unit UNIT --actor ACTOR --reason REASON
+  gb10_lifecycle.sh start [--reset-failed] --unit UNIT --actor ACTOR --reason REASON
 
 Only tracked GB10 model units are accepted. `restart` is intentionally rejected:
 perform separately audited stop and start operations instead.
+`--reset-failed` is only for explicit maintenance starts.
 USAGE
 }
 
@@ -100,6 +102,7 @@ shift
 ACTOR=""
 REASON=""
 UNIT=""
+RESET_FAILED="false"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -117,6 +120,10 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || fail "--unit requires a value"
             UNIT="$2"
             shift 2
+            ;;
+        --reset-failed)
+            RESET_FAILED="true"
+            shift
             ;;
         --help|-h)
             usage
@@ -136,6 +143,10 @@ case "$ACTION" in
         fail "unknown action: $ACTION"
         ;;
 esac
+
+if [[ "$RESET_FAILED" == "true" && "$ACTION" != "start" ]]; then
+    fail "--reset-failed is only valid with start"
+fi
 
 require_token actor "$ACTOR"
 require_token reason "$REASON"
@@ -202,16 +213,18 @@ case "$ACTION" in
         ;;
     start)
         if [[ -e "$INVESTIGATION_LOCK" || -L "$INVESTIGATION_LOCK" ]]; then
-            audit request action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=blocked investigation=active
+            audit request action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=blocked investigation=active reset_failed="$RESET_FAILED"
             fail "active investigation lock blocks lifecycle operation"
         fi
-        audit request action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=accepted
-        if "$SYSTEMCTL_BIN" --user reset-failed "$UNIT"; then
-            audit reset-failed action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=success
-        else
-            status=$?
-            audit reset-failed action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=failure exit_status="$status"
-            exit "$status"
+        audit request action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=accepted reset_failed="$RESET_FAILED"
+        if [[ "$RESET_FAILED" == "true" ]]; then
+            if "$SYSTEMCTL_BIN" --user reset-failed "$UNIT"; then
+                audit reset-failed action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=success
+            else
+                status=$?
+                audit reset-failed action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=failure exit_status="$status"
+                exit "$status"
+            fi
         fi
         if "$SYSTEMCTL_BIN" --user start --no-block "$UNIT"; then
             audit result action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=submitted
