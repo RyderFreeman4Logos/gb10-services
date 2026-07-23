@@ -206,6 +206,13 @@ case "$ACTION" in
             fail "active investigation lock blocks lifecycle operation"
         fi
         audit request action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=accepted
+        if "$SYSTEMCTL_BIN" --user reset-failed "$UNIT"; then
+            audit reset-failed action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=success
+        else
+            status=$?
+            audit reset-failed action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=failure exit_status="$status"
+            exit "$status"
+        fi
         if "$SYSTEMCTL_BIN" --user start --no-block "$UNIT"; then
             audit result action=start unit="$UNIT" actor="$ACTOR" reason="$REASON" outcome=submitted
         else

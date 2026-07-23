@@ -202,7 +202,9 @@ results and failed investigation closes include `exit_status`, and blocked
 requests identify the active investigation. The accepted request is written
 before `systemctl` executes. A successful start result is `submitted`: it means
 `systemctl --user start --no-block` accepted the submission, not that the unit
-is ready. The calling helpers retain their existing readiness deadlines.
+is ready. Before each submission, the wrapper resets the unit's failed state
+inside its lifecycle lock; that reset is audited and any reset failure is
+propagated. The calling helpers retain their existing readiness deadlines.
 
 Before a benchmark investigation or other evidence-preserving diagnosis, create
 the durable marker first:
@@ -242,7 +244,9 @@ An authorized maintenance cycle must use two separately auditable operations;
 The stop and start are intentionally independent audited commands. If an
 investigation marker is created between them, start fails closed and the service
 remains stopped. This preserves evidence intentionally; do not add an unbounded
-cross-process transaction or lock protocol around the pair.
+cross-process transaction or lock protocol around the pair. Investigation-begin
+gates future submissions only; it does not guarantee lifecycle quiescence for an
+in-flight start job already submitted with `--no-block`.
 
 `aeon_text_stop_start.sh` and `gb10_restart_text_safe.sh` route their AEON and
 reranker stop/start calls through this wrapper. The independently locked,

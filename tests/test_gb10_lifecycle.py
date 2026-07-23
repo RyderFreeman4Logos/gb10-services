@@ -41,7 +41,7 @@ class LifecycleAuditScriptTests(unittest.TestCase):
             "#!/bin/sh\n"
             'printf "%s\\n" "$*" >> "$GB10_LIFECYCLE_TEST_SYSTEMCTL_LOG"\n'
             'if [ -n "${GB10_LIFECYCLE_TEST_REQUIRE_NO_BLOCK:-}" ] '
-            '&& [ "${3:-}" != "--no-block" ]; then\n'
+            '&& [ "${2:-}" = "start" ] && [ "${3:-}" != "--no-block" ]; then\n'
             "    exit 91\n"
             "fi\n"
             'if [ -n "${GB10_LIFECYCLE_TEST_SYSTEMCTL_ENTERED:-}" ]; then\n'
@@ -183,6 +183,7 @@ class LifecycleAuditScriptTests(unittest.TestCase):
         self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
         self.assertEqual(
             self.systemctl_log.read_text(),
+            f"--user reset-failed {UNIT}\n"
             f"--user start --no-block {UNIT}\n",
         )
         audit = (self.state / "lifecycle-audit.log").read_text()
@@ -337,7 +338,9 @@ class LifecycleAuditScriptTests(unittest.TestCase):
         self.assertEqual(owner.returncode, 0, stdout + stderr)
         self.assertEqual(self.systemctl_log.read_text(), f"--user stop {UNIT}\n")
 
-    def test_start_submits_no_block_and_audits_attribution(self) -> None:
+    def test_start_resets_failed_state_then_submits_no_block_and_audits_attribution(
+        self,
+    ) -> None:
         environment = self.environment.copy()
         environment["GB10_LIFECYCLE_TEST_REQUIRE_NO_BLOCK"] = "1"
         result = self.execute(*self.arguments("start"), environment=environment)
@@ -345,27 +348,45 @@ class LifecycleAuditScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(
             self.systemctl_log.read_text(),
+            f"--user reset-failed {UNIT}\n"
             f"--user start --no-block {UNIT}\n",
         )
         audit = (self.state / "lifecycle-audit.log").read_text()
+        self.assertIn(
+            "event=reset-failed action=start unit=vllm-aeon-27b-dflash.service "
+            "actor=test-operator reason=approved-maintenance outcome=success",
+            audit,
+        )
         self.assertIn(
             "event=result action=start unit=vllm-aeon-27b-dflash.service "
             "actor=test-operator reason=approved-maintenance outcome=submitted",
             audit,
         )
         self.assertNotIn(
-            "action=start unit=vllm-aeon-27b-dflash.service "
+            "event=result action=start unit=vllm-aeon-27b-dflash.service "
             "actor=test-operator reason=approved-maintenance outcome=success",
             audit,
         )
 
     def test_failed_start_submission_keeps_reason_and_exit_status(self) -> None:
-        environment = self.environment.copy()
-        environment["GB10_LIFECYCLE_TEST_SYSTEMCTL_STATUS"] = "7"
+        self.systemctl.write_text(
+            "#!/bin/sh\n"
+            'printf "%s\\n" "$*" >> "$GB10_LIFECYCLE_TEST_SYSTEMCTL_LOG"\n'
+            'if [ "${2:-}" = "start" ]; then\n'
+            "    exit 7\n"
+            "fi\n"
+            "exit 0\n"
+        )
+        self.systemctl.chmod(self.systemctl.stat().st_mode | stat.S_IXUSR)
 
-        result = self.execute(*self.arguments("start"), environment=environment)
+        result = self.execute(*self.arguments("start"))
 
         self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+        self.assertEqual(
+            self.systemctl_log.read_text(),
+            f"--user reset-failed {UNIT}\n"
+            f"--user start --no-block {UNIT}\n",
+        )
         audit = (self.state / "lifecycle-audit.log").read_text()
         self.assertIn(
             "event=result action=start unit=vllm-aeon-27b-dflash.service "
@@ -373,6 +394,30 @@ class LifecycleAuditScriptTests(unittest.TestCase):
             "outcome=failure exit_status=7",
             audit,
         )
+
+    def test_reset_failed_failure_is_audited_and_propagated_without_start(self) -> None:
+        self.systemctl.write_text(
+            "#!/bin/sh\n"
+            'printf "%s\\n" "$*" >> "$GB10_LIFECYCLE_TEST_SYSTEMCTL_LOG"\n'
+            'if [ "${2:-}" = "reset-failed" ]; then\n'
+            "    exit 29\n"
+            "fi\n"
+            "exit 0\n"
+        )
+        self.systemctl.chmod(self.systemctl.stat().st_mode | stat.S_IXUSR)
+
+        result = self.execute(*self.arguments("start"))
+
+        self.assertEqual(result.returncode, 29, result.stdout + result.stderr)
+        self.assertEqual(self.systemctl_log.read_text(), f"--user reset-failed {UNIT}\n")
+        audit = (self.state / "lifecycle-audit.log").read_text()
+        self.assertIn(
+            "event=reset-failed action=start unit=vllm-aeon-27b-dflash.service "
+            "actor=test-operator reason=approved-maintenance "
+            "outcome=failure exit_status=29",
+            audit,
+        )
+        self.assertNotIn("event=result action=start", audit)
 
     def test_failed_result_keeps_reason_and_exit_status(self) -> None:
         environment = self.environment.copy()
@@ -445,6 +490,12 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             runbook,
         )
         self.assertIn(
+            "Investigation-begin gates future submissions only; it does not "
+            "guarantee lifecycle quiescence for an in-flight start job already "
+            "submitted with `--no-block`.",
+            runbook,
+        )
+        self.assertIn(
             "Every record contains UTC and monotonic timestamps, UID, PID, "
             "event, actor, reason, and outcome",
             runbook,
@@ -509,6 +560,102 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             self.assertFalse(
                 any(line.startswith("systemctl ") for line in event_lines)
             )
+
+    def test_restart_helper_clears_rate_limits_before_each_start_mode(self) -> None:
+        cases = (
+            ("--rr-only", ("vllm-querit-4b-reranker.service",)),
+            ("--start-only", ("vllm-aeon-27b-dflash.service",)),
+            (
+                None,
+                (
+                    "vllm-aeon-27b-dflash.service",
+                    "vllm-querit-4b-reranker.service",
+                ),
+            ),
+        )
+
+        for mode, expected_units in cases:
+            with self.subTest(mode=mode or "full"):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    commands_log = root / "systemctl.log"
+                    rate_limits = root / "rate-limits"
+                    rate_limits.mkdir()
+                    for unit in expected_units:
+                        (rate_limits / unit).touch()
+
+                    fake_bin = root / "bin"
+                    fake_bin.mkdir()
+                    self.make_executable(fake_bin / "curl", "#!/bin/sh\nexit 0\n")
+                    self.make_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
+                    systemctl = root / "systemctl"
+                    self.make_executable(
+                        systemctl,
+                        "#!/bin/sh\n"
+                        'printf "%s\\n" "$*" >> "$GB10_HELPER_SYSTEMCTL_LOG"\n'
+                        'if [ "${1:-}" = "--user" ] && '
+                        '[ "${2:-}" = "is-active" ]; then\n'
+                        "    exit 1\n"
+                        "fi\n"
+                        'if [ "${1:-}" = "--user" ] && '
+                        '[ "${2:-}" = "reset-failed" ]; then\n'
+                        '    rm -f "$GB10_HELPER_RATE_LIMIT_DIR/${3:?}"\n'
+                        "    exit 0\n"
+                        "fi\n"
+                        'if [ "${1:-}" = "--user" ] && '
+                        '[ "${2:-}" = "start" ]; then\n'
+                        '    if [ -e "$GB10_HELPER_RATE_LIMIT_DIR/${4:?}" ]; then\n'
+                        '        printf "start-limit-hit %s\\n" "$4" >&2\n'
+                        "        exit 73\n"
+                        "    fi\n"
+                        "    exit 0\n"
+                        "fi\n"
+                        "exit 0\n",
+                    )
+                    lifecycle = root / "gb10_lifecycle.sh"
+                    lifecycle.write_text(
+                        SCRIPT.read_text().replace(
+                            f'readonly STATE_DIR="{PRODUCTION_STATE}"',
+                            f'readonly STATE_DIR="{root / "state"}"',
+                        )
+                    )
+                    lifecycle.chmod(lifecycle.stat().st_mode | stat.S_IXUSR)
+                    helper = root / "gb10_restart_text_safe.sh"
+                    helper.write_text(
+                        RESTART_HELPER.read_text().replace("systemctl", str(systemctl))
+                    )
+                    helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
+
+                    environment = os.environ.copy()
+                    environment.update(
+                        {
+                            "GB10_HELPER_SYSTEMCTL_LOG": str(commands_log),
+                            "GB10_HELPER_RATE_LIMIT_DIR": str(rate_limits),
+                            "GB10_LIFECYCLE_BIN": str(lifecycle),
+                            "GB10_LIFECYCLE_SYSTEMCTL": str(systemctl),
+                            "PATH": f"{fake_bin}:/usr/bin:/bin",
+                        }
+                    )
+                    arguments = [] if mode is None else [mode]
+                    result = subprocess.run(
+                        ["/usr/bin/bash", str(helper), *arguments],
+                        cwd=ROOT,
+                        env=environment,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        timeout=10,
+                    )
+
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    commands = commands_log.read_text().splitlines()
+                    for unit in expected_units:
+                        reset = f"--user reset-failed {unit}"
+                        start = f"--user start --no-block {unit}"
+                        self.assertEqual(commands.count(reset), 1)
+                        self.assertEqual(commands.count(start), 1)
+                        self.assertLess(commands.index(reset), commands.index(start))
+                        self.assertFalse((rate_limits / unit).exists())
 
     def test_guard_helper_calls_lifecycle_without_an_outer_timeout(self) -> None:
         source = GUARD_HELPER.read_text()
