@@ -321,8 +321,8 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertEqual(server["generation_queue_timeout_ms"], 1_800_000)
 
         profiles = {profile["name"]: profile for profile in config["upstreams"]}
-        self.assertEqual(profiles["aeon-chat"]["max_in_flight_requests"], 4)
-        self.assertEqual(profiles["aeon-chat"]["max_queued_generation_requests"], 64)
+        self.assertEqual(profiles["aeon-guard-max"]["max_in_flight_requests"], 4)
+        self.assertEqual(profiles["aeon-guard-max"]["max_queued_generation_requests"], 64)
         self.assertEqual(profiles["qwen3-embedding-8b"]["max_in_flight_requests"], 8)
         self.assertEqual(
             profiles["qwen3-embedding-8b"]["max_queued_generation_requests"], 64
@@ -332,11 +332,45 @@ class QueritServiceContractTests(unittest.TestCase):
             profiles["qwen3-reranker-8b"]["max_queued_generation_requests"], 64
         )
 
+    def test_guard_listener_forced_benchmark_profiles(self) -> None:
+        config = tomllib.loads(CONFIG.read_text())
+        profiles = {profile["name"]: profile for profile in config["upstreams"]}
+        aeon_profiles = {name for name in profiles if name.startswith("aeon-")}
+        self.assertEqual(
+            aeon_profiles,
+            {"aeon-guard-max", "aeon-raw-no-think", "aeon-raw-max"},
+        )
+
+        listeners = {listener["port"]: listener for listener in config["listeners"]}
+        self.assertEqual(listeners[18011]["upstream_profile"], "aeon-guard-max")
+        self.assertEqual(
+            listeners[18014]["upstream_profile"], "aeon-raw-no-think"
+        )
+        self.assertEqual(listeners[18015]["upstream_profile"], "aeon-raw-max")
+
+        guarded = profiles["aeon-guard-max"]
+        self.assertEqual(guarded["thinking"]["mode"], "force_thinking")
+        self.assertEqual(guarded["thinking"]["budget_tokens"], 32768)
+        self.assertEqual(guarded["loop_guard"]["mode"], "enforce")
+        self.assertTrue(guarded["local_recovery"]["enabled"])
+        self.assertEqual(len(guarded["retry"]["ladder"]), 4)
+
+        no_think = profiles["aeon-raw-no-think"]
+        self.assertEqual(no_think["thinking"]["mode"], "force_disable")
+        self.assertEqual(no_think["loop_guard"]["mode"], "disabled")
+        self.assertEqual(len(no_think["retry"]["ladder"]), 1)
+
+        raw_max = profiles["aeon-raw-max"]
+        self.assertEqual(raw_max["thinking"]["mode"], "force_thinking")
+        self.assertEqual(raw_max["thinking"]["budget_tokens"], 32768)
+        self.assertEqual(raw_max["loop_guard"]["mode"], "disabled")
+        self.assertEqual(len(raw_max["retry"]["ladder"]), 1)
+
     def test_guard_uses_vllm_native_thinking_budget_schema_everywhere(self) -> None:
         config = tomllib.loads(CONFIG.read_text())
         profiles = {profile["name"]: profile for profile in config["upstreams"]}
         schemas = [
-            profiles["aeon-chat"]["thinking"]["default_injection_schema"],
+            profiles["aeon-guard-max"]["thinking"]["default_injection_schema"],
             config["thinking"]["default_injection_schema"],
             *[
                 rung["default_injection_schema"]
@@ -386,7 +420,7 @@ class QueritServiceContractTests(unittest.TestCase):
 
         config = tomllib.loads(CONFIG.read_text())
         profiles = {profile["name"]: profile for profile in config["upstreams"]}
-        self.assertLess(profiles["aeon-chat"]["max_in_flight_requests"], backend_limit)
+        self.assertLess(profiles["aeon-guard-max"]["max_in_flight_requests"], backend_limit)
 
     def test_readme_disables_fallback_before_enabling_canonical_querit_vllm_owner(self) -> None:
         readme = README.read_text()

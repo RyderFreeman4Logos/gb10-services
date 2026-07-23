@@ -37,6 +37,29 @@ name = "aggregate"
 bind_host = "100.105.4.92"
 port = 18005
 
+# Three benchmark arms force their policy-scoped AEON profile regardless of the
+# caller model alias. Port 18009 remains the compatibility/default listener.
+[[listeners]]
+name = "aeon-guard-max"
+bind_host = "100.105.4.92"
+port = 18011
+allowed_upstreams = ["aeon-guard-max"]
+upstream_profile = "aeon-guard-max"
+
+[[listeners]]
+name = "aeon-raw-no-think"
+bind_host = "100.105.4.92"
+port = 18014
+allowed_upstreams = ["aeon-raw-no-think"]
+upstream_profile = "aeon-raw-no-think"
+
+[[listeners]]
+name = "aeon-raw-max"
+bind_host = "100.105.4.92"
+port = 18015
+allowed_upstreams = ["aeon-raw-max"]
+upstream_profile = "aeon-raw-max"
+
 [upstream]
 base_url = "http://100.105.4.92:18010/v1"
 request_timeout_ms = 1800000
@@ -86,8 +109,10 @@ enrich_responses = true
 refresh_interval_secs = 60
 input_token_safety_margin = 512
 
+# Listener-forced benchmark profiles intentionally reuse aeon-ultimate aliases.
+# Their duplicate aliases are valid because each new listener fixes one profile.
 [[upstreams]]
-name = "aeon-chat"
+name = "aeon-guard-max"
 base_url = "http://100.105.4.92:18010/v1"
 match_models = ["aeon-ultimate", "qwen3.6-27b-decensor-by-aeon", "qwen3.6-27b-decensored"]
 request_timeout_ms = 1800000
@@ -106,6 +131,7 @@ probe_max_tokens = 1
 probe_interval_secs = 5
 probe_timeout_secs = 600
 
+# Retain the existing Guard arm's guarded AEON recovery contract.
 [upstreams.local_recovery]
 enabled = true
 restart_command = ["/home/obj/scripts/aeon_text_stop_start.sh"]
@@ -119,26 +145,15 @@ cooldown_ms = 300000
 budget_window_ms = 900000
 max_per_window = 2
 
-[upstreams.stuck_watchdog]
-enabled = true
-check_interval_secs = 30
-detection_window_secs = 180
-min_output_progress_units_in_window = 1
-
-[upstreams.restart_queue]
-enabled = true
-queue_deadline_secs = 300
-restart_timeout_secs = 300
-
 [upstreams.thinking]
-mode = "bounded_thinking"
+mode = "force_thinking"
 enabled = true
 force_disable = false
 max_tokens = 50000
 budget_tokens = 32768
 preserve_answer_budget = true
 tool_request_policy = "apply"
-no_thinking_marker_policy = "respect_no_thinking_markers"
+no_thinking_marker_policy = "force"
 default_injection_schema = "vllm_native"
 
 [upstreams.param_override]
@@ -149,6 +164,175 @@ top_k = 20
 max_tokens = 50000
 frequency_penalty = 0.0
 presence_penalty = 0.0
+
+[upstreams.loop_guard]
+enabled = true
+mode = "enforce"
+on_reasoning_loop = "bounded_answer_from_cot"
+normalized_input_window_secs = 120
+max_repeated_inputs = 1
+output_repeated_line_threshold = 24
+output_token_window_size = 12
+output_repeated_token_window_threshold = 32
+output_suffix_cycle_threshold = 32
+output_low_progress_min_bytes = 4096
+output_low_progress_unique_ratio_percent = 15
+reasoning_semantic_detection_enabled = true
+reasoning_semantic_similarity_threshold_percent = 55
+reasoning_semantic_window_token_count = 24
+reasoning_semantic_minimum_token_count = 8
+reasoning_semantic_history_window_count = 16
+input_overlap_threshold_multiplier = 4
+
+[upstreams.loop_guard.embedding]
+provider = "openai_compatible"
+endpoint = "http://100.105.4.92:18012/v1/embeddings"
+model = "Qwen/Qwen3-Embedding-8B"
+window_token_count = 96
+window_stride_tokens = 48
+minimum_token_count = 16
+history_window_count = 64
+batch_max_windows = 64
+batch_max_wait_ms = 75
+queue_max_windows = 4096
+on_queue_full = "block"
+vector_dim = 256
+
+[[upstreams.retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 32768
+preserve_answer_budget = true
+tool_request_policy = "apply"
+no_thinking_marker_policy = "force"
+default_injection_schema = "vllm_native"
+
+[[upstreams.retry.ladder]]
+name = "bounded-thinking-deep"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 16384
+preserve_answer_budget = true
+tool_request_policy = "apply"
+no_thinking_marker_policy = "force"
+default_injection_schema = "vllm_native"
+anti_loop_hint = "Previous attempt became repetitive. Do not repeat prior analysis; answer directly."
+
+[[upstreams.retry.ladder]]
+name = "bounded-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 8192
+preserve_answer_budget = true
+tool_request_policy = "apply"
+no_thinking_marker_policy = "force"
+default_injection_schema = "vllm_native"
+anti_loop_hint = "Previous attempt became repetitive after a deeper retry. Use only the useful prior work and answer directly."
+
+[[upstreams.retry.ladder]]
+name = "no-thinking"
+thinking_mode = "force_disable"
+max_tokens = 1024
+preserve_answer_budget = true
+tool_request_policy = "apply"
+no_thinking_marker_policy = "force"
+default_injection_schema = "vllm_native"
+
+[[upstreams]]
+name = "aeon-raw-no-think"
+base_url = "http://100.105.4.92:18010/v1"
+match_models = ["aeon-ultimate", "qwen3.6-27b-decensor-by-aeon", "qwen3.6-27b-decensored"]
+request_timeout_ms = 1800000
+# One active request per raw arm keeps the three-arm benchmark within Guard's
+# documented 1792 MiB MemoryHigh admission budget.
+max_in_flight_requests = 1
+max_queued_generation_requests = 0
+
+[upstreams.metadata]
+discovery_enabled = true
+enrich_responses = true
+refresh_interval_secs = 60
+input_token_safety_margin = 512
+
+[upstreams.hot_restart]
+enabled = false
+
+[upstreams.thinking]
+mode = "force_disable"
+enabled = true
+force_disable = true
+max_tokens = 50000
+budget_tokens = 0
+preserve_answer_budget = true
+tool_request_policy = "apply"
+no_thinking_marker_policy = "force"
+default_injection_schema = "vllm_native"
+
+[upstreams.param_override]
+enabled = false
+
+[upstreams.loop_guard]
+enabled = false
+mode = "disabled"
+
+# A one-rung profile ladder preserves a single upstream attempt (no retry).
+[[upstreams.retry.ladder]]
+name = "no-thinking-only"
+thinking_mode = "force_disable"
+max_tokens = 50000
+preserve_answer_budget = true
+tool_request_policy = "apply"
+no_thinking_marker_policy = "force"
+default_injection_schema = "vllm_native"
+
+[[upstreams]]
+name = "aeon-raw-max"
+base_url = "http://100.105.4.92:18010/v1"
+match_models = ["aeon-ultimate", "qwen3.6-27b-decensor-by-aeon", "qwen3.6-27b-decensored"]
+request_timeout_ms = 1800000
+# One active request per raw arm keeps the three-arm benchmark within Guard's
+# documented 1792 MiB MemoryHigh admission budget.
+max_in_flight_requests = 1
+max_queued_generation_requests = 0
+
+[upstreams.metadata]
+discovery_enabled = true
+enrich_responses = true
+refresh_interval_secs = 60
+input_token_safety_margin = 512
+
+[upstreams.hot_restart]
+enabled = false
+
+[upstreams.thinking]
+mode = "force_thinking"
+enabled = true
+force_disable = false
+max_tokens = 50000
+budget_tokens = 32768
+preserve_answer_budget = true
+tool_request_policy = "apply"
+no_thinking_marker_policy = "force"
+default_injection_schema = "vllm_native"
+
+[upstreams.param_override]
+enabled = false
+
+[upstreams.loop_guard]
+enabled = false
+mode = "disabled"
+
+# A one-rung profile ladder preserves a single upstream attempt (no retry).
+[[upstreams.retry.ladder]]
+name = "max-thinking-only"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 32768
+preserve_answer_budget = true
+tool_request_policy = "apply"
+no_thinking_marker_policy = "force"
+default_injection_schema = "vllm_native"
 
 [[upstreams]]
 name = "qwen3-embedding-8b"
