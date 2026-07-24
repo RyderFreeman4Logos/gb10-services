@@ -8,7 +8,7 @@
 Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (v0.25.1, seqs=16, batch=4096, util=0.355, AUTO KV, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
 # Independent of embedding/reranker so text can restart alone (no HTTP poll).
 After=network.target
-Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
+Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash-hikv.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
 StartLimitIntervalSec=600
 StartLimitBurst=3
 
