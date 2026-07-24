@@ -175,6 +175,10 @@ presence_penalty = 0.0
 enabled = true
 mode = "enforce"
 on_reasoning_loop = "bounded_answer_from_cot"
+# Preserve a larger bounded first-attempt private CoT prefix for #211 salvage.
+cot_salvage_prefix_max_bytes = 32768
+# Give the bounded salvage retry enough thinking budget for a useful answer.
+cot_salvage_retry_thinking_budget = 8192
 normalized_input_window_secs = 120
 max_repeated_inputs = 1
 output_repeated_line_threshold = 24
