@@ -29,6 +29,10 @@ SERVICE_CONTRACTS = {
         "vllm-aeon-27b-dflash-n12",
         "%t/gb10-memory-guardian/aeon-text.cid",
     ),
+    "vllm-aeon-27b-dflash-hikv.service": (
+        "vllm-aeon-27b-dflash-hikv",
+        "%t/gb10-memory-guardian/aeon-text.cid",
+    ),
     "vllm-embedding.service": (
         "vllm-embedding",
         "%t/gb10-vllm-cids/vllm-embedding.cid",

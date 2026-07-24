@@ -1,0 +1,127 @@
+# ── High-KV variant (deployment-choice, 2026-07-23) ──
+# GPU: ~83.89G  RSS: ~6.50G  Startup: ~1100s est. (FlashInfer JIT serial)
+# Config: util=0.50 AUTO KV, batch=4096, MAX_JOBS=1, FP8 KV
+# KV capacity est.: ~560K tokens (~2.14 full 262144-token contexts)
+# MemAvail after all 3: ~14G est. (tight co-resident; best for text-heavy
+#   or 2-model deployments where embedding/reranker are optional)
+#
+# TRADE-OFF vs baseline vllm-aeon-27b-dflash.service:
+#   +2x KV capacity → supports ~2 concurrent 262K-token requests without
+#     severe queueing, versus the baseline's ~1.1x.
+#   -15G system MemAvailable → co-resident emb+rr+text leaves only ~14G
+#     headroom. Embedding or reranker may need to be stopped under heavy
+#     concurrent long-context load to avoid OOM pressure.
+#
+# DEPLOYMENT: Choose this OR the baseline; they conflict (cannot run both).
+#   To activate: stop baseline, rsync this unit, daemon-reload, start.
+#   To revert: stop this, start baseline.
+#
+# GUARD CONFIG: When using this variant, the watchdog/recovery
+#   readiness_deadline_ms should be raised from 600000 (10min) to 900000
+#   (15min) because the larger KV pool increases cold-start time.
+#   The aeon_text_stop_start.sh wrapper is unit-name agnostic and works
+#   with either variant.
+[Unit]
+Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 HIGH-KV (v0.25.1, seqs=16, batch=4096, util=0.50, AUTO KV, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
+# Independent of embedding/reranker so text can restart alone (no HTTP poll).
+After=network.target
+Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+UMask=0077
+Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
+Environment=HF_HUB_OFFLINE=1
+Environment=GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1
+Environment=GB10_CONTAINER_CIDFILE=%t/gb10-memory-guardian/aeon-text.cid
+Environment=AEON_URL=http://100.105.4.92:18010
+# Prefer killing text before reranker under host OOM (reranker uses 500).
+OOMScoreAdjust=800
+# Wrapper only. The container's 128G cap is not a physical NVML/UMA ceiling.
+# HIGH-KV variant: weights~22G + AUTO KV ~31G at util=0.50 + graphs~0.5G
+# + emb~20G + rr~18G ≈ 91.5G engine-side policy. Leaves ~14G MemAvailable.
+# KV capacity est.: ~560K tokens (2.14 full 262144-token contexts).
+# Co-resident emb+rr is possible but tight; consider stopping one under
+# heavy concurrent long-context load.
+# Auto-KV at util=0.50: larger pool, longer cold-start (~15min est.).
+# NO --kv-cache-memory-bytes: AEON confirmed pinning KV bypasses UMA guard
+# (#46932). AUTO sizing lets clamps bound the pool based on actual free memory.
+# batch=4096: reduces profile-run compile/cudagraph peak shape to fit co-resident
+# emb+rr without stopping them. Steady-state decode unaffected (governed by seqs).
+# Manual lifecycle changes must use gb10_lifecycle.sh; the text helper routes through it.
+MemoryMax=256M
+# Recover from any stop cause (crash, OOM kill, guardian cgroup.kill).
+Restart=always
+RestartSec=30
+TimeoutStartSec=3000
+TimeoutStopSec=60
+
+ExecCondition=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-aeon-27b-dflash-hikv.service
+ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-memory-guardian
+ExecStartPre=/usr/bin/install -d -m 0700 /home/obj/.cache/vllm-compile/aeon-qwen36-v0251-c15e2c
+ExecStartPre=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-aeon-27b-dflash-hikv --cidfile %t/gb10-memory-guardian/aeon-text.cid
+ExecStartPre=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1
+ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.cid --name vllm-aeon-27b-dflash-hikv \
+  --cgroup-parent app.slice \
+  --gpus all --ipc host \
+  -p 100.105.4.92:18010:8000 \
+  -v /home/obj/.cache/huggingface/hub/models--AEON-7--Qwen3.6-27B-AEON-Ultimate-Uncensored-Multimodal-NVFP4-MTP-XS:/models/aeon-cache:ro \
+  -v /home/obj/.cache/huggingface/hub/models--z-lab--Qwen3.6-27B-DFlash:/models/dflash-cache:ro \
+  -v /home/obj/.cache/vllm-compile/aeon-qwen36-v0251-c15e2c:/var/cache/vllm/aeon-qwen36-v0251 \
+  -v /home/obj/scripts/aeon_hang_guard.py:/opt/hang_guard/aeon_hang_guard.py:ro \
+  -v /home/obj/scripts/aeon_vllm_wrapper.py:/opt/hang_guard/aeon_vllm_wrapper.py:ro \
+  -e HF_HUB_OFFLINE=1 \
+  -e MAX_JOBS=1 \
+  -e CMAKE_BUILD_PARALLEL_LEVEL=1 \
+  -e PYTHONPATH=/opt/hang_guard \
+  -e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768 \
+  -e AEON_THINKING_BUDGET_GUARD=0 \
+  --memory-swappiness 0 \
+  --memory 128g \
+  --memory-swap 128g \
+  --oom-score-adj 800 \
+  --entrypoint python3 \
+  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d \
+  /opt/hang_guard/aeon_vllm_wrapper.py serve \
+    /models/aeon-cache/snapshots/6394b93fa092dcbfbf09e952f56f30337509d17c \
+    --host 0.0.0.0 --port 8000 \
+    --served-model-name "aeon-ultimate" "qwen3.6-27b-decensor-by-aeon" "qwen3.6-27b-decensored" \
+    --quantization modelopt \
+    --kv-cache-dtype fp8_e4m3 \
+    --attention-backend TRITON_ATTN \
+    --mamba-cache-dtype float32 \
+    --max-model-len 262144 \
+    --max-num-seqs 16 \
+    --max-num-batched-tokens 4096 \
+    --max-num-partial-prefills 1 \
+    --max-long-partial-prefills 1 \
+    --enable-prefix-caching \
+    --gpu-memory-utilization 0.50 \
+    --enable-chunked-prefill \
+    --scheduler-reserve-full-isl \
+    --compilation-config "{\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_num_of_warmups\":0,\"cache_dir\":\"/var/cache/vllm/aeon-qwen36-v0251\"}" \
+    --jit-monitor-mode warn \
+    --max-logprobs 20 \
+    --speculative-config "{\"method\":\"dflash\",\"model\":\"/models/dflash-cache/snapshots/0919688658996800f86b895034249700e9481106\",\"num_speculative_tokens\":10,\"attention_backend\":\"TRITON_ATTN\"}" \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --default-chat-template-kwargs "{\"enable_thinking\":false}" \
+    --override-generation-config "{\"temperature\":0.6,\"top_p\":0.95,\"top_k\":20}" \
+    --trust-remote-code
+# Multimodal retained: no --language-model-only
+ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-aeon-27b-dflash-hikv.service --container vllm-aeon-27b-dflash-hikv
+# Publish the exact Docker cgroup for llm-guard-proxy's integrated guardian.
+ExecStartPost=/home/obj/.local/bin/llm_guard_proxy_publish_cgroup_registration.sh
+# Raw :18010 readiness (defaults target Guard :18009).
+ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh chat http://100.105.4.92:18010 aeon-ultimate --deadline 2800
+ExecStop=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-aeon-27b-dflash-hikv --cidfile %t/gb10-memory-guardian/aeon-text.cid
+ExecStopPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-aeon-27b-dflash-hikv --cidfile %t/gb10-memory-guardian/aeon-text.cid
+ExecStopPost=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

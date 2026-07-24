@@ -85,6 +85,9 @@ restart_command = ["/home/obj/scripts/aeon_text_stop_start.sh"]
 restart_timeout_ms = 300000
 readiness_endpoint = "/v1/chat/completions"
 readiness_request_timeout_ms = 30000
+# Baseline (util=0.355): 600s is sufficient (~17min cold start).
+# HIGH-KV variant (util=0.50): raise to 900000 (15min) — larger KV pool
+# increases cold-start profiling time. See systemd/vllm-aeon-27b-dflash-hikv.service.
 readiness_deadline_ms = 600000
 readiness_interval_ms = 5000
 max_attempts_per_request = 1
@@ -99,6 +102,9 @@ detection_window_secs = 180
 min_output_progress_units_in_window = 1
 
 [upstream.restart_queue]
+# Baseline (util=0.355): 300s restart timeout is sufficient.
+# HIGH-KV variant (util=0.50): raise both to 600 — larger KV pool needs
+# longer Docker pull/start and readiness wait.
 enabled = true
 queue_deadline_secs = 300
 restart_timeout_secs = 300
