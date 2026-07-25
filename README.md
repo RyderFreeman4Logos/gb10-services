@@ -38,28 +38,22 @@ graph TD
    `429`/`Retry-After`, model metadata enrichment, AEON chat hot-restart probes,
    stall detection, request parameter overrides for the AEON service-unit
    sampling defaults (`temperature=0.6`, `top_p=0.95`, `top_k=20`,
-   `max_tokens=50000`), semantic loop detection, metrics, debug summaries,
-   SQLite observability, full quality-debug evidence logging, SSE heartbeats, and
-   Cloudflare-friendly streaming. Reasoning-loop failures use private CoT
-   salvage (`loop_guard.on_reasoning_loop = "bounded_answer_from_cot"`) so the
-   retry can answer from a bounded pre-loop reasoning prefix instead of falling
-   straight to a no-thinking attempt. The proxy still keeps a shielded AEON
-   retry ladder: max thinking, deep bounded thinking, bounded thinking, and
-   final no-thinking fallback.
+   `max_tokens=50000`), metrics, debug summaries, SQLite observability, full
+   quality-debug evidence logging, SSE heartbeats, and Cloudflare-friendly
+   streaming. Default multi-model chat on `:18009` is **force_disable** (no
+   thinking, single-rung ladder, loop_guard off) after the 2026-07 three-arm
+   quality benchmark; embedding/reranker models still route on the same port by
+   `model`. Opt-in legacy **bounded** chat is on forced listener `:18014`
+   (bounded 32768 + loop_guard CoT salvage + multi-rung ladder). Experimental
+   max-thinking arms remain on `:18011` (guarded) and `:18015` (raw).
 
    Evidence is intentionally configured for loop-detector improvement rather
    than privacy-minimal production: redacted raw payloads, selected request
    headers, raw reasoning, loop shadow continuations, and 100% paired
    max/bounded/no-thinking comparisons are recorded within bounded retention.
 
-   Normal chat uses `mode = "bounded_thinking"` with a 32,768-token thinking
-   budget and explicit `vllm_native` injection: Guard preserves the template
-   `enable_thinking` marker and sends the effective budget through vLLM's
-   top-level `thinking_token_budget` field. Client no-thinking markers are respected:
-   a request with `"chat_template_kwargs": {"enable_thinking": false}` should
-   pass through without `reasoning_content`. Embedding and reranker profiles
-   explicitly disable chat-only hot-restart probes, thinking rewrites, and
-   parameter overrides.
+   Embedding and reranker profiles explicitly disable chat-only hot-restart
+   probes, thinking rewrites, and parameter overrides.
 5. **sysmon.service**
    A lightweight observer-only system monitor targeting a one-second interval,
    recording system load, exact Linux `MemAvailable`, temperatures, GPU metrics,
