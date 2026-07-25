@@ -8,10 +8,13 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 * **Host Internal IP / Tailscale IP**: `100.105.4.92` (Verify using `ip route` or `ip addr show`)
 * **Docker Environment**: Rootless Docker active at `unix:///run/user/1001/docker.sock`.
 * **Port Allocations**:
-  * `18009`: `llm-guard-proxy.service` (stable OpenAI-compatible entrypoint for chat, embeddings, and rerank)
+  * `18009`: `llm-guard-proxy.service` (stable OpenAI-compatible entrypoint for chat, embeddings, and rerank; default chat is force_disable)
   * `18010`: `vllm-aeon-27b-dflash.service` (raw AEON chat backend)
+  * `18011`: `llm-guard-proxy.service` experimental guarded max-thinking AEON chat
   * `18012`: `vllm-embedding.service` (raw Qwen3-Embedding-8B backend routed by guard)
   * `18013`: `vllm-querit-4b-reranker.service` (canonical raw Querit-4B backend routed by guard)
+  * `18014`: `llm-guard-proxy.service` opt-in legacy bounded AEON chat (former 18009 default)
+  * `18015`: `llm-guard-proxy.service` experimental raw max-thinking AEON chat
   * `18002`: `llm-guard-proxy.service` legacy embedding-compatible listener; only embedding upstream profiles are allowed
   * `18003`: `llm-guard-proxy.service` legacy reranker-compatible listener; only reranker upstream profiles are allowed
   * `18005`: `llm-guard-proxy.service` aggregate listener for chat, embedding, and rerank profiles
@@ -27,7 +30,7 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 * `vllm-querit-4b-reranker.service`: single canonical BF16 pooling production owner on `18013`, with a 32,768-token context, 4,800 MiB KV cache, equal 18 GiB Docker memory/swap caps, and the live-proven AEON scheduler profile `--max-num-batched-tokens 16384`, `--max-num-seqs 32`, `--max-num-partial-prefills 1`, and `--max-long-partial-prefills 1`. Every startup completes the bounded rerank-readiness probe before its unit-owned generation verifier runs; that verifier binds the exact Docker generation without querying the still-starting `Type=simple` service's active state.
 * `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
 * `llm-guard-proxy` routes by request `model` to AEON chat (`aeon-ultimate`, `qwen3.6-27b-decensor-by-aeon`, `qwen3.6-27b-decensored`), embedding (`qwen3-embedding-8b`, `Qwen/Qwen3-Embedding-8B`), or reranker (`qwen3-reranker-8b`, `Qwen/Qwen3-Reranker-8B`).
-* `llm-guard-proxy` uses a shielded AEON retry ladder for chat: max thinking, bounded thinking, then no-thinking direct streaming relay if prior streaming attempts trip the loop guard. The legacy 18002/18003 ports are guard-owned downstream listeners, not raw vLLM publishes.
+* `llm-guard-proxy` default chat (`:18009`) is force_disable with a single no-thinking rung. Opt-in legacy bounded chat (`:18014`) and guarded max-thinking (`:18011`) keep multi-rung ladders and loop salvage. The legacy 18002/18003 ports are guard-owned downstream listeners, not raw vLLM publishes.
 * `llm-guard-proxy` also hot-reloads `config.toml`. Use `[server]` to change default/chat request parallelism and per-`[[upstreams]]` `max_in_flight_requests` / `max_queued_generation_requests` to tune embedding/reranker independently without restarting vLLM, trading total throughput against single-stream latency.
 
 ### llm-guard-proxy Enabled Features
@@ -57,25 +60,22 @@ chat-only mutation disabled for embedding/reranker profiles:
 * **Chat parameter override**: AEON chat overrides requests to the service-unit
   sampling defaults (`temperature = 0.6`, `top_p = 0.95`, `top_k = 20`) and
   `max_tokens = 50000`. Embedding/reranker disable parameter override.
-* **Thinking policy**: normal chat uses `mode = "bounded_thinking"`,
-  `budget_tokens = 32768`, `max_tokens = 50000`,
+* **Thinking policy (default `:18009` chat)**: after the 2026-07 three-arm
+  quality benchmark (arm B force_disable best/fastest), normal multi-model
+  entry chat uses `mode = "force_disable"`, `force_disable = true`,
+  `budget_tokens = 0`, `max_tokens = 50000`,
   `default_injection_schema = "vllm_native"`, and
-  `no_thinking_marker_policy = "respect_no_thinking_markers"`. Guard preserves
-  `chat_template_kwargs.enable_thinking` for explicit enablement or opt-out and
-  emits the effective numeric budget as the top-level `thinking_token_budget`.
-  No-thinking requests remove any positive native thinking budget. Do **not**
-  change normal chat back to `force_thinking` unless callers should lose that
-  opt-out.
-* **Shielded retry ladder**: retry remains enabled with max-thinking,
-  bounded-thinking, and no-thinking ladder steps. The thinking ladder steps
-  also respect no-thinking markers, so a client opt-out is preserved during
-  retries.
-* **Loop guard**: enforce mode is enabled, including semantic reasoning-loop
-  detection (`reasoning_semantic_detection_enabled = true`) and embedding-backed
-  self-loop scoring through the local Qwen3-Embedding-8B service. Reasoning-loop
-  failures use `on_reasoning_loop = "bounded_answer_from_cot"`, which retries
-  from a bounded private pre-loop CoT prefix before falling back to the normal
-  retry ladder.
+  `no_thinking_marker_policy = "force"`. Embedding and reranker models still
+  route on `:18009` by `model` name. Opt-in **legacy bounded** chat lives on
+  forced listener `:18014` (`aeon-legacy-bounded`: `bounded_thinking` 32768,
+  `respect_no_thinking_markers`, loop_guard enforce + retry ladder). Experimental
+  max-thinking arms remain on `:18011` (guarded) and `:18015` (raw).
+* **Shielded retry ladder**: default chat uses a single no-thinking rung.
+  Legacy `:18014` and guarded `:18011` retain multi-rung ladders.
+* **Loop guard**: disabled on the default `:18009` chat path (matches the
+  benchmarked force_disable arm). Legacy `:18014` and guarded `:18011` still
+  enforce loop detection, including embedding-backed semantic scoring and
+  `on_reasoning_loop = "bounded_answer_from_cot"` salvage where configured.
 * **Observability**: SQLite observability, Prometheus metrics, upstream health
   probing, debug summaries, and raw observability payload capture are enabled.
   `/debug/recent-requests` currently has no admin token configured; treat it as

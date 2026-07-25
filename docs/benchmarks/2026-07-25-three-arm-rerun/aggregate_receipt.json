@@ -1,0 +1,43 @@
+{
+  "arm_sources": {
+    "A": {
+      "origin": "fresh_rerun",
+      "planned_cases": 155,
+      "progress": 155,
+      "result_rows": 155,
+      "run_id": "26c52f4568",
+      "run_status": "succeeded",
+      "scored_rows": 155,
+      "unique_case_ids": 155
+    },
+    "B": {
+      "origin": "previous_completed_run",
+      "planned_cases": 155,
+      "progress": 155,
+      "result_rows": 155,
+      "run_id": "e837eb97cb",
+      "run_status": "succeeded",
+      "scored_rows": 155,
+      "unique_case_ids": 155
+    },
+    "C": {
+      "origin": "fresh_rerun",
+      "planned_cases": 155,
+      "progress": 155,
+      "result_rows": 155,
+      "run_id": "e876b0e593",
+      "run_status": "succeeded",
+      "scored_rows": 155,
+      "unique_case_ids": 155
+    }
+  },
+  "content_free": true,
+  "export_policy": {
+    "blob_stores_excluded": true,
+    "content_payloads_excluded": true,
+    "endpoint_addresses_excluded": true,
+    "private_databases_excluded": true
+  },
+  "generated_at": "2026-07-25T04:56:36.469837Z",
+  "schema_version": 1
+}

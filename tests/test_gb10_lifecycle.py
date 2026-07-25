@@ -494,11 +494,13 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             self.assertIn(destination, readme.replace("~/.local", "/home/obj/.local"))
 
         guard_config = GUARD_CONFIG.read_text()
+        # The primary profile plus guarded, default-no-think, and legacy-bounded
+        # profiles each retain the one controlled AEON recovery helper.
         self.assertEqual(
             guard_config.count(
                 'restart_command = ["/home/obj/scripts/aeon_text_stop_start.sh"]'
             ),
-            2,
+            4,
         )
 
     def test_runbook_documents_actual_event_outcomes(self) -> None:

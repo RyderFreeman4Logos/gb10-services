@@ -321,8 +321,10 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertEqual(server["generation_queue_timeout_ms"], 1_800_000)
 
         profiles = {profile["name"]: profile for profile in config["upstreams"]}
+        # :18011 is experimental; do not let its post-body queue displace the
+        # default :18009 path from Guard's MemoryHigh residency envelope.
         self.assertEqual(profiles["aeon-guard-max"]["max_in_flight_requests"], 4)
-        self.assertEqual(profiles["aeon-guard-max"]["max_queued_generation_requests"], 64)
+        self.assertEqual(profiles["aeon-guard-max"]["max_queued_generation_requests"], 0)
         self.assertEqual(profiles["qwen3-embedding-8b"]["max_in_flight_requests"], 8)
         self.assertEqual(
             profiles["qwen3-embedding-8b"]["max_queued_generation_requests"], 64
@@ -338,15 +340,53 @@ class QueritServiceContractTests(unittest.TestCase):
         aeon_profiles = {name for name in profiles if name.startswith("aeon-")}
         self.assertEqual(
             aeon_profiles,
-            {"aeon-guard-max", "aeon-raw-no-think", "aeon-raw-max"},
+            {
+                "aeon-default-no-think",
+                "aeon-guard-max",
+                "aeon-legacy-bounded",
+                "aeon-raw-max",
+            },
         )
 
         listeners = {listener["port"]: listener for listener in config["listeners"]}
         self.assertEqual(listeners[18011]["upstream_profile"], "aeon-guard-max")
         self.assertEqual(
-            listeners[18014]["upstream_profile"], "aeon-raw-no-think"
+            listeners[18014]["upstream_profile"], "aeon-legacy-bounded"
         )
         self.assertEqual(listeners[18015]["upstream_profile"], "aeon-raw-max")
+
+        # Default multi-model entry (:18009) follows arm-B force_disable policy
+        # while remaining open for embedding/reranker model routing.
+        self.assertEqual(config["thinking"]["mode"], "force_disable")
+        self.assertTrue(config["thinking"]["force_disable"])
+        self.assertEqual(config["loop_guard"]["mode"], "disabled")
+        self.assertEqual(len(config["retry"]["ladder"]), 1)
+        self.assertEqual(config["retry"]["ladder"][0]["thinking_mode"], "force_disable")
+
+        default_chat = profiles["aeon-default-no-think"]
+        self.assertEqual(
+            default_chat["match_models"],
+            [
+                "aeon-ultimate",
+                "qwen3.6-27b-decensor-by-aeon",
+                "qwen3.6-27b-decensored",
+            ],
+        )
+        self.assertEqual(default_chat["thinking"]["mode"], "force_disable")
+        self.assertTrue(default_chat["thinking"]["force_disable"])
+        self.assertEqual(default_chat["loop_guard"]["mode"], "disabled")
+        self.assertEqual(len(default_chat["retry"]["ladder"]), 1)
+
+        # Runtime schema rejects empty match_models, so listener-forced arms use
+        # reserved aliases that cannot collide with default public chat aliases.
+        reserved_listener_aliases = {
+            "aeon-guard-max": "__listener_forced_aeon_guard_max__",
+            "aeon-legacy-bounded": "__listener_forced_aeon_legacy_bounded__",
+            "aeon-raw-max": "__listener_forced_aeon_raw_max__",
+        }
+        for name, alias in reserved_listener_aliases.items():
+            self.assertEqual(profiles[name]["match_models"], [alias])
+            self.assertNotIn(alias, default_chat["match_models"])
 
         guarded = profiles["aeon-guard-max"]
         self.assertEqual(guarded["thinking"]["mode"], "force_thinking")
@@ -355,10 +395,16 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertTrue(guarded["local_recovery"]["enabled"])
         self.assertEqual(len(guarded["retry"]["ladder"]), 4)
 
-        no_think = profiles["aeon-raw-no-think"]
-        self.assertEqual(no_think["thinking"]["mode"], "force_disable")
-        self.assertEqual(no_think["loop_guard"]["mode"], "disabled")
-        self.assertEqual(len(no_think["retry"]["ladder"]), 1)
+        # :18014 now hosts the former default bounded chat policy as opt-in.
+        legacy = profiles["aeon-legacy-bounded"]
+        self.assertEqual(legacy["thinking"]["mode"], "bounded_thinking")
+        self.assertEqual(legacy["thinking"]["budget_tokens"], 32768)
+        self.assertEqual(
+            legacy["thinking"]["no_thinking_marker_policy"],
+            "respect_no_thinking_markers",
+        )
+        self.assertEqual(legacy["loop_guard"]["mode"], "enforce")
+        self.assertEqual(len(legacy["retry"]["ladder"]), 4)
 
         raw_max = profiles["aeon-raw-max"]
         self.assertEqual(raw_max["thinking"]["mode"], "force_thinking")
@@ -370,14 +416,23 @@ class QueritServiceContractTests(unittest.TestCase):
         config = tomllib.loads(CONFIG.read_text())
         profiles = {profile["name"]: profile for profile in config["upstreams"]}
         schemas = [
+            profiles["aeon-default-no-think"]["thinking"]["default_injection_schema"],
             profiles["aeon-guard-max"]["thinking"]["default_injection_schema"],
+            profiles["aeon-legacy-bounded"]["thinking"]["default_injection_schema"],
             config["thinking"]["default_injection_schema"],
             *[
                 rung["default_injection_schema"]
                 for rung in config["retry"]["ladder"]
             ],
+            *[
+                rung["default_injection_schema"]
+                for rung in profiles["aeon-default-no-think"]["retry"]["ladder"]
+            ],
+            *[
+                rung["default_injection_schema"]
+                for rung in profiles["aeon-legacy-bounded"]["retry"]["ladder"]
+            ],
         ]
-        self.assertEqual(len(schemas), 6)
         self.assertEqual(set(schemas), {"vllm_native"})
 
     def test_guard_queue_body_residency_fits_memory_budget(self) -> None:
