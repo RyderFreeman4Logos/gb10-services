@@ -1,0 +1,412 @@
+{
+  "arms": {
+    "A": {
+      "arm": "A",
+      "label": "aeon-guard-max",
+      "run": {
+        "finished_at_epoch": 1784926250.9277928,
+        "id": "26c52f4568",
+        "model": "aeon-ultimate",
+        "planned_cases": 155,
+        "progress_field": 155,
+        "started_at_epoch": 1784882570.021375,
+        "status": "succeeded",
+        "suite_hash": "754c67a7902d379a",
+        "suite_id": "aeon-suite-v3"
+      },
+      "summary": {
+        "availability_scored_rate": 1.0,
+        "category_summary": {
+          "Coding": {
+            "mean_score": 0.4838709677419355,
+            "scored_n": 31
+          },
+          "Instruction": {
+            "mean_score": 0.4838709677419355,
+            "scored_n": 31
+          },
+          "Math": {
+            "mean_score": 0.3225806451612903,
+            "scored_n": 31
+          },
+          "Prose": {
+            "mean_score": 0.2903225806451613,
+            "scored_n": 31
+          },
+          "Reasoning": {
+            "mean_score": 0.3548387096774194,
+            "scored_n": 31
+          }
+        },
+        "duplicate_case_ids": [],
+        "full_pass_n_scored": 60,
+        "full_pass_rate_planned_cases": 0.3870967741935484,
+        "full_pass_rate_scored": 0.3870967741935484,
+        "latency_answered_rows": {
+          "decode_tps": {
+            "max": 314012862.06,
+            "mean": 27592264.943972602,
+            "median": 30.04,
+            "min": 6.44,
+            "n": 146,
+            "p50": 30.04,
+            "p95": 170440973.08249998
+          },
+          "e2e_ms": {
+            "max": 1135497.89,
+            "mean": 265463.7430821918,
+            "median": 187136.425,
+            "min": 3208.11,
+            "n": 146,
+            "p50": 187136.425,
+            "p95": 735527.9825
+          },
+          "output_tokens": {
+            "max": 33476.0,
+            "mean": 2224.3225806451615,
+            "median": 998.0,
+            "min": 0.0,
+            "n": 155,
+            "p50": 998.0,
+            "p95": 9290.5
+          },
+          "ttft_ms": {
+            "max": 1135497.79,
+            "mean": 252197.4226712329,
+            "median": 184426.685,
+            "min": 3208.02,
+            "n": 146,
+            "p50": 184426.685,
+            "p95": 719305.495
+          }
+        },
+        "mean_score_scored": 0.3870967741935484,
+        "median_score_scored": 0.0,
+        "no_answer_n": 0,
+        "result_rows": 155,
+        "score_histogram_scored": {
+          "0.0": 95,
+          "1.0": 60
+        },
+        "scored_n": 155,
+        "status_counts": {
+          "scored": 155
+        },
+        "unique_case_ids": 155
+      }
+    },
+    "B": {
+      "arm": "B",
+      "label": "aeon-raw-no-think",
+      "run": {
+        "finished_at_epoch": 1784855551.6287572,
+        "id": "e837eb97cb",
+        "model": "aeon-ultimate",
+        "planned_cases": 155,
+        "progress_field": 155,
+        "started_at_epoch": 1784848679.4728706,
+        "status": "succeeded",
+        "suite_hash": "754c67a7902d379a",
+        "suite_id": "aeon-suite-v3"
+      },
+      "summary": {
+        "availability_scored_rate": 1.0,
+        "category_summary": {
+          "Coding": {
+            "mean_score": 0.9032258064516129,
+            "scored_n": 31
+          },
+          "Instruction": {
+            "mean_score": 0.25806451612903225,
+            "scored_n": 31
+          },
+          "Math": {
+            "mean_score": 0.3870967741935484,
+            "scored_n": 31
+          },
+          "Prose": {
+            "mean_score": 0.3548387096774194,
+            "scored_n": 31
+          },
+          "Reasoning": {
+            "mean_score": 1.0,
+            "scored_n": 31
+          }
+        },
+        "duplicate_case_ids": [],
+        "full_pass_n_scored": 90,
+        "full_pass_rate_planned_cases": 0.5806451612903226,
+        "full_pass_rate_scored": 0.5806451612903226,
+        "latency_answered_rows": {
+          "decode_tps": {
+            "max": 216270041.98,
+            "mean": 14348321.517612902,
+            "median": 3243519.79,
+            "min": 98105.37,
+            "n": 155,
+            "p50": 3243519.79,
+            "p95": 57048711.75599976
+          },
+          "e2e_ms": {
+            "max": 357878.43,
+            "mean": 44141.76625806451,
+            "median": 22297.28,
+            "min": 724.32,
+            "n": 155,
+            "p50": 22297.28,
+            "p95": 167871.6979999996
+          },
+          "output_tokens": {
+            "max": 14303.0,
+            "mean": 1149.5290322580645,
+            "median": 418.0,
+            "min": 6.0,
+            "n": 155,
+            "p50": 418.0,
+            "p95": 5182.3
+          },
+          "ttft_ms": {
+            "max": 357878.06,
+            "mean": 44141.58167741936,
+            "median": 22296.34,
+            "min": 724.24,
+            "n": 155,
+            "p50": 22296.34,
+            "p95": 167871.6489999996
+          }
+        },
+        "mean_score_scored": 0.5806451612903226,
+        "median_score_scored": 1.0,
+        "no_answer_n": 0,
+        "result_rows": 155,
+        "score_histogram_scored": {
+          "0.0": 65,
+          "1.0": 90
+        },
+        "scored_n": 155,
+        "status_counts": {
+          "scored": 155
+        },
+        "unique_case_ids": 155
+      }
+    },
+    "C": {
+      "arm": "C",
+      "label": "aeon-raw-max",
+      "run": {
+        "finished_at_epoch": 1784955380.9288607,
+        "id": "e876b0e593",
+        "model": "aeon-ultimate",
+        "planned_cases": 155,
+        "progress_field": 155,
+        "started_at_epoch": 1784883091.4911358,
+        "status": "succeeded",
+        "suite_hash": "754c67a7902d379a",
+        "suite_id": "aeon-suite-v3"
+      },
+      "summary": {
+        "availability_scored_rate": 1.0,
+        "category_summary": {
+          "Coding": {
+            "mean_score": 0.45161290322580644,
+            "scored_n": 31
+          },
+          "Instruction": {
+            "mean_score": 0.8709677419354839,
+            "scored_n": 31
+          },
+          "Math": {
+            "mean_score": 0.0967741935483871,
+            "scored_n": 31
+          },
+          "Prose": {
+            "mean_score": 0.8064516129032258,
+            "scored_n": 31
+          },
+          "Reasoning": {
+            "mean_score": 0.5806451612903226,
+            "scored_n": 31
+          }
+        },
+        "duplicate_case_ids": [],
+        "full_pass_n_scored": 87,
+        "full_pass_rate_planned_cases": 0.5612903225806452,
+        "full_pass_rate_scored": 0.5612903225806452,
+        "latency_answered_rows": {
+          "decode_tps": {
+            "max": 772582747.75,
+            "mean": 169781191.36106795,
+            "median": 89034336.38,
+            "min": 281454.87,
+            "n": 103,
+            "p50": 89034336.38,
+            "p95": 564873778.9989998
+          },
+          "e2e_ms": {
+            "max": 1173172.86,
+            "mean": 431062.1996116505,
+            "median": 287832.09,
+            "min": 6617.42,
+            "n": 103,
+            "p50": 287832.09,
+            "p95": 1020472.252
+          },
+          "output_tokens": {
+            "max": 33888.0,
+            "mean": 9677.077419354839,
+            "median": 4015.0,
+            "min": 0.0,
+            "n": 155,
+            "p50": 4015.0,
+            "p95": 33318.4
+          },
+          "ttft_ms": {
+            "max": 1173172.79,
+            "mean": 431062.02572815533,
+            "median": 287832.03,
+            "min": 6617.37,
+            "n": 103,
+            "p50": 287832.03,
+            "p95": 1020472.179
+          }
+        },
+        "mean_score_scored": 0.5612903225806452,
+        "median_score_scored": 1.0,
+        "no_answer_n": 0,
+        "result_rows": 155,
+        "score_histogram_scored": {
+          "0.0": 68,
+          "1.0": 87
+        },
+        "scored_n": 155,
+        "status_counts": {
+          "scored": 155
+        },
+        "unique_case_ids": 155
+      }
+    }
+  },
+  "cochran_q_full_pass": {
+    "asymptotic_p": 0.0002774138842406257,
+    "common_scored_n": 155,
+    "df": 2,
+    "full_pass_totals": {
+      "A": 60,
+      "B": 90,
+      "C": 87
+    },
+    "q": 16.38
+  },
+  "content_free": true,
+  "eligibility": {
+    "all_cases_have_numeric_scores": true,
+    "eligibility_note": "Eligibility requires terminal succeeded ledger status, planned unique case coverage, numeric scores for all planned cases, and common suite identity. Paired results retain their explicit paired-N boundary.",
+    "ledger_complete_all_arms": true,
+    "quality_comparison_eligible": true
+  },
+  "generated_at": "2026-07-25T04:56:36.456647Z",
+  "pairwise_gaps": [
+    {
+      "left_arm": "A",
+      "left_only_case_ids_n": 0,
+      "left_wins": 12,
+      "mcnemar_full_pass": {
+        "left_full_pass_right_not": 12,
+        "left_not_right_full_pass": 42,
+        "mcnemar_exact_two_sided_p": 5.2094472007935266e-05,
+        "mcnemar_holm_adjusted_p": 0.0001562834160238058
+      },
+      "mean_left_on_paired_subset": 0.3870967741935484,
+      "mean_right_on_paired_subset": 0.5806451612903226,
+      "mean_score_gap_left_minus_right": -0.1935483870967742,
+      "paired_bootstrap_95": {
+        "lower_95": -0.2838709677419355,
+        "method": "paired percentile bootstrap",
+        "replicates": 20000,
+        "seed": 20260725,
+        "upper_95": -0.1032258064516129
+      },
+      "paired_scored_n": 155,
+      "relative_gap_pct_vs_right": -33.33333333333333,
+      "right_arm": "B",
+      "right_only_case_ids_n": 0,
+      "right_wins": 42,
+      "shared_case_ids_n": 155,
+      "ties": 101
+    },
+    {
+      "left_arm": "A",
+      "left_only_case_ids_n": 0,
+      "left_wins": 22,
+      "mcnemar_full_pass": {
+        "left_full_pass_right_not": 22,
+        "left_not_right_full_pass": 49,
+        "mcnemar_exact_two_sided_p": 0.0018204049356112858,
+        "mcnemar_holm_adjusted_p": 0.0036408098712225716
+      },
+      "mean_left_on_paired_subset": 0.3870967741935484,
+      "mean_right_on_paired_subset": 0.5612903225806452,
+      "mean_score_gap_left_minus_right": -0.17419354838709677,
+      "paired_bootstrap_95": {
+        "lower_95": -0.27741935483870966,
+        "method": "paired percentile bootstrap",
+        "replicates": 20000,
+        "seed": 20260726,
+        "upper_95": -0.07096774193548387
+      },
+      "paired_scored_n": 155,
+      "relative_gap_pct_vs_right": -31.034482758620687,
+      "right_arm": "C",
+      "right_only_case_ids_n": 0,
+      "right_wins": 49,
+      "shared_case_ids_n": 155,
+      "ties": 84
+    },
+    {
+      "left_arm": "B",
+      "left_only_case_ids_n": 0,
+      "left_wins": 39,
+      "mcnemar_full_pass": {
+        "left_full_pass_right_not": 39,
+        "left_not_right_full_pass": 36,
+        "mcnemar_exact_two_sided_p": 0.8175538505509844,
+        "mcnemar_holm_adjusted_p": 0.8175538505509844
+      },
+      "mean_left_on_paired_subset": 0.5806451612903226,
+      "mean_right_on_paired_subset": 0.5612903225806452,
+      "mean_score_gap_left_minus_right": 0.01935483870967742,
+      "paired_bootstrap_95": {
+        "lower_95": -0.09032258064516129,
+        "method": "paired percentile bootstrap",
+        "replicates": 20000,
+        "seed": 20260727,
+        "upper_95": 0.12903225806451613
+      },
+      "paired_scored_n": 155,
+      "relative_gap_pct_vs_right": 3.4482758620689657,
+      "right_arm": "C",
+      "right_only_case_ids_n": 0,
+      "right_wins": 36,
+      "shared_case_ids_n": 155,
+      "ties": 80
+    }
+  ],
+  "publication": {
+    "archive_filename": "aeon_3arm_comparison_redacted.zip",
+    "content_payloads_excluded": true,
+    "private_databases_excluded": true,
+    "verification_receipt": "package_manifest.json"
+  },
+  "schema_version": 1,
+  "scope": {
+    "planned_cases": 155,
+    "routes": {
+      "A": "aeon-guard-max",
+      "B": "aeon-raw-no-think",
+      "C": "aeon-raw-max"
+    },
+    "same_suite_identity_all_arms": true,
+    "suite_hash": "754c67a7902d379a",
+    "suite_id": "aeon-suite-v3"
+  }
+}
