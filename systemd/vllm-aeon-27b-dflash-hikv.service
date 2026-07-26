@@ -1,16 +1,15 @@
 # ── High-KV variant (deployment-choice, 2026-07-23) ──
 # GPU: ~83.89G  RSS: ~6.50G  Startup: ~1100s est. (FlashInfer JIT serial)
-# Config: util=0.50 AUTO KV, batch=4096, MAX_JOBS=1, FP8 KV
-# KV capacity est.: ~560K tokens (~2.14 full 262144-token contexts)
-# MemAvail after all 3: ~14G est. (tight co-resident; best for text-heavy
-#   or 2-model deployments where embedding/reranker are optional)
+# Config: util=0.45 AUTO KV, batch=4096, MAX_JOBS=1, FP8 KV
+# KV capacity est.: ~470K tokens (~1.8 full 262144-token contexts)
+# MemAvail after all 3: ~20G est. (safer co-resident than util=0.50;
+#   still for text-heavy or 2-model deployments under pressure)
 #
 # TRADE-OFF vs baseline vllm-aeon-27b-dflash.service:
-#   +2x KV capacity → supports ~2 concurrent 262K-token requests without
-#     severe queueing, versus the baseline's ~1.1x.
-#   -15G system MemAvailable → co-resident emb+rr+text leaves only ~14G
-#     headroom. Embedding or reranker may need to be stopped under heavy
-#     concurrent long-context load to avoid OOM pressure.
+#   +~1.6x KV capacity → better concurrent long-context headroom than
+#     baseline's ~1.1x, without the instability risk of util=0.50.
+#   -~10G system MemAvailable vs baseline → emb+rr+text remains viable;
+#     stop a peer only under heavy concurrent long-context load.
 #
 # DEPLOYMENT: Choose this OR the baseline; they conflict (cannot run both).
 #   To activate: stop baseline, rsync this unit, daemon-reload, start.
@@ -22,7 +21,7 @@
 #   The aeon_text_stop_start.sh wrapper is unit-name agnostic and works
 #   with either variant.
 [Unit]
-Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 HIGH-KV (v0.25.1, seqs=16, batch=4096, util=0.50, AUTO KV, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
+Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 HIGH-KV (v0.25.1, seqs=16, batch=4096, util=0.45, AUTO KV, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
 # Independent of embedding/reranker so text can restart alone (no HTTP poll).
 After=network.target
 Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
@@ -40,12 +39,12 @@ Environment=AEON_URL=http://100.105.4.92:18010
 # Prefer killing text before reranker under host OOM (reranker uses 500).
 OOMScoreAdjust=800
 # Wrapper only. The container's 128G cap is not a physical NVML/UMA ceiling.
-# HIGH-KV variant: weights~22G + AUTO KV ~31G at util=0.50 + graphs~0.5G
-# + emb~20G + rr~18G ≈ 91.5G engine-side policy. Leaves ~14G MemAvailable.
-# KV capacity est.: ~560K tokens (2.14 full 262144-token contexts).
-# Co-resident emb+rr is possible but tight; consider stopping one under
-# heavy concurrent long-context load.
-# Auto-KV at util=0.50: larger pool, longer cold-start (~15min est.).
+# HIGH-KV variant: weights~22G + AUTO KV ~26G at util=0.45 + graphs~0.5G
+# + emb~20G + rr~18G ≈ 86.5G engine-side policy. Leaves ~20G MemAvailable.
+# KV capacity est.: ~470K tokens (~1.8 full 262144-token contexts).
+# Co-resident emb+rr is safer than util=0.50; still stop a peer under
+# heavy concurrent long-context load if MemAvailable collapses.
+# Auto-KV at util=0.45: larger pool than baseline, cold-start ~15min est.
 # NO --kv-cache-memory-bytes: AEON confirmed pinning KV bypasses UMA guard
 # (#46932). AUTO sizing lets clamps bound the pool based on actual free memory.
 # batch=4096: reduces profile-run compile/cudagraph peak shape to fit co-resident
@@ -98,7 +97,7 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
     --max-num-partial-prefills 1 \
     --max-long-partial-prefills 1 \
     --enable-prefix-caching \
-    --gpu-memory-utilization 0.50 \
+    --gpu-memory-utilization 0.45 \
     --enable-chunked-prefill \
     --scheduler-reserve-full-isl \
     --compilation-config "{\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_num_of_warmups\":0,\"cache_dir\":\"/var/cache/vllm/aeon-qwen36-v0251\"}" \
