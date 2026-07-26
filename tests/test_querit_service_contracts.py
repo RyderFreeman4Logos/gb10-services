@@ -345,7 +345,7 @@ class QueritServiceContractTests(unittest.TestCase):
             {
                 "aeon-default-no-think",
                 "aeon-guard-max",
-                "aeon-legacy-bounded",
+                "aeon-quality-first",
                 "aeon-raw-max",
             },
         )
@@ -353,7 +353,7 @@ class QueritServiceContractTests(unittest.TestCase):
         listeners = {listener["port"]: listener for listener in config["listeners"]}
         self.assertEqual(listeners[18011]["upstream_profile"], "aeon-guard-max")
         self.assertEqual(
-            listeners[18014]["upstream_profile"], "aeon-legacy-bounded"
+            listeners[18014]["upstream_profile"], "aeon-quality-first"
         )
         self.assertEqual(listeners[18015]["upstream_profile"], "aeon-raw-max")
 
@@ -383,7 +383,7 @@ class QueritServiceContractTests(unittest.TestCase):
         # reserved aliases that cannot collide with default public chat aliases.
         reserved_listener_aliases = {
             "aeon-guard-max": "__listener_forced_aeon_guard_max__",
-            "aeon-legacy-bounded": "__listener_forced_aeon_legacy_bounded__",
+            "aeon-quality-first": "__listener_forced_aeon_quality_first__",
             "aeon-raw-max": "__listener_forced_aeon_raw_max__",
         }
         for name, alias in reserved_listener_aliases.items():
@@ -397,16 +397,20 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertTrue(guarded["local_recovery"]["enabled"])
         self.assertEqual(len(guarded["retry"]["ladder"]), 4)
 
-        # :18014 now hosts the former default bounded chat policy as opt-in.
-        legacy = profiles["aeon-legacy-bounded"]
-        self.assertEqual(legacy["thinking"]["mode"], "bounded_thinking")
-        self.assertEqual(legacy["thinking"]["budget_tokens"], 32768)
+        # :18014 hosts the quality-first loop recovery policy (#213):
+        # max thinking + truncate_cot_then_answer (pre-loop CoT + bounded salvage).
+        quality = profiles["aeon-quality-first"]
+        self.assertEqual(quality["thinking"]["mode"], "force_thinking")
+        self.assertEqual(quality["thinking"]["budget_tokens"], 32768)
         self.assertEqual(
-            legacy["thinking"]["no_thinking_marker_policy"],
-            "respect_no_thinking_markers",
+            quality["loop_guard"]["on_reasoning_loop"],
+            "truncate_cot_then_answer",
         )
-        self.assertEqual(legacy["loop_guard"]["mode"], "enforce")
-        self.assertEqual(len(legacy["retry"]["ladder"]), 4)
+        self.assertEqual(quality["loop_guard"]["mode"], "enforce")
+        self.assertEqual(len(quality["retry"]["ladder"]), 4)
+        self.assertEqual(
+            quality["retry"]["ladder"][3]["thinking_mode"], "force_disable"
+        )
 
         raw_max = profiles["aeon-raw-max"]
         self.assertEqual(raw_max["thinking"]["mode"], "force_thinking")
@@ -420,7 +424,7 @@ class QueritServiceContractTests(unittest.TestCase):
         schemas = [
             profiles["aeon-default-no-think"]["thinking"]["default_injection_schema"],
             profiles["aeon-guard-max"]["thinking"]["default_injection_schema"],
-            profiles["aeon-legacy-bounded"]["thinking"]["default_injection_schema"],
+            profiles["aeon-quality-first"]["thinking"]["default_injection_schema"],
             config["thinking"]["default_injection_schema"],
             *[
                 rung["default_injection_schema"]
@@ -432,7 +436,7 @@ class QueritServiceContractTests(unittest.TestCase):
             ],
             *[
                 rung["default_injection_schema"]
-                for rung in profiles["aeon-legacy-bounded"]["retry"]["ladder"]
+                for rung in profiles["aeon-quality-first"]["retry"]["ladder"]
             ],
         ]
         self.assertEqual(set(schemas), {"vllm_native"})

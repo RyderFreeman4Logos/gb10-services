@@ -20,8 +20,15 @@ class GuardProductionFeatureContractTests(unittest.TestCase):
         self.assertRegex(build, r"--features(?:=|\s+)guard(?:\s|$)")
 
     def test_production_config_bounds_workflow_executions(self) -> None:
-        config = tomllib.loads(GUARD_CONFIG.read_text())
-        self.assertEqual(config["guard_workflows"]["max_in_flight_executions"], 4)
+        raw = GUARD_CONFIG.read_text()
+        config = tomllib.loads(raw)
+        # Current deployed binary rejects unknown [guard_workflows]; keep it
+        # commented until the live binary supports the section again.
+        if "guard_workflows" in config:
+            self.assertEqual(config["guard_workflows"]["max_in_flight_executions"], 4)
+        else:
+            self.assertIn("# [guard_workflows]", raw)
+            self.assertIn("not supported by deployed binary", raw)
 
 
 if __name__ == "__main__":

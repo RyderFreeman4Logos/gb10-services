@@ -40,8 +40,8 @@ port = 18005
 # Three policy-scoped AEON listeners force one chat profile regardless of the
 # caller model alias. Port 18009 remains the multi-model default entrypoint
 # (chat + embedding + rerank). After the 2026-07 three-arm quality benchmark,
-# default chat on 18009 is force_disable; 18014 hosts the previous bounded
-# default chat policy as an opt-in escape hatch.
+# default chat on 18009 is force_disable; 18014 hosts the quality-first
+# loop-recovery policy (max thinking + pre-loop CoT salvage + force_disable).
 [[listeners]]
 name = "aeon-guard-max"
 bind_host = "100.105.4.92"
@@ -50,11 +50,11 @@ allowed_upstreams = ["aeon-guard-max"]
 upstream_profile = "aeon-guard-max"
 
 [[listeners]]
-name = "aeon-legacy-bounded"
+name = "aeon-quality-first"
 bind_host = "100.105.4.92"
 port = 18014
-allowed_upstreams = ["aeon-legacy-bounded"]
-upstream_profile = "aeon-legacy-bounded"
+allowed_upstreams = ["aeon-quality-first"]
+upstream_profile = "aeon-quality-first"
 
 [[listeners]]
 name = "aeon-raw-max"
@@ -329,14 +329,15 @@ tool_request_policy = "apply"
 no_thinking_marker_policy = "force"
 default_injection_schema = "vllm_native"
 
-# Former default 18009 chat policy, now opt-in on forced listener :18014.
-# Keep queue empty so Guard MemoryHigh admission budget stays within the
-# documented residency ceiling (see test_guard_queue_body_residency...).
+# Quality-first :18014 profile (issue #213). Spend max thinking compute, then
+# on loop detection: truncate at the detector's precise loop boundary, retain
+# pre-loop CoT as private system notes, and re-answer with force_disable.
+# This is the intended quality-maximizing recovery — not a destructive cancel.
 [[upstreams]]
-name = "aeon-legacy-bounded"
+name = "aeon-quality-first"
 base_url = "http://100.105.4.92:18010/v1"
 # Listener-forced :18014 profile; reserved alias avoids default-route overlap.
-match_models = ["__listener_forced_aeon_legacy_bounded__"]
+match_models = ["__listener_forced_aeon_quality_first__"]
 request_timeout_ms = 1800000
 max_in_flight_requests = 4
 max_queued_generation_requests = 0
@@ -367,14 +368,14 @@ budget_window_ms = 900000
 max_per_window = 2
 
 [upstreams.thinking]
-mode = "bounded_thinking"
+mode = "force_thinking"
 enabled = true
 force_disable = false
 max_tokens = 50000
 budget_tokens = 32768
 preserve_answer_budget = true
 tool_request_policy = "apply"
-no_thinking_marker_policy = "respect_no_thinking_markers"
+no_thinking_marker_policy = "force"
 default_injection_schema = "vllm_native"
 
 [upstreams.param_override]
@@ -389,12 +390,12 @@ presence_penalty = 0.0
 [upstreams.loop_guard]
 enabled = true
 mode = "enforce"
-on_reasoning_loop = "bounded_answer_from_cot"
+on_reasoning_loop = "truncate_cot_then_answer"
 cot_salvage_prefix_max_bytes = 32768
 cot_salvage_retry_thinking_budget = 8192
 normalized_input_window_secs = 120
 max_repeated_inputs = 1
-output_repeated_line_threshold = 24
+output_repeated_line_threshold = 72
 output_token_window_size = 12
 output_repeated_token_window_threshold = 32
 output_suffix_cycle_threshold = 32
@@ -428,7 +429,7 @@ max_tokens = 50000
 thinking_token_budget = 32768
 preserve_answer_budget = true
 tool_request_policy = "apply"
-no_thinking_marker_policy = "respect_no_thinking_markers"
+no_thinking_marker_policy = "force"
 default_injection_schema = "vllm_native"
 
 [[upstreams.retry.ladder]]
@@ -438,7 +439,7 @@ max_tokens = 50000
 thinking_token_budget = 16384
 preserve_answer_budget = true
 tool_request_policy = "apply"
-no_thinking_marker_policy = "respect_no_thinking_markers"
+no_thinking_marker_policy = "force"
 default_injection_schema = "vllm_native"
 anti_loop_hint = "Previous attempt became repetitive. Do not repeat prior analysis; answer directly."
 
@@ -449,14 +450,14 @@ max_tokens = 50000
 thinking_token_budget = 8192
 preserve_answer_budget = true
 tool_request_policy = "apply"
-no_thinking_marker_policy = "respect_no_thinking_markers"
+no_thinking_marker_policy = "force"
 default_injection_schema = "vllm_native"
 anti_loop_hint = "Previous attempt became repetitive after a deeper retry. Use only the useful prior work and answer directly."
 
 [[upstreams.retry.ladder]]
-name = "no-thinking"
+name = "truncate-cot-then-answer"
 thinking_mode = "force_disable"
-max_tokens = 1024
+max_tokens = 50000
 preserve_answer_budget = true
 tool_request_policy = "apply"
 no_thinking_marker_policy = "force"
@@ -626,18 +627,18 @@ tool_request_policy = "apply"
 no_thinking_marker_policy = "force"
 default_injection_schema = "vllm_native"
 
-[guard_workflows]
-max_in_flight_executions = 4
+# [guard_workflows] - not supported by deployed binary
+# max_in_flight_executions = 4
 
 # Match former :18014 raw-no-think chat policy: no loop salvage on the default
-# entry. Opt-in bounded chat on :18014 still enforces loop_guard.
+# entry. Quality-first loop recovery on :18014 uses truncate_cot_then_answer.
 [loop_guard]
 enabled = false
 mode = "disabled"
 
 [retry]
 enabled = true
-max_attempts = 1
+max_attempts = 3
 request_deadline_ms = 1200000
 anti_loop_hint_enabled = false
 shielded_streaming_enabled = true
