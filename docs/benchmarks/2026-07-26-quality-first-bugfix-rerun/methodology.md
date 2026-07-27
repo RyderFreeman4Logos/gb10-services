@@ -4,6 +4,12 @@
 
 Reproduce the A/B/C comparison under a **shared evaluation contract** after Guard infrastructure bugs were fixed. This is a quality + efficiency comparison, not a training-time eval.
 
+> **Historical boundary:** the published 290-case wave used runner
+> `temperature=0.0` and is historical evidence only. Its results must not be
+> used for the next ranking. The next ranking requires a complete serial A/B/C
+> re-run at the author-recommended `temperature=0.6`; Guard-overridden A/C
+> routes must also pin `top_p=0.95` and `top_k=20`.
+
 ## Preconditions
 
 1. GB10 services active: `vllm-embedding`, `vllm-querit-4b-reranker`, `vllm-aeon-27b-dflash` (baseline), `llm-guard-proxy`.
@@ -22,7 +28,8 @@ Reproduce the A/B/C comparison under a **shared evaluation contract** after Guar
 - [ ] suite_id = `aeon-suite-v2`
 - [ ] suite_hash = `015c06c71ec7f162`
 - [ ] n_cases = 290
-- [ ] temperature = 0.0 (runner); audit whether Guard overrides A
+- [ ] temperature = 0.6 (runner and every Guard-overridden text route)
+- [ ] Guard override sampling = `top_p=0.95`, `top_k=20`
 - [ ] max_tokens = 8192 (runner budget)
 - [ ] same evaluator / no frontier judge for subjective tier-1
 - [ ] serial execution on one AEON backend
@@ -34,24 +41,26 @@ Reproduce the A/B/C comparison under a **shared evaluation contract** after Guar
 # B
 curl -sf -X POST http://100.105.4.92:18010/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"aeon-ultimate","messages":[{"role":"user","content":"What is 5+5?"}],"enable_thinking":false,"stream":false,"max_tokens":64,"temperature":0.0}'
+  -d '{"model":"aeon-ultimate","messages":[{"role":"user","content":"What is 5+5?"}],"enable_thinking":false,"stream":false,"max_tokens":64,"temperature":0.6}'
 
 # C (use aeon-ultimate, not synthetic forced alias if AEON rejects it)
 curl -sf -X POST http://100.105.4.92:18015/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"aeon-ultimate","messages":[{"role":"user","content":"What is 5+5?"}],"stream":false,"max_tokens":64,"temperature":0.0}'
+  -d '{"model":"aeon-ultimate","messages":[{"role":"user","content":"What is 5+5?"}],"stream":false,"max_tokens":64,"temperature":0.6}'
 
 # A
 curl -sf -X POST http://100.105.4.92:18014/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"aeon-ultimate","messages":[{"role":"user","content":"What is 5+5?"}],"stream":false,"max_tokens":64,"temperature":0.0}'
+  -d '{"model":"aeon-ultimate","messages":[{"role":"user","content":"What is 5+5?"}],"stream":false,"max_tokens":64,"temperature":0.6}'
 ```
 
 Confirm HTTP 200 and expected thinking shape (B: no reasoning; A/C: reasoning allowed).
 
 ## Launch
 
-Scripts in this package are **method snapshots** from the successful wave:
+Scripts in this package are rerun-ready **method snapshots**. They have been
+updated to the author-recommended `temperature=0.6`; do not use the published
+0.0 result rows as part of that next ranking.
 
 | Script | Arm |
 |---|---|

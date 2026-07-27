@@ -377,6 +377,21 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertEqual(default_chat["loop_guard"]["mode"], "disabled")
         self.assertEqual(len(default_chat["retry"]["ladder"]), 1)
 
+        # Every AEON text profile used by the three-arm comparison pins the
+        # author-recommended sampling contract, regardless of client body.
+        for name in (
+            "aeon-default-no-think",
+            "aeon-guard-max",
+            "aeon-quality-first",
+            "aeon-raw-max",
+        ):
+            sampling = profiles[name]["param_override"]
+            self.assertTrue(sampling["enabled"], name)
+            self.assertEqual(sampling["temperature"], 0.6, name)
+            self.assertEqual(sampling["top_p"], 0.95, name)
+            self.assertEqual(sampling["top_k"], 20, name)
+            self.assertEqual(sampling["max_tokens"], 50000, name)
+
         # Runtime schema rejects empty match_models, so listener-forced arms use
         # reserved aliases that cannot collide with default public chat aliases.
         reserved_listener_aliases = {
@@ -394,6 +409,8 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertEqual(guarded["loop_guard"]["mode"], "enforce")
         self.assertTrue(guarded["local_recovery"]["enabled"])
         self.assertEqual(len(guarded["retry"]["ladder"]), 4)
+        self.assertEqual(guarded["retry"]["ladder"][3]["thinking_mode"], "force_disable")
+        self.assertEqual(guarded["retry"]["ladder"][3]["max_tokens"], 50000)
 
         # :18014 hosts the quality-first loop recovery policy (#213):
         # max thinking + truncate_cot_then_answer (pre-loop CoT + bounded salvage).
@@ -409,6 +426,7 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertEqual(
             quality["retry"]["ladder"][3]["thinking_mode"], "force_disable"
         )
+        self.assertEqual(quality["retry"]["ladder"][3]["max_tokens"], 50000)
 
         raw_max = profiles["aeon-raw-max"]
         self.assertEqual(raw_max["thinking"]["mode"], "force_thinking")
