@@ -7,7 +7,7 @@ from aeon import runner, db, suite as suite_mod
 from aeon.targets import TargetError
 
 run_id = "qf18014-" + uuid.uuid4().hex[:10]
-params = {"temperature": 0.0, "max_tokens": 8192}
+params = {"temperature": 0.6, "max_tokens": 8192}
 model = "aeon-ultimate"
 target_url = "http://100.105.4.92:18014/v1"
 

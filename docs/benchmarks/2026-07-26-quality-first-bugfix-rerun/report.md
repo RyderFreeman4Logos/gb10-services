@@ -1,11 +1,14 @@
 # AEON Three-Arm Quality Comparison — Guard Bugfix Wave
 
-**状态：Quality comparison eligible**
+**状态：历史结果（published 0.0 wave）**
 
 生成时间：`2026-07-27T18:30:00Z`
 
-本目录是 **Guard #216/#220/#219 修复后**、同一 evaluation contract 上的 A/B/C 三臂完整发布包。
-旧 155-case / suite-v3 / temp=0.6 结果**不可配对**，仅作历史背景。
+本目录是 **Guard #216/#220/#219 修复后**的 A/B/C 三臂完整发布包；其已发布
+290-case wave 的 runner `temperature=0.0`，现在仅作历史证据，**不得作为下一次排名**。
+下一次排名必须在同一 backend 上串行完整重跑 A/B/C，且三个 runner 都使用作者推荐的
+`temperature=0.6`（Guard override 同时固定 `top_p=0.95`、`top_k=20`）。旧
+155-case / suite-v3 / temp=0.6 结果同样**不可配对**，仅作历史背景。
 
 ## 结论（先说）
 
@@ -24,7 +27,7 @@
 
 **默认路由建议**：质量上 A≈C；若同时要 **延迟与 token 成本**，**A 优于 C**；纯吞吐无 thinking 则 B 最快但质量最低。
 
-## 1. Evaluation contract（三臂相同）
+## 1. 已发布的历史 evaluation contract
 
 | 字段 | 值 |
 |---|---|
@@ -32,7 +35,7 @@
 | Suite hash | `015c06c71ec7f162` |
 | Planned cases | 290 |
 | Categories | Coding, Instruction, Math, Prose, Reasoning |
-| temperature | 0.0 |
+| temperature | 0.0（已发布历史 wave；下一次完整重跑必须为 0.6） |
 | max_tokens | 8192 |
 | Runner | `aeon-mvp-resilient`（见 `scripts/`） |
 | Backend | AEON baseline dflash util=0.355, vLLM 0.25.1 |
@@ -158,13 +161,13 @@ BENCH_ARM=C AEON_DB=... AEON_BLOB_DIR=... python3 run_bench_arm_B_C.py
 2. **Salvage 路径是双刃剑**：`on_reasoning_loop = bounded_answer_from_cot` + ladder 最终可落到 `force_disable` / 短 `max_tokens`。截断后的 CoT 可能 **丢掉 C 靠继续思考才得到的正确答案**，同时在另一些题上 **救回** C 因循环而烂掉的答案 → 净零。
 3. **A 的 2 个 timeout 是纯损失**：C 在同题有答案（虽可能错）；A 直接 0 分。修 timeout / 请求 deadline 对齐可抬 A 的可用性分数。
 4. **Checker 偏 final answer**：context rot 伤害的是长程一致性；本 suite 大量 numeric/regex checker 对「冗长但最终 box 对」仍给 1.0，弱化 A 的 rot-avoidance 优势。
-5. **Param 契约不一致风险**：quality-first upstream 配置含 `temperature=0.6` 等 override，而 runner 声明 temp=0.0。若 listener 强制 param_override，则 A 与「runner 契约」不完全一致——需审计 live 请求实际 temperature（见 `improve_A.md`）。
+5. **Param 契约曾不一致**：quality-first upstream 配置含 `temperature=0.6` 等 override，而已发布 runner 声明 temp=0.0。该 0.0 wave 因而仅保留为历史证据；下一排名必须完整重跑 A/B/C，并在 runner 与 Guard override 统一使用 temp=0.6（见 `improve_A.md`）。
 
 ## 6. 证据边界
 
 - 未读取/导出 raw prompts、completions、blobs、credentials、源 sqlite。
 - `decode_tps` 在 thinking 流上可能因 timing 定义失真；**排名以 e2e_ms 与 output_tokens 为准**。
-- 旧 155-case 三臂（temp=0.6, max_tokens=50000）仅历史参考，**不参与本排名**。
+- 已发布 290-case 三臂（runner temp=0.0）与旧 155-case 三臂（temp=0.6, max_tokens=50000）均仅历史参考，**不参与下一次排名**；下一排名须完整重跑 A/B/C（temp=0.6）。
 
 ## 7. 相关 commit（gb10-services 分支）
 

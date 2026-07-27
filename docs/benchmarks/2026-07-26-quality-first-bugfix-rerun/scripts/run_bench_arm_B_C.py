@@ -109,7 +109,7 @@ ARM_CONFIG = {
 cfg = ARM_CONFIG[ARM]
 
 run_id = f"qf18014-{uuid.uuid4().hex[:10]}"
-params = {"temperature": 0.0, "max_tokens": 8192}
+params = {"temperature": 0.6, "max_tokens": 8192}
 model = cfg["model"]
 target_url = cfg["url"]
 target = runner.build_target(model, target_url)

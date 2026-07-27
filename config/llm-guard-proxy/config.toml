@@ -323,7 +323,9 @@ anti_loop_hint = "Previous attempt became repetitive after a deeper retry. Use o
 [[upstreams.retry.ladder]]
 name = "no-thinking"
 thinking_mode = "force_disable"
-max_tokens = 1024
+# max_tokens is the total completion budget; force_disable leaves all 50k for
+# the answer rather than reserving any tokens for thinking.
+max_tokens = 50000
 preserve_answer_budget = true
 tool_request_policy = "apply"
 no_thinking_marker_policy = "force"
@@ -457,6 +459,8 @@ anti_loop_hint = "Previous attempt became repetitive after a deeper retry. Use o
 [[upstreams.retry.ladder]]
 name = "truncate-cot-then-answer"
 thinking_mode = "force_disable"
+# max_tokens is the total completion budget; force_disable leaves all 50k for
+# the answer rather than reserving any tokens for thinking.
 max_tokens = 50000
 preserve_answer_budget = true
 tool_request_policy = "apply"
@@ -495,7 +499,13 @@ no_thinking_marker_policy = "force"
 default_injection_schema = "vllm_native"
 
 [upstreams.param_override]
-enabled = false
+enabled = true
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+max_tokens = 50000
+frequency_penalty = 0.0
+presence_penalty = 0.0
 
 [upstreams.loop_guard]
 enabled = false
