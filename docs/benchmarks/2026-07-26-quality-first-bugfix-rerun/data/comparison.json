@@ -1,0 +1,489 @@
+{
+  "arms": {
+    "A": {
+      "label": "quality-first (Guard max thinking + loop salvage)",
+      "mean": 0.9307958477508651,
+      "model": "aeon-ultimate",
+      "null_score": 1,
+      "passed": 269,
+      "planned": 290,
+      "route": "http://100.105.4.92:18014/v1",
+      "rows": 290,
+      "run_id": "qf18014-fac195ca84",
+      "scored_non_null": 289,
+      "speed": {
+        "e2e_ms": {
+          "max": 1031388.55,
+          "mean": 85815.96805555555,
+          "n": 288,
+          "p50": 50461.09,
+          "p95": 281678.17
+        },
+        "output_tokens": {
+          "max": 33578,
+          "mean": 1304.21875,
+          "n": 288,
+          "p50": 418,
+          "p95": 4998
+        },
+        "ttft_ms": {
+          "max": 1031388.46,
+          "mean": 85648.69536842105,
+          "n": 285,
+          "p50": 50081.55,
+          "p95": 281677.96
+        }
+      },
+      "status_counts": {
+        "gen_error: TimeoutError('timed out')": 2,
+        "scored": 288
+      }
+    },
+    "B": {
+      "enable_thinking": false,
+      "label": "raw-no-think",
+      "mean": 0.9054209919261823,
+      "model": "aeon-ultimate",
+      "null_score": 1,
+      "passed": 261,
+      "planned": 290,
+      "route": "http://100.105.4.92:18010/v1",
+      "rows": 290,
+      "run_id": "qf18014-e007cd098d",
+      "scored_non_null": 289,
+      "speed": {
+        "e2e_ms": {
+          "max": 220782.9708029749,
+          "mean": 14194.26962235252,
+          "n": 290,
+          "p50": 5626.922570052557,
+          "p95": 49780.178874963894
+        },
+        "output_tokens": {
+          "max": 8192,
+          "mean": 487.44827586206895,
+          "n": 290,
+          "p50": 191,
+          "p95": 1904
+        },
+        "ttft_ms": {
+          "max": 756.6327779786661,
+          "mean": 523.6018969777747,
+          "n": 290,
+          "p50": 548.7155719893053,
+          "p95": 668.2493579573929
+        }
+      },
+      "status_counts": {
+        "scored": 290
+      }
+    },
+    "C": {
+      "label": "raw-max (thinking on, no Guard quality policy)",
+      "mean": 0.9307958477508651,
+      "model": "aeon-ultimate",
+      "null_score": 1,
+      "passed": 269,
+      "planned": 290,
+      "route": "http://100.105.4.92:18015/v1",
+      "rows": 290,
+      "run_id": "qf18014-4501e9cd26",
+      "scored_non_null": 289,
+      "speed": {
+        "e2e_ms": {
+          "max": 1200004.2490119995,
+          "mean": 236558.0331605827,
+          "n": 290,
+          "p50": 94196.675889998,
+          "p95": 800085.1395710051
+        },
+        "output_tokens": {
+          "max": 40960,
+          "mean": 10266.996551724138,
+          "n": 290,
+          "p50": 2711,
+          "p95": 33432
+        },
+        "ttft_ms": {
+          "max": 1181359.3715009992,
+          "mean": 233224.162075512,
+          "n": 289,
+          "p50": 94196.53323300008,
+          "p95": 772692.9038159943
+        }
+      },
+      "status_counts": {
+        "scored": 290
+      }
+    }
+  },
+  "backend": {
+    "aeon_variant": "vllm-aeon-27b-dflash baseline",
+    "guard_binary_commit": "1e02e59",
+    "guard_binary_sha256_prefix": "3716e4b6",
+    "util": 0.355,
+    "vllm": "0.25.1"
+  },
+  "by_category": {
+    "Coding": {
+      "A": {
+        "mean": 0.9814814814814815,
+        "n": 54,
+        "passed": 53
+      },
+      "B": {
+        "mean": 1.0,
+        "n": 54,
+        "passed": 54
+      },
+      "C": {
+        "mean": 0.9629629629629629,
+        "n": 54,
+        "passed": 52
+      }
+    },
+    "Instruction": {
+      "A": {
+        "mean": 0.9508196721311475,
+        "n": 61,
+        "passed": 58
+      },
+      "B": {
+        "mean": 0.8852459016393442,
+        "n": 61,
+        "passed": 54
+      },
+      "C": {
+        "mean": 0.9508196721311475,
+        "n": 61,
+        "passed": 58
+      }
+    },
+    "Math": {
+      "A": {
+        "mean": 0.9014084507042254,
+        "n": 71,
+        "passed": 64
+      },
+      "B": {
+        "mean": 0.9014084507042254,
+        "n": 71,
+        "passed": 64
+      },
+      "C": {
+        "mean": 0.9154929577464789,
+        "n": 71,
+        "passed": 65
+      }
+    },
+    "Prose": {
+      "A": {
+        "mean": 0.85,
+        "n": 40,
+        "passed": 34
+      },
+      "B": {
+        "mean": 0.7166666666666667,
+        "n": 40,
+        "passed": 28
+      },
+      "C": {
+        "mean": 0.875,
+        "n": 40,
+        "passed": 35
+      }
+    },
+    "Reasoning": {
+      "A": {
+        "mean": 0.9523809523809523,
+        "n": 63,
+        "passed": 60
+      },
+      "B": {
+        "mean": 0.9682539682539683,
+        "n": 63,
+        "passed": 61
+      },
+      "C": {
+        "mean": 0.9365079365079365,
+        "n": 63,
+        "passed": 59
+      }
+    }
+  },
+  "comparison_eligible": true,
+  "content_policy": {
+    "blobs_included": false,
+    "includes": "case_id,category,tier,status,score,speed metrics,aggregates only",
+    "prompts_included": false,
+    "raw_output_included": false,
+    "sqlite_included": false
+  },
+  "disagreements": {
+    "A_vs_C": [
+      {
+        "A": 1.0,
+        "C": 0.0,
+        "case_id": "code.palindrome",
+        "category": "Coding"
+      },
+      {
+        "A": 0.0,
+        "C": 1.0,
+        "case_id": "instruction.forbid_letter.0001",
+        "category": "Instruction"
+      },
+      {
+        "A": 1.0,
+        "C": 0.0,
+        "case_id": "instruction.iso_date.0001",
+        "category": "Instruction"
+      },
+      {
+        "A": 1.0,
+        "C": 0.0,
+        "case_id": "math.comb.0002",
+        "category": "Math"
+      },
+      {
+        "A": 0.0,
+        "C": 1.0,
+        "case_id": "math.digits.0001",
+        "category": "Math"
+      },
+      {
+        "A": 0.0,
+        "C": 1.0,
+        "case_id": "math.easy.linear-7x-minus-4",
+        "category": "Math"
+      },
+      {
+        "A": 1.0,
+        "C": 0.0,
+        "case_id": "math.hard.last-two-digits-power",
+        "category": "Math"
+      },
+      {
+        "A": 1.0,
+        "C": 0.0,
+        "case_id": "math.medium.trains-meeting-time",
+        "category": "Math"
+      },
+      {
+        "A": 0.0,
+        "C": 1.0,
+        "case_id": "math.seq.0003",
+        "category": "Math"
+      },
+      {
+        "A": 0.0,
+        "C": 1.0,
+        "case_id": "math.seq.0004",
+        "category": "Math"
+      },
+      {
+        "A": 1.0,
+        "C": 0.0,
+        "case_id": "prose.expert.anaphora-lipogram",
+        "category": "Prose"
+      },
+      {
+        "A": 0.0,
+        "C": 1.0,
+        "case_id": "prose.expert.telestich-snow",
+        "category": "Prose"
+      },
+      {
+        "A": 0.0,
+        "C": 1.0,
+        "case_id": "prose.hard.acrostic-storm-pentastich",
+        "category": "Prose"
+      },
+      {
+        "A": 1.0,
+        "C": 0.0,
+        "case_id": "prose.hard.double-acrostic-frost",
+        "category": "Prose"
+      },
+      {
+        "A": 0.0,
+        "C": 1.0,
+        "case_id": "prose.medium.lipogram-no-the",
+        "category": "Prose"
+      },
+      {
+        "A": 1.0,
+        "C": 0.0,
+        "case_id": "reasoning.date.0005",
+        "category": "Reasoning"
+      },
+      {
+        "A": 0.0,
+        "C": 1.0,
+        "case_id": "reasoning.expert.nim-three-piles",
+        "category": "Reasoning"
+      },
+      {
+        "A": 1.0,
+        "C": 0.0,
+        "case_id": "reasoning.hard.mcnugget-frobenius",
+        "category": "Reasoning"
+      }
+    ]
+  },
+  "eligibility_notes": "All three arms complete on aeon-suite-v2 (290 cases), same temperature/max_tokens/runner. No infrastructure-induced loop_errors. One shared subjective null-score case (prose.ocean3). A has 2 runner TimeoutError gen_errors.",
+  "generated_at_utc": "2026-07-27T18:30:00Z",
+  "guard_bugfix": [
+    {
+      "commit": "2736757",
+      "fix": "non-stream stuck_watchdog exempt",
+      "issue": "#216"
+    },
+    {
+      "commit": "1e02e59",
+      "fix": "request_deadline no longer triggers local_recovery by default",
+      "issue": "#220"
+    },
+    {
+      "commit": null,
+      "issue": "#219",
+      "mitigation": "max_attempts 1\u21923 (config; root cause still open)"
+    }
+  ],
+  "paired_speed_A_vs_C": {
+    "A_faster": 224,
+    "C_faster": 64,
+    "mean_delta_A_minus_C": -146744.6477708019,
+    "mean_e2e_A": 85815.96805555555,
+    "mean_e2e_C": 232560.6158263576,
+    "mean_tokens_A": 1304.21875,
+    "mean_tokens_C": 10078.256944444445,
+    "n": 288
+  },
+  "pairwise": {
+    "A_vs_B": {
+      "A_win": 14,
+      "B_win": 7,
+      "delta": 0.025374855824682796,
+      "mean_A": 0.9307958477508651,
+      "mean_B": 0.9054209919261823,
+      "n": 289,
+      "tie": 268
+    },
+    "A_vs_C": {
+      "A_win": 9,
+      "C_win": 9,
+      "delta": 0.0,
+      "mean_A": 0.9307958477508651,
+      "mean_C": 0.9307958477508651,
+      "n": 289,
+      "tie": 271
+    },
+    "B_vs_C": {
+      "B_win": 9,
+      "C_win": 16,
+      "delta": -0.025374855824682796,
+      "mean_B": 0.9054209919261823,
+      "mean_C": 0.9307958477508651,
+      "n": 289,
+      "tie": 264
+    }
+  },
+  "params": {
+    "max_tokens": 8192,
+    "runner": "aeon-mvp-resilient",
+    "temperature": 0.0
+  },
+  "ranking": {
+    "latency_e2e_mean": "B << A << C",
+    "quality_mean": [
+      "A=C (0.9308)",
+      "B (0.9054)"
+    ],
+    "tokens_mean": "B << A << C"
+  },
+  "speed": {
+    "A": {
+      "e2e_ms": {
+        "max": 1031388.55,
+        "mean": 85815.96805555555,
+        "n": 288,
+        "p50": 50461.09,
+        "p95": 281678.17
+      },
+      "output_tokens": {
+        "max": 33578,
+        "mean": 1304.21875,
+        "n": 288,
+        "p50": 418,
+        "p95": 4998
+      },
+      "ttft_ms": {
+        "max": 1031388.46,
+        "mean": 85648.69536842105,
+        "n": 285,
+        "p50": 50081.55,
+        "p95": 281677.96
+      }
+    },
+    "B": {
+      "e2e_ms": {
+        "max": 220782.9708029749,
+        "mean": 14194.26962235252,
+        "n": 290,
+        "p50": 5626.922570052557,
+        "p95": 49780.178874963894
+      },
+      "output_tokens": {
+        "max": 8192,
+        "mean": 487.44827586206895,
+        "n": 290,
+        "p50": 191,
+        "p95": 1904
+      },
+      "ttft_ms": {
+        "max": 756.6327779786661,
+        "mean": 523.6018969777747,
+        "n": 290,
+        "p50": 548.7155719893053,
+        "p95": 668.2493579573929
+      }
+    },
+    "C": {
+      "e2e_ms": {
+        "max": 1200004.2490119995,
+        "mean": 236558.0331605827,
+        "n": 290,
+        "p50": 94196.675889998,
+        "p95": 800085.1395710051
+      },
+      "output_tokens": {
+        "max": 40960,
+        "mean": 10266.996551724138,
+        "n": 290,
+        "p50": 2711,
+        "p95": 33432
+      },
+      "ttft_ms": {
+        "max": 1181359.3715009992,
+        "mean": 233224.162075512,
+        "n": 289,
+        "p50": 94196.53323300008,
+        "p95": 772692.9038159943
+      }
+    }
+  },
+  "suite": {
+    "categories": [
+      "Coding",
+      "Instruction",
+      "Math",
+      "Prose",
+      "Reasoning"
+    ],
+    "hash": "015c06c71ec7f162",
+    "id": "aeon-suite-v2",
+    "n_cases": 290
+  },
+  "title": "AEON three-arm quality comparison after Guard bugfix"
+}
