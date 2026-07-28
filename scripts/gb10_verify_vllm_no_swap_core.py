@@ -45,6 +45,12 @@ FULL_ID = re.compile(r"[0-9a-f]{64}")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 STARTED_AT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z")
 COMPONENT = re.compile(r"[A-Za-z0-9_.@:-]+")
+RERANKER_VLLM_UNITS = frozenset(
+    {
+        "vllm-querit-4b-reranker.service",
+        "vllm-qwen3-reranker-8b.service",
+    }
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -340,10 +346,23 @@ def parse_unit(path_raw: str) -> UnitContract:
     memory = parse_memory(memory_raw)
     if exactly_one("--memory-swappiness") != "0":
         reject("Docker memory swappiness intent is not exactly zero")
-    if any(
-        token.split("=", 1)[0].replace("_", "-") == "--swap-space"
+    normalized_swap_space = [
+        token
         for token in command
-    ):
+        if token.split("=", 1)[0].replace("_", "-") == "--swap-space"
+    ]
+    direct_swap_space = [
+        command[index : index + 2]
+        for index, token in enumerate(command[:-1])
+        if token == "--swap-space"
+    ]
+    if path.name in RERANKER_VLLM_UNITS:
+        if (
+            normalized_swap_space != ["--swap-space"]
+            or direct_swap_space != [["--swap-space", "0"]]
+        ):
+            reject("reranker vLLM must pass exactly one direct --swap-space 0")
+    elif normalized_swap_space:
         reject("unsupported vLLM --swap-space option is forbidden")
     entrypoint_value = exactly_one("--entrypoint")
     if entrypoint_value != "python3":
