@@ -141,8 +141,9 @@ image with pulls and networking disabled, a read-only container root and
 source mounts, equal 12 GiB Docker memory/swap caps for the disposable
 conversion process, and only the disposable copied snapshot mounted writable.
 This conversion-container limit is not the vLLM runtime no-swap attestation.
-Every tracked production/canary vLLM backend omits the unsupported vLLM
-`--swap-space` flag and uses zero Docker swappiness plus equal memory/swap
+The tracked Querit production owner and Qwen reranker fallback now pass direct
+`--swap-space 0`; the AEON vLLM fork omits that unsupported upstream option.
+All tracked vLLM backends use zero Docker swappiness plus equal memory/swap
 intent; before readiness the
 canonical helper binds full CID/PID/`StartedAt`, `/proc` starttime and exact
 Docker scope, scope inode/population, then proves exact `memory.max`, zero

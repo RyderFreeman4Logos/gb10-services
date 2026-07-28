@@ -46,6 +46,10 @@ SERVICE_CONTRACTS = {
         "%t/gb10-vllm-cids/vllm-qwen3-reranker-8b.cid",
     ),
 }
+RERANKER_VLLM_UNITS = {
+    "vllm-querit-4b-reranker.service",
+    "vllm-qwen3-reranker-8b.service",
+}
 
 
 def _logical_argv(unit: str, directive: str) -> list[list[str]]:
@@ -119,7 +123,15 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                     for token in application
                     if token.split("=", 1)[0].replace("_", "-") == "--swap-space"
                 ]
-                self.assertEqual(normalized_swap, [])
+                expected_swap = ["--swap-space"] if name in RERANKER_VLLM_UNITS else []
+                self.assertEqual(normalized_swap, expected_swap)
+                direct_swap_pairs = [
+                    application[index : index + 2]
+                    for index, token in enumerate(application[:-1])
+                    if token == "--swap-space"
+                ]
+                expected_pairs = [["--swap-space", "0"]] if name in RERANKER_VLLM_UNITS else []
+                self.assertEqual(direct_swap_pairs, expected_pairs)
                 self.assertEqual(argv.count("--memory"), 1)
                 self.assertEqual(argv.count("--memory-swap"), 1)
                 self.assertEqual(argv.count("--memory-swappiness"), 1)
@@ -130,7 +142,17 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                 )
                 self.assertIn(f"--cidfile={cidfile}", argv)
                 self.assertIn("UMask=0077", unit)
-                self.assertNotIn("MemorySwapMax=0", unit)
+                expected_memory_swap_max = (
+                    ["0"] if name == "vllm-querit-4b-reranker.service" else []
+                )
+                self.assertEqual(
+                    [
+                        line.removeprefix("MemorySwapMax=")
+                        for line in unit.splitlines()
+                        if line.startswith("MemorySwapMax=")
+                    ],
+                    expected_memory_swap_max,
+                )
                 unit_path = f"{UNIT_ROOT}/{name}"
                 condition = PRODUCTION_PREFIX + ["--unit", unit_path]
                 self.assertEqual(_logical_argv(unit, "ExecCondition")[0], condition)
