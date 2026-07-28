@@ -256,9 +256,12 @@ do not replace that transaction with manual lifecycle commands.
 
 ### Generation-bound vLLM no-swap authority
 
-Every tracked vLLM backend must omit the unsupported vLLM `--swap-space` flag,
-contain Docker `--memory-swappiness 0`, and use equal Docker `--memory` /
-`--memory-swap` values. Those Docker source args are intent, not runtime proof.
+The AEON-based Querit production owner and Qwen reranker fallback must omit
+`--swap-space`: the pinned AEON vLLM fork does not support that upstream
+option. Every tracked vLLM backend must contain Docker `--memory-swappiness 0`
+and use equal Docker `--memory` / `--memory-swap` values. The Querit systemd
+parent also retains `MemorySwapMax=0`. Those source-level controls are intent,
+not runtime proof.
 The public `gb10_verify_vllm_no_swap.sh` wrapper
 opens its fixed non-executable `gb10_verify_vllm_no_swap_core.py` companion with
 `O_NOFOLLOW`, verifies owner/link/mode/identity and its embedded SHA-256, then

@@ -18,6 +18,7 @@ Environment=TRANSFORMERS_OFFLINE=1
 
 # Wrapper/docker-CLI only. Docker owns the 18 GiB container cap.
 MemoryMax=256M
+MemorySwapMax=0
 OOMScoreAdjust=500
 Restart=no
 TimeoutStartSec=1800

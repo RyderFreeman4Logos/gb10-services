@@ -154,7 +154,7 @@ class QueritVllmProductionContractTests(unittest.TestCase):
             },
         )
         self.assertIn("MemoryMax=256M", unit)
-        self.assertNotIn("MemorySwapMax=0", unit)
+        self.assertEqual(_unit_directive_values(unit, "MemorySwapMax"), ["0"])
         self.assertIn("Restart=no", unit)
         self.assertEqual(_unit_directive_values(unit, "TimeoutStartSec"), ["1800"])
 
@@ -278,16 +278,30 @@ class QueritVllmProductionContractTests(unittest.TestCase):
                 self.assertIn(address, {"100.105.4.92", "127.0.0.1"}, path.name)
                 self.assertEqual(container_port, "8000", path.name)
 
-    def test_every_reranker_vllm_unit_omits_unsupported_swap_space_flag(self) -> None:
+    def test_every_reranker_vllm_unit_omits_unsupported_vllm_swap_space(self) -> None:
         for path in (PRODUCTION_UNIT, LEGACY_QWEN_UNIT):
             argv = _logical_argv(path.read_text(), "ExecStart")
             self.assertEqual(len(argv), 1, path.name)
-            normalized_swap = [
+            normalized_swap_space = [
                 token
                 for token in argv[0]
                 if token.split("=", 1)[0].replace("_", "-") == "--swap-space"
             ]
-            self.assertEqual(normalized_swap, [], path.name)
+            self.assertEqual(normalized_swap_space, [], path.name)
+
+        host, _options = _docker_host_and_vllm_options(PRODUCTION_UNIT.read_text())
+        docker_memory = [
+            host[index + 1]
+            for index, token in enumerate(host[:-1])
+            if token == "--memory"
+        ]
+        docker_swap = [
+            host[index + 1]
+            for index, token in enumerate(host[:-1])
+            if token == "--memory-swap"
+        ]
+        self.assertEqual(docker_memory, ["18g"])
+        self.assertEqual(docker_swap, docker_memory)
 
 
 if __name__ == "__main__":

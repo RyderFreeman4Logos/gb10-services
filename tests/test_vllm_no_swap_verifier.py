@@ -343,6 +343,45 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
                 )
                 self.assert_rejected(containers=())
 
+    def test_reranker_units_reject_every_unsupported_swap_space_form(self) -> None:
+        hostile_suffixes = (
+            ["--swap-space", "0"],
+            ["--swap-space=0"],
+            ["--swap_space", "0"],
+            ["--swap_space=0"],
+            ["--swap-space", "1"],
+            ["--swap-space", "0", "--swap_space=0"],
+        )
+        for name in (
+            "vllm-querit-4b-reranker.service",
+            "vllm-qwen3-reranker-8b.service",
+        ):
+            with self.subTest(unit=name, case="without-swap-space"):
+                reranker_unit = self.root / name
+                command = ["/usr/local/bin/vllm", "serve", "model"]
+                self._write_unit(
+                    reranker_unit,
+                    "vllm-test",
+                    "/run/user/1001/gb10-vllm-cids/test.cid",
+                    application=command,
+                )
+                payload = self._inspect("vllm-test", command=command)
+                result = self._run(
+                    units=(reranker_unit,),
+                    inspect_sequences={"vllm-test": [payload]},
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            for suffix in hostile_suffixes:
+                with self.subTest(unit=name, suffix=suffix):
+                    self._write_unit(
+                        reranker_unit,
+                        "vllm-test",
+                        "/run/user/1001/gb10-vllm-cids/test.cid",
+                        application=["/usr/local/bin/vllm", "serve", "model", *suffix],
+                    )
+                    self.assert_rejected(units=(reranker_unit,), containers=())
+
     def test_rejects_nonzero_docker_memory_swappiness_intent(self) -> None:
         self._write_unit(
             self.unit,
