@@ -41,7 +41,6 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-vllm-cids/vllm-qwen3-rerank
     --max-num-seqs 64 \
     --gpu-memory-utilization 0.22 \
     --kv-cache-memory-bytes 5820M \
-    --swap-space 0 \
     --enforce-eager \
     --chat-template /vllm-workspace/examples/pooling/score/template/qwen3_reranker.jinja \
     --hf-overrides '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}' \

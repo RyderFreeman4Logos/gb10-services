@@ -94,7 +94,6 @@ def _docker_host_and_vllm_options(unit: str) -> tuple[list[str], dict[str, list[
         "--tensor-parallel-size": 1,
         "--pipeline-parallel-size": 1,
         "--cpu-offload-gb": 1,
-        "--swap-space": 1,
         "--max-num-batched-tokens": 1,
         "--max-num-seqs": 1,
         "--enable-chunked-prefill": 0,
@@ -146,7 +145,7 @@ class QueritVllmProductionContractTests(unittest.TestCase):
                 "--max-model-len": ["32768"], "--gpu-memory-utilization": ["0.17"],
                 "--kv-cache-memory-bytes": ["4800M"], "--kv-cache-dtype": ["auto"],
                 "--tensor-parallel-size": ["1"], "--pipeline-parallel-size": ["1"],
-                "--cpu-offload-gb": ["0"], "--swap-space": ["0"],
+                "--cpu-offload-gb": ["0"],
                 "--max-num-batched-tokens": ["16384"], "--max-num-seqs": ["32"],
                 "--enable-chunked-prefill": [],
                 "--max-num-partial-prefills": ["1"], "--max-long-partial-prefills": ["1"],
@@ -279,16 +278,16 @@ class QueritVllmProductionContractTests(unittest.TestCase):
                 self.assertIn(address, {"100.105.4.92", "127.0.0.1"}, path.name)
                 self.assertEqual(container_port, "8000", path.name)
 
-    def test_every_reranker_vllm_unit_disables_vllm_and_container_swap(self) -> None:
+    def test_every_reranker_vllm_unit_omits_unsupported_vllm_swap_space(self) -> None:
         for path in (PRODUCTION_UNIT, LEGACY_QWEN_UNIT):
             argv = _logical_argv(path.read_text(), "ExecStart")
             self.assertEqual(len(argv), 1, path.name)
-            swap_space_pairs = [
-                argv[0][index : index + 2]
-                for index, token in enumerate(argv[0][:-1])
-                if token == "--swap-space"
+            normalized_swap_space = [
+                token
+                for token in argv[0]
+                if token.split("=", 1)[0].replace("_", "-") == "--swap-space"
             ]
-            self.assertEqual(swap_space_pairs, [["--swap-space", "0"]], path.name)
+            self.assertEqual(normalized_swap_space, [], path.name)
 
         host, _options = _docker_host_and_vllm_options(PRODUCTION_UNIT.read_text())
         docker_memory = [

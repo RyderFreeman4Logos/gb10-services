@@ -18,7 +18,7 @@ __all__ = ["ActivationInterrupted", "activate", "main"]
 EXPECTED_IMPORT_AUTHORITY: dict[str, str] = {
     "gb10_embedding_activation_checks.py": "7e6d00538e8d952c137e5b5114fc16919f6e1bab59d6260602f989a2103f44a4",
     "gb10_embedding_activation_config.py": "8cfe41e37a31adc2c060cd68700c304775231b62d9e8f03170f0bc371ced5de7",
-    "gb10_embedding_activation_storage.py": "c02dd93e37c0944043f17212eae8932b553011586eea406025f15f12368cc646",
+    "gb10_embedding_activation_storage.py": "793e6ecf502a28205b6ca7dbdd5ae85bf6ed6e0f504e0de5fba37f78de6ade92",
     "gb10_embedding_profile_contract.py": "8efb412edadb55e7d702e354ef7f4d0be6ea659628929cc9aebc847f18758b01",
     "gb10_embedding_verifier_runtime.py": "599af1c802e1a0d3e942fb0b16cdfd3a66f9e928ab64eabf3fb455ec007df629",
     "gb10_verify_embedding_profile.py": "5ddbea42ec11ab6cf8fd8a0df14d40edd6b3920d33851510274c24a5092732f4",
