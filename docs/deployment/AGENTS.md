@@ -169,7 +169,8 @@ mkdir -p /home/obj/.config/systemd/user/
 # Install tracked services.
 install -m 0644 systemd/llm-guard-proxy.service \
   systemd/vllm-querit-4b-reranker.service systemd/sysmon.service \
-  systemd/vllm-aeon-27b-dflash.service systemd/vllm-embedding.service \
+  systemd/vllm-aeon-27b-dflash.service systemd/vllm-aeon-27b-dflash-hikv.service \
+  systemd/vllm-embedding.service \
   systemd/vllm-qwen3-reranker-8b.service \
   /home/obj/.config/systemd/user/
 
@@ -422,20 +423,22 @@ required for these proxy-only queue/concurrency changes.
 
 ## Troubleshooting & Recovery
 
-### 0. v0.25.1 FlashInfer JIT Compilation
+### 0. Historical v0.25.1 FlashInfer JIT Compilation (not v0.26.0 guidance)
 
-The v0.25.1 image (`sha256:c15e2c4b...`) uses FlashInfer 0.6.13 which requires JIT
+The historical v0.25.1 image (`sha256:c15e2c4b...`) used FlashInfer 0.6.13 which required JIT
 compilation of 30+ CUTLASS FP4 GEMM kernels on first startup. Without `MAX_JOBS=1`,
 ninja compiles in parallel → multiple nvcc/cc1plus procs exhaust UMA → kernel OOM
 → `ninja: build stopped` → `RuntimeError` exit 1.
 
-**This is the #1 cause of text startup failures on v0.25.x.**
+**This was the #1 cause of text startup failures on v0.25.x; it is historical
+evidence, not a v0.26.0 readiness diagnosis.**
 
-The text unit sets `MAX_JOBS=1` + `CMAKE_BUILD_PARALLEL_LEVEL=1` to serialize
-compilation. JIT cache is NOT persisted (ephemeral `--rm` container), so a cold
-start recompiles for roughly two minutes. The integrated guardian remains active
-and enforces the configured 5 GiB `MemAvailable` threshold during startup;
-serialized compilation is pressure reduction, not an exemption from that guard.
+The tracked text units retain `MAX_JOBS=1` + `CMAKE_BUILD_PARALLEL_LEVEL=1` to
+serialize compilation. JIT cache is NOT persisted (ephemeral `--rm` container),
+but this retained v0.25.1 observation does not establish v0.26.0's HIGH-KV
+compilation/profiling latency. The integrated guardian remains active and enforces
+the configured 5 GiB `MemAvailable` threshold during startup; serialized
+compilation is pressure reduction, not an exemption from that guard.
 
 ### 1. CUDA Hang or Service Crash
 If `vllm-aeon-27b-dflash.service` hangs or refuses to respond, preserve

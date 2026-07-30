@@ -358,6 +358,19 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertEqual(restart_queue["queue_deadline_secs"], 600)
         self.assertEqual(restart_queue["restart_timeout_secs"], 600)
 
+    def test_guard_recovery_helper_path_matches_the_deployment_instructions(self) -> None:
+        config = tomllib.loads(CONFIG.read_text())
+        helper_path = "/home/obj/scripts/aeon_text_stop_start.sh"
+        self.assertEqual(
+            config["upstream"]["local_recovery"]["restart_command"], [helper_path]
+        )
+
+        guide = (ROOT / "docs" / "deployment" / "AGENTS.md").read_text()
+        self.assertIn(
+            "install -m 0755 scripts/aeon_text_stop_start.sh " + helper_path,
+            guide,
+        )
+
     def test_guard_listener_forced_benchmark_profiles(self) -> None:
         config = tomllib.loads(CONFIG.read_text())
         profiles = {profile["name"]: profile for profile in config["upstreams"]}

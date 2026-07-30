@@ -23,7 +23,7 @@ graph TD
 
 ### The 5 Core Services
 1. **vllm-aeon-27b-dflash.service**
-   Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside the pinned AEON v0.25 GB10 Docker image for long-context processing up to 256k tokens, with FP8 KV cache and DFlash `TRITON_ATTN` enabled.
+   Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside the pinned AEON v0.26.0 GB10 Docker image for long-context processing up to 256k tokens, with FP8 KV cache and DFlash `TRITON_ATTN` enabled.
 2. **vllm-embedding.service**
    Serves BF16 `Qwen/Qwen3-Embedding-8B` with its full 4,096-dimensional output. This is the reliability-critical baseline service. The tracked source profile contracts for 32,768 tokens and 4,800 MiB explicit KV while preserving 8,192 batched tokens, 64 sequences, aliases, and quality semantics. It requests equal 128 GiB Docker memory/swap caps without imposing the obsolete 20 GiB service budget. Before readiness, its verifier binds the full Docker ID, PID, Docker `StartedAt`, `/proc` PID starttime and canonical Docker scope, scope inode, and `cgroup.events` population, then proves `HostConfig.MemorySwap == HostConfig.Memory`, `memory.swap.max == 0`, and `memory.swap.current == 0` on that unchanged generation. Its raw backend listens only on port `18012`; clients should use `llm-guard-proxy` on port `18009` or the guard-owned legacy listener `18002` with model `qwen3-embedding-8b`.
 3. **vllm-querit-4b-reranker.service**
@@ -136,9 +136,9 @@ gb10-services/
 │   └── sysmon.sh           # Observer-only metrics with measured sample cadence
 └── systemd/
     ├── llm-guard-proxy.service
-    ├── vllm-querit-4b-reranker.service
     ├── sysmon.service
     ├── vllm-aeon-27b-dflash.service
+    ├── vllm-aeon-27b-dflash-hikv.service # Alternative HIGH-KV AEON text unit
     ├── vllm-embedding.service
     └── vllm-qwen3-reranker-8b.service # disabled fallback only
 ```
@@ -226,7 +226,8 @@ cp config/llm-guard-proxy/config.toml ~/.config/llm-guard-proxy/config.toml
 mkdir -p ~/.config/systemd/user/
 install -m 0644 systemd/llm-guard-proxy.service \
   systemd/vllm-querit-4b-reranker.service systemd/sysmon.service \
-  systemd/vllm-aeon-27b-dflash.service systemd/vllm-embedding.service \
+  systemd/vllm-aeon-27b-dflash.service systemd/vllm-aeon-27b-dflash-hikv.service \
+  systemd/vllm-embedding.service \
   systemd/vllm-qwen3-reranker-8b.service \
   ~/.config/systemd/user/
 ```

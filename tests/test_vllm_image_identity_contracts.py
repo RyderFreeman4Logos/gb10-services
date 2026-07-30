@@ -172,6 +172,8 @@ class VllmImageIdentityContractTests(unittest.TestCase):
 
     def test_current_docs_publish_one_coherent_release_identity(self) -> None:
         readme = (ROOT / "README.md").read_text()
+        self.assertIn("pinned AEON v0.26.0 GB10 Docker image", readme)
+        self.assertNotIn("pinned AEON v0.25 GB10 Docker image", readme)
         self.assertRegex(
             readme,
             re.compile(
@@ -189,6 +191,15 @@ class VllmImageIdentityContractTests(unittest.TestCase):
             f"(`{CURRENT_RELEASE.digest}`; runtime `{CURRENT_RELEASE.version}`)",
             guide,
         )
+
+    def test_current_deployment_docs_install_both_selectable_aeon_units(self) -> None:
+        documents = (
+            (ROOT / "README.md").read_text(),
+            (ROOT / "docs" / "deployment" / "AGENTS.md").read_text(),
+        )
+        for document in documents:
+            self.assertIn("systemd/vllm-aeon-27b-dflash.service", document)
+            self.assertIn("systemd/vllm-aeon-27b-dflash-hikv.service", document)
 
     def test_aeon_tracked_runtime_profile_matches_deployment_reference(self) -> None:
         unit = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
