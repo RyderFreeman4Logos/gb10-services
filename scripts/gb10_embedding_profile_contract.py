@@ -22,12 +22,12 @@ __all__ = [
 
 EXPECTED_IMAGE = (
     "ghcr.io/aeon-7/aeon-vllm-ultimate@"
-    "sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d"
+    "sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7"
 )
 EXPECTED_CONTAINER = "vllm-embedding"
 EXPECTED_MODELS = ("qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B")
 EXPECTED_PROFILE = "qwen3-embedding-8b-32k-4800M-128GiB"
-EXPECTED_UNIT_SHA256 = "e43bdaf5f1b3cc7a06ad174915551aa377a0a9922e3b63fa77860be3e658d353"
+EXPECTED_UNIT_SHA256 = "ecd1994bf8033558dfe2d3d2ee5827f1f8fa8ac4aab9e0ad20f9232b37693787"
 EXPECTED_NO_SWAP_PREFIX = [
     "/usr/bin/env",
     "-i",

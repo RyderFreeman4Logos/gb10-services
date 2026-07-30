@@ -26,7 +26,6 @@
 #   3  text service not found / misconfigured
 set -Eeuo pipefail
 
-TEXT_UNIT="vllm-aeon-27b-dflash"
 RR_UNIT="vllm-querit-4b-reranker"
 EMB_UNIT="vllm-embedding"
 TEXT_URL="http://100.105.4.92:18010/v1/models"
@@ -37,6 +36,10 @@ POLL_INTERVAL="${POLL_INTERVAL:-10}"
 LIFECYCLE="${GB10_LIFECYCLE_BIN:-/home/obj/.local/bin/gb10_lifecycle.sh}"
 LIFECYCLE_ACTOR="${GB10_LIFECYCLE_ACTOR:-gb10_restart_text_safe}"
 LIFECYCLE_REASON="${GB10_LIFECYCLE_REASON:-authorized-text-maintenance}"
+readonly -a TEXT_UNITS=(
+  vllm-aeon-27b-dflash
+  vllm-aeon-27b-dflash-hikv
+)
 
 MODE="full"
 
@@ -53,6 +56,89 @@ while [[ $# -gt 0 ]]; do
 done
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+
+SELECTED_TEXT_UNIT_FILE="${GB10_SELECTED_TEXT_UNIT_FILE:-/home/obj/.local/state/gb10-lifecycle/selected-text-unit}"
+
+read_persisted_text_unit() {
+  local candidate=""
+  if [[ -r "$SELECTED_TEXT_UNIT_FILE" ]]; then
+    candidate="$(<"$SELECTED_TEXT_UNIT_FILE")"
+    candidate="${candidate//$'\r'/}"
+    candidate="${candidate//$'\n'/}"
+    # File stores full unit name; strip .service for this script's bare names.
+    candidate="${candidate%.service}"
+    case "$candidate" in
+      vllm-aeon-27b-dflash|vllm-aeon-27b-dflash-hikv)
+        printf '%s\n' "$candidate"
+        return 0
+        ;;
+    esac
+  fi
+  return 1
+}
+
+persist_selected_text_unit() {
+  local unit="$1"
+  local parent name tmp
+  parent="$(dirname -- "$SELECTED_TEXT_UNIT_FILE")"
+  name="${SELECTED_TEXT_UNIT_FILE##*/}"
+  mkdir -p -- "$parent"
+  tmp="$(mktemp -- "${parent}/.${name}.XXXXXXXXXX")"
+  if ! printf '%s\n' "${unit}.service" >"$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  mv -f -- "$tmp" "$SELECTED_TEXT_UNIT_FILE"
+}
+
+select_text_unit() {
+  local candidate state persisted
+  local -a matching=()
+
+  for candidate in "${TEXT_UNITS[@]}"; do
+    state="$(systemctl --user show --property=ActiveState --value "${candidate}.service" 2>/dev/null || true)"
+    case "$state" in
+      active|activating|reloading) matching+=("$candidate") ;;
+    esac
+  done
+  if (( ${#matching[@]} == 1 )); then
+    printf '%s\n' "${matching[0]}"
+    return 0
+  fi
+  if (( ${#matching[@]} > 1 )); then
+    echo "ambiguous active AEON text units: ${matching[*]}" >&2
+    return 1
+  fi
+
+  if persisted="$(read_persisted_text_unit)"; then
+    printf '%s\n' "$persisted"
+    return 0
+  fi
+
+  for candidate in "${TEXT_UNITS[@]}"; do
+    state="$(systemctl --user is-enabled "${candidate}.service" 2>/dev/null || true)"
+    case "$state" in
+      enabled|enabled-runtime|linked|linked-runtime) matching+=("$candidate") ;;
+    esac
+  done
+  if (( ${#matching[@]} == 1 )); then
+    printf '%s\n' "${matching[0]}"
+    return 0
+  fi
+  if (( ${#matching[@]} > 1 )); then
+    echo "ambiguous enabled AEON text units: ${matching[*]}" >&2
+  else
+    echo "no active, persisted, or enabled AEON text unit is available" >&2
+  fi
+  return 1
+}
+
+validate_text_unit() {
+  case "$1" in
+    vllm-aeon-27b-dflash|vllm-aeon-27b-dflash-hikv) ;;
+    *) echo "unsupported AEON text unit: $1" >&2; return 1 ;;
+  esac
+}
 
 wait_for_url() {
   local url="$1" deadline="$2" name="$3"
@@ -96,6 +182,13 @@ if [[ "$MODE" == "rr-only" ]]; then
 fi
 
 # ---------------------------------------------------------- text-only / full --
+TEXT_UNIT="${GB10_TEXT_UNIT:-}"
+if [[ -z "$TEXT_UNIT" ]]; then
+  TEXT_UNIT="$(select_text_unit)"
+fi
+validate_text_unit "$TEXT_UNIT"
+persist_selected_text_unit "$TEXT_UNIT"
+
 # Verify embedding is running; if not, warn but do NOT auto-start (caller's job).
 if ! systemctl --user is-active --quiet "$EMB_UNIT" 2>/dev/null; then
   log "WARNING: $EMB_UNIT is not active — it should be started separately first!"

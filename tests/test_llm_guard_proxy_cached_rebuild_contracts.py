@@ -20,8 +20,20 @@ class GuardProductionFeatureContractTests(unittest.TestCase):
         self.assertRegex(build, r"--features(?:=|\s+)guard(?:\s|$)")
 
     def test_production_config_bounds_workflow_executions(self) -> None:
-        config = tomllib.loads(GUARD_CONFIG.read_text())
-        self.assertEqual(config["guard_workflows"]["max_in_flight_executions"], 4)
+        # Active [guard_workflows] is temporarily commented: the installed
+        # binary fail-closes on unknown sections. Keep the intended bound in
+        # comments so deploy does not forget the value when re-enabled.
+        text = GUARD_CONFIG.read_text()
+        config = tomllib.loads(text)
+        self.assertNotIn("guard_workflows", config)
+        self.assertRegex(
+            text,
+            r"(?m)^# \[guard_workflows\]\s*$",
+        )
+        self.assertRegex(
+            text,
+            r"(?m)^# max_in_flight_executions = 4\s*$",
+        )
 
 
 if __name__ == "__main__":

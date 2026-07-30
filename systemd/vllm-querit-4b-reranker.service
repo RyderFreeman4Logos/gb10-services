@@ -1,9 +1,10 @@
-# Canonical Querit-4B vLLM pooling reranker (AEON v0.25.1, raw Tailnet :18013).
+# Canonical Querit-4B vLLM pooling reranker (AEON v0.26.0, raw Tailnet :18013).
 # The llm-guard-proxy adapter on :18009/:18003 forwards rerank requests to
 # this backend; clients (CodeSeek, mempal, verbatim) see a DeepInfra-compatible
 # contract through the adapter.
 [Unit]
-Description=Canonical Querit-4B vLLM pooling reranker (AEON v0.25.1, raw Tailnet :18013)
+# AEON image release: 2026-07-27-v0.26.0; immutable digest: sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7
+Description=Canonical Querit-4B vLLM pooling reranker (AEON v0.26.0, raw Tailnet :18013)
 After=network.target
 Conflicts=vllm-qwen3-reranker-8b.service
 StartLimitIntervalSec=600
@@ -40,7 +41,7 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-vllm-cids/vllm-querit-4b-re
   --memory-swappiness 0 \
   --oom-score-adj 500 \
   --entrypoint python3 \
-  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d \
+  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7 \
   /usr/local/bin/vllm serve /home/obj/models/querit-4b-vllm \
     --host 0.0.0.0 \
     --port 8000 \

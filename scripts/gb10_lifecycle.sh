@@ -84,7 +84,7 @@ require_token() {
 
 require_unit() {
     case "$1" in
-        vllm-aeon-27b-dflash.service|vllm-embedding.service|vllm-querit-4b-reranker.service|vllm-qwen3-reranker-8b.service)
+        vllm-aeon-27b-dflash.service|vllm-aeon-27b-dflash-hikv.service|vllm-embedding.service|vllm-querit-4b-reranker.service|vllm-qwen3-reranker-8b.service)
             ;;
         *)
             fail "unit is not an approved GB10 model service: $1"
