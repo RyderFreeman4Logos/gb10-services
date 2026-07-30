@@ -12,7 +12,7 @@ README = ROOT / "README.md"
 AGENT_PLAYBOOK = ROOT / "docs" / "deployment" / "AGENTS.md"
 EMBEDDING_IMAGE = (
     "ghcr.io/aeon-7/aeon-vllm-ultimate@"
-    "sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d"
+    "sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7"
 )
 
 VALIDATED_KV_MIB = 5_820

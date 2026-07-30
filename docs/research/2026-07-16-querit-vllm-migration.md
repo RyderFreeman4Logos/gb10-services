@@ -20,7 +20,7 @@ GB10 local Querit-4B and cloud DeepInfra Qwen3-Reranker-8B must ultimately be tr
 
 ### AEON v0.25.1 support (verified)
 
-- Image tag `2026-07-16-v0.25.1` resolves to repository digest `sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d` and installed distribution `0.25.1+aeon.sm121a.dflash` (AEON build revision `afd9b8b7faa6fbe2ceab13a14638e97dc5ca718f`; upstream vLLM `752a3a504485790a2e8491cacbb35c137339ad34`).
+- Image tag `2026-07-16-v0.25.1` resolves to repository digest `sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7` and installed distribution `0.25.1+aeon.sm121a.dflash` (AEON build revision `afd9b8b7faa6fbe2ceab13a14638e97dc5ca718f`; upstream vLLM `752a3a504485790a2e8491cacbb35c137339ad34`).
 - OCI inspection reports the stale inherited label `org.opencontainers.image.revision=06e292d0ce7e0ddc4f84bd200c3bdf55c7875eb7`, not the 0.25.1 build revision. Treat the repository digest as image authority; AEON's later README/label-card correction is revision `3374b528b68369189190852314c759305402017e`.
 - Release delta: MRv2 `lm_head` sharing is ported across DFlash, Eagle, and DSpark; vLLM #47888 permits startup without FFmpeg when optional torchcodec is absent; #48330 guards mixed-dtype FlashInfer allreduce/RMSNorm/quant fusion under TP>1. AEON documents TP>1 as unvalidated despite the DSpark/TP=2-ready source fixes.
 - Rollback/superseded identity retained on GB10: `2026-07-14-v0.25.0`, `sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55`.

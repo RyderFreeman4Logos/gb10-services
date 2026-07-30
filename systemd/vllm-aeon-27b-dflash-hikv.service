@@ -22,7 +22,7 @@
 #   The aeon_text_stop_start.sh wrapper is unit-name agnostic and works
 #   with either variant.
 [Unit]
-Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 HIGH-KV (v0.25.1, seqs=16, batch=4096, util=0.50, AUTO KV, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
+Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 HIGH-KV (v0.26.0, seqs=16, batch=4096, util=0.45, AUTO KV, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
 # Independent of embedding/reranker so text can restart alone (no HTTP poll).
 After=network.target
 Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
@@ -83,7 +83,7 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
   --memory-swap 128g \
   --oom-score-adj 800 \
   --entrypoint python3 \
-  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d \
+  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7 \
   /opt/hang_guard/aeon_vllm_wrapper.py serve \
     /models/aeon-cache/snapshots/6394b93fa092dcbfbf09e952f56f30337509d17c \
     --host 0.0.0.0 --port 8000 \
@@ -98,7 +98,7 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
     --max-num-partial-prefills 1 \
     --max-long-partial-prefills 1 \
     --enable-prefix-caching \
-    --gpu-memory-utilization 0.50 \
+    --gpu-memory-utilization 0.45 \
     --enable-chunked-prefill \
     --scheduler-reserve-full-isl \
     --compilation-config "{\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_num_of_warmups\":0,\"cache_dir\":\"/var/cache/vllm/aeon-qwen36-v0251\"}" \
