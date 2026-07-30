@@ -1,5 +1,6 @@
 [Unit]
-Description=vLLM Qwen3-Reranker-8B (AEON v0.25.1 GB10 image, BF16, 40k ctx, pooling reranker, util=0.22, raw backend port 18013, behind llm-guard-proxy listeners 18009/18003/18005, 64 seq)
+# AEON image release: 2026-07-27-v0.26.0; immutable digest: sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7
+Description=vLLM Qwen3-Reranker-8B (AEON v0.26.0 GB10 image, BF16, 40k ctx, pooling reranker, util=0.22, raw backend port 18013, behind llm-guard-proxy listeners 18009/18003/18005, 64 seq)
 # lifecycle-independent from text: guardian recovery must not change reranker state.
 After=network.target
 Conflicts=vllm-querit-4b-reranker.service vllm-qwen35-hauhau.service

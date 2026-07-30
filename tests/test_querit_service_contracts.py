@@ -33,12 +33,12 @@ def _live_receipt() -> dict[str, Any]:
 
 
 _RECEIPT = _live_receipt()
-# Source-selected AEON text image digest (v0.25.1, 2026-07-16). The receipt is
+# Source-selected AEON text image digest (v0.26.0, 2026-07-27). The receipt is
 # retained as historical 15 GiB KV capacity evidence, not the AUTO-KV source profile.
 IMAGE_DIGEST = (
     "sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7"
 )
-# Querit pins the source-selected v0.25.1 offline transformers runtime image.
+# Querit pins the source-selected v0.26.0 offline transformers runtime image.
 QUERIT_IMAGE_DIGEST = (
     "sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7"
 )
@@ -335,6 +335,28 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertEqual(
             profiles["qwen3-reranker-8b"]["max_queued_generation_requests"], 64
         )
+
+    def test_hikv_guard_recovery_budget_covers_the_cold_start_window(self) -> None:
+        config = tomllib.loads(CONFIG.read_text())
+        profiles = {profile["name"]: profile for profile in config["upstreams"]}
+        recoveries = [
+            config["upstream"]["local_recovery"],
+            *[
+                profiles[name]["local_recovery"]
+                for name in (
+                    "aeon-default-no-think",
+                    "aeon-guard-max",
+                    "aeon-legacy-bounded",
+                )
+            ],
+        ]
+        self.assertEqual(len(recoveries), 4)
+        for recovery in recoveries:
+            self.assertEqual(recovery["readiness_deadline_ms"], 900_000)
+
+        restart_queue = config["upstream"]["restart_queue"]
+        self.assertEqual(restart_queue["queue_deadline_secs"], 600)
+        self.assertEqual(restart_queue["restart_timeout_secs"], 600)
 
     def test_guard_listener_forced_benchmark_profiles(self) -> None:
         config = tomllib.loads(CONFIG.read_text())

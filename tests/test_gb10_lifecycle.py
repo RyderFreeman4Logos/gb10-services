@@ -18,6 +18,7 @@ README = ROOT / "README.md"
 GUARD_CONFIG = ROOT / "config" / "llm-guard-proxy" / "config.toml"
 PRODUCTION_STATE = "/home/obj/.local/state/gb10-lifecycle"
 UNIT = "vllm-aeon-27b-dflash.service"
+HIKV_UNIT = "vllm-aeon-27b-dflash-hikv.service"
 
 
 class LifecycleAuditScriptTests(unittest.TestCase):
@@ -464,6 +465,29 @@ class LifecycleAuditScriptTests(unittest.TestCase):
             audit,
         )
 
+    def test_hikv_unit_is_accepted_for_audited_lifecycle(self) -> None:
+        result = self.execute(
+            "start",
+            "--unit",
+            HIKV_UNIT,
+            "--actor",
+            "test-operator",
+            "--reason",
+            "approved-maintenance",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            self.systemctl_log.read_text(), f"--user start --no-block {HIKV_UNIT}\n"
+        )
+        audit = (self.state / "lifecycle-audit.log").read_text()
+        self.assertIn(
+            f"event=request action=start unit={HIKV_UNIT} "
+            "actor=test-operator reason=approved-maintenance outcome=accepted "
+            "reset_failed=false",
+            audit,
+        )
+
     def test_restart_is_rejected_so_restarts_are_explicit_stop_start_operations(self) -> None:
         result = self.execute(*self.arguments("restart"))
 
@@ -667,6 +691,7 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                             "GB10_HELPER_RATE_LIMIT_DIR": str(rate_limits),
                             "GB10_LIFECYCLE_BIN": str(lifecycle),
                             "GB10_LIFECYCLE_SYSTEMCTL": str(systemctl),
+                            "GB10_TEXT_UNIT": "vllm-aeon-27b-dflash",
                             "PATH": f"{fake_bin}:/usr/bin:/bin",
                         }
                     )
@@ -736,6 +761,7 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                     "GB10_HELPER_SYSTEMCTL_LOG": str(commands_log),
                     "GB10_LIFECYCLE_BIN": str(lifecycle),
                     "GB10_LIFECYCLE_SYSTEMCTL": str(systemctl),
+                    "GB10_TEXT_UNIT": UNIT,
                 }
             )
 
@@ -803,6 +829,7 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                 {
                     "GB10_HELPER_EVENT_LOG": str(events),
                     "GB10_LIFECYCLE_BIN": str(lifecycle),
+                    "GB10_TEXT_UNIT": UNIT,
                 }
             )
 
@@ -825,6 +852,77 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                 event_lines[2],
                 "systemctl --user is-active --quiet "
                 "vllm-aeon-27b-dflash.service",
+            )
+
+    def test_guard_helper_selects_an_activating_hikv_unit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            events = root / "events.log"
+            lifecycle = root / "lifecycle"
+            systemctl = root / "systemctl"
+            sleep = root / "sleep"
+            self.make_executable(
+                lifecycle,
+                "#!/bin/sh\n"
+                'printf "lifecycle %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n',
+            )
+            self.make_executable(
+                systemctl,
+                "#!/bin/sh\n"
+                'printf "systemctl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
+                'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then\n'
+                '    case "${5:-}" in\n'
+                f'        {UNIT}) printf "inactive\\n" ;;\n'
+                f'        {HIKV_UNIT}) printf "activating\\n" ;;\n'
+                "    esac\n"
+                "    exit 0\n"
+                "fi\n"
+                'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "is-active" ] '
+                f'&& [ "${{4:-}}" = "{HIKV_UNIT}" ]; then\n'
+                "    exit 0\n"
+                "fi\n"
+                "exit 1\n",
+            )
+            self.make_executable(sleep, "#!/bin/sh\nexit 0\n")
+            helper = root / "aeon_text_stop_start.sh"
+            helper.write_text(
+                GUARD_HELPER.read_text()
+                .replace("/usr/bin/systemctl", str(systemctl))
+                .replace("/usr/bin/sleep", str(sleep))
+            )
+            environment = os.environ.copy()
+            environment.pop("GB10_TEXT_UNIT", None)
+            environment.update(
+                {
+                    "GB10_HELPER_EVENT_LOG": str(events),
+                    "GB10_LIFECYCLE_BIN": str(lifecycle),
+                }
+            )
+
+            result = subprocess.run(
+                ["/usr/bin/bash", str(helper)],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(
+                events.read_text().splitlines(),
+                [
+                    "systemctl --user show --property=ActiveState --value " + UNIT,
+                    "systemctl --user show --property=ActiveState --value " + HIKV_UNIT,
+                    "lifecycle stop --unit "
+                    + HIKV_UNIT
+                    + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
+                    "lifecycle start --unit "
+                    + HIKV_UNIT
+                    + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
+                    "systemctl --user is-active --quiet " + HIKV_UNIT,
+                ],
             )
 
 

@@ -67,7 +67,7 @@ The immutable running container is authoritative for the live configuration desc
 
 A newer image was pulled but **not deployed**:
 
-- digest: `sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7`
+- digest: `sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d`
 - version family: v0.25.1
 - operational status: image-store candidate only; it is not evidence about the running generation
 

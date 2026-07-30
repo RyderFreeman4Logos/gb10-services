@@ -79,28 +79,24 @@ checkout owns the integrated guardian implementation and build. The retained
 `%t/gb10-memory-guardian` name is only the runtime registration directory
 shared by the proxy and text unit.
 
-### Reference Production Profile (source updated 2026-07-17)
+### Reference Production Profile (source updated 2026-07-27)
 
 The tracked source selects this friendly release and immutable repository digest
 for every AEON-backed unit. The running containers remain on their prior image
 until a separately authorized deployment changes them.
 
 ```text
-friendly tag: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-16-v0.25.1
+friendly tag: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-27-v0.26.0
 repository digest: sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7
 rollback/superseded: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-14-v0.25.0 @ sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55
-runtime version: 0.25.1+aeon.sm121a.dflash
+runtime version: v0.26.0
 ```
 
-AEON build revision [`afd9b8b7`](https://github.com/AEON-7/vllm-ultimate-dgx-spark/commit/afd9b8b7faa6fbe2ceab13a14638e97dc5ca718f)
-rebases to vLLM 0.25.1 and ports the MRv2 `lm_head` sharing fix to
-DFlash, Eagle, and DSpark. It also includes upstream
-[#47888](https://github.com/vllm-project/vllm/pull/47888), which prevents the
-optional torchcodec import from blocking startup when FFmpeg is absent, and
-[#48330](https://github.com/vllm-project/vllm/pull/48330), which guards the
-mixed-dtype FlashInfer allreduce/RMSNorm/quant fusion for TP>1. Upstream labels
-the DSpark loader fix-covered and TP=2-ready but still says TP>1 is unvalidated;
-this repository does not claim a multi-Spark hardware validation.
+The v0.26.0 image's `ai.aeon.vllm_base` metadata identifies vLLM 0.26.0. Its
+inherited OCI description still names v0.25.1, so the dated friendly tag and
+immutable digest above are the release identity; the stale description is not
+release provenance. Historical v0.25.1 feature claims and deployment evidence
+remain in their dated research records and do not establish v0.26.0 behavior.
 
 Capacity contracts and evidence:
 

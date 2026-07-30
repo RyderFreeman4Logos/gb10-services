@@ -1,16 +1,13 @@
-# ── High-KV variant (deployment-choice, 2026-07-23) ──
-# GPU: ~83.89G  RSS: ~6.50G  Startup: ~1100s est. (FlashInfer JIT serial)
-# Config: util=0.50 AUTO KV, batch=4096, MAX_JOBS=1, FP8 KV
-# KV capacity est.: ~560K tokens (~2.14 full 262144-token contexts)
-# MemAvail after all 3: ~14G est. (tight co-resident; best for text-heavy
-#   or 2-model deployments where embedding/reranker are optional)
+# ── High-KV variant (deployment choice; v0.26.0 source selected 2026-07-27) ──
+# Config: util=0.45 AUTO KV, batch=4096, MAX_JOBS=1, FP8 KV.
+# Startup can take 15–20 minutes because FlashInfer JIT compilation is serial.
+# Capacity and MemAvailable need a fresh v0.26.0 live receipt; do not use the
+# prior v0.25.1/util=0.50 estimates for this source profile.
 #
 # TRADE-OFF vs baseline vllm-aeon-27b-dflash.service:
-#   +2x KV capacity → supports ~2 concurrent 262K-token requests without
-#     severe queueing, versus the baseline's ~1.1x.
-#   -15G system MemAvailable → co-resident emb+rr+text leaves only ~14G
-#     headroom. Embedding or reranker may need to be stopped under heavy
-#     concurrent long-context load to avoid OOM pressure.
+#   Higher AUTO-KV target may reduce long-context queueing, but has less host
+#   headroom than the co-resident baseline. Stop an optional backend only after
+#   evidence shows it is necessary; do not assume a capacity multiple.
 #
 # DEPLOYMENT: Choose this OR the baseline; they conflict (cannot run both).
 #   To activate: stop baseline, rsync this unit, daemon-reload, start.
@@ -22,6 +19,7 @@
 #   The aeon_text_stop_start.sh wrapper is unit-name agnostic and works
 #   with either variant.
 [Unit]
+# AEON image release: 2026-07-27-v0.26.0; immutable digest: sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7
 Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 HIGH-KV (v0.26.0, seqs=16, batch=4096, util=0.45, AUTO KV, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)
 # Independent of embedding/reranker so text can restart alone (no HTTP poll).
 After=network.target
@@ -40,12 +38,10 @@ Environment=AEON_URL=http://100.105.4.92:18010
 # Prefer killing text before reranker under host OOM (reranker uses 500).
 OOMScoreAdjust=800
 # Wrapper only. The container's 128G cap is not a physical NVML/UMA ceiling.
-# HIGH-KV variant: weights~22G + AUTO KV ~31G at util=0.50 + graphs~0.5G
-# + emb~20G + rr~18G ≈ 91.5G engine-side policy. Leaves ~14G MemAvailable.
-# KV capacity est.: ~560K tokens (2.14 full 262144-token contexts).
-# Co-resident emb+rr is possible but tight; consider stopping one under
-# heavy concurrent long-context load.
-# Auto-KV at util=0.50: larger pool, longer cold-start (~15min est.).
+# HIGH-KV v0.26.0 source profile: AUTO KV at util=0.45 with serial JIT.
+# Its v0.25.1/util=0.50 capacity and headroom estimates were intentionally
+# retired with the image/cache rotation. Capture a live receipt before relying
+# on a capacity or co-residency claim.
 # NO --kv-cache-memory-bytes: AEON confirmed pinning KV bypasses UMA guard
 # (#46932). AUTO sizing lets clamps bound the pool based on actual free memory.
 # batch=4096: reduces profile-run compile/cudagraph peak shape to fit co-resident
@@ -60,7 +56,7 @@ TimeoutStopSec=60
 
 ExecCondition=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-aeon-27b-dflash-hikv.service
 ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-memory-guardian
-ExecStartPre=/usr/bin/install -d -m 0700 /home/obj/.cache/vllm-compile/aeon-qwen36-v0251-c15e2c
+ExecStartPre=/usr/bin/install -d -m 0700 /home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473
 ExecStartPre=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-aeon-27b-dflash-hikv --cidfile %t/gb10-memory-guardian/aeon-text.cid
 ExecStartPre=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1
 ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.cid --name vllm-aeon-27b-dflash-hikv \
@@ -69,7 +65,7 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
   -p 100.105.4.92:18010:8000 \
   -v /home/obj/.cache/huggingface/hub/models--AEON-7--Qwen3.6-27B-AEON-Ultimate-Uncensored-Multimodal-NVFP4-MTP-XS:/models/aeon-cache:ro \
   -v /home/obj/.cache/huggingface/hub/models--z-lab--Qwen3.6-27B-DFlash:/models/dflash-cache:ro \
-  -v /home/obj/.cache/vllm-compile/aeon-qwen36-v0251-c15e2c:/var/cache/vllm/aeon-qwen36-v0251 \
+  -v /home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473:/var/cache/vllm/aeon-qwen36-v0260 \
   -v /home/obj/scripts/aeon_hang_guard.py:/opt/hang_guard/aeon_hang_guard.py:ro \
   -v /home/obj/scripts/aeon_vllm_wrapper.py:/opt/hang_guard/aeon_vllm_wrapper.py:ro \
   -e HF_HUB_OFFLINE=1 \
@@ -101,7 +97,7 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
     --gpu-memory-utilization 0.45 \
     --enable-chunked-prefill \
     --scheduler-reserve-full-isl \
-    --compilation-config "{\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_num_of_warmups\":0,\"cache_dir\":\"/var/cache/vllm/aeon-qwen36-v0251\"}" \
+    --compilation-config "{\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_num_of_warmups\":0,\"cache_dir\":\"/var/cache/vllm/aeon-qwen36-v0260\"}" \
     --jit-monitor-mode warn \
     --max-logprobs 20 \
     --speculative-config "{\"method\":\"dflash\",\"model\":\"/models/dflash-cache/snapshots/0919688658996800f86b895034249700e9481106\",\"num_speculative_tokens\":10,\"attention_backend\":\"TRITON_ATTN\"}" \
