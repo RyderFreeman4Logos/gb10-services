@@ -10,8 +10,9 @@
 #   evidence shows it is necessary; do not assume a capacity multiple.
 #
 # DEPLOYMENT: Choose this OR the baseline; they conflict (cannot run both).
-#   To activate: stop baseline, rsync this unit, daemon-reload, start.
-#   To revert: stop this, start baseline.
+#   Enable this unit without --now, then use gb10_lifecycle.sh to stop the
+#   baseline and start this unit (and likewise for a revert) so investigation
+#   locks and lifecycle audit records apply to every stop/start.
 #
 # GUARD CONFIG: When using this variant, the watchdog/recovery
 #   readiness_deadline_ms must stay above the documented 15–20 minute

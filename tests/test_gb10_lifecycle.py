@@ -4,6 +4,7 @@ import os
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -1072,6 +1073,87 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             )
             self.assertNotIn("lifecycle stop --unit " + UNIT, "\n".join(lines))
             self.assertEqual(selected.read_text().strip(), HIKV_UNIT)
+
+    def test_selected_text_unit_publish_is_atomic_for_concurrent_readers(self) -> None:
+        """A reader must observe a complete old or new marker during publishes."""
+        for source in (GUARD_HELPER, RESTART_HELPER):
+            with self.subTest(helper=source.name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                selected = root / "selected-text-unit"
+                selected.write_text(UNIT + "\n")
+                source_text = source.read_text()
+                self.assertIn("mktemp", source_text)
+                self.assertTrue(
+                    '"$MV" -f -- "$tmp" "$SELECTED_TEXT_UNIT_FILE"' in source_text
+                    or 'mv -f -- "$tmp" "$SELECTED_TEXT_UNIT_FILE"' in source_text
+                )
+                self.assertNotIn('cp -- "$tmp" "$SELECTED_TEXT_UNIT_FILE"', source_text)
+
+                lifecycle = root / "lifecycle"
+                systemctl = root / "systemctl"
+                sleep = root / "sleep"
+                self.make_executable(lifecycle, "#!/bin/sh\nexit 0\n")
+                self.make_executable(
+                    systemctl,
+                    "#!/bin/sh\n"
+                    'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then\n'
+                    '    printf "active\\n"\n'
+                    "fi\n"
+                    "exit 0\n",
+                )
+                self.make_executable(sleep, "#!/bin/sh\nexit 0\n")
+                helper = root / source.name
+                helper.write_text(
+                    source_text.replace("/usr/bin/systemctl", str(systemctl)).replace(
+                        "/usr/bin/sleep", str(sleep)
+                    )
+                )
+                helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
+                valid = {UNIT + "\n", HIKV_UNIT + "\n"}
+                observed: list[str] = []
+                done = threading.Event()
+
+                def reader() -> None:
+                    while not done.is_set():
+                        observed.append(selected.read_text())
+
+                thread = threading.Thread(target=reader)
+                thread.start()
+                try:
+                    processes = []
+                    for index in range(40):
+                        text_unit = UNIT if index % 2 else HIKV_UNIT
+                        if source == RESTART_HELPER:
+                            text_unit = text_unit.removesuffix(".service")
+                        environment = os.environ.copy()
+                        environment.update(
+                            {
+                                "GB10_LIFECYCLE_BIN": str(lifecycle),
+                                "GB10_SELECTED_TEXT_UNIT_FILE": str(selected),
+                                "GB10_TEXT_UNIT": text_unit,
+                                "PATH": f"{root}:/usr/bin:/bin",
+                            }
+                        )
+                        processes.append(
+                            subprocess.Popen(
+                                ["/usr/bin/bash", str(helper)],
+                                cwd=ROOT,
+                                env=environment,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True,
+                            )
+                        )
+                    for process in processes:
+                        stdout, stderr = process.communicate(timeout=10)
+                        self.assertEqual(process.returncode, 0, stdout + stderr)
+                finally:
+                    done.set()
+                    thread.join(timeout=10)
+
+                self.assertFalse(thread.is_alive())
+                self.assertGreater(len(observed), 0)
+                self.assertTrue(all(value in valid for value in observed), observed[:10])
 
 
 

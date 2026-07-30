@@ -11,7 +11,8 @@ set -euo pipefail
 readonly SYSTEMCTL="/usr/bin/systemctl"
 readonly SLEEP="/usr/bin/sleep"
 readonly MKDIR="/usr/bin/mkdir"
-readonly CP="/usr/bin/cp"
+readonly MKTEMP="/usr/bin/mktemp"
+readonly MV="/usr/bin/mv"
 readonly ACTIVE_WAIT_SECS=30
 readonly LIFECYCLE="${GB10_LIFECYCLE_BIN:-/home/obj/.local/bin/gb10_lifecycle.sh}"
 readonly LIFECYCLE_ACTOR="llm-guard-proxy.local-recovery"
@@ -49,13 +50,16 @@ read_persisted_text_unit() {
 
 persist_selected_text_unit() {
     local unit="$1"
-    local parent tmp
+    local parent name tmp
     parent="$(dirname -- "$SELECTED_TEXT_UNIT_FILE")"
+    name="${SELECTED_TEXT_UNIT_FILE##*/}"
     "$MKDIR" -p -- "$parent"
-    tmp="${SELECTED_TEXT_UNIT_FILE}.tmp.$$"
-    printf '%s\n' "$unit" >"$tmp"
-    "$CP" -- "$tmp" "$SELECTED_TEXT_UNIT_FILE"
-    rm -f -- "$tmp"
+    tmp="$("$MKTEMP" -- "${parent}/.${name}.XXXXXXXXXX")"
+    if ! printf '%s\n' "$unit" >"$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    "$MV" -f -- "$tmp" "$SELECTED_TEXT_UNIT_FILE"
 }
 
 select_text_unit() {

@@ -186,11 +186,17 @@ systemctl --user enable --now sysmon.service
 systemctl --user enable --now vllm-embedding.service
 systemctl --user enable --now vllm-aeon-27b-dflash.service
 # Optional HIGH-KV switch (mutually exclusive with baseline):
-#   systemctl --user stop vllm-aeon-27b-dflash.service
+#   systemctl --user enable vllm-aeon-27b-dflash-hikv.service
+#   /home/obj/.local/bin/gb10_lifecycle.sh stop \
+#     --unit vllm-aeon-27b-dflash.service --actor deployment-operator --reason hikv-switch
 #   systemctl --user disable vllm-aeon-27b-dflash.service
-#   systemctl --user enable --now vllm-aeon-27b-dflash-hikv.service
-#   printf 'vllm-aeon-27b-dflash-hikv.service\n' > \
-#     /home/obj/.local/state/gb10-lifecycle/selected-text-unit
+#   state_dir=/home/obj/.local/state/gb10-lifecycle
+#   marker="$state_dir/selected-text-unit"
+#   install -d -m 0700 "$state_dir"
+#   tmp="$(mktemp "$state_dir/.selected-text-unit.XXXXXXXXXX")"
+#   printf 'vllm-aeon-27b-dflash-hikv.service\n' > "$tmp" && mv -f -- "$tmp" "$marker"
+#   /home/obj/.local/bin/gb10_lifecycle.sh start \
+#     --unit vllm-aeon-27b-dflash-hikv.service --actor deployment-operator --reason hikv-switch
 # Recovery helpers prefer that selected-text-unit file (or GB10_TEXT_UNIT)
 # over a still-enabled baseline so a failed HIGH-KV start cannot silently
 # recycle the co-resident baseline profile.

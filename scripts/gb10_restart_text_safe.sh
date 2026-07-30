@@ -79,13 +79,16 @@ read_persisted_text_unit() {
 
 persist_selected_text_unit() {
   local unit="$1"
-  local parent tmp
+  local parent name tmp
   parent="$(dirname -- "$SELECTED_TEXT_UNIT_FILE")"
+  name="${SELECTED_TEXT_UNIT_FILE##*/}"
   mkdir -p -- "$parent"
-  tmp="${SELECTED_TEXT_UNIT_FILE}.tmp.$$"
-  printf '%s\n' "${unit}.service" >"$tmp"
-  cp -- "$tmp" "$SELECTED_TEXT_UNIT_FILE"
-  rm -f -- "$tmp"
+  tmp="$(mktemp -- "${parent}/.${name}.XXXXXXXXXX")"
+  if ! printf '%s\n' "${unit}.service" >"$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  mv -f -- "$tmp" "$SELECTED_TEXT_UNIT_FILE"
 }
 
 select_text_unit() {
