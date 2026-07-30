@@ -329,15 +329,16 @@ no_thinking_marker_policy = "force"
 default_injection_schema = "vllm_native"
 
 # Former default 18009 chat policy, now opt-in on forced listener :18014.
-# Keep queue empty so Guard MemoryHigh admission budget stays within the
-# documented residency ceiling (see test_guard_queue_body_residency...).
+# Queue stays empty so Guard MemoryHigh residency budget remains valid
+# (test_guard_queue_body_residency_fits_memory_budget). In-flight=8 is the
+# fair A-arm concurrency ceiling (c8); queue=0 avoids 429 when c≤8.
 [[upstreams]]
 name = "aeon-legacy-bounded"
 base_url = "http://100.105.4.92:18010/v1"
 # Listener-forced :18014 profile; reserved alias avoids default-route overlap.
 match_models = ["__listener_forced_aeon_legacy_bounded__"]
 request_timeout_ms = 1800000
-max_in_flight_requests = 4
+max_in_flight_requests = 8
 max_queued_generation_requests = 0
 
 [upstreams.metadata]
