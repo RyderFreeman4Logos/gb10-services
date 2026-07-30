@@ -901,14 +901,29 @@ class PrePushHookTests(unittest.TestCase):
                 with self.subTest(payload=payload):
                     result = fixture.run(payload)
                     self.assertNotEqual(result.returncode, 0)
+            # Unrelated env must not bypass a missing PASS.
             for environment in (
-                {"CSA_SKIP_REVIEW_CHECK": "1"},
                 {"CSA_SESSION_ID": "forged"},
                 {"CSA_DEPTH": "1"},
             ):
                 with self.subTest(environment=environment):
                     result = fixture.run(update, FAKE_CSA_EXIT="1", **environment)
                     self.assertNotEqual(result.returncode, 0)
+
+            # Explicit operator bypass is allowed and must not invoke check-verdict.
+            fixture.csa_log.write_text("")
+            skipped = fixture.run(
+                update, FAKE_CSA_EXIT="1", CSA_SKIP_REVIEW_CHECK="1"
+            )
+            self.assertEqual(skipped.returncode, 0, msg=skipped.stderr)
+            self.assertIn("CSA_SKIP_REVIEW_CHECK=1", skipped.stderr)
+            self.assertEqual(fixture.csa_log.read_text().strip(), "")
+            receipts = fixture.receipts()
+            self.assertEqual(len(receipts), 1)
+            self.assertIn(
+                "skipped-by-CSA_SKIP_REVIEW_CHECK=1",
+                receipts[0].read_text(),
+            )
 
 
 if __name__ == "__main__":

@@ -85,12 +85,23 @@ while IFS=$'\t' read -r kind _remote_ref _local_ref _local_sha \
   fi
 done < "$plan_before"
 
+# Explicit operator bypass for config-only repos when live boot already proved.
+# Receipt records skip vs pass-required before hashing; default remains fail-closed.
+skip_review_check=0
+if [[ "${CSA_SKIP_REVIEW_CHECK:-}" == "1" ]]; then
+  skip_review_check=1
+fi
+
 {
   printf 'schema\tgb10-pre-push-receipt-v1\n'
   printf 'csa\t%s\t%s\n' "$CSA_EXECUTABLE" "$csa_identity_before"
   /usr/bin/cat -- "$plan_before"
   for review_range in "${review_ranges[@]}"; do
-    printf 'review\t%s\tpass-required\n' "$review_range"
+    if (( skip_review_check )); then
+      printf 'review\t%s\tskipped-by-CSA_SKIP_REVIEW_CHECK=1\n' "$review_range"
+    else
+      printf 'review\t%s\tpass-required\n' "$review_range"
+    fi
   done
 } > "$candidate_receipt"
 
@@ -102,18 +113,24 @@ receipt_sha=${receipt_output%% *}
   verify "$receipt_dir" "$candidate_receipt" "$receipt_sha" \
   || die "pre-push receipt state failed validation."
 
-for review_range in "${review_ranges[@]}"; do
-  if ! "$CSA_EXECUTABLE" review --check-verdict --range "$review_range"; then
-    cat >&2 <<GATE_BLOCKED
+if (( skip_review_check )); then
+  printf 'pre-push: CSA_SKIP_REVIEW_CHECK=1 — skipping check-verdict for %d range(s).\n' \
+    "${#review_ranges[@]}" >&2
+else
+  for review_range in "${review_ranges[@]}"; do
+    if ! "$CSA_EXECUTABLE" review --check-verdict --range "$review_range"; then
+      cat >&2 <<GATE_BLOCKED
 <!-- CSA:REVIEW_GATE_BLOCKED range="${review_range}" receipt_sha256="${receipt_sha}" -->
 Push blocked: no passing review is bound to this exact immutable commit range.
 Run: ${CSA_EXECUTABLE} review --range ${review_range} --sa-mode true
 Wait for PASS, then retry the unchanged complete push update set.
+Or, after live-boot proof on config-only changes: CSA_SKIP_REVIEW_CHECK=1 git push ...
 <!-- /CSA:REVIEW_GATE_BLOCKED -->
 GATE_BLOCKED
-    exit 1
-  fi
-done
+      exit 1
+    fi
+  done
+fi
 
 if ! "$script_dir/branch-protection.sh" \
     "$updates_file" "$remote_name" "$remote_location" > "$plan_after"; then
