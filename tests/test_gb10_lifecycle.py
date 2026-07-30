@@ -1102,6 +1102,8 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                     "exit 0\n",
                 )
                 self.make_executable(sleep, "#!/bin/sh\nexit 0\n")
+                self.make_executable(root / "curl", "#!/bin/sh\nexit 0\n")
+                self.make_executable(root / "pkill", "#!/bin/sh\nexit 0\n")
                 helper = root / source.name
                 helper.write_text(
                     source_text.replace("/usr/bin/systemctl", str(systemctl)).replace(
@@ -1119,8 +1121,8 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
 
                 thread = threading.Thread(target=reader)
                 thread.start()
+                processes: list[subprocess.Popen[str]] = []
                 try:
-                    processes = []
                     for index in range(40):
                         text_unit = UNIT if index % 2 else HIKV_UNIT
                         if source == RESTART_HELPER:
@@ -1150,6 +1152,15 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                 finally:
                     done.set()
                     thread.join(timeout=10)
+                    for process in processes:
+                        if process.poll() is None:
+                            process.terminate()
+                    for process in processes:
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=5)
 
                 self.assertFalse(thread.is_alive())
                 self.assertGreater(len(observed), 0)
