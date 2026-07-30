@@ -14,10 +14,10 @@
 #   To revert: stop this, start baseline.
 #
 # GUARD CONFIG: When using this variant, the watchdog/recovery
-#   readiness_deadline_ms should be raised from 600000 (10min) to 900000
-#   (15min) because the larger KV pool increases cold-start time.
-#   The aeon_text_stop_start.sh wrapper is unit-name agnostic and works
-#   with either variant.
+#   readiness_deadline_ms must stay above the documented 15–20 minute
+#   cold start (tracked config uses 1500000 / 25min). Persist the selected
+#   unit via GB10_TEXT_UNIT or selected-text-unit so recovery cannot fall
+#   back to the enabled baseline after a failed HIGH-KV start.
 [Unit]
 # AEON image release: 2026-07-27-v0.26.0; immutable digest: sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7
 Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 HIGH-KV (v0.26.0, seqs=16, batch=4096, util=0.45, AUTO KV, FULL_DECODE_ONLY, FP8 KV, 262144 ctx, multimodal, port 18010)

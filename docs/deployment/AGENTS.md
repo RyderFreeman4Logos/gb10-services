@@ -185,6 +185,15 @@ systemctl --user enable --now sysmon.service
 # Start model services and the proxy independently.
 systemctl --user enable --now vllm-embedding.service
 systemctl --user enable --now vllm-aeon-27b-dflash.service
+# Optional HIGH-KV switch (mutually exclusive with baseline):
+#   systemctl --user stop vllm-aeon-27b-dflash.service
+#   systemctl --user disable vllm-aeon-27b-dflash.service
+#   systemctl --user enable --now vllm-aeon-27b-dflash-hikv.service
+#   printf 'vllm-aeon-27b-dflash-hikv.service\n' > \
+#     /home/obj/.local/state/gb10-lifecycle/selected-text-unit
+# Recovery helpers prefer that selected-text-unit file (or GB10_TEXT_UNIT)
+# over a still-enabled baseline so a failed HIGH-KV start cannot silently
+# recycle the co-resident baseline profile.
 systemctl --user disable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now vllm-querit-4b-reranker.service
 systemctl --user enable --now llm-guard-proxy.service
@@ -434,8 +443,11 @@ ninja compiles in parallel → multiple nvcc/cc1plus procs exhaust UMA → kerne
 evidence, not a v0.26.0 readiness diagnosis.**
 
 The tracked text units retain `MAX_JOBS=1` + `CMAKE_BUILD_PARALLEL_LEVEL=1` to
-serialize compilation. JIT cache is NOT persisted (ephemeral `--rm` container),
-but this retained v0.25.1 observation does not establish v0.26.0's HIGH-KV
+serialize compilation. The container itself is ephemeral (`--rm`), but both text
+units bind-mount a host compile cache at
+`/home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473` into the container
+cache path, so host-side JIT/compile artifacts persist across container recycles.
+This retained v0.25.1 observation does not establish v0.26.0's HIGH-KV
 compilation/profiling latency. The integrated guardian remains active and enforces
 the configured 5 GiB `MemAvailable` threshold during startup; serialized
 compilation is pressure reduction, not an exemption from that guard.

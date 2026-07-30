@@ -814,7 +814,12 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             self.make_executable(
                 systemctl,
                 "#!/bin/sh\n"
-                'printf "systemctl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n',
+                'printf "systemctl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
+                'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then\n'
+                '    printf "active\\n"\n'
+                "    exit 0\n"
+                "fi\n"
+                "exit 0\n",
             )
             self.make_executable(sleep, "#!/bin/sh\nexit 0\n")
             helper = root / "aeon_text_stop_start.sh"
@@ -824,12 +829,14 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                     str(sleep),
                 )
             )
+            selected = root / "selected-text-unit"
             environment = os.environ.copy()
             environment.update(
                 {
                     "GB10_HELPER_EVENT_LOG": str(events),
                     "GB10_LIFECYCLE_BIN": str(lifecycle),
                     "GB10_TEXT_UNIT": UNIT,
+                    "GB10_SELECTED_TEXT_UNIT_FILE": str(selected),
                 }
             )
 
@@ -844,13 +851,14 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(selected.read_text().strip(), UNIT)
             event_lines = events.read_text().splitlines()
             self.assertEqual(len(event_lines), 3)
             self.assertTrue(event_lines[0].startswith("lifecycle stop "))
             self.assertTrue(event_lines[1].startswith("lifecycle start "))
             self.assertEqual(
                 event_lines[2],
-                "systemctl --user is-active --quiet "
+                "systemctl --user show --property=ActiveState --value "
                 "vllm-aeon-27b-dflash.service",
             )
 
@@ -877,9 +885,149 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                 "    esac\n"
                 "    exit 0\n"
                 "fi\n"
-                'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "is-active" ] '
-                f'&& [ "${{4:-}}" = "{HIKV_UNIT}" ]; then\n'
+                # is-active must stay nonzero for activating Type=simple units.
+                "exit 1\n",
+            )
+            self.make_executable(sleep, "#!/bin/sh\nexit 0\n")
+            helper = root / "aeon_text_stop_start.sh"
+            helper.write_text(
+                GUARD_HELPER.read_text()
+                .replace("/usr/bin/systemctl", str(systemctl))
+                .replace("/usr/bin/sleep", str(sleep))
+            )
+            selected = root / "selected-text-unit"
+            environment = os.environ.copy()
+            environment.pop("GB10_TEXT_UNIT", None)
+            environment.update(
+                {
+                    "GB10_HELPER_EVENT_LOG": str(events),
+                    "GB10_LIFECYCLE_BIN": str(lifecycle),
+                    "GB10_SELECTED_TEXT_UNIT_FILE": str(selected),
+                }
+            )
+
+            result = subprocess.run(
+                ["/usr/bin/bash", str(helper)],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(selected.read_text().strip(), HIKV_UNIT)
+            self.assertEqual(
+                events.read_text().splitlines(),
+                [
+                    "systemctl --user show --property=ActiveState --value " + UNIT,
+                    "systemctl --user show --property=ActiveState --value " + HIKV_UNIT,
+                    "lifecycle stop --unit "
+                    + HIKV_UNIT
+                    + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
+                    "lifecycle start --unit "
+                    + HIKV_UNIT
+                    + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
+                    "systemctl --user show --property=ActiveState --value " + HIKV_UNIT,
+                ],
+            )
+
+    def test_guard_helper_accepts_activating_without_is_active_success(self) -> None:
+        """Type=simple HIGH-KV units remain activating while ExecStartPost runs."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            events = root / "events.log"
+            lifecycle = root / "lifecycle"
+            systemctl = root / "systemctl"
+            sleep = root / "sleep"
+            selected = root / "selected-text-unit"
+            self.make_executable(
+                lifecycle,
+                "#!/bin/sh\n"
+                'printf "lifecycle %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n',
+            )
+            self.make_executable(
+                systemctl,
+                "#!/bin/sh\n"
+                'printf "systemctl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
+                'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then\n'
+                f'    printf "activating\\n"\n'
                 "    exit 0\n"
+                "fi\n"
+                "exit 1\n",
+            )
+            self.make_executable(sleep, "#!/bin/sh\nexit 0\n")
+            helper = root / "aeon_text_stop_start.sh"
+            helper.write_text(
+                GUARD_HELPER.read_text()
+                .replace("/usr/bin/systemctl", str(systemctl))
+                .replace("/usr/bin/sleep", str(sleep))
+            )
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "GB10_HELPER_EVENT_LOG": str(events),
+                    "GB10_LIFECYCLE_BIN": str(lifecycle),
+                    "GB10_TEXT_UNIT": HIKV_UNIT,
+                    "GB10_SELECTED_TEXT_UNIT_FILE": str(selected),
+                }
+            )
+            result = subprocess.run(
+                ["/usr/bin/bash", str(helper)],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(selected.read_text().strip(), HIKV_UNIT)
+            self.assertIn(
+                "systemctl --user show --property=ActiveState --value " + HIKV_UNIT,
+                events.read_text(),
+            )
+            self.assertNotIn("is-active", events.read_text())
+
+    def test_guard_helper_prefers_persisted_hikv_over_enabled_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            events = root / "events.log"
+            lifecycle = root / "lifecycle"
+            systemctl = root / "systemctl"
+            sleep = root / "sleep"
+            selected = root / "selected-text-unit"
+            selected.write_text(HIKV_UNIT + "\n")
+            self.make_executable(
+                lifecycle,
+                "#!/bin/sh\n"
+                'printf "lifecycle %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n',
+            )
+            self.make_executable(
+                systemctl,
+                "#!/bin/sh\n"
+                'printf "systemctl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
+                'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then\n'
+                # Both inactive initially; after start, hikv becomes activating.
+                '    if [ "${5:-}" = "' + HIKV_UNIT + '" ]; then\n'
+                '        if grep -q "lifecycle start" "$GB10_HELPER_EVENT_LOG" 2>/dev/null; then\n'
+                '            printf "activating\\n"\n'
+                "        else\n"
+                '            printf "failed\\n"\n'
+                "        fi\n"
+                "        exit 0\n"
+                "    fi\n"
+                '    printf "inactive\\n"\n'
+                "    exit 0\n"
+                "fi\n"
+                'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "is-enabled" ]; then\n'
+                f'    if [ "${{3:-}}" = "{UNIT}" ]; then\n'
+                '        printf "enabled\\n"\n'
+                "        exit 0\n"
+                "    fi\n"
+                '    printf "disabled\\n"\n'
+                "    exit 1\n"
                 "fi\n"
                 "exit 1\n",
             )
@@ -896,9 +1044,9 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                 {
                     "GB10_HELPER_EVENT_LOG": str(events),
                     "GB10_LIFECYCLE_BIN": str(lifecycle),
+                    "GB10_SELECTED_TEXT_UNIT_FILE": str(selected),
                 }
             )
-
             result = subprocess.run(
                 ["/usr/bin/bash", str(helper)],
                 cwd=ROOT,
@@ -908,22 +1056,23 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                 check=False,
                 timeout=10,
             )
-
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(
-                events.read_text().splitlines(),
-                [
-                    "systemctl --user show --property=ActiveState --value " + UNIT,
-                    "systemctl --user show --property=ActiveState --value " + HIKV_UNIT,
-                    "lifecycle stop --unit "
-                    + HIKV_UNIT
-                    + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
-                    "lifecycle start --unit "
-                    + HIKV_UNIT
-                    + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
-                    "systemctl --user is-active --quiet " + HIKV_UNIT,
-                ],
+            lines = events.read_text().splitlines()
+            self.assertIn(
+                "lifecycle stop --unit "
+                + HIKV_UNIT
+                + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
+                lines,
             )
+            self.assertIn(
+                "lifecycle start --unit "
+                + HIKV_UNIT
+                + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
+                lines,
+            )
+            self.assertNotIn("lifecycle stop --unit " + UNIT, "\n".join(lines))
+            self.assertEqual(selected.read_text().strip(), HIKV_UNIT)
+
 
 
 if __name__ == "__main__":

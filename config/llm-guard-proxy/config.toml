@@ -88,10 +88,10 @@ restart_command = ["/home/obj/scripts/aeon_text_stop_start.sh"]
 restart_timeout_ms = 300000
 readiness_endpoint = "/v1/chat/completions"
 readiness_request_timeout_ms = 30000
-# The selected v0.26.0 HIGH-KV source profile (util=0.45) can take up to 15
-# minutes to compile and profile. Keep recovery readiness at its cold-start
-# budget; see systemd/vllm-aeon-27b-dflash-hikv.service.
-readiness_deadline_ms = 900000
+# The selected v0.26.0 HIGH-KV source profile (util=0.45) can take up to 20
+# minutes to compile and profile. Keep recovery readiness above that cold-start
+# window with operational margin; see systemd/vllm-aeon-27b-dflash-hikv.service.
+readiness_deadline_ms = 1500000
 readiness_interval_ms = 5000
 max_attempts_per_request = 1
 cooldown_ms = 300000
@@ -146,7 +146,7 @@ restart_command = ["/home/obj/scripts/aeon_text_stop_start.sh"]
 restart_timeout_ms = 300000
 readiness_endpoint = "/v1/chat/completions"
 readiness_request_timeout_ms = 30000
-readiness_deadline_ms = 900000
+readiness_deadline_ms = 1500000
 readiness_interval_ms = 5000
 max_attempts_per_request = 1
 cooldown_ms = 300000
@@ -223,7 +223,7 @@ restart_command = ["/home/obj/scripts/aeon_text_stop_start.sh"]
 restart_timeout_ms = 300000
 readiness_endpoint = "/v1/chat/completions"
 readiness_request_timeout_ms = 30000
-readiness_deadline_ms = 900000
+readiness_deadline_ms = 1500000
 readiness_interval_ms = 5000
 max_attempts_per_request = 1
 cooldown_ms = 300000
@@ -358,7 +358,7 @@ restart_command = ["/home/obj/scripts/aeon_text_stop_start.sh"]
 restart_timeout_ms = 300000
 readiness_endpoint = "/v1/chat/completions"
 readiness_request_timeout_ms = 30000
-readiness_deadline_ms = 900000
+readiness_deadline_ms = 1500000
 readiness_interval_ms = 5000
 max_attempts_per_request = 1
 cooldown_ms = 300000

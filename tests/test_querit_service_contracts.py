@@ -352,7 +352,9 @@ class QueritServiceContractTests(unittest.TestCase):
         ]
         self.assertEqual(len(recoveries), 4)
         for recovery in recoveries:
-            self.assertEqual(recovery["readiness_deadline_ms"], 900_000)
+            # HiKV cold-start can take ~20 minutes; keep recovery readiness above
+            # that window (1500s) with operational margin.
+            self.assertEqual(recovery["readiness_deadline_ms"], 1_500_000)
 
         restart_queue = config["upstream"]["restart_queue"]
         self.assertEqual(restart_queue["queue_deadline_secs"], 600)

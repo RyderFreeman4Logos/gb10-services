@@ -57,8 +57,39 @@ done
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
+SELECTED_TEXT_UNIT_FILE="${GB10_SELECTED_TEXT_UNIT_FILE:-/home/obj/.local/state/gb10-lifecycle/selected-text-unit}"
+
+read_persisted_text_unit() {
+  local candidate=""
+  if [[ -r "$SELECTED_TEXT_UNIT_FILE" ]]; then
+    candidate="$(<"$SELECTED_TEXT_UNIT_FILE")"
+    candidate="${candidate//$'\r'/}"
+    candidate="${candidate//$'\n'/}"
+    # File stores full unit name; strip .service for this script's bare names.
+    candidate="${candidate%.service}"
+    case "$candidate" in
+      vllm-aeon-27b-dflash|vllm-aeon-27b-dflash-hikv)
+        printf '%s\n' "$candidate"
+        return 0
+        ;;
+    esac
+  fi
+  return 1
+}
+
+persist_selected_text_unit() {
+  local unit="$1"
+  local parent tmp
+  parent="$(dirname -- "$SELECTED_TEXT_UNIT_FILE")"
+  mkdir -p -- "$parent"
+  tmp="${SELECTED_TEXT_UNIT_FILE}.tmp.$$"
+  printf '%s\n' "${unit}.service" >"$tmp"
+  cp -- "$tmp" "$SELECTED_TEXT_UNIT_FILE"
+  rm -f -- "$tmp"
+}
+
 select_text_unit() {
-  local candidate state
+  local candidate state persisted
   local -a matching=()
 
   for candidate in "${TEXT_UNITS[@]}"; do
@@ -76,6 +107,11 @@ select_text_unit() {
     return 1
   fi
 
+  if persisted="$(read_persisted_text_unit)"; then
+    printf '%s\n' "$persisted"
+    return 0
+  fi
+
   for candidate in "${TEXT_UNITS[@]}"; do
     state="$(systemctl --user is-enabled "${candidate}.service" 2>/dev/null || true)"
     case "$state" in
@@ -89,7 +125,7 @@ select_text_unit() {
   if (( ${#matching[@]} > 1 )); then
     echo "ambiguous enabled AEON text units: ${matching[*]}" >&2
   else
-    echo "no active or enabled AEON text unit is available" >&2
+    echo "no active, persisted, or enabled AEON text unit is available" >&2
   fi
   return 1
 }
@@ -148,6 +184,7 @@ if [[ -z "$TEXT_UNIT" ]]; then
   TEXT_UNIT="$(select_text_unit)"
 fi
 validate_text_unit "$TEXT_UNIT"
+persist_selected_text_unit "$TEXT_UNIT"
 
 # Verify embedding is running; if not, warn but do NOT auto-start (caller's job).
 if ! systemctl --user is-active --quiet "$EMB_UNIT" 2>/dev/null; then
