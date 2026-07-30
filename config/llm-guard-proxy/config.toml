@@ -625,8 +625,11 @@ tool_request_policy = "apply"
 no_thinking_marker_policy = "force"
 default_injection_schema = "vllm_native"
 
-[guard_workflows]
-max_in_flight_executions = 4
+# Temporarily commented: installed llm-guard-proxy rejects unknown
+# [guard_workflows] and crash-loops. Re-enable after deploying a binary that
+# supports this section (or after parser softens unknown-section handling).
+# [guard_workflows]
+# max_in_flight_executions = 4
 
 # Match former :18014 raw-no-think chat policy: no loop salvage on the default
 # entry. Opt-in bounded chat on :18014 still enforces loop_guard.
