@@ -417,6 +417,14 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertTrue(default_chat["thinking"]["force_disable"])
         self.assertEqual(default_chat["loop_guard"]["mode"], "disabled")
         self.assertEqual(len(default_chat["retry"]["ladder"]), 1)
+        self.assertEqual(
+            profiles["qwen3-reranker-8b"]["match_models"],
+            [
+                "Querit/Querit-4B",
+                "qwen3-reranker-8b",
+                "Qwen/Qwen3-Reranker-8B",
+            ],
+        )
 
         # Runtime schema rejects empty match_models, so listener-forced arms use
         # reserved aliases that cannot collide with default public chat aliases.
