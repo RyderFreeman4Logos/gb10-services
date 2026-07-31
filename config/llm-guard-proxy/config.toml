@@ -641,7 +641,7 @@ mode = "disabled"
 
 [retry]
 enabled = true
-max_attempts = 1
+max_attempts = 4
 request_deadline_ms = 1200000
 anti_loop_hint_enabled = false
 shielded_streaming_enabled = true
