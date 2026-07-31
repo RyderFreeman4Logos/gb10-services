@@ -539,7 +539,7 @@ enabled = false
 [[upstreams]]
 name = "qwen3-reranker-8b"
 base_url = "http://100.105.4.92:18013/v1"
-match_models = ["qwen3-reranker-8b", "Qwen/Qwen3-Reranker-8B"]
+match_models = ["Querit/Querit-4B", "qwen3-reranker-8b", "Qwen/Qwen3-Reranker-8B"]
 request_timeout_ms = 1800000
 max_in_flight_requests = 8
 max_queued_generation_requests = 64
