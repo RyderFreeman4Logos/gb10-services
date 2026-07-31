@@ -1,0 +1,514 @@
+{
+  "arms": {
+    "A": {
+      "arm": "A",
+      "label": "aeon-guard-bounded",
+      "run": {
+        "finished_at_epoch": 1785495658.3842976,
+        "id": "guard4037258-c8-20260730-231420",
+        "model": "aeon-ultimate",
+        "planned_cases": 290,
+        "progress_field": 322,
+        "started_at_epoch": 1785478723.116501,
+        "status": "succeeded",
+        "suite_hash": "015c06c71ec7f162",
+        "suite_id": "aeon-suite-v2"
+      },
+      "summary": {
+        "availability_scored_rate": 0.996551724137931,
+        "category_summary": {
+          "Coding": {
+            "mean_score": 0.9629629629629629,
+            "scored_n": 54
+          },
+          "Instruction": {
+            "mean_score": 0.9016393442622951,
+            "scored_n": 61
+          },
+          "Math": {
+            "mean_score": 0.9154929577464789,
+            "scored_n": 71
+          },
+          "Prose": {
+            "mean_score": 0.725,
+            "scored_n": 40
+          },
+          "Reasoning": {
+            "mean_score": 0.9682539682539683,
+            "scored_n": 63
+          }
+        },
+        "duplicate_case_ids": [],
+        "full_pass_n_scored": 262,
+        "full_pass_rate_planned_cases": 0.903448275862069,
+        "full_pass_rate_scored": 0.9065743944636678,
+        "latency_answered_rows": {
+          "decode_tps": {
+            "max": 593767987.16,
+            "mean": 32695916.4105,
+            "median": 12667406.565000001,
+            "min": 538974.09,
+            "n": 220,
+            "p50": 12667406.565000001,
+            "p95": 113501360.97199999
+          },
+          "e2e_ms": {
+            "max": 1160142.73,
+            "mean": 197208.6510034602,
+            "median": 93641.35,
+            "min": 2867.15,
+            "n": 289,
+            "p50": 93641.35,
+            "p95": 824591.0439999999
+          },
+          "output_tokens": {
+            "max": 50000.0,
+            "mean": 4899.107266435986,
+            "median": 2073.0,
+            "min": 1.0,
+            "n": 289,
+            "p50": 2073.0,
+            "p95": 20540.799999999996
+          },
+          "ttft_ms": {
+            "max": 1090492.06,
+            "mean": 190720.78163636365,
+            "median": 95372.13500000001,
+            "min": 2867.01,
+            "n": 220,
+            "p50": 95372.13500000001,
+            "p95": 742147.1854999994
+          }
+        },
+        "mean_score_scored": 0.9065743944636678,
+        "median_score_scored": 1.0,
+        "no_answer_n": 1,
+        "result_rows": 290,
+        "score_histogram_scored": {
+          "0.0": 27,
+          "1.0": 262
+        },
+        "scored_n": 289,
+        "status_counts": {
+          "scored": 290
+        },
+        "unique_case_ids": 290
+      }
+    },
+    "B": {
+      "arm": "B",
+      "label": "aeon-direct-no-think",
+      "run": {
+        "finished_at_epoch": 1785351271.8439715,
+        "id": "bc-rebench-20260729-B-c8",
+        "model": "aeon-ultimate",
+        "planned_cases": 290,
+        "progress_field": 290,
+        "started_at_epoch": 1785350445.3011308,
+        "status": "succeeded",
+        "suite_hash": "015c06c71ec7f162",
+        "suite_id": "aeon-suite-v2"
+      },
+      "summary": {
+        "availability_scored_rate": 0.996551724137931,
+        "category_summary": {
+          "Coding": {
+            "mean_score": 0.9814814814814815,
+            "scored_n": 54
+          },
+          "Instruction": {
+            "mean_score": 0.8524590163934426,
+            "scored_n": 61
+          },
+          "Math": {
+            "mean_score": 0.9436619718309859,
+            "scored_n": 71
+          },
+          "Prose": {
+            "mean_score": 0.7166666666666667,
+            "scored_n": 40
+          },
+          "Reasoning": {
+            "mean_score": 0.9682539682539683,
+            "scored_n": 63
+          }
+        },
+        "duplicate_case_ids": [],
+        "full_pass_n_scored": 261,
+        "full_pass_rate_planned_cases": 0.9,
+        "full_pass_rate_scored": 0.903114186851211,
+        "latency_answered_rows": {
+          "decode_tps": {
+            "max": 41633.05,
+            "mean": 172.4633103448276,
+            "median": 32.15,
+            "min": 6.08,
+            "n": 290,
+            "p50": 32.15,
+            "p95": 46.22150000000001
+          },
+          "e2e_ms": {
+            "max": 564946.91,
+            "mean": 20462.516551724137,
+            "median": 8316.3,
+            "min": 564.61,
+            "n": 290,
+            "p50": 8316.3,
+            "p95": 66555.87550000004
+          },
+          "output_tokens": {
+            "max": 15811.0,
+            "mean": 550.3310344827586,
+            "median": 192.0,
+            "min": 2.0,
+            "n": 290,
+            "p50": 192.0,
+            "p95": 1924.65
+          },
+          "ttft_ms": {
+            "max": 56302.24,
+            "mean": 3207.8568620689657,
+            "median": 1476.355,
+            "min": 286.71,
+            "n": 290,
+            "p50": 1476.355,
+            "p95": 11156.593000000003
+          }
+        },
+        "mean_score_scored": 0.9054209919261823,
+        "median_score_scored": 1.0,
+        "no_answer_n": 1,
+        "result_rows": 290,
+        "score_histogram_scored": {
+          "0.0": 27,
+          "0.6666666666666666": 1,
+          "1.0": 261
+        },
+        "scored_n": 289,
+        "status_counts": {
+          "scored": 290
+        },
+        "unique_case_ids": 290
+      }
+    },
+    "C": {
+      "arm": "C",
+      "label": "aeon-raw-max",
+      "run": {
+        "finished_at_epoch": 1785366584.4165967,
+        "id": "bc-rebench-20260729-C-c8-retry3",
+        "model": "aeon-ultimate",
+        "planned_cases": 290,
+        "progress_field": 291,
+        "started_at_epoch": 1785353649.7577598,
+        "status": "succeeded",
+        "suite_hash": "015c06c71ec7f162",
+        "suite_id": "aeon-suite-v2"
+      },
+      "summary": {
+        "availability_scored_rate": 0.996551724137931,
+        "category_summary": {
+          "Coding": {
+            "mean_score": 1.0,
+            "scored_n": 54
+          },
+          "Instruction": {
+            "mean_score": 0.9672131147540983,
+            "scored_n": 61
+          },
+          "Math": {
+            "mean_score": 0.9577464788732394,
+            "scored_n": 71
+          },
+          "Prose": {
+            "mean_score": 0.9,
+            "scored_n": 40
+          },
+          "Reasoning": {
+            "mean_score": 0.9841269841269841,
+            "scored_n": 63
+          }
+        },
+        "duplicate_case_ids": [],
+        "full_pass_n_scored": 279,
+        "full_pass_rate_planned_cases": 0.9620689655172414,
+        "full_pass_rate_scored": 0.9653979238754326,
+        "latency_answered_rows": {
+          "decode_tps": {
+            "max": 350515931.02,
+            "mean": 38548529.71192982,
+            "median": 19202672.44,
+            "min": 596143.28,
+            "n": 285,
+            "p50": 19202672.44,
+            "p95": 158477041.17000002
+          },
+          "e2e_ms": {
+            "max": 1175344.49,
+            "mean": 307161.2813793103,
+            "median": 195285.16499999998,
+            "min": 9563.19,
+            "n": 290,
+            "p50": 195285.16499999998,
+            "p95": 935919.7745
+          },
+          "output_tokens": {
+            "max": 33780.0,
+            "mean": 6518.937931034483,
+            "median": 2634.0,
+            "min": 118.0,
+            "n": 290,
+            "p50": 2634.0,
+            "p95": 32799.75
+          },
+          "ttft_ms": {
+            "max": 1175344.32,
+            "mean": 297590.2278245614,
+            "median": 192806.84,
+            "min": 9562.99,
+            "n": 285,
+            "p50": 192806.84,
+            "p95": 887058.794
+          }
+        },
+        "mean_score_scored": 0.9653979238754326,
+        "median_score_scored": 1.0,
+        "no_answer_n": 1,
+        "result_rows": 290,
+        "score_histogram_scored": {
+          "0.0": 10,
+          "1.0": 279
+        },
+        "scored_n": 289,
+        "status_counts": {
+          "scored": 290
+        },
+        "unique_case_ids": 290
+      }
+    }
+  },
+  "cochran_q_full_pass": {
+    "asymptotic_p": 0.0006691356122239282,
+    "common_scored_n": 289,
+    "df": 2,
+    "full_pass_totals": {
+      "A": 262,
+      "B": 261,
+      "C": 279
+    },
+    "q": 14.619047619047619
+  },
+  "content_free": true,
+  "eligibility": {
+    "aligned_non_numeric_case_ids": [
+      "prose.ocean3"
+    ],
+    "all_cases_have_numeric_scores": false,
+    "eligibility_note": "Eligibility requires terminal succeeded ledgers, planned unique coverage, no infra statuses, common suite identity, and identical non-numeric case IDs across arms. Paired results retain their explicit paired-N boundary.",
+    "ledger_complete_all_arms": true,
+    "no_infra_statuses": true,
+    "quality_comparison_eligible": true
+  },
+  "generated_at": "2026-07-31T22:13:11.884878Z",
+  "pairwise_gaps": [
+    {
+      "left_arm": "A",
+      "left_only_case_ids_n": 0,
+      "left_wins": 19,
+      "mcnemar_full_pass": {
+        "left_full_pass_right_not": 19,
+        "left_not_right_full_pass": 18,
+        "mcnemar_exact_two_sided_p": 1.0,
+        "mcnemar_holm_adjusted_p": 1.0
+      },
+      "mean_left_on_paired_subset": 0.9065743944636678,
+      "mean_right_on_paired_subset": 0.9054209919261823,
+      "mean_score_gap_left_minus_right": 0.0011534025374855825,
+      "paired_bootstrap_95": {
+        "lower_95": -0.040369088811995385,
+        "method": "paired percentile bootstrap",
+        "replicates": 20000,
+        "seed": 20260725,
+        "upper_95": 0.042675893886966555
+      },
+      "paired_scored_n": 289,
+      "relative_gap_pct_vs_right": 0.12738853503184713,
+      "right_arm": "B",
+      "right_only_case_ids_n": 0,
+      "right_wins": 18,
+      "shared_case_ids_n": 290,
+      "ties": 252
+    },
+    {
+      "left_arm": "A",
+      "left_only_case_ids_n": 0,
+      "left_wins": 5,
+      "mcnemar_full_pass": {
+        "left_full_pass_right_not": 5,
+        "left_not_right_full_pass": 22,
+        "mcnemar_exact_two_sided_p": 0.0015137195587158203,
+        "mcnemar_holm_adjusted_p": 0.0030274391174316406
+      },
+      "mean_left_on_paired_subset": 0.9065743944636678,
+      "mean_right_on_paired_subset": 0.9653979238754326,
+      "mean_score_gap_left_minus_right": -0.058823529411764705,
+      "paired_bootstrap_95": {
+        "lower_95": -0.09342560553633218,
+        "method": "paired percentile bootstrap",
+        "replicates": 20000,
+        "seed": 20260726,
+        "upper_95": -0.02422145328719723
+      },
+      "paired_scored_n": 289,
+      "relative_gap_pct_vs_right": -6.093189964157705,
+      "right_arm": "C",
+      "right_only_case_ids_n": 0,
+      "right_wins": 22,
+      "shared_case_ids_n": 290,
+      "ties": 262
+    },
+    {
+      "left_arm": "B",
+      "left_only_case_ids_n": 0,
+      "left_wins": 1,
+      "mcnemar_full_pass": {
+        "left_full_pass_right_not": 1,
+        "left_not_right_full_pass": 19,
+        "mcnemar_exact_two_sided_p": 4.00543212890625e-05,
+        "mcnemar_holm_adjusted_p": 0.0001201629638671875
+      },
+      "mean_left_on_paired_subset": 0.9054209919261823,
+      "mean_right_on_paired_subset": 0.9653979238754326,
+      "mean_score_gap_left_minus_right": -0.05997693194925029,
+      "paired_bootstrap_95": {
+        "lower_95": -0.08996539792387544,
+        "method": "paired percentile bootstrap",
+        "replicates": 20000,
+        "seed": 20260727,
+        "upper_95": -0.032295271049596314
+      },
+      "paired_scored_n": 289,
+      "relative_gap_pct_vs_right": -6.212664277180406,
+      "right_arm": "C",
+      "right_only_case_ids_n": 0,
+      "right_wins": 19,
+      "shared_case_ids_n": 290,
+      "ties": 269
+    }
+  ],
+  "publication": {
+    "archive_filename": "aeon_3arm_comparison_redacted.zip",
+    "content_payloads_excluded": true,
+    "private_databases_excluded": true,
+    "verification_receipt": "package_manifest.json"
+  },
+  "schema_version": 1,
+  "scope": {
+    "planned_cases": 290,
+    "request_contracts": {
+      "A": {
+        "concurrency": 8,
+        "max_tokens": 50000,
+        "model": "aeon-ultimate",
+        "request_fields_declared": [
+          "model",
+          "messages",
+          "stream",
+          "temperature",
+          "top_p",
+          "top_k",
+          "max_tokens"
+        ],
+        "request_fields_effective": [
+          "model",
+          "messages",
+          "stream",
+          "temperature",
+          "top_p",
+          "top_k",
+          "max_tokens",
+          "enable_thinking"
+        ],
+        "request_fields_note": "effective fields include runner-injected extensions omitted by the base contract list",
+        "run_id": "guard4037258-c8-20260730-231420",
+        "sha256": "ece5c5b6cd1f54fc3d93e9f550ae9c887304c44aab8ad655d7ec96072c497e25",
+        "temperature": 0.6,
+        "thinking_mode": "top_level_enable_thinking_true",
+        "timeout_seconds": 1800,
+        "top_k": 20,
+        "top_p": 0.95
+      },
+      "B": {
+        "concurrency": 8,
+        "max_tokens": 50000,
+        "model": "aeon-ultimate",
+        "request_fields_declared": [
+          "model",
+          "messages",
+          "stream",
+          "temperature",
+          "top_p",
+          "top_k",
+          "max_tokens"
+        ],
+        "request_fields_effective": [
+          "model",
+          "messages",
+          "stream",
+          "temperature",
+          "top_p",
+          "top_k",
+          "max_tokens",
+          "enable_thinking"
+        ],
+        "request_fields_note": "effective fields include runner-injected extensions omitted by the base contract list",
+        "run_id": "bc-rebench-20260729-B-c8",
+        "sha256": "bc92d13fa9e5aaefdc4b43be94a87a08fac032f553c05bea8a9128016fb6008c",
+        "temperature": 0.6,
+        "thinking_mode": "top_level_enable_thinking_false",
+        "timeout_seconds": 1800,
+        "top_k": 20,
+        "top_p": 0.95
+      },
+      "C": {
+        "concurrency": 8,
+        "max_tokens": 50000,
+        "model": "aeon-ultimate",
+        "request_fields_declared": [
+          "model",
+          "messages",
+          "stream",
+          "temperature",
+          "top_p",
+          "top_k",
+          "max_tokens"
+        ],
+        "request_fields_effective": [
+          "model",
+          "messages",
+          "stream",
+          "temperature",
+          "top_p",
+          "top_k",
+          "max_tokens"
+        ],
+        "request_fields_note": "effective fields include runner-injected extensions omitted by the base contract list",
+        "run_id": "bc-rebench-20260729-C-c8-retry3",
+        "sha256": "de3301f96a571a343ab68a5359124967114ef530d5d40543ed51ab764844b684",
+        "temperature": 0.6,
+        "thinking_mode": "listener_default_no_enable_thinking_field",
+        "timeout_seconds": 1800,
+        "top_k": 20,
+        "top_p": 0.95
+      }
+    },
+    "routes": {
+      "A": "aeon-guard-bounded",
+      "B": "aeon-direct-no-think",
+      "C": "aeon-raw-max"
+    },
+    "same_suite_identity_all_arms": true,
+    "suite_hash": "015c06c71ec7f162",
+    "suite_id": "aeon-suite-v2"
+  }
+}

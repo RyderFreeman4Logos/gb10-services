@@ -1,0 +1,133 @@
+{
+  "arms": {
+    "A": {
+      "contract_sha256": "ece5c5b6cd1f54fc3d93e9f550ae9c887304c44aab8ad655d7ec96072c497e25",
+      "full_pass_numeric": 262,
+      "full_pass_rate_planned": 0.903448275862069,
+      "ledger_sha256": "6d92964942efd0cad1c1c7013de97251ce84dd133f39f63e8c1982641270ebd1",
+      "mean_score_numeric": 0.9065743944636678,
+      "numeric_scores": 289,
+      "planned_cases": 290,
+      "progress_field": 322,
+      "result_rows": 290,
+      "run_id": "guard4037258-c8-20260730-231420",
+      "run_status": "succeeded",
+      "runner_sha256": "f5f985cabfe943c9d29b066786664dc9e742ddf67a67cf937419422c02afa446",
+      "status_counts": {
+        "scored": 290
+      },
+      "unique_case_ids": 290
+    },
+    "B": {
+      "contract_sha256": "bc92d13fa9e5aaefdc4b43be94a87a08fac032f553c05bea8a9128016fb6008c",
+      "full_pass_numeric": 261,
+      "full_pass_rate_planned": 0.9,
+      "ledger_sha256": "5451dfc837546a7e039dbeddc4708229bc06523dc059beb275abd36220d008db",
+      "mean_score_numeric": 0.9054209919261823,
+      "numeric_scores": 289,
+      "planned_cases": 290,
+      "progress_field": 290,
+      "result_rows": 290,
+      "run_id": "bc-rebench-20260729-B-c8",
+      "run_status": "succeeded",
+      "runner_sha256": "24c9c565f8769097c63adc5b082c3601a300025d4e3b406dc6c3d91fff4ebc79",
+      "status_counts": {
+        "scored": 290
+      },
+      "unique_case_ids": 290
+    },
+    "C": {
+      "contract_sha256": "de3301f96a571a343ab68a5359124967114ef530d5d40543ed51ab764844b684",
+      "full_pass_numeric": 279,
+      "full_pass_rate_planned": 0.9620689655172414,
+      "ledger_sha256": "68cd2d4342ba34b234cbe43bcf567527caaed3e4f2f724b1f03028bc3efb2fbf",
+      "mean_score_numeric": 0.9653979238754326,
+      "numeric_scores": 289,
+      "planned_cases": 290,
+      "progress_field": 291,
+      "result_rows": 290,
+      "run_id": "bc-rebench-20260729-C-c8-retry3",
+      "run_status": "succeeded",
+      "runner_sha256": "24c9c565f8769097c63adc5b082c3601a300025d4e3b406dc6c3d91fff4ebc79",
+      "status_counts": {
+        "scored": 290
+      },
+      "unique_case_ids": 290
+    }
+  },
+  "content_free": true,
+  "eligibility": {
+    "aligned_non_numeric_case_ids": [
+      "prose.ocean3"
+    ],
+    "all_cases_have_numeric_scores": false,
+    "eligibility_note": "Eligibility requires terminal succeeded ledgers, planned unique coverage, no infra statuses, common suite identity, and identical non-numeric case IDs across arms. Paired results retain their explicit paired-N boundary.",
+    "ledger_complete_all_arms": true,
+    "no_infra_statuses": true,
+    "quality_comparison_eligible": true
+  },
+  "export_policy": {
+    "blob_stores_excluded": true,
+    "content_payloads_excluded": true,
+    "endpoint_addresses_excluded": true,
+    "private_databases_excluded": true
+  },
+  "generated_at": "2026-07-31T22:14:18.691889Z",
+  "progress_counter_note": "A and C progress_field exceed planned_cases because post-run upsert retries incremented the run counter; immutable unique result rows and case IDs are exactly 290 per arm.",
+  "provenance": {
+    "deployed_guard_binary_sha256": "9c4550ff648ad945c38f988c0ab9795c9677a699f5cb0eff5a30b31438ecd381",
+    "gb10_services_commit": "daa3d6ef078a6d908b2b2d6ebdd9f43ee5530090",
+    "live_guard_config_sha256": "442e88c5bb7888ca73d980e645e9cb5822b7328aead308a591be76ed0da3e36d",
+    "llm_guard_proxy_commit": "4037258b7785cf8a7168e838ab7c9cdd5da1e98b",
+    "publisher_sha256": "aee7e38fcc77b3eaf12f6d187171ea64c613ec540be6b90330d3240103a19063"
+  },
+  "public_assets": {
+    "aeon_3arm_comparison_redacted.zip": {
+      "bytes": 30780,
+      "sha256": "b4de547d644c8a41deb3ff98f0cd3896bf7372612b32635967c361678ede5b29"
+    },
+    "comparison.json": {
+      "bytes": 15104,
+      "sha256": "614bd29286ba35810d356e8ac28a15c5d778cec2944d6fdda7eaf9d9abcc63c2"
+    },
+    "comparison_report.md": {
+      "bytes": 3512,
+      "sha256": "956daf9d833a8f4cf9f29b46c52212fea7813508b870081077ee08bb30e18f82"
+    },
+    "package_manifest.json": {
+      "bytes": 586,
+      "sha256": "281a4c02b9e7977609a3318313f64439911da968797834351d172798d64c1e23"
+    },
+    "sanitized_manifest.json": {
+      "bytes": 3959,
+      "sha256": "6e1024fbbf96321aed6698d20ce1d6bcf98992b7ef32d3b9956a0d8bae5832a7"
+    }
+  },
+  "retry_treatment": {
+    "A": {
+      "final_infra": 0,
+      "finalizer_sha256": "f58316784fefd6dbd7f94093f3c6c9cbaeac4545e1ed6ea1e6e13ee5e079c153",
+      "initial_infra": 13,
+      "last_transport_502_reclassified": "model_loop_guard",
+      "score": 0.0
+    },
+    "B": {
+      "final_infra": 0,
+      "initial_infra": 0
+    },
+    "C": {
+      "final_infra": 0,
+      "initial_infra": 1,
+      "recovered_attempt": 1,
+      "retry_script_sha256": "16d2195620123fa2f86264d69b9a14368c533ad41943ea040b485a19c63a29fd",
+      "score": 1.0
+    }
+  },
+  "schema_version": 2,
+  "suite": {
+    "hash": "015c06c71ec7f162",
+    "id": "aeon-suite-v2",
+    "paired_numeric_n": 289,
+    "planned_cases": 290
+  }
+}
