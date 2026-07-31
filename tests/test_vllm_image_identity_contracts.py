@@ -235,11 +235,12 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         self.assertEqual(option_value("--attention-backend"), "TRITON_ATTN")
         served_name_index = runtime_argv.index("--served-model-name")
         self.assertEqual(
-            runtime_argv[served_name_index + 1 : served_name_index + 4],
+            runtime_argv[served_name_index + 1 : served_name_index + 5],
             [
                 "aeon-ultimate",
                 "qwen3.6-27b-decensor-by-aeon",
                 "qwen3.6-27b-decensored",
+                "qwen3.6-27b-nvfp4-fast-nothinking",
             ],
         )
         speculative = json.loads(option_value("--speculative-config"))
@@ -280,6 +281,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
             "aeon-ultimate",
             "qwen3.6-27b-decensor-by-aeon",
             "qwen3.6-27b-decensored",
+            "qwen3.6-27b-nvfp4-fast-nothinking",
         ):
             with self.subTest(alias=alias):
                 self.assertIn(alias, guide)

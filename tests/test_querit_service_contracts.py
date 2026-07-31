@@ -409,6 +409,7 @@ class QueritServiceContractTests(unittest.TestCase):
                 "aeon-ultimate",
                 "qwen3.6-27b-decensor-by-aeon",
                 "qwen3.6-27b-decensored",
+                "qwen3.6-27b-nvfp4-fast-nothinking",
             ],
         )
         self.assertEqual(default_chat["thinking"]["mode"], "force_disable")
