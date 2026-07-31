@@ -376,6 +376,13 @@ class QueritServiceContractTests(unittest.TestCase):
     def test_guard_listener_forced_benchmark_profiles(self) -> None:
         config = tomllib.loads(CONFIG.read_text())
         profiles = {profile["name"]: profile for profile in config["upstreams"]}
+        self.assertEqual(
+            config["retry"]["max_attempts"],
+            max(
+                len(profiles[name]["retry"]["ladder"])
+                for name in ("aeon-guard-max", "aeon-legacy-bounded")
+            ),
+        )
         aeon_profiles = {name for name in profiles if name.startswith("aeon-")}
         self.assertEqual(
             aeon_profiles,
