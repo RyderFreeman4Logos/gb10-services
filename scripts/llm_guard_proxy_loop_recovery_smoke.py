@@ -59,6 +59,8 @@ SYS_PIDFD_OPEN = 434
 PR_SET_CHILD_SUBREAPER = 36
 PR_GET_CHILD_SUBREAPER = 37
 SYSTEMD_RUN_BIN = "/usr/bin/systemd-run"
+SYSTEMCTL_BIN = "/usr/bin/systemctl"
+SCOPE_COLLECT_TIMEOUT = 2.0
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 
@@ -1539,6 +1541,83 @@ def _close_scope_fence(scope: ScopeFence) -> None:
     _close_identity_pidfd(scope.worker_identity)
 
 
+def _scope_cgroup_collected(control_group: str | None) -> bool | None:
+    if control_group is None:
+        return None
+    return not (CGROUP_ROOT / control_group.removeprefix("/")).exists()
+
+
+def _wait_scope_collected(
+    unit: str,
+    control_group: str | None,
+    deadline: float,
+) -> tuple[bool, bool | None]:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("scope_collect_timeout")
+        try:
+            result = subprocess.run(
+                [
+                    SYSTEMCTL_BIN,
+                    "--user",
+                    "show",
+                    "--property=LoadState",
+                    "--value",
+                    "--",
+                    unit,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+                timeout=remaining,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("scope_collect_timeout") from exc
+        if result.returncode != 0:
+            raise RuntimeError("scope_collect_systemctl_failed")
+        state = result.stdout.strip()
+        if state not in {"loaded", "not-found"}:
+            raise RuntimeError("scope_collect_state_invalid")
+        cgroup_collected = _scope_cgroup_collected(control_group)
+        if state == "not-found" and cgroup_collected is not False:
+            return True, cgroup_collected
+        time.sleep(min(PROCESS_POLL_INTERVAL, max(0.0, deadline - time.monotonic())))
+
+
+def _collect_supervisor_scope(
+    cleanup: dict[str, object],
+    unit: str,
+    control_group: str | None,
+) -> dict[str, object]:
+    started_ns = time.monotonic_ns()
+    unit_collected = False
+    cgroup_collected = _scope_cgroup_collected(control_group)
+    error: dict[str, str] | None = None
+    try:
+        unit_collected, cgroup_collected = _wait_scope_collected(
+            unit,
+            control_group,
+            time.monotonic() + SCOPE_COLLECT_TIMEOUT,
+        )
+    except Exception as exc:
+        error = _stable_error(exc, "scope_collection_failed")
+    finished_ns = time.monotonic_ns()
+    cleanup.update(
+        {
+            "scope_unit": unit,
+            "scope_unit_collected": unit_collected,
+            "scope_cgroup_collected": cgroup_collected,
+            "scope_collected": unit_collected and cgroup_collected is not False,
+            "scope_collection_error": error,
+            "scope_collection_duration_ms": (finished_ns - started_ns) // 1_000_000,
+        }
+    )
+    return cleanup
+
+
 def _process_control_group(pid: int) -> str:
     lines = (Path("/proc") / str(pid) / "cgroup").read_text(encoding="ascii").splitlines()
     unified = [line.split("::", 1)[1] for line in lines if line.startswith("0::")]
@@ -1613,7 +1692,7 @@ def _fence_supervisor_scope(
     kill_sent = False
     populated_final: int | None = None
     removed = False
-    error: dict[str, str] | None = None
+    fence_error: dict[str, str] | None = None
     try:
         populated, removed = _scope_population(scope.events_fd)
         cleanup["scope_populated_initial"] = populated
@@ -1633,11 +1712,12 @@ def _fence_supervisor_scope(
                 raise TimeoutError("scope_quiescence_timeout")
             time.sleep(PROCESS_POLL_INTERVAL)
     except Exception as exc:
-        error = _stable_error(exc, "scope_fence_failed")
+        fence_error = _stable_error(exc, "scope_fence_failed")
     finally:
         _close_scope_fence(scope)
+    _collect_supervisor_scope(cleanup, scope.unit, scope.control_group)
 
-    scope_quiesced = error is None and populated_final == 0
+    scope_quiesced = fence_error is None and populated_final == 0
     cleanup.update(
         {
             "scope_fence_established": True,
@@ -1649,7 +1729,7 @@ def _fence_supervisor_scope(
             "scope_populated_final": populated_final,
             "scope_removed": removed,
             "scope_quiesced": scope_quiesced,
-            "scope_error": error,
+            "scope_error": fence_error,
         }
     )
     if scope_quiesced:
@@ -2187,6 +2267,8 @@ def start_candidate_supervisor(
             pid, wrapper_identity, parent_control, error
         )
         cleanup.update(scope_cleanup)
+        if scope is None:
+            _collect_supervisor_scope(cleanup, unit, None)
         raise SupervisorStartError(error, cleanup, False, False) from exc
 
     if receipt.get("kind") != "started":
@@ -2744,6 +2826,14 @@ def acceptance_errors(summary: dict) -> list[str]:
         errors.append("cleanup_scope_fence_missing")
     if process_cleanup.get("scope_populated_final") != 0:
         errors.append("cleanup_scope_populated")
+    if (
+        process_cleanup.get("scope_collected") is not True
+        or process_cleanup.get("scope_unit_collected") is not True
+        or process_cleanup.get("scope_cgroup_collected") is not True
+    ):
+        errors.append("cleanup_scope_not_collected")
+    if process_cleanup.get("scope_collection_error"):
+        errors.append("cleanup_scope_collection_failed")
     if not process_cleanup.get("scope_quiesced"):
         errors.append("cleanup_scope_not_quiesced")
     if process_cleanup.get("scope_error"):

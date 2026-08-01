@@ -6,6 +6,7 @@ import io
 import importlib.util
 import json
 import os
+import secrets
 import signal
 import socket
 import subprocess
@@ -116,6 +117,36 @@ def write_forking_systemd_run_bridge(path: Path) -> None:
         "_, status = os.waitpid(pid, 0)\n"
         "code = os.waitstatus_to_exitcode(status)\n"
         "os._exit(code if code >= 0 else 128 - code)\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
+
+
+def write_systemctl_collection_bridge(path: Path) -> None:
+    path.write_text(
+        r'''#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+unit = os.environ["SCOPE_COLLECT_EXPECTED_UNIT"]
+if sys.argv[1:] != [
+    "--user",
+    "show",
+    "--property=LoadState",
+    "--value",
+    "--",
+    unit,
+]:
+    raise SystemExit(91)
+mode = os.environ["SCOPE_COLLECT_MODE"]
+if mode == "error":
+    raise SystemExit(17)
+counter = pathlib.Path(os.environ["SCOPE_COLLECT_COUNTER"])
+count = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(count))
+print("not-found" if mode == "delayed" and count >= 3 else "loaded")
+''',
         encoding="utf-8",
     )
     path.chmod(0o700)
@@ -244,6 +275,12 @@ def passing_summary() -> dict:
             "candidate_ownership_quiesced": True,
             "scope_fence_established": True,
             "scope_populated_final": 0,
+            "scope_removed": False,
+            "scope_unit_collected": True,
+            "scope_cgroup_collected": True,
+            "scope_collected": True,
+            "scope_collection_error": None,
+            "scope_collection_duration_ms": 1,
             "scope_quiesced": True,
             "scope_error": None,
             "supervisor_error": None,
@@ -680,6 +717,96 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
         }
         self.assertIn("cleanup_scope_failed", smoke.acceptance_errors(scope_error))
 
+    def test_final_acceptance_requires_scope_collection(self) -> None:
+        not_collected = passing_summary()
+        not_collected["process_cleanup"]["scope_collected"] = False
+        self.assertIn(
+            "cleanup_scope_not_collected",
+            smoke.acceptance_errors(not_collected),
+        )
+
+        collection_error = passing_summary()
+        collection_error["process_cleanup"]["scope_collection_error"] = {
+            "class": "RuntimeError",
+            "code": "scope_collect_systemctl_failed",
+        }
+        self.assertIn(
+            "cleanup_scope_collection_failed",
+            smoke.acceptance_errors(collection_error),
+        )
+
+    def test_scope_collection_bridge_is_bounded_exact_and_closes_fds_once(self) -> None:
+        for mode, collected, error_code in (
+            ("delayed", True, None),
+            ("no_collect", False, "scope_collect_timeout"),
+            ("error", False, "scope_collect_systemctl_failed"),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                bridge = root / "systemctl"
+                counter = root / "counter"
+                write_systemctl_collection_bridge(bridge)
+                unit = f"guard-collect-{secrets.token_hex(12)}.scope"
+                events = root / "cgroup.events"
+                kill = root / "cgroup.kill"
+                events.write_text("populated 0\n", encoding="ascii")
+                kill.write_bytes(b"")
+                scope = smoke.ScopeFence(
+                    unit,
+                    f"/test/{unit}",
+                    os.open(events, os.O_RDONLY | os.O_CLOEXEC),
+                    os.open(kill, os.O_WRONLY | os.O_CLOEXEC),
+                    smoke.ProcessIdentity(
+                        os.getpid(),
+                        "R",
+                        os.getppid(),
+                        os.getpgrp(),
+                        os.getsid(0),
+                        1,
+                    ),
+                )
+                env = {
+                    "SCOPE_COLLECT_EXPECTED_UNIT": unit,
+                    "SCOPE_COLLECT_COUNTER": str(counter),
+                    "SCOPE_COLLECT_MODE": mode,
+                }
+                cleanup: dict[str, object] = {}
+                started = time.monotonic()
+                with (
+                    patch.object(smoke, "SYSTEMCTL_BIN", str(bridge), create=True),
+                    patch.object(smoke, "SCOPE_COLLECT_TIMEOUT", 0.12, create=True),
+                    patch.dict(os.environ, env),
+                    patch.object(
+                        smoke,
+                        "_close_scope_fence",
+                        wraps=smoke._close_scope_fence,
+                    ) as close_scope,
+                ):
+                    smoke._fence_supervisor_scope(cleanup, scope)
+                elapsed = time.monotonic() - started
+
+                self.assertLess(elapsed, 0.5)
+                self.assertEqual(close_scope.call_count, 1)
+                self.assertEqual(cleanup["scope_unit"], unit)
+                self.assertFalse(cleanup["scope_removed"])
+                self.assertEqual(cleanup["scope_collected"], collected)
+                self.assertTrue(cleanup["scope_quiesced"])
+                self.assertTrue(cleanup["candidate_ownership_quiesced"])
+                if error_code is None:
+                    self.assertIsNone(cleanup["scope_collection_error"])
+                else:
+                    collection_error = cleanup["scope_collection_error"]
+                    self.assertIsInstance(collection_error, dict)
+                    assert isinstance(collection_error, dict)
+                    self.assertEqual(
+                        collection_error["code"],
+                        error_code,
+                    )
+                for fd in (scope.events_fd, scope.kill_fd):
+                    with self.assertRaises(OSError) as closed:
+                        os.fstat(fd)
+                    self.assertEqual(closed.exception.errno, errno.EBADF)
+
     def test_direct_stop_never_claims_unrelated_post_baseline_child(self) -> None:
         child = r"""
 import os, signal, sys, time
@@ -844,6 +971,8 @@ while True:
                     self.assertTrue(cleanup["candidate_ownership_quiesced"])
                     self.assertTrue(cleanup["supervisor_exited"])
                     self.assertTrue(cleanup["supervisor_reaped"])
+                    self.assertTrue(cleanup["scope_collected"])
+                    self.assertIsNone(cleanup["scope_collection_error"])
                     self.assertFalse(smoke.process_identity_is_live(candidate_pid))
                     self.assertFalse(smoke.process_identity_is_live(worker_pid))
                     with self.assertRaises(ChildProcessError):
@@ -1026,6 +1155,10 @@ with socket.socket() as listener:
                     self.assertEqual(caught.exception.__cause__.args[1], expected_code)
                     self.assertTrue(caught.exception.cleanup["supervisor_exited"])
                     self.assertTrue(caught.exception.cleanup["supervisor_reaped"])
+                    self.assertTrue(caught.exception.cleanup["scope_collected"])
+                    self.assertIsNone(
+                        caught.exception.cleanup["scope_collection_error"]
+                    )
                     wrapper_pid = int(wrapper_marker.read_text())
                     worker_info = json.loads(worker_marker.read_text())
                     worker_pid = worker_info["pid"]
@@ -1118,6 +1251,8 @@ while True:
                 self.assertTrue(cleanup["scope_kill_all_sent"])
                 self.assertEqual(cleanup["scope_populated_final"], 0)
                 self.assertTrue(cleanup["scope_quiesced"])
+                self.assertTrue(cleanup["scope_collected"])
+                self.assertIsNone(cleanup["scope_collection_error"])
                 self.assertTrue(cleanup["candidate_ownership_quiesced"])
                 self.assertTrue(cleanup["supervisor_reaped"])
                 self.assertTrue(cleanup["forced_kill"])
@@ -1188,6 +1323,8 @@ while True:
                 self.assertEqual(cleanup["residual_producer_count_final"], 0)
                 self.assertTrue(cleanup["supervisor_exited"])
                 self.assertTrue(cleanup["supervisor_reaped"])
+                self.assertTrue(cleanup["scope_collected"])
+                self.assertIsNone(cleanup["scope_collection_error"])
 
     def test_stop_reports_unexpected_exit_and_graceful_stop(self) -> None:
         child = r"""
