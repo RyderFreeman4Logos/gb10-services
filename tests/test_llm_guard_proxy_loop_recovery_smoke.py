@@ -39,6 +39,65 @@ def fd_count() -> int:
     return len(os.listdir("/proc/self/fd"))
 
 
+def write_forking_systemd_run_bridge(path: Path) -> None:
+    real_systemd_run = smoke.SYSTEMD_RUN_BIN
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        f"real_systemd_run = {real_systemd_run!r}\n"
+        "args = sys.argv[1:]\n"
+        "if worker := os.environ.get('SCOPE_READY_TEST_WORKER'):\n"
+        "    separator = args.index('--')\n"
+        "    args[separator + 1:] = [\n"
+        "        sys.executable, worker,\n"
+        "        os.environ['SCOPE_READY_TEST_MARKER'],\n"
+        "        os.environ['SCOPE_READY_TEST_PID'],\n"
+        "    ]\n"
+        "if marker := os.environ.get('SCOPE_WRAPPER_MARKER'):\n"
+        "    Path(marker).write_text(str(os.getpid()), encoding='ascii')\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        "    os.closerange(3, os.sysconf('SC_OPEN_MAX'))\n"
+        "    os.execv(real_systemd_run, [real_systemd_run, *args])\n"
+        "_, status = os.waitpid(pid, 0)\n"
+        "code = os.waitstatus_to_exitcode(status)\n"
+        "os._exit(code if code >= 0 else 128 - code)\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
+
+
+def write_invalid_scope_ready_worker(path: Path) -> None:
+    path.write_text(
+        """from __future__ import annotations
+import json
+import os
+import socket
+import sys
+from pathlib import Path
+
+control_group = next(
+    line.split("::", 1)[1]
+    for line in Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines()
+    if line.startswith("0::")
+)
+Path(sys.argv[1]).write_text(
+    json.dumps({"pid": os.getpid(), "control_group": control_group}),
+    encoding="ascii",
+)
+control = socket.socket(fileno=0)
+control.send(json.dumps({"kind": "scope_ready", "pid": json.loads(sys.argv[2])}).encode())
+try:
+    while control.recv(4096):
+        pass
+except OSError:
+    pass
+""",
+        encoding="utf-8",
+    )
+
+
 def attempt(
     number: int,
     phase: str,
@@ -342,7 +401,7 @@ while True:
                         pass
                     smoke._close_identity_pidfd(unrelated_identity)
 
-    def test_systemd_run_stdio_preserves_control_after_closing_nonstdio_fds(self) -> None:
+    def test_systemd_run_distinct_wrapper_preserves_stdio_control(self) -> None:
         candidate = r"""
 import os, signal, sys, time
 ready = sys.argv[1]
@@ -353,46 +412,23 @@ while True:
     time.sleep(1)
 """
 
-        def establish_scope(control, unit, pid, deadline):
-            self.assertEqual(
-                smoke._recv_supervisor_receipt(control, deadline),
-                {"kind": "scope_ready", "pid": pid},
-            )
-            return smoke.ScopeFence(unit, f"/{unit}", -1, -1)
-
-        def fence_scope(cleanup, _scope):
-            cleanup.update(
-                {
-                    "scope_fence_established": True,
-                    "scope_kill_all_sent": False,
-                    "scope_populated_final": 0,
-                    "scope_quiesced": True,
-                    "scope_error": None,
-                }
-            )
-            return cleanup
-
         before_fds = fd_count()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ready = root / "candidate.ready"
             bridge = root / "systemd-run"
-            bridge.write_text(
-                "#!/usr/bin/env python3\n"
-                "import os, sys\n"
-                "args = sys.argv[1:]\n"
-                "command = args[args.index('--') + 1:]\n"
-                "os.closerange(3, os.sysconf('SC_OPEN_MAX'))\n"
-                "os.execv(command[0], command)\n",
-                encoding="utf-8",
-            )
-            bridge.chmod(0o700)
+            wrapper_marker = root / "wrapper.pid"
+            write_forking_systemd_run_bridge(bridge)
             supervisor = None
             candidate_pid = None
+            worker_pid = None
+            scope_path = None
             with (
                 patch.object(smoke, "SYSTEMD_RUN_BIN", str(bridge)),
-                patch.object(smoke, "_establish_scope_fence", establish_scope),
-                patch.object(smoke, "_fence_supervisor_scope", fence_scope),
+                patch.dict(
+                    os.environ,
+                    {"SCOPE_WRAPPER_MARKER": str(wrapper_marker)},
+                ),
             ):
                 try:
                     supervisor = smoke.start_candidate_supervisor(
@@ -404,6 +440,35 @@ while True:
                     candidate_pid = supervisor.started_receipt["candidate_identity"][
                         "pid"
                     ]
+                    worker_pid = supervisor.scope.worker_identity.pid
+                    scope_path = smoke.CGROUP_ROOT / supervisor.scope.control_group.removeprefix(
+                        "/"
+                    )
+                    self.assertEqual(int(wrapper_marker.read_text()), supervisor.pid)
+                    self.assertNotEqual(supervisor.pid, worker_pid)
+                    self.assertEqual(
+                        supervisor.started_receipt["scope_worker_pid"], worker_pid
+                    )
+                    self.assertEqual(
+                        supervisor.started_receipt["scope_worker_starttime"],
+                        supervisor.scope.worker_identity.starttime,
+                    )
+                    self.assertEqual(
+                        supervisor.started_receipt["candidate_identity"]["ppid"],
+                        worker_pid,
+                    )
+                    self.assertTrue(
+                        smoke._same_process(
+                            smoke._read_process_identity(worker_pid),
+                            supervisor.scope.worker_identity,
+                        )
+                    )
+                    members = {
+                        int(pid)
+                        for pid in (scope_path / "cgroup.procs").read_text().split()
+                    }
+                    self.assertIn(worker_pid, members)
+                    self.assertIn(candidate_pid, members)
                     deadline = time.monotonic() + 2
                     while not ready.exists() and time.monotonic() < deadline:
                         time.sleep(0.01)
@@ -418,6 +483,13 @@ while True:
                     self.assertTrue(cleanup["supervisor_exited"])
                     self.assertTrue(cleanup["supervisor_reaped"])
                     self.assertFalse(smoke.process_identity_is_live(candidate_pid))
+                    self.assertFalse(smoke.process_identity_is_live(worker_pid))
+                    with self.assertRaises(ChildProcessError):
+                        os.waitpid(supervisor.pid, os.WNOHANG)
+                    deadline = time.monotonic() + 2
+                    while scope_path.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertFalse(scope_path.exists())
                 finally:
                     if supervisor is not None and smoke.process_identity_is_live(
                         supervisor.pid
@@ -427,6 +499,75 @@ while True:
                         candidate_pid
                     ):
                         os.kill(candidate_pid, signal.SIGKILL)
+        self.assertEqual(fd_count(), before_fds)
+
+    def test_invalid_scope_worker_pid_fails_closed_and_cleans_scope(self) -> None:
+        before_fds = fd_count()
+        for name, value, expected_code in (
+            ("malformed", json.dumps("not-a-pid"), "scope_worker_identity_invalid"),
+            ("bool", "true", "scope_worker_identity_invalid"),
+            ("foreign", None, "scope_identity_invalid"),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                bridge = root / "systemd-run"
+                worker = root / "invalid_worker.py"
+                wrapper_marker = root / "wrapper.pid"
+                worker_marker = root / "worker.json"
+                write_forking_systemd_run_bridge(bridge)
+                write_invalid_scope_ready_worker(worker)
+                foreign = None
+                if value is None:
+                    foreign = subprocess.Popen(
+                        [sys.executable, "-c", "import time; time.sleep(30)"]
+                    )
+                    value = str(foreign.pid)
+                environment = {
+                    "SCOPE_WRAPPER_MARKER": str(wrapper_marker),
+                    "SCOPE_READY_TEST_WORKER": str(worker),
+                    "SCOPE_READY_TEST_MARKER": str(worker_marker),
+                    "SCOPE_READY_TEST_PID": value,
+                }
+                try:
+                    with (
+                        patch.object(smoke, "SYSTEMD_RUN_BIN", str(bridge)),
+                        patch.dict(os.environ, environment),
+                        self.assertRaises(smoke.SupervisorStartError) as caught,
+                    ):
+                        smoke.start_candidate_supervisor(
+                            [sys.executable, "-c", "raise SystemExit(99)"],
+                            root,
+                            os.environ.copy(),
+                            root / "candidate.log",
+                        )
+                    self.assertEqual(caught.exception.error["code"], "ESTALE")
+                    self.assertIsInstance(caught.exception.__cause__, OSError)
+                    self.assertEqual(caught.exception.__cause__.args[1], expected_code)
+                    self.assertTrue(caught.exception.cleanup["supervisor_exited"])
+                    self.assertTrue(caught.exception.cleanup["supervisor_reaped"])
+                    wrapper_pid = int(wrapper_marker.read_text())
+                    worker_info = json.loads(worker_marker.read_text())
+                    worker_pid = worker_info["pid"]
+                    scope_path = smoke.CGROUP_ROOT / worker_info[
+                        "control_group"
+                    ].removeprefix("/")
+                    deadline = time.monotonic() + 2
+                    while (
+                        smoke._read_process_identity(worker_pid) is not None
+                        or scope_path.exists()
+                    ) and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertIsNone(smoke._read_process_identity(wrapper_pid))
+                    self.assertIsNone(smoke._read_process_identity(worker_pid))
+                    self.assertFalse(scope_path.exists())
+                    with self.assertRaises(ChildProcessError):
+                        os.waitpid(wrapper_pid, os.WNOHANG)
+                    if foreign is not None:
+                        self.assertIsNone(foreign.poll())
+                finally:
+                    if foreign is not None:
+                        foreign.terminate()
+                        foreign.wait(timeout=2)
         self.assertEqual(fd_count(), before_fds)
 
     def test_parent_scope_fence_kills_candidate_after_supervisor_sigkill(self) -> None:

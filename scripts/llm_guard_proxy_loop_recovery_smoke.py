@@ -68,6 +68,7 @@ class ScopeFence(NamedTuple):
     control_group: str
     events_fd: int
     kill_fd: int
+    worker_identity: ProcessIdentity
 
 
 class SupervisorHandle(NamedTuple):
@@ -1193,6 +1194,7 @@ def _close_scope_fence(scope: ScopeFence) -> None:
             os.close(fd)
         except OSError:
             pass
+    _close_identity_pidfd(scope.worker_identity)
 
 
 def _process_control_group(pid: int) -> str:
@@ -1204,41 +1206,61 @@ def _process_control_group(pid: int) -> str:
 
 
 def _establish_scope_fence(
-    control: socket.socket, unit: str, pid: int, deadline: float
+    control: socket.socket, unit: str, _wrapper_pid: int, deadline: float
 ) -> ScopeFence:
     receipt = _recv_supervisor_receipt(control, deadline)
-    if receipt.get("kind") != "scope_ready" or receipt.get("pid") != pid:
+    worker_pid = receipt.get("pid")
+    if (
+        receipt.get("kind") != "scope_ready"
+        or type(worker_pid) is not int
+        or worker_pid <= 1
+    ):
         raise OSError(errno.ESTALE, "scope_worker_identity_invalid")
-    control_group = _process_control_group(pid)
-    parts = Path(control_group).parts
-    if ".." in parts or not parts or parts[-1] != unit:
-        raise OSError(errno.ESTALE, "scope_identity_invalid")
-    cgroup_path = CGROUP_ROOT / control_group.removeprefix("/")
-    if not stat.S_ISDIR(cgroup_path.lstat().st_mode):
-        raise OSError(errno.ENOTDIR, "scope_cgroup_invalid")
-    events_fd = os.open(
-        cgroup_path / "cgroup.events",
-        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-    )
+    worker_identity = capture_process_identity(worker_pid)
+    events_fd: int | None = None
+    kill_fd: int | None = None
     try:
+        control_group = _process_control_group(worker_pid)
+        parts = Path(control_group).parts
+        if ".." in parts or not parts or parts[-1] != unit:
+            raise OSError(errno.ESTALE, "scope_identity_invalid")
+        cgroup_path = CGROUP_ROOT / control_group.removeprefix("/")
+        if not stat.S_ISDIR(cgroup_path.lstat().st_mode):
+            raise OSError(errno.ENOTDIR, "scope_cgroup_invalid")
+        events_fd = os.open(
+            cgroup_path / "cgroup.events",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
         kill_fd = os.open(
             cgroup_path / "cgroup.kill",
             os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
         )
-    except Exception:
-        os.close(events_fd)
-        raise
-    scope = ScopeFence(unit, control_group, events_fd, kill_fd)
-    try:
         populated, removed = _scope_population(events_fd)
         members = {
             int(member) for member in (cgroup_path / "cgroup.procs").read_text().split()
         }
-        if removed or populated != 1 or pid not in members:
+        if removed or populated != 1 or worker_pid not in members:
             raise OSError(errno.ESTALE, "scope_membership_invalid")
-        return scope
+        if (
+            _process_control_group(worker_pid) != control_group
+            or not _same_process(_read_process_identity(worker_pid), worker_identity)
+        ):
+            raise OSError(errno.ESTALE, "scope_worker_identity_changed")
+        return ScopeFence(
+            unit,
+            control_group,
+            events_fd,
+            kill_fd,
+            worker_identity,
+        )
     except Exception:
-        _close_scope_fence(scope)
+        for fd in (events_fd, kill_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        _close_identity_pidfd(worker_identity)
         raise
 
 
@@ -1279,6 +1301,8 @@ def _fence_supervisor_scope(
             "scope_fence_established": True,
             "scope_unit": scope.unit,
             "scope_control_group": scope.control_group,
+            "scope_worker_pid": scope.worker_identity.pid,
+            "scope_worker_starttime": scope.worker_identity.starttime,
             "scope_kill_all_sent": kill_sent,
             "scope_populated_final": populated_final,
             "scope_removed": removed,
@@ -1794,10 +1818,10 @@ def start_candidate_supervisor(
     child_control.close()
     deadline = time.monotonic() + SUPERVISOR_START_TIMEOUT
     scope: ScopeFence | None = None
-    supervisor_identity: ProcessIdentity | None = None
+    wrapper_identity: ProcessIdentity | None = None
     try:
         scope = _establish_scope_fence(parent_control, unit, pid, deadline)
-        supervisor_identity = capture_process_identity(pid)
+        wrapper_identity = capture_process_identity(pid)
         _send_supervisor_packet(
             parent_control,
             {
@@ -1818,7 +1842,7 @@ def start_candidate_supervisor(
         if scope is not None:
             _fence_supervisor_scope(scope_cleanup, scope)
         cleanup = _emergency_supervisor_cleanup(
-            pid, supervisor_identity, parent_control, error
+            pid, wrapper_identity, parent_control, error
         )
         cleanup.update(scope_cleanup)
         raise SupervisorStartError(error, cleanup, False, False) from exc
@@ -1835,7 +1859,7 @@ def start_candidate_supervisor(
         )
         if status is None:
             cleanup = _emergency_supervisor_cleanup(
-                pid, supervisor_identity, parent_control, error
+                pid, wrapper_identity, parent_control, error
             )
         else:
             cleanup_value = receipt.get("process_cleanup")
@@ -1844,7 +1868,7 @@ def start_candidate_supervisor(
             )
             _finalize_supervisor_cleanup(cleanup, status, error)
             parent_control.close()
-            _close_identity_pidfd(supervisor_identity)
+            _close_identity_pidfd(wrapper_identity)
         _fence_supervisor_scope(cleanup, scope)
         raise SupervisorStartError(
             error,
@@ -1853,15 +1877,39 @@ def start_candidate_supervisor(
             bool(receipt.get("exclusive_supervisor")),
         )
 
+    assert scope is not None and wrapper_identity is not None
     try:
-        current_identity = _read_process_identity(pid)
+        current_wrapper = _read_process_identity(pid)
+        current_worker = _read_process_identity(scope.worker_identity.pid)
         receipt_identity = receipt.get("supervisor_identity")
-        if not _same_process(current_identity, supervisor_identity):
-            raise OSError(errno.ESTALE, "supervisor_identity_changed")
+        candidate_identity = receipt.get("candidate_identity")
+        if not _same_process(current_wrapper, wrapper_identity):
+            raise OSError(errno.ESTALE, "scope_wrapper_identity_changed")
+        if not _same_process(current_worker, scope.worker_identity):
+            raise OSError(errno.ESTALE, "scope_worker_identity_changed")
         if not isinstance(receipt_identity, dict) or (
             receipt_identity.get("pid"), receipt_identity.get("starttime")
-        ) != (supervisor_identity.pid, supervisor_identity.starttime):
-            raise OSError(errno.ESTALE, "supervisor_identity_changed")
+        ) != (scope.worker_identity.pid, scope.worker_identity.starttime):
+            raise OSError(errno.ESTALE, "scope_worker_identity_changed")
+        if not isinstance(candidate_identity, dict) or any(
+            type(candidate_identity.get(field)) is not int
+            for field in ("pid", "ppid", "starttime")
+        ):
+            raise OSError(errno.ESTALE, "candidate_lineage_invalid")
+        candidate_pid = candidate_identity["pid"]
+        current_candidate = _read_process_identity(candidate_pid)
+        if current_candidate is None or (
+            current_candidate.pid,
+            current_candidate.ppid,
+            current_candidate.starttime,
+        ) != (
+            candidate_pid,
+            scope.worker_identity.pid,
+            candidate_identity["starttime"],
+        ):
+            raise OSError(errno.ESTALE, "candidate_lineage_invalid")
+        if _process_control_group(candidate_pid) != scope.control_group:
+            raise OSError(errno.ESTALE, "candidate_scope_identity_invalid")
         if not receipt.get("exclusive_supervisor") or not receipt.get(
             "subreaper_enabled"
         ):
@@ -1871,7 +1919,7 @@ def start_candidate_supervisor(
         scope_cleanup = _fence_supervisor_scope({}, scope)
         cleanup = _emergency_supervisor_cleanup(
             pid,
-            supervisor_identity,
+            wrapper_identity,
             parent_control,
             error,
         )
@@ -1887,9 +1935,11 @@ def start_candidate_supervisor(
             "scope_fence_established": True,
             "scope_unit": scope.unit,
             "scope_control_group": scope.control_group,
+            "scope_worker_pid": scope.worker_identity.pid,
+            "scope_worker_starttime": scope.worker_identity.starttime,
         }
     )
-    return SupervisorHandle(pid, supervisor_identity, parent_control, receipt, scope)
+    return SupervisorHandle(pid, wrapper_identity, parent_control, receipt, scope)
 
 
 def _finish_candidate_supervisor(
