@@ -1,0 +1,147 @@
+{
+  "arms": [
+    {
+      "arm": "A",
+      "label": "aeon-guard-max",
+      "run_id": "guardmax-retry4-cap8-c8-20260801-001541",
+      "run_status": "succeeded"
+    },
+    {
+      "arm": "B",
+      "label": "aeon-direct-no-think",
+      "run_id": "bc-rebench-20260729-B-c8",
+      "run_status": "succeeded"
+    },
+    {
+      "arm": "C",
+      "label": "aeon-raw-max",
+      "run_id": "bc-rebench-20260729-C-c8-retry3",
+      "run_status": "succeeded"
+    }
+  ],
+  "content_free": true,
+  "redaction": {
+    "include_blob_stores": false,
+    "include_content_payloads": false,
+    "include_endpoint_addresses": false,
+    "include_private_databases": false,
+    "included_fields": [
+      "case_id",
+      "category",
+      "tier",
+      "status",
+      "score",
+      "speed metadata"
+    ]
+  },
+  "schema_version": 1,
+  "suite": {
+    "planned_cases": 290,
+    "request_contracts": {
+      "A": {
+        "concurrency": 8,
+        "max_tokens": 50000,
+        "model": "aeon-ultimate",
+        "request_fields_declared": [
+          "model",
+          "messages",
+          "stream",
+          "temperature",
+          "top_p",
+          "top_k",
+          "max_tokens",
+          "enable_thinking"
+        ],
+        "request_fields_effective": [
+          "model",
+          "messages",
+          "stream",
+          "temperature",
+          "top_p",
+          "top_k",
+          "max_tokens",
+          "enable_thinking"
+        ],
+        "request_fields_note": "effective fields include runner-injected extensions omitted by the base contract list",
+        "run_id": "guardmax-retry4-cap8-c8-20260801-001541",
+        "sha256": "288c62a626c8637ae0a6d7ea775d855150593ac4864688ba967656b9981dd16d",
+        "temperature": 0.6,
+        "thinking_mode": "top_level_enable_thinking_true",
+        "timeout_seconds": 1800,
+        "top_k": 20,
+        "top_p": 0.95
+      },
+      "B": {
+        "concurrency": 8,
+        "max_tokens": 50000,
+        "model": "aeon-ultimate",
+        "request_fields_declared": [
+          "model",
+          "messages",
+          "stream",
+          "temperature",
+          "top_p",
+          "top_k",
+          "max_tokens"
+        ],
+        "request_fields_effective": [
+          "model",
+          "messages",
+          "stream",
+          "temperature",
+          "top_p",
+          "top_k",
+          "max_tokens",
+          "enable_thinking"
+        ],
+        "request_fields_note": "effective fields include runner-injected extensions omitted by the base contract list",
+        "run_id": "bc-rebench-20260729-B-c8",
+        "sha256": "bc92d13fa9e5aaefdc4b43be94a87a08fac032f553c05bea8a9128016fb6008c",
+        "temperature": 0.6,
+        "thinking_mode": "top_level_enable_thinking_false",
+        "timeout_seconds": 1800,
+        "top_k": 20,
+        "top_p": 0.95
+      },
+      "C": {
+        "concurrency": 8,
+        "max_tokens": 50000,
+        "model": "aeon-ultimate",
+        "request_fields_declared": [
+          "model",
+          "messages",
+          "stream",
+          "temperature",
+          "top_p",
+          "top_k",
+          "max_tokens"
+        ],
+        "request_fields_effective": [
+          "model",
+          "messages",
+          "stream",
+          "temperature",
+          "top_p",
+          "top_k",
+          "max_tokens"
+        ],
+        "request_fields_note": "effective fields include runner-injected extensions omitted by the base contract list",
+        "run_id": "bc-rebench-20260729-C-c8-retry3",
+        "sha256": "de3301f96a571a343ab68a5359124967114ef530d5d40543ed51ab764844b684",
+        "temperature": 0.6,
+        "thinking_mode": "listener_default_no_enable_thinking_field",
+        "timeout_seconds": 1800,
+        "top_k": 20,
+        "top_p": 0.95
+      }
+    },
+    "routes": {
+      "A": "aeon-guard-max",
+      "B": "aeon-direct-no-think",
+      "C": "aeon-raw-max"
+    },
+    "same_suite_identity_all_arms": true,
+    "suite_hash": "015c06c71ec7f162",
+    "suite_id": "aeon-suite-v2"
+  }
+}

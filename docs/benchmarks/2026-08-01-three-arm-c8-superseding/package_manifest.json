@@ -1,0 +1,17 @@
+{
+  "content_payloads_excluded": true,
+  "member_path_policy_verified": true,
+  "private_databases_excluded": true,
+  "zip": "aeon_3arm_comparison_redacted.zip",
+  "zip_crc_verified": true,
+  "zip_members": [
+    "arms/A/sanitized_results.csv",
+    "arms/B/sanitized_results.csv",
+    "arms/C/sanitized_results.csv",
+    "comparison.json",
+    "comparison_report.md",
+    "manifest/export.json",
+    "sanitized_manifest.json"
+  ],
+  "zip_sha256": "de5d6fbf11f4ebc217bd849c6431749b9871176924d27c9ded6069a96697bed8"
+}
