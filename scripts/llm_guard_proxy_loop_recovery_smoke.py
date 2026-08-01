@@ -48,6 +48,8 @@ SYS_PIDFD_SEND_SIGNAL = 424
 SYS_PIDFD_OPEN = 434
 PR_SET_CHILD_SUBREAPER = 36
 PR_GET_CHILD_SUBREAPER = 37
+SYSTEMD_RUN_BIN = "/usr/bin/systemd-run"
+CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 
 class ProcessIdentity(NamedTuple):
@@ -61,11 +63,19 @@ class ProcessIdentity(NamedTuple):
     pidfd_errno: int | None = None
 
 
+class ScopeFence(NamedTuple):
+    unit: str
+    control_group: str
+    events_fd: int
+    kill_fd: int
+
+
 class SupervisorHandle(NamedTuple):
     pid: int
     identity: ProcessIdentity
     control: socket.socket
     started_receipt: dict[str, object]
+    scope: ScopeFence
 
 
 class SupervisorStartError(RuntimeError):
@@ -87,6 +97,7 @@ _LIBC = ctypes.CDLL(None, use_errno=True)
 _LIBC.syscall.restype = ctypes.c_long
 _LIBC.prctl.restype = ctypes.c_int
 _EXCLUSIVE_SUPERVISOR_PID: int | None = None
+_SUPERVISOR_TEST_FAILPOINT: str | None = None
 
 
 def _linux_syscall(number: int, *args) -> int:
@@ -1163,6 +1174,137 @@ def _recv_supervisor_receipt(
     return receipt
 
 
+def _scope_population(events_fd: int) -> tuple[int, bool]:
+    try:
+        payload = os.pread(events_fd, 4096, 0).decode("ascii")
+    except OSError as exc:
+        if exc.errno in {errno.ENODEV, errno.ENOENT}:
+            return 0, True
+        raise
+    values = dict(line.split() for line in payload.splitlines())
+    if values.get("populated") not in {"0", "1"}:
+        raise OSError(errno.EIO, "scope_events_invalid")
+    return int(values["populated"]), False
+
+
+def _close_scope_fence(scope: ScopeFence) -> None:
+    for fd in (scope.events_fd, scope.kill_fd):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _process_control_group(pid: int) -> str:
+    lines = (Path("/proc") / str(pid) / "cgroup").read_text(encoding="ascii").splitlines()
+    unified = [line.split("::", 1)[1] for line in lines if line.startswith("0::")]
+    if len(unified) != 1 or not unified[0].startswith("/"):
+        raise OSError(errno.EIO, "unified_cgroup_identity_invalid")
+    return unified[0]
+
+
+def _establish_scope_fence(
+    control: socket.socket, unit: str, pid: int, deadline: float
+) -> ScopeFence:
+    receipt = _recv_supervisor_receipt(control, deadline)
+    if receipt.get("kind") != "scope_ready" or receipt.get("pid") != pid:
+        raise OSError(errno.ESTALE, "scope_worker_identity_invalid")
+    control_group = _process_control_group(pid)
+    parts = Path(control_group).parts
+    if ".." in parts or not parts or parts[-1] != unit:
+        raise OSError(errno.ESTALE, "scope_identity_invalid")
+    cgroup_path = CGROUP_ROOT / control_group.removeprefix("/")
+    if not stat.S_ISDIR(cgroup_path.lstat().st_mode):
+        raise OSError(errno.ENOTDIR, "scope_cgroup_invalid")
+    events_fd = os.open(
+        cgroup_path / "cgroup.events",
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        kill_fd = os.open(
+            cgroup_path / "cgroup.kill",
+            os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except Exception:
+        os.close(events_fd)
+        raise
+    scope = ScopeFence(unit, control_group, events_fd, kill_fd)
+    try:
+        populated, removed = _scope_population(events_fd)
+        members = {
+            int(member) for member in (cgroup_path / "cgroup.procs").read_text().split()
+        }
+        if removed or populated != 1 or pid not in members:
+            raise OSError(errno.ESTALE, "scope_membership_invalid")
+        return scope
+    except Exception:
+        _close_scope_fence(scope)
+        raise
+
+
+def _fence_supervisor_scope(
+    cleanup: dict[str, object], scope: ScopeFence
+) -> dict[str, object]:
+    deadline = time.monotonic() + SUPERVISOR_EMERGENCY_TIMEOUT
+    kill_sent = False
+    populated_final: int | None = None
+    removed = False
+    error: dict[str, str] | None = None
+    try:
+        populated, removed = _scope_population(scope.events_fd)
+        cleanup["scope_populated_initial"] = populated
+        if populated:
+            try:
+                if os.write(scope.kill_fd, b"1") != 1:
+                    raise OSError(errno.EIO, "scope_kill_truncated")
+                kill_sent = True
+            except OSError as exc:
+                if exc.errno not in {errno.ENODEV, errno.ENOENT}:
+                    raise
+        while True:
+            populated_final, removed = _scope_population(scope.events_fd)
+            if populated_final == 0:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError("scope_quiescence_timeout")
+            time.sleep(PROCESS_POLL_INTERVAL)
+    except Exception as exc:
+        error = _stable_error(exc, "scope_fence_failed")
+    finally:
+        _close_scope_fence(scope)
+
+    scope_quiesced = error is None and populated_final == 0
+    cleanup.update(
+        {
+            "scope_fence_established": True,
+            "scope_unit": scope.unit,
+            "scope_control_group": scope.control_group,
+            "scope_kill_all_sent": kill_sent,
+            "scope_populated_final": populated_final,
+            "scope_removed": removed,
+            "scope_quiesced": scope_quiesced,
+            "scope_error": error,
+        }
+    )
+    if scope_quiesced:
+        cleanup.update(
+            {
+                "proxy_exited": True,
+                "ownership_quiesced": True,
+                "group_quiesced": True,
+                "session_quiesced": True,
+                "residual_producer_count_final": 0,
+                "candidate_ownership_quiesced": True,
+            }
+        )
+    else:
+        cleanup["candidate_ownership_quiesced"] = False
+    if kill_sent:
+        cleanup["forced_kill"] = True
+        cleanup["graceful_stop"] = False
+    return cleanup
+
+
 def _wait_supervisor(pid: int, deadline: float) -> int | None:
     while True:
         try:
@@ -1375,6 +1517,84 @@ def _emergency_supervisor_cleanup(
     return _finalize_supervisor_cleanup(cleanup, status, error)
 
 
+def _exclusive_supervisor_worker(control_fd: int) -> int:
+    try:
+        control = socket.socket(fileno=control_fd)
+    except OSError:
+        return 2
+    try:
+        _send_supervisor_packet(
+            control,
+            {"kind": "scope_ready", "pid": os.getpid()},
+            time.monotonic() + SUPERVISOR_START_TIMEOUT,
+        )
+        launch = _recv_supervisor_receipt(
+            control, time.monotonic() + SUPERVISOR_START_TIMEOUT
+        )
+        argv = launch.get("argv")
+        cwd = launch.get("cwd")
+        env = launch.get("env")
+        log_path = launch.get("log_path")
+        test_failpoint = launch.get("test_failpoint")
+        control_timeout = launch.get("control_timeout")
+        if (
+            launch.get("kind") != "launch"
+            or not isinstance(argv, list)
+            or not argv
+            or not all(isinstance(value, str) for value in argv)
+            or not isinstance(cwd, str)
+            or not isinstance(env, dict)
+            or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in env.items()
+            )
+            or not isinstance(log_path, str)
+            or test_failpoint
+            not in {None, "subreaper:EPERM", "pidfd:EMFILE", "pidfd:EPERM"}
+            or not isinstance(control_timeout, (int, float))
+            or not 0 < control_timeout <= 3600
+        ):
+            raise ValueError("supervisor_launch_invalid")
+    except Exception as exc:
+        error = _stable_error(exc, "supervisor_launch_failed")
+        try:
+            _send_supervisor_packet(
+                control,
+                {
+                    "kind": "startup_error",
+                    "exclusive_supervisor": False,
+                    "subreaper_enabled": False,
+                    "supervisor_error": error,
+                    "process_cleanup": stop(None),
+                },
+                time.monotonic() + SUPERVISOR_CLEANUP_TIMEOUT,
+            )
+        except Exception:
+            pass
+        control.close()
+        return 2
+    if isinstance(test_failpoint, str):
+        target, code_name = test_failpoint.split(":", 1)
+        code = getattr(errno, code_name)
+
+        def injected_failure(*_args) -> None:
+            raise OSError(code, os.strerror(code))
+
+        globals()[
+            "_enable_child_subreaper" if target == "subreaper" else "_pidfd_open"
+        ] = injected_failure
+    globals()["SUPERVISOR_CONTROL_TIMEOUT"] = float(control_timeout)
+    _exclusive_supervisor_main(
+        control,
+        argv,
+        Path(cwd),
+        env,
+        Path(log_path),
+        (),
+    )
+    return 1
+
+
 def _exclusive_supervisor_main(
     control: socket.socket,
     argv: list[str],
@@ -1520,6 +1740,10 @@ def start_candidate_supervisor(
 ) -> SupervisorHandle:
     if threading.active_count() != 1:
         raise RuntimeError("supervisor_fork_parent_multithreaded")
+    if not os.access(SYSTEMD_RUN_BIN, os.X_OK):
+        raise RuntimeError("systemd_user_scope_unavailable")
+    unit = f"llm-guard-loop-recovery-{os.getpid()}-{secrets.token_hex(8)}.scope"
+    script = Path(__file__).resolve(strict=True)
     parent_control, child_control = socket.socketpair(
         socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
     )
@@ -1531,26 +1755,65 @@ def start_candidate_supervisor(
         raise
     if pid == 0:
         parent_control.close()
-        _exclusive_supervisor_main(
-            child_control, argv, cwd, env, log_path, inherited_fds
-        )
-        os._exit(1)
+        for fd in inherited_fds:
+            if fd != child_control.fileno():
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        os.set_inheritable(child_control.fileno(), True)
+        try:
+            os.execv(
+                SYSTEMD_RUN_BIN,
+                [
+                    SYSTEMD_RUN_BIN,
+                    "--user",
+                    "--scope",
+                    "--quiet",
+                    "--collect",
+                    f"--unit={unit}",
+                    "--property=KillMode=control-group",
+                    "--property=SendSIGKILL=yes",
+                    "--",
+                    sys.executable,
+                    str(script),
+                    "--exclusive-supervisor-fd",
+                    str(child_control.fileno()),
+                ],
+            )
+        except Exception:
+            os._exit(127)
 
     child_control.close()
-    try:
-        supervisor_identity = capture_process_identity(pid)
-    except Exception as exc:
-        error = _stable_error(exc, "supervisor_identity_capture_failed")
-        cleanup = _emergency_supervisor_cleanup(pid, None, parent_control, error)
-        raise SupervisorStartError(error, cleanup, False, False) from exc
     deadline = time.monotonic() + SUPERVISOR_START_TIMEOUT
+    scope: ScopeFence | None = None
+    supervisor_identity: ProcessIdentity | None = None
     try:
+        scope = _establish_scope_fence(parent_control, unit, pid, deadline)
+        supervisor_identity = capture_process_identity(pid)
+        _send_supervisor_packet(
+            parent_control,
+            {
+                "kind": "launch",
+                "argv": argv,
+                "cwd": str(cwd),
+                "env": env,
+                "log_path": str(log_path),
+                "test_failpoint": _SUPERVISOR_TEST_FAILPOINT,
+                "control_timeout": SUPERVISOR_CONTROL_TIMEOUT,
+            },
+            deadline,
+        )
         receipt = _recv_supervisor_receipt(parent_control, deadline)
     except Exception as exc:
         error = _stable_error(exc, "supervisor_start_receipt_failed")
+        scope_cleanup: dict[str, object] = {}
+        if scope is not None:
+            _fence_supervisor_scope(scope_cleanup, scope)
         cleanup = _emergency_supervisor_cleanup(
             pid, supervisor_identity, parent_control, error
         )
+        cleanup.update(scope_cleanup)
         raise SupervisorStartError(error, cleanup, False, False) from exc
 
     if receipt.get("kind") != "started":
@@ -1575,6 +1838,7 @@ def start_candidate_supervisor(
             _finalize_supervisor_cleanup(cleanup, status, error)
             parent_control.close()
             _close_identity_pidfd(supervisor_identity)
+        _fence_supervisor_scope(cleanup, scope)
         raise SupervisorStartError(
             error,
             cleanup,
@@ -1597,19 +1861,28 @@ def start_candidate_supervisor(
             raise RuntimeError("exclusive_supervisor_not_enabled")
     except Exception as exc:
         error = _stable_error(exc, "supervisor_identity_capture_failed")
+        scope_cleanup = _fence_supervisor_scope({}, scope)
         cleanup = _emergency_supervisor_cleanup(
             pid,
             supervisor_identity,
             parent_control,
             error,
         )
+        cleanup.update(scope_cleanup)
         raise SupervisorStartError(
             error,
             cleanup,
             bool(receipt.get("subreaper_enabled")),
             bool(receipt.get("exclusive_supervisor")),
         ) from exc
-    return SupervisorHandle(pid, supervisor_identity, parent_control, receipt)
+    receipt.update(
+        {
+            "scope_fence_established": True,
+            "scope_unit": scope.unit,
+            "scope_control_group": scope.control_group,
+        }
+    )
+    return SupervisorHandle(pid, supervisor_identity, parent_control, receipt, scope)
 
 
 def _finish_candidate_supervisor(
@@ -1641,14 +1914,17 @@ def _finish_candidate_supervisor(
         )
         handle.control.close()
         _close_identity_pidfd(handle.identity)
-        return cleanup
+        return _fence_supervisor_scope(cleanup, handle.scope)
     except Exception as exc:
         error = control_error or _stable_error(
             exc, "supervisor_cleanup_receipt_failed"
         )
-        return _emergency_supervisor_cleanup(
+        scope_cleanup = _fence_supervisor_scope({}, handle.scope)
+        cleanup = _emergency_supervisor_cleanup(
             handle.pid, handle.identity, handle.control, error
         )
+        cleanup.update(scope_cleanup)
+        return cleanup
 
 
 def stop_candidate_supervisor(handle: SupervisorHandle) -> dict[str, object]:
@@ -1965,6 +2241,14 @@ def acceptance_errors(summary: dict) -> list[str]:
         errors.append("supervisor_not_reaped")
     if not process_cleanup.get("candidate_ownership_quiesced"):
         errors.append("candidate_ownership_not_quiesced")
+    if not process_cleanup.get("scope_fence_established"):
+        errors.append("cleanup_scope_fence_missing")
+    if process_cleanup.get("scope_populated_final") != 0:
+        errors.append("cleanup_scope_populated")
+    if not process_cleanup.get("scope_quiesced"):
+        errors.append("cleanup_scope_not_quiesced")
+    if process_cleanup.get("scope_error"):
+        errors.append("cleanup_scope_failed")
     if process_cleanup.get("supervisor_error"):
         errors.append("supervisor_cleanup_failed")
     if process_cleanup.get("unexpected_exit"):
@@ -2234,4 +2518,6 @@ def _rebindable(port: int) -> bool:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--exclusive-supervisor-fd":
+        raise SystemExit(_exclusive_supervisor_worker(int(sys.argv[2])))
     raise SystemExit(main())

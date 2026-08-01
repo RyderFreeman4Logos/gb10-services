@@ -82,6 +82,10 @@ def passing_summary() -> dict:
             "supervisor_exited": True,
             "supervisor_reaped": True,
             "candidate_ownership_quiesced": True,
+            "scope_fence_established": True,
+            "scope_populated_final": 0,
+            "scope_quiesced": True,
+            "scope_error": None,
             "supervisor_error": None,
             "proxy_exited": True,
             "unexpected_exit": False,
@@ -224,6 +228,12 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
                 "candidate_ownership_quiesced",
                 "candidate_ownership_not_quiesced",
             ),
+            (
+                "process_cleanup",
+                "scope_fence_established",
+                "cleanup_scope_fence_missing",
+            ),
+            ("process_cleanup", "scope_quiesced", "cleanup_scope_not_quiesced"),
         ):
             summary = passing_summary()
             target = summary if scope is None else summary[scope]
@@ -237,6 +247,17 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
             "code": "supervisor_control_timeout",
         }
         self.assertIn("supervisor_cleanup_failed", smoke.acceptance_errors(summary))
+
+        populated = passing_summary()
+        populated["process_cleanup"]["scope_populated_final"] = 1
+        self.assertIn("cleanup_scope_populated", smoke.acceptance_errors(populated))
+
+        scope_error = passing_summary()
+        scope_error["process_cleanup"]["scope_error"] = {
+            "class": "TimeoutError",
+            "code": "scope_quiescence_timeout",
+        }
+        self.assertIn("cleanup_scope_failed", smoke.acceptance_errors(scope_error))
 
     def test_direct_stop_never_claims_unrelated_post_baseline_child(self) -> None:
         child = r"""
@@ -320,6 +341,95 @@ while True:
                     except ChildProcessError:
                         pass
                     smoke._close_identity_pidfd(unrelated_identity)
+
+    def test_parent_scope_fence_kills_candidate_after_supervisor_sigkill(self) -> None:
+        candidate = r"""
+import os, signal, sys, time
+ready = sys.argv[1]
+producer = os.fork()
+if producer == 0:
+    os.setsid()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    while True:
+        time.sleep(1)
+with open(ready, "w", encoding="ascii") as output:
+    output.write(f"{os.getpid()} {producer}")
+    output.flush()
+    os.fsync(output.fileno())
+while True:
+    time.sleep(1)
+"""
+        unrelated_child = r"""
+import os, signal, sys, time
+ready, term = sys.argv[1:]
+signal.signal(signal.SIGTERM, lambda *_: (open(term, "w").write("term"), os._exit(73)))
+open(ready, "w").write("ready")
+while True:
+    time.sleep(1)
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ready = root / "candidate.ready"
+            unrelated_ready = root / "unrelated.ready"
+            unrelated_term = root / "unrelated.term"
+            supervisor = smoke.start_candidate_supervisor(
+                [sys.executable, "-c", candidate, str(ready)],
+                root,
+                os.environ.copy(),
+                root / "candidate.log",
+            )
+            unrelated = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    unrelated_child,
+                    str(unrelated_ready),
+                    str(unrelated_term),
+                ],
+                start_new_session=True,
+            )
+            candidate_pids: list[int] = []
+            try:
+                deadline = time.monotonic() + 2
+                while (
+                    not ready.exists() or not unrelated_ready.exists()
+                ) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                self.assertTrue(unrelated_ready.exists())
+                candidate_pids = [int(pid) for pid in ready.read_text().split()]
+
+                os.kill(supervisor.pid, signal.SIGKILL)
+                started = time.monotonic()
+                cleanup = smoke._finish_candidate_supervisor(supervisor, None)
+
+                self.assertLess(time.monotonic() - started, 2.0)
+                self.assertTrue(supervisor.started_receipt["scope_fence_established"])
+                self.assertTrue(cleanup["scope_fence_established"])
+                self.assertTrue(cleanup["scope_kill_all_sent"])
+                self.assertEqual(cleanup["scope_populated_final"], 0)
+                self.assertTrue(cleanup["scope_quiesced"])
+                self.assertTrue(cleanup["candidate_ownership_quiesced"])
+                self.assertTrue(cleanup["supervisor_reaped"])
+                self.assertTrue(cleanup["forced_kill"])
+                for pid in candidate_pids:
+                    self.assertFalse(smoke.process_identity_is_live(pid))
+                self.assertIsNone(unrelated.poll())
+                self.assertFalse(unrelated_term.exists())
+            finally:
+                if smoke.process_identity_is_live(supervisor.pid):
+                    try:
+                        smoke.stop_candidate_supervisor(supervisor)
+                    except OSError:
+                        pass
+                for pid in candidate_pids:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                if unrelated.poll() is None:
+                    os.killpg(unrelated.pid, signal.SIGKILL)
+                    unrelated.wait(timeout=2)
 
     def test_supervisor_control_failures_cleanup_candidate_bounded(self) -> None:
         candidate = r"""
@@ -556,8 +666,8 @@ while True:
                 ),
                 patch.object(
                     smoke,
-                    "_enable_child_subreaper",
-                    side_effect=PermissionError(errno.EPERM, "denied"),
+                    "_SUPERVISOR_TEST_FAILPOINT",
+                    "subreaper:EPERM",
                 ),
                 redirect_stdout(output),
             ):
@@ -771,8 +881,8 @@ while True:
                         patch.object(sys, "argv", argv),
                         patch.object(
                             smoke,
-                            "_pidfd_open",
-                            side_effect=OSError(code, os.strerror(code)),
+                            "_SUPERVISOR_TEST_FAILPOINT",
+                            f"pidfd:{errno.errorcode[code]}",
                         ),
                         redirect_stdout(output),
                     ):
