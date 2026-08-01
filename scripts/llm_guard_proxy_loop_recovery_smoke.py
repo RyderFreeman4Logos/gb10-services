@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import hashlib
 import json
@@ -34,6 +35,8 @@ PROCESS_TERM_GRACE = 1.0
 PROCESS_STOP_TIMEOUT = 4.0
 PROCESS_POLL_INTERVAL = 0.02
 SCAN_CHUNK_SIZE = 64 * 1024
+SYS_PIDFD_SEND_SIGNAL = 424
+SYS_PIDFD_OPEN = 434
 
 
 class ProcessIdentity(NamedTuple):
@@ -43,6 +46,39 @@ class ProcessIdentity(NamedTuple):
     session: int
     starttime: int
     pidfd: int | None = None
+
+
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_LIBC.syscall.restype = ctypes.c_long
+
+
+def _linux_syscall(number: int, *args) -> int:
+    result = _LIBC.syscall(number, *args)
+    if result == -1:
+        value = ctypes.get_errno()
+        raise OSError(value, os.strerror(value))
+    return result
+
+
+def _pidfd_open(pid: int) -> int:
+    opener = getattr(os, "pidfd_open", None)
+    if opener is not None:
+        return opener(pid)
+    return _linux_syscall(SYS_PIDFD_OPEN, pid, 0)
+
+
+def _pidfd_send_signal(pidfd: int, signum: int) -> None:
+    sender = getattr(signal, "pidfd_send_signal", None)
+    if sender is not None:
+        sender(pidfd, signum)
+        return
+    _linux_syscall(
+        SYS_PIDFD_SEND_SIGNAL,
+        pidfd,
+        signum,
+        ctypes.c_void_p(),
+        0,
+    )
 
 
 def fail(message: str) -> None:
@@ -424,7 +460,7 @@ def capture_spawn_identity(pid: int) -> ProcessIdentity:
     before = _read_process_identity(pid)
     if before is None:
         raise ProcessLookupError(pid)
-    pidfd = os.pidfd_open(pid)
+    pidfd = _pidfd_open(pid)
     after = _read_process_identity(pid)
     if not _same_process(after, before):
         os.close(pidfd)
@@ -492,13 +528,13 @@ def _signal_group(identity: ProcessIdentity, signum: int) -> bool:
 
 def _signal_identity(identity: ProcessIdentity, signum: int) -> bool:
     try:
-        pidfd = os.pidfd_open(identity.pid)
+        pidfd = _pidfd_open(identity.pid)
     except ProcessLookupError:
         return False
     try:
         if not _same_process(_read_process_identity(identity.pid), identity):
             return False
-        signal.pidfd_send_signal(pidfd, signum)
+        _pidfd_send_signal(pidfd, signum)
         return True
     except ProcessLookupError:
         return False

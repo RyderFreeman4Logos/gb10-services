@@ -245,6 +245,36 @@ while True:
                         smoke._signal_group(identity, signal.SIGKILL)
                         proc.wait(timeout=2)
 
+    def test_stop_uses_linux_pidfd_syscalls_when_python_omits_wrappers(self) -> None:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            start_new_session=True,
+        )
+        native_pidfd_open = smoke.os.pidfd_open
+        native_pidfd_send_signal = smoke.signal.pidfd_send_signal
+        identity = None
+        try:
+            with (
+                patch.object(smoke.os, "pidfd_open", None),
+                patch.object(smoke.signal, "pidfd_send_signal", None),
+            ):
+                identity = smoke.capture_spawn_identity(proc.pid)
+                cleanup = smoke.stop(proc, identity)
+            self.assertTrue(cleanup["spawn_identity_captured"])
+            self.assertFalse(cleanup["graceful_stop"])
+            self.assertFalse(cleanup["forced_kill"])
+            self.assertEqual(cleanup["returncode"], -signal.SIGTERM)
+            self.assertTrue(cleanup["group_quiesced"])
+            self.assertTrue(cleanup["session_quiesced"])
+        finally:
+            if proc.returncode is None:
+                pidfd = native_pidfd_open(proc.pid)
+                try:
+                    native_pidfd_send_signal(pidfd, signal.SIGKILL)
+                finally:
+                    os.close(pidfd)
+                proc.wait(timeout=2)
+
     def test_stop_kills_same_session_residual_before_reaping_leader(self) -> None:
         child_ready = r"""
 import os, signal, sys, time
@@ -262,10 +292,12 @@ os.close(writer)
 os.read(reader, 1)
 os.close(reader)
 signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
-with open(ready, "w", encoding="ascii") as receipt:
+receipt_path = ready + ".tmp"
+with open(receipt_path, "w", encoding="ascii") as receipt:
     receipt.write(str(child))
     receipt.flush()
     os.fsync(receipt.fileno())
+os.replace(receipt_path, ready)
 while True:
     time.sleep(1)
 """
