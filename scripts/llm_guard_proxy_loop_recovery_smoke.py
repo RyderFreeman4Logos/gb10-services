@@ -34,6 +34,11 @@ FIXTURE_STOP_TIMEOUT = 2.0
 PROCESS_TERM_GRACE = 1.0
 PROCESS_STOP_TIMEOUT = 4.0
 PROCESS_POLL_INTERVAL = 0.02
+SUPERVISOR_START_TIMEOUT = 5.0
+SUPERVISOR_CONTROL_TIMEOUT = 180.0
+SUPERVISOR_CLEANUP_TIMEOUT = PROCESS_STOP_TIMEOUT + 2.0
+SUPERVISOR_EMERGENCY_TIMEOUT = PROCESS_STOP_TIMEOUT * 2 + 2.0
+SUPERVISOR_MESSAGE_LIMIT = 16 * 1024
 SCAN_CHUNK_SIZE = 64 * 1024
 SCAN_MAX_ENTRIES = 2_048
 SCAN_MAX_FILE_BYTES = 64 * 1024 * 1024
@@ -56,9 +61,32 @@ class ProcessIdentity(NamedTuple):
     pidfd_errno: int | None = None
 
 
+class SupervisorHandle(NamedTuple):
+    pid: int
+    identity: ProcessIdentity
+    control: socket.socket
+    started_receipt: dict[str, object]
+
+
+class SupervisorStartError(RuntimeError):
+    def __init__(
+        self,
+        error: dict[str, str],
+        cleanup: dict[str, object],
+        subreaper_enabled: bool,
+        exclusive_supervisor: bool,
+    ) -> None:
+        super().__init__(error["code"])
+        self.error = error
+        self.cleanup = cleanup
+        self.subreaper_enabled = subreaper_enabled
+        self.exclusive_supervisor = exclusive_supervisor
+
+
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _LIBC.syscall.restype = ctypes.c_long
 _LIBC.prctl.restype = ctypes.c_int
+_EXCLUSIVE_SUPERVISOR_PID: int | None = None
 
 
 def _linux_syscall(number: int, *args) -> int:
@@ -478,12 +506,10 @@ def _same_process(left: ProcessIdentity | None, right: ProcessIdentity) -> bool:
     )
 
 
-def capture_spawn_identity(pid: int) -> ProcessIdentity:
+def capture_process_identity(pid: int) -> ProcessIdentity:
     before = _read_process_identity(pid)
     if before is None:
         raise ProcessLookupError(pid)
-    if before.pgrp != pid or before.session != pid:
-        raise RuntimeError("proxy_not_session_leader")
     pidfd = None
     pidfd_errno = None
     try:
@@ -501,10 +527,6 @@ def capture_spawn_identity(pid: int) -> ProcessIdentity:
             os.close(pidfd)
         raise OSError(errno.ESTALE, "spawn_identity_changed")
     assert after is not None
-    if after.pgrp != pid or after.session != pid:
-        if pidfd is not None:
-            os.close(pidfd)
-        raise RuntimeError("proxy_not_session_leader")
     return ProcessIdentity(
         pid=after.pid,
         state=after.state,
@@ -515,6 +537,15 @@ def capture_spawn_identity(pid: int) -> ProcessIdentity:
         pidfd=pidfd,
         pidfd_errno=pidfd_errno,
     )
+
+
+def capture_spawn_identity(pid: int) -> ProcessIdentity:
+    identity = capture_process_identity(pid)
+    if identity.pgrp != pid or identity.session != pid:
+        if identity.pidfd is not None:
+            os.close(identity.pidfd)
+        raise RuntimeError("proxy_not_session_leader")
+    return identity
 
 
 def process_identity_is_live(pid: int) -> bool:
@@ -558,10 +589,13 @@ def _capture_direct_children() -> dict[int, ProcessIdentity]:
 
 
 def _owned_processes(
-    root: ProcessIdentity,
-    baseline: dict[int, ProcessIdentity],
+    root: ProcessIdentity | None,
     known: dict[int, ProcessIdentity],
+    *,
+    exclusive_supervisor: bool,
 ) -> dict[int, ProcessIdentity]:
+    if exclusive_supervisor and _EXCLUSIVE_SUPERVISOR_PID != os.getpid():
+        raise RuntimeError("exclusive_supervisor_scope_required")
     table = _process_table()
     owned: dict[int, ProcessIdentity] = {}
     for pid, remembered in known.items():
@@ -569,18 +603,17 @@ def _owned_processes(
         if _same_process(current, remembered):
             assert current is not None
             owned[pid] = current
-    current_root = table.get(root.pid)
-    if _same_process(current_root, root):
-        assert current_root is not None
-        owned[root.pid] = current_root
+    if root is not None:
+        current_root = table.get(root.pid)
+        if _same_process(current_root, root):
+            assert current_root is not None
+            owned[root.pid] = current_root
 
-    parent = os.getpid()
-    for pid, current in table.items():
-        baseline_identity = baseline.get(pid)
-        if current.ppid == parent and (
-            baseline_identity is None or not _same_process(current, baseline_identity)
-        ):
-            owned[pid] = current
+    if exclusive_supervisor:
+        parent = os.getpid()
+        for pid, current in table.items():
+            if current.ppid == parent:
+                owned[pid] = current
 
     changed = True
     while changed:
@@ -603,12 +636,12 @@ def _owned_processes(
 
 
 def _reap_adopted(
-    owned: dict[int, ProcessIdentity], root_pid: int
+    owned: dict[int, ProcessIdentity], root_pid: int | None
 ) -> None:
     parent = os.getpid()
     for identity in owned.values():
         if (
-            identity.pid == root_pid
+            (root_pid is not None and identity.pid == root_pid)
             or identity.ppid != parent
             or identity.state != "Z"
         ):
@@ -689,11 +722,12 @@ def _signal_identity(identity: ProcessIdentity, signum: int) -> bool:
 
 def _wait_for_quiescence(
     identity: ProcessIdentity,
-    baseline: dict[int, ProcessIdentity],
     known: dict[int, ProcessIdentity],
     deadline: float,
     signum: int,
     signalled: set[tuple[int, int]],
+    *,
+    exclusive_supervisor: bool,
 ) -> tuple[
     bool,
     dict[int, ProcessIdentity],
@@ -705,9 +739,13 @@ def _wait_for_quiescence(
     sent = False
     signal_error = None
     while True:
-        owned = _owned_processes(identity, baseline, known)
+        owned = _owned_processes(
+            identity, known, exclusive_supervisor=exclusive_supervisor
+        )
         _reap_adopted(owned, identity.pid)
-        owned = _owned_processes(identity, baseline, known)
+        owned = _owned_processes(
+            identity, known, exclusive_supervisor=exclusive_supervisor
+        )
         for member in owned.values():
             key = (member.pid, member.starttime)
             if member.state in {"X", "Z"} or key in signalled:
@@ -734,10 +772,15 @@ def _wait_for_quiescence(
         time.sleep(min(PROCESS_POLL_INTERVAL, remaining))
 
 
-def wait_port(port: int, proc: subprocess.Popen[bytes], deadline: float) -> None:
+def wait_port(port: int, supervisor: SupervisorHandle, deadline: float) -> None:
     while time.monotonic() < deadline:
-        if _child_exited(proc.pid):
-            fail("proxy_exit_before_ready")
+        current = _read_process_identity(supervisor.pid)
+        if (
+            current is None
+            or not _same_process(current, supervisor.identity)
+            or current.state in {"X", "Z"}
+        ):
+            fail("supervisor_exit_before_ready")
         with socket.socket() as sock:
             sock.settimeout(0.15)
             if sock.connect_ex(("127.0.0.1", port)) == 0:
@@ -784,11 +827,99 @@ def _stable_error(exc: Exception, fallback: str) -> dict[str, str]:
     return {"class": type(exc).__name__, "code": code}
 
 
+def _stop_uncaptured_exclusive(
+    proc: subprocess.Popen[bytes],
+    cleanup: dict[str, object],
+    deadline: float,
+) -> dict[str, object]:
+    known: dict[int, ProcessIdentity] = {}
+    cleanup["unexpected_exit"] = proc.poll() is not None
+    quiesced = False
+    for signum, phase_deadline in (
+        (
+            signal.SIGTERM,
+            min(deadline, time.monotonic() + PROCESS_TERM_GRACE),
+        ),
+        (signal.SIGKILL, deadline),
+    ):
+        if signum == signal.SIGKILL and quiesced:
+            break
+        if signum == signal.SIGKILL:
+            cleanup["forced_kill"] = True
+        signalled: set[tuple[int, int]] = set()
+        while True:
+            owned = _owned_processes(
+                None, known, exclusive_supervisor=True
+            )
+            _reap_adopted(owned, proc.pid)
+            proc.poll()
+            owned = _owned_processes(
+                None, known, exclusive_supervisor=True
+            )
+            live = [
+                member
+                for member in owned.values()
+                if member.state not in {"X", "Z"}
+            ]
+            for member in live:
+                key = (member.pid, member.starttime)
+                if key in signalled:
+                    continue
+                if _signal_identity(member, signum):
+                    signalled.add(key)
+                    cleanup["term_sent" if signum == signal.SIGTERM else "kill_sent"] = True
+            if proc.returncode is not None and not live:
+                quiesced = True
+                break
+            remaining = phase_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(PROCESS_POLL_INTERVAL, remaining))
+        if signum == signal.SIGTERM and not quiesced:
+            cleanup["residual_producer_count_before_kill"] = len(live)
+
+    final_owned: dict[int, ProcessIdentity] = {}
+    try:
+        while True:
+            final_owned = _owned_processes(
+                None, known, exclusive_supervisor=True
+            )
+            _reap_adopted(final_owned, proc.pid)
+            proc.poll()
+            final_owned = _owned_processes(
+                None, known, exclusive_supervisor=True
+            )
+            if not final_owned or time.monotonic() >= deadline:
+                break
+            time.sleep(
+                min(PROCESS_POLL_INTERVAL, max(0.0, deadline - time.monotonic()))
+            )
+    except Exception as exc:
+        cleanup.setdefault(
+            "cleanup_error", _stable_error(exc, "uncaptured_cleanup_failed")
+        )
+    cleanup["returncode"] = proc.returncode
+    cleanup["proxy_exited"] = proc.returncode is not None
+    cleanup["ownership_quiesced"] = not final_owned
+    cleanup["group_quiesced"] = not final_owned
+    cleanup["session_quiesced"] = not final_owned
+    cleanup["residual_producer_count_final"] = sum(
+        member.state not in {"X", "Z"} for member in final_owned.values()
+    )
+    if cleanup["residual_producer_count_before_kill"] is None and not final_owned:
+        cleanup["residual_producer_count_before_kill"] = 0
+    return cleanup
+
+
 def stop(
     proc: subprocess.Popen[bytes] | None,
     identity: ProcessIdentity | None = None,
     baseline_children: dict[int, ProcessIdentity] | None = None,
+    *,
+    exclusive_supervisor: bool = False,
 ) -> dict[str, object]:
+    if exclusive_supervisor and _EXCLUSIVE_SUPERVISOR_PID != os.getpid():
+        raise RuntimeError("exclusive_supervisor_scope_required")
     cleanup: dict[str, object] = {
         "proxy_exited": proc is None,
         "unexpected_exit": False,
@@ -813,6 +944,8 @@ def stop(
             identity = capture_spawn_identity(proc.pid)
         except Exception as exc:
             cleanup["stop_error"] = _stable_error(exc, "spawn_identity_missing")
+            if exclusive_supervisor:
+                return _stop_uncaptured_exclusive(proc, cleanup, deadline)
             cleanup["unexpected_exit"] = proc.poll() is not None
             try:
                 if proc.returncode is None:
@@ -848,7 +981,10 @@ def stop(
         "session": identity.session,
     }
 
-    baseline = baseline_children or {}
+    # Generic callers may pass the former baseline argument, but it no longer
+    # grants ownership of later direct children. Only the isolated supervisor
+    # may claim all of its direct/adopted children.
+    del baseline_children
     known = {identity.pid: identity}
     group: dict[int, ProcessIdentity] = {}
     session_members: dict[int, ProcessIdentity] = {}
@@ -863,11 +999,11 @@ def stop(
         quiesced, group, session_members, owned, sent, signal_error = (
             _wait_for_quiescence(
                 identity,
-                baseline,
                 known,
                 term_deadline,
                 signal.SIGTERM,
                 set(),
+                exclusive_supervisor=exclusive_supervisor,
             )
         )
         ownership_scan_ok = True
@@ -897,11 +1033,11 @@ def stop(
             quiesced, group, session_members, owned, sent, signal_error = (
                 _wait_for_quiescence(
                     identity,
-                    baseline,
                     known,
                     deadline,
                     signal.SIGKILL,
                     set(),
+                    exclusive_supervisor=exclusive_supervisor,
                 )
             )
             ownership_scan_ok = True
@@ -932,9 +1068,13 @@ def stop(
     final_owned: dict[int, ProcessIdentity] = owned
     try:
         while True:
-            final_owned = _owned_processes(identity, baseline, known)
+            final_owned = _owned_processes(
+                identity, known, exclusive_supervisor=exclusive_supervisor
+            )
             _reap_adopted(final_owned, identity.pid)
-            final_owned = _owned_processes(identity, baseline, known)
+            final_owned = _owned_processes(
+                identity, known, exclusive_supervisor=exclusive_supervisor
+            )
             if not final_owned or time.monotonic() >= deadline:
                 break
             time.sleep(
@@ -973,6 +1113,546 @@ def stop(
         and "stop_error" not in cleanup
     )
     return cleanup
+
+
+def _identity_receipt(identity: ProcessIdentity) -> dict[str, int]:
+    return {
+        "pid": identity.pid,
+        "ppid": identity.ppid,
+        "starttime": identity.starttime,
+        "pgid": identity.pgrp,
+        "session": identity.session,
+    }
+
+
+def _send_supervisor_packet(
+    control: socket.socket,
+    packet: bytes | dict[str, object],
+    deadline: float,
+) -> None:
+    payload = (
+        packet
+        if isinstance(packet, bytes)
+        else json.dumps(packet, sort_keys=True, separators=(",", ":")).encode()
+    )
+    if not payload or len(payload) > SUPERVISOR_MESSAGE_LIMIT:
+        raise OSError(errno.E2BIG, "supervisor_message_invalid")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("supervisor_send_timeout")
+    control.settimeout(remaining)
+    if control.send(payload) != len(payload):
+        raise OSError(errno.EIO, "supervisor_message_truncated")
+
+
+def _recv_supervisor_receipt(
+    control: socket.socket, deadline: float
+) -> dict[str, object]:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("supervisor_receipt_timeout")
+    control.settimeout(remaining)
+    payload = control.recv(SUPERVISOR_MESSAGE_LIMIT + 1)
+    if not payload:
+        raise EOFError("supervisor_receipt_eof")
+    if len(payload) > SUPERVISOR_MESSAGE_LIMIT:
+        raise OSError(errno.E2BIG, "supervisor_receipt_too_large")
+    receipt = json.loads(payload)
+    if not isinstance(receipt, dict):
+        raise ValueError("supervisor_receipt_invalid")
+    return receipt
+
+
+def _wait_supervisor(pid: int, deadline: float) -> int | None:
+    while True:
+        try:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return None
+        if waited == pid:
+            return status
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(PROCESS_POLL_INTERVAL, remaining))
+
+
+def _close_identity_pidfd(identity: ProcessIdentity | None) -> None:
+    if identity is not None and identity.pidfd is not None:
+        try:
+            os.close(identity.pidfd)
+        except OSError:
+            pass
+
+
+def _finalize_supervisor_cleanup(
+    cleanup: dict[str, object],
+    status: int | None,
+    error: dict[str, str] | None = None,
+) -> dict[str, object]:
+    cleanup["exclusive_supervisor"] = bool(cleanup.get("exclusive_supervisor"))
+    cleanup["supervisor_exited"] = status is not None
+    cleanup["supervisor_reaped"] = status is not None
+    cleanup["supervisor_exitcode"] = (
+        os.waitstatus_to_exitcode(status) if status is not None else None
+    )
+    cleanup["candidate_ownership_quiesced"] = bool(
+        cleanup.get("proxy_exited")
+        and cleanup.get("ownership_quiesced")
+        and cleanup.get("residual_producer_count_final") == 0
+    )
+    if error is not None and not cleanup.get("supervisor_error"):
+        cleanup["supervisor_error"] = error
+    if (
+        cleanup["supervisor_exitcode"] not in (None, 0)
+        and not cleanup.get("supervisor_error")
+    ):
+        cleanup["supervisor_error"] = {
+            "class": "RuntimeError",
+            "code": "supervisor_exit_nonzero",
+        }
+    cleanup.setdefault("supervisor_error", None)
+    return cleanup
+
+
+def _descendant_processes(
+    root: ProcessIdentity, table: dict[int, ProcessIdentity]
+) -> dict[int, ProcessIdentity]:
+    current_root = table.get(root.pid)
+    if not _same_process(current_root, root):
+        return {}
+    descendants: dict[int, ProcessIdentity] = {}
+    changed = True
+    while changed:
+        changed = False
+        parents = {root.pid, *descendants}
+        for pid, current in table.items():
+            if pid not in descendants and current.ppid in parents:
+                descendants[pid] = current
+                changed = True
+    return descendants
+
+
+def _signal_external_identity(
+    identity: ProcessIdentity,
+    signum: int,
+    owner: ProcessIdentity,
+) -> bool:
+    close_pidfd = False
+    try:
+        if identity.pidfd is not None:
+            pidfd = identity.pidfd
+        else:
+            pidfd = _pidfd_open(identity.pid)
+            close_pidfd = True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        table = _process_table()
+        current = table.get(identity.pid)
+        if not _same_process(current, identity):
+            return False
+        if identity.pid != owner.pid and identity.pid not in _descendant_processes(
+            owner, table
+        ):
+            return False
+        os.kill(identity.pid, signum)
+        return True
+    try:
+        if not _same_process(_read_process_identity(identity.pid), identity):
+            return False
+        _pidfd_send_signal(pidfd, signum)
+        return True
+    except ProcessLookupError:
+        return False
+    finally:
+        if close_pidfd:
+            os.close(pidfd)
+
+
+def _emergency_supervisor_cleanup(
+    pid: int,
+    identity: ProcessIdentity | None,
+    control: socket.socket,
+    error: dict[str, str],
+) -> dict[str, object]:
+    deadline = time.monotonic() + SUPERVISOR_EMERGENCY_TIMEOUT
+    try:
+        control.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+    try:
+        receipt = _recv_supervisor_receipt(
+            control,
+            min(deadline, time.monotonic() + SUPERVISOR_CLEANUP_TIMEOUT),
+        )
+    except Exception:
+        receipt = None
+    late_cleanup: dict[str, object] | None = None
+    cleanup_value = receipt.get("process_cleanup") if isinstance(receipt, dict) else None
+    if isinstance(cleanup_value, dict):
+        late_cleanup = cleanup_value
+        status = _wait_supervisor(
+            pid, min(deadline, time.monotonic() + PROCESS_TERM_GRACE)
+        )
+        if status is not None:
+            cleanup = _finalize_supervisor_cleanup(late_cleanup, status, error)
+            control.close()
+            _close_identity_pidfd(identity)
+            return cleanup
+
+    if identity is None:
+        try:
+            identity = capture_process_identity(pid)
+        except Exception:
+            identity = None
+    if identity is not None:
+        try:
+            _signal_external_identity(identity, signal.SIGTERM, identity)
+        except OSError:
+            pass
+    status = _wait_supervisor(
+        pid, min(deadline, time.monotonic() + PROCESS_TERM_GRACE)
+    )
+
+    known: dict[int, ProcessIdentity] = {}
+    if status is None and identity is not None:
+        try:
+            _signal_external_identity(identity, signal.SIGSTOP, identity)
+        except OSError:
+            pass
+        stable = 0
+        previous: set[tuple[int, int]] = set()
+        while stable < 2 and time.monotonic() < deadline:
+            descendants = _descendant_processes(identity, _process_table())
+            for member in descendants.values():
+                known[member.pid] = member
+                if member.state not in {"X", "Z"}:
+                    try:
+                        _signal_external_identity(member, signal.SIGSTOP, identity)
+                    except OSError:
+                        pass
+            current = {(item.pid, item.starttime) for item in descendants.values()}
+            stable = stable + 1 if current == previous else 0
+            previous = current
+            time.sleep(PROCESS_POLL_INTERVAL)
+        for member in known.values():
+            if member.state not in {"X", "Z"}:
+                try:
+                    _signal_external_identity(member, signal.SIGKILL, identity)
+                except OSError:
+                    pass
+        try:
+            _signal_external_identity(identity, signal.SIGKILL, identity)
+        except OSError:
+            pass
+        status = _wait_supervisor(pid, deadline)
+
+    while time.monotonic() < deadline:
+        remaining = [
+            member
+            for member in known.values()
+            if _same_process(_read_process_identity(member.pid), member)
+        ]
+        if not remaining:
+            break
+        time.sleep(PROCESS_POLL_INTERVAL)
+    else:
+        remaining = list(known.values())
+
+    control.close()
+    _close_identity_pidfd(identity)
+    cleanup = late_cleanup or stop(None)
+    cleanup.update(
+        {
+            "exclusive_supervisor": True,
+            "ownership_quiesced": not remaining,
+            "group_quiesced": not remaining,
+            "session_quiesced": not remaining,
+            "residual_producer_count_final": len(remaining),
+        }
+    )
+    return _finalize_supervisor_cleanup(cleanup, status, error)
+
+
+def _exclusive_supervisor_main(
+    control: socket.socket,
+    argv: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    log_path: Path,
+    inherited_fds: tuple[int, ...],
+) -> None:
+    global _EXCLUSIVE_SUPERVISOR_PID
+    proc: subprocess.Popen[bytes] | None = None
+    identity: ProcessIdentity | None = None
+    log = None
+    started = False
+    subreaper_enabled = False
+    supervisor_error: dict[str, str] | None = None
+    stop_requested = False
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+
+    try:
+        for fd in inherited_fds:
+            if fd != control.fileno():
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        os.setsid()
+        _enable_child_subreaper()
+        subreaper_enabled = True
+        _EXCLUSIVE_SUPERVISOR_PID = os.getpid()
+        signal.signal(signal.SIGTERM, request_stop)
+        log = log_path.open("wb")
+        proc = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        identity = capture_spawn_identity(proc.pid)
+        if identity.pidfd_errno is not None:
+            raise OSError(identity.pidfd_errno, os.strerror(identity.pidfd_errno))
+        supervisor_identity = _read_process_identity(os.getpid())
+        if supervisor_identity is None:
+            raise ProcessLookupError(os.getpid())
+        _send_supervisor_packet(
+            control,
+            {
+                "kind": "started",
+                "exclusive_supervisor": True,
+                "subreaper_enabled": True,
+                "candidate_identity": _identity_receipt(identity),
+                "pidfd_available": True,
+                "supervisor_identity": _identity_receipt(supervisor_identity),
+            },
+            time.monotonic() + SUPERVISOR_START_TIMEOUT,
+        )
+        started = True
+        control_deadline = time.monotonic() + SUPERVISOR_CONTROL_TIMEOUT
+        while True:
+            if stop_requested:
+                supervisor_error = {
+                    "class": "SignalExit",
+                    "code": "supervisor_parent_signal",
+                }
+                break
+            if _child_exited(identity.pid):
+                supervisor_error = {
+                    "class": "RuntimeError",
+                    "code": "proxy_exit_before_stop",
+                }
+                break
+            remaining = control_deadline - time.monotonic()
+            if remaining <= 0:
+                supervisor_error = {
+                    "class": "TimeoutError",
+                    "code": "supervisor_control_timeout",
+                }
+                break
+            control.settimeout(min(PROCESS_POLL_INTERVAL, remaining))
+            try:
+                command = control.recv(SUPERVISOR_MESSAGE_LIMIT + 1)
+            except socket.timeout:
+                continue
+            except (ConnectionError, OSError):
+                command = b""
+            if not command:
+                supervisor_error = {
+                    "class": "EOFError",
+                    "code": "supervisor_parent_eof",
+                }
+            elif command != b"stop":
+                supervisor_error = {
+                    "class": "ValueError",
+                    "code": "supervisor_invalid_control",
+                }
+            break
+    except Exception as exc:
+        supervisor_error = _stable_error(exc, "supervisor_start_failed")
+    finally:
+        cleanup = stop(
+            proc,
+            identity,
+            exclusive_supervisor=subreaper_enabled,
+        )
+        cleanup["exclusive_supervisor"] = subreaper_enabled
+        cleanup["candidate_ownership_quiesced"] = bool(
+            cleanup.get("proxy_exited")
+            and cleanup.get("ownership_quiesced")
+            and cleanup.get("residual_producer_count_final") == 0
+        )
+        cleanup["supervisor_error"] = supervisor_error
+        receipt = {
+            "kind": "cleanup" if started else "startup_failed",
+            "exclusive_supervisor": subreaper_enabled,
+            "subreaper_enabled": subreaper_enabled,
+            "supervisor_error": supervisor_error,
+            "process_cleanup": cleanup,
+        }
+        try:
+            _send_supervisor_packet(
+                control,
+                receipt,
+                time.monotonic() + SUPERVISOR_CLEANUP_TIMEOUT,
+            )
+        except Exception:
+            pass
+        if log is not None:
+            log.close()
+        control.close()
+        os._exit(0 if cleanup["candidate_ownership_quiesced"] else 1)
+
+
+def start_candidate_supervisor(
+    argv: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    log_path: Path,
+    inherited_fds: tuple[int, ...] = (),
+) -> SupervisorHandle:
+    if threading.active_count() != 1:
+        raise RuntimeError("supervisor_fork_parent_multithreaded")
+    parent_control, child_control = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
+    )
+    try:
+        pid = os.fork()
+    except Exception:
+        parent_control.close()
+        child_control.close()
+        raise
+    if pid == 0:
+        parent_control.close()
+        _exclusive_supervisor_main(
+            child_control, argv, cwd, env, log_path, inherited_fds
+        )
+        os._exit(1)
+
+    child_control.close()
+    try:
+        supervisor_identity = capture_process_identity(pid)
+    except Exception as exc:
+        error = _stable_error(exc, "supervisor_identity_capture_failed")
+        cleanup = _emergency_supervisor_cleanup(pid, None, parent_control, error)
+        raise SupervisorStartError(error, cleanup, False, False) from exc
+    deadline = time.monotonic() + SUPERVISOR_START_TIMEOUT
+    try:
+        receipt = _recv_supervisor_receipt(parent_control, deadline)
+    except Exception as exc:
+        error = _stable_error(exc, "supervisor_start_receipt_failed")
+        cleanup = _emergency_supervisor_cleanup(
+            pid, supervisor_identity, parent_control, error
+        )
+        raise SupervisorStartError(error, cleanup, False, False) from exc
+
+    if receipt.get("kind") != "started":
+        status = _wait_supervisor(
+            pid, time.monotonic() + SUPERVISOR_CLEANUP_TIMEOUT
+        )
+        error_value = receipt.get("supervisor_error")
+        error = (
+            error_value
+            if isinstance(error_value, dict)
+            else {"class": "RuntimeError", "code": "supervisor_start_failed"}
+        )
+        if status is None:
+            cleanup = _emergency_supervisor_cleanup(
+                pid, supervisor_identity, parent_control, error
+            )
+        else:
+            cleanup_value = receipt.get("process_cleanup")
+            cleanup = (
+                cleanup_value if isinstance(cleanup_value, dict) else stop(None)
+            )
+            _finalize_supervisor_cleanup(cleanup, status, error)
+            parent_control.close()
+            _close_identity_pidfd(supervisor_identity)
+        raise SupervisorStartError(
+            error,
+            cleanup,
+            bool(receipt.get("subreaper_enabled")),
+            bool(receipt.get("exclusive_supervisor")),
+        )
+
+    try:
+        current_identity = _read_process_identity(pid)
+        receipt_identity = receipt.get("supervisor_identity")
+        if not _same_process(current_identity, supervisor_identity):
+            raise OSError(errno.ESTALE, "supervisor_identity_changed")
+        if not isinstance(receipt_identity, dict) or (
+            receipt_identity.get("pid"), receipt_identity.get("starttime")
+        ) != (supervisor_identity.pid, supervisor_identity.starttime):
+            raise OSError(errno.ESTALE, "supervisor_identity_changed")
+        if not receipt.get("exclusive_supervisor") or not receipt.get(
+            "subreaper_enabled"
+        ):
+            raise RuntimeError("exclusive_supervisor_not_enabled")
+    except Exception as exc:
+        error = _stable_error(exc, "supervisor_identity_capture_failed")
+        cleanup = _emergency_supervisor_cleanup(
+            pid,
+            supervisor_identity,
+            parent_control,
+            error,
+        )
+        raise SupervisorStartError(
+            error,
+            cleanup,
+            bool(receipt.get("subreaper_enabled")),
+            bool(receipt.get("exclusive_supervisor")),
+        ) from exc
+    return SupervisorHandle(pid, supervisor_identity, parent_control, receipt)
+
+
+def _finish_candidate_supervisor(
+    handle: SupervisorHandle, command: bytes | None
+) -> dict[str, object]:
+    deadline = time.monotonic() + SUPERVISOR_CLEANUP_TIMEOUT
+    control_error: dict[str, str] | None = None
+    if command is not None:
+        try:
+            _send_supervisor_packet(handle.control, command, deadline)
+        except Exception as exc:
+            control_error = _stable_error(exc, "supervisor_control_send_failed")
+            try:
+                handle.control.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+    try:
+        receipt = _recv_supervisor_receipt(handle.control, deadline)
+        cleanup_value = receipt.get("process_cleanup")
+        if receipt.get("kind") != "cleanup" or not isinstance(
+            cleanup_value, dict
+        ):
+            raise ValueError("supervisor_cleanup_receipt_invalid")
+        status = _wait_supervisor(handle.pid, deadline)
+        if status is None:
+            raise TimeoutError("supervisor_exit_timeout")
+        cleanup = _finalize_supervisor_cleanup(
+            cleanup_value, status, control_error
+        )
+        handle.control.close()
+        _close_identity_pidfd(handle.identity)
+        return cleanup
+    except Exception as exc:
+        error = control_error or _stable_error(
+            exc, "supervisor_cleanup_receipt_failed"
+        )
+        return _emergency_supervisor_cleanup(
+            handle.pid, handle.identity, handle.control, error
+        )
+
+
+def stop_candidate_supervisor(handle: SupervisorHandle) -> dict[str, object]:
+    return _finish_candidate_supervisor(handle, b"stop")
 
 
 def stop_fixture_server(
@@ -1231,6 +1911,8 @@ def acceptance_errors(summary: dict) -> list[str]:
         errors.append("execution_failed")
     if not summary.get("subreaper_enabled"):
         errors.append("child_subreaper_not_enabled")
+    if not summary.get("exclusive_supervisor"):
+        errors.append("exclusive_supervisor_missing")
     errors.extend(summary.get("fixture_errors", []))
 
     attempts = summary.get("attempts", [])
@@ -1275,6 +1957,16 @@ def acceptance_errors(summary: dict) -> list[str]:
         errors.append("fresh_client_failed")
 
     process_cleanup = summary.get("process_cleanup", {})
+    if not process_cleanup.get("exclusive_supervisor"):
+        errors.append("cleanup_supervisor_not_exclusive")
+    if not process_cleanup.get("supervisor_exited"):
+        errors.append("supervisor_not_exited")
+    if not process_cleanup.get("supervisor_reaped"):
+        errors.append("supervisor_not_reaped")
+    if not process_cleanup.get("candidate_ownership_quiesced"):
+        errors.append("candidate_ownership_not_quiesced")
+    if process_cleanup.get("supervisor_error"):
+        errors.append("supervisor_cleanup_failed")
     if process_cleanup.get("unexpected_exit"):
         errors.append("proxy_unexpected_exit")
     if process_cleanup.get("forced_kill"):
@@ -1356,6 +2048,7 @@ def main() -> int:
         "ports": {"fake": fake_port, "guard": guard_port},
         "execution_error": None,
         "subreaper_enabled": False,
+        "exclusive_supervisor": False,
         "scan_limits": {
             "max_entries": SCAN_MAX_ENTRIES,
             "max_file_bytes": SCAN_MAX_FILE_BYTES,
@@ -1364,53 +2057,79 @@ def main() -> int:
         },
         "scan_limits_enforced": False,
     }
-    proc = None
-    process_identity = None
-    baseline_children: dict[int, ProcessIdentity] = {}
+    supervisor = None
+    process_cleanup = None
     server = None
     server_thread = None
     try:
         config, hashes = isolated_config(candidate, root, fake_port, guard_port)
         summary.update(hashes)
-        _enable_child_subreaper()
-        summary["subreaper_enabled"] = True
-        baseline_children = _capture_direct_children()
         server = FixtureHTTPServer(("127.0.0.1", fake_port), fixture.handler(), fixture)
+        env = {"HOME": str(root / "home"), "TMPDIR": str(root / "tmp"), "XDG_CACHE_HOME": str(root / "home" / ".cache"), "XDG_CONFIG_HOME": str(root / "home" / ".config"), "XDG_DATA_HOME": str(root / "home" / ".local" / "share"), "PATH": os.environ["PATH"]}
+        supervisor = start_candidate_supervisor(
+            [
+                str(binary),
+                "--config",
+                str(config),
+                "--guardian-runtime-dir",
+                str(root / "guardian-runtime"),
+            ],
+            root,
+            env,
+            root / "proxy.log",
+            (server.fileno(),),
+        )
+        summary["subreaper_enabled"] = bool(
+            supervisor.started_receipt["subreaper_enabled"]
+        )
+        summary["exclusive_supervisor"] = bool(
+            supervisor.started_receipt["exclusive_supervisor"]
+        )
         server_thread = threading.Thread(
             target=server.serve_forever,
             kwargs={"poll_interval": 0.05},
             daemon=True,
         )
         server_thread.start()
-        env = {"HOME": str(root / "home"), "TMPDIR": str(root / "tmp"), "XDG_CACHE_HOME": str(root / "home" / ".cache"), "XDG_CONFIG_HOME": str(root / "home" / ".config"), "XDG_DATA_HOME": str(root / "home" / ".local" / "share"), "PATH": os.environ["PATH"]}
-        with (root / "proxy.log").open("wb") as log:
-            proc = subprocess.Popen([str(binary), "--config", str(config), "--guardian-runtime-dir", str(root / "guardian-runtime")], cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-            process_identity = capture_spawn_identity(proc.pid)
-            if process_identity.pidfd_errno is not None:
-                raise OSError(
-                    process_identity.pidfd_errno,
-                    os.strerror(process_identity.pidfd_errno),
-                )
-            wait_port(guard_port, proc, time.monotonic() + 20)
-            summary["candidate_full_toml_release_binary_parsed"] = True
-            summary["positive_client"] = client(
-                guard_port,
-                positive_input_marker,
-                positive_output_marker,
-                reasoning_marker,
-                private_prefix_marker,
-            )
-            summary["fresh_client"] = client(
-                guard_port,
-                fresh_input_marker,
-                fresh_output_marker,
-                reasoning_marker,
-                private_prefix_marker,
-            )
+        wait_port(guard_port, supervisor, time.monotonic() + 20)
+        summary["candidate_full_toml_release_binary_parsed"] = True
+        summary["positive_client"] = client(
+            guard_port,
+            positive_input_marker,
+            positive_output_marker,
+            reasoning_marker,
+            private_prefix_marker,
+        )
+        summary["fresh_client"] = client(
+            guard_port,
+            fresh_input_marker,
+            fresh_output_marker,
+            reasoning_marker,
+            private_prefix_marker,
+        )
+    except SupervisorStartError as exc:
+        summary["execution_error"] = exc.error
+        summary["subreaper_enabled"] = exc.subreaper_enabled
+        summary["exclusive_supervisor"] = exc.exclusive_supervisor
+        process_cleanup = exc.cleanup
     except Exception as exc:
         summary["execution_error"] = _stable_error(exc, "execution_failed")
 
-    summary["process_cleanup"] = stop(proc, process_identity, baseline_children)
+    if process_cleanup is None:
+        if supervisor is not None:
+            process_cleanup = stop_candidate_supervisor(supervisor)
+        else:
+            process_cleanup = stop(None)
+            process_cleanup.update(
+                {
+                    "exclusive_supervisor": False,
+                    "supervisor_exited": True,
+                    "supervisor_reaped": True,
+                    "candidate_ownership_quiesced": True,
+                    "supervisor_error": summary["execution_error"],
+                }
+            )
+    summary["process_cleanup"] = process_cleanup
     summary["fixture_cleanup"] = stop_fixture_server(server, server_thread, fixture)
     attempts, fixture_errors = fixture.snapshot()
     summary["attempts"] = attempts
@@ -1447,6 +2166,12 @@ def main() -> int:
 
     lifecycle_final = (
         summary["subreaper_enabled"]
+        and summary["exclusive_supervisor"]
+        and summary["process_cleanup"]["exclusive_supervisor"]
+        and summary["process_cleanup"]["supervisor_exited"]
+        and summary["process_cleanup"]["supervisor_reaped"]
+        and summary["process_cleanup"]["candidate_ownership_quiesced"]
+        and not summary["process_cleanup"]["supervisor_error"]
         and summary["process_cleanup"]["proxy_exited"]
         and summary["process_cleanup"]["ownership_quiesced"]
         and summary["process_cleanup"]["group_quiesced"]

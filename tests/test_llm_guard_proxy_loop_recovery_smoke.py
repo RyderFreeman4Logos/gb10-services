@@ -76,7 +76,13 @@ def passing_summary() -> dict:
         "fresh_negative_pass": True,
         "execution_error": None,
         "subreaper_enabled": True,
+        "exclusive_supervisor": True,
         "process_cleanup": {
+            "exclusive_supervisor": True,
+            "supervisor_exited": True,
+            "supervisor_reaped": True,
+            "candidate_ownership_quiesced": True,
+            "supervisor_error": None,
             "proxy_exited": True,
             "unexpected_exit": False,
             "graceful_stop": True,
@@ -207,6 +213,163 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertTrue(smoke.acceptance_errors(summary))
 
+    def test_exclusive_supervisor_receipts_are_required(self) -> None:
+        for scope, field, code in (
+            (None, "exclusive_supervisor", "exclusive_supervisor_missing"),
+            ("process_cleanup", "exclusive_supervisor", "cleanup_supervisor_not_exclusive"),
+            ("process_cleanup", "supervisor_exited", "supervisor_not_exited"),
+            ("process_cleanup", "supervisor_reaped", "supervisor_not_reaped"),
+            (
+                "process_cleanup",
+                "candidate_ownership_quiesced",
+                "candidate_ownership_not_quiesced",
+            ),
+        ):
+            summary = passing_summary()
+            target = summary if scope is None else summary[scope]
+            target[field] = False
+            with self.subTest(field=field):
+                self.assertIn(code, smoke.acceptance_errors(summary))
+
+        summary = passing_summary()
+        summary["process_cleanup"]["supervisor_error"] = {
+            "class": "TimeoutError",
+            "code": "supervisor_control_timeout",
+        }
+        self.assertIn("supervisor_cleanup_failed", smoke.acceptance_errors(summary))
+
+    def test_direct_stop_never_claims_unrelated_post_baseline_child(self) -> None:
+        child = r"""
+import os, signal, sys, time
+ready = sys.argv[1]
+signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+with open(ready, "w", encoding="ascii") as output:
+    output.write("ready")
+while True:
+    time.sleep(1)
+"""
+        unrelated_child = r"""
+import os, signal, sys, time
+ready, term = sys.argv[1:]
+def terminated(*_):
+    with open(term, "w", encoding="ascii") as output:
+        output.write("term")
+    os._exit(73)
+signal.signal(signal.SIGTERM, terminated)
+with open(ready, "w", encoding="ascii") as output:
+    output.write("ready")
+while True:
+    time.sleep(1)
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate_ready = root / "candidate.ready"
+            unrelated_ready = root / "unrelated.ready"
+            unrelated_term = root / "unrelated.term"
+            baseline = smoke._capture_direct_children()
+            proc = subprocess.Popen(
+                [sys.executable, "-c", child, str(candidate_ready)],
+                start_new_session=True,
+            )
+            identity = smoke.capture_spawn_identity(proc.pid)
+            unrelated = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    unrelated_child,
+                    str(unrelated_ready),
+                    str(unrelated_term),
+                ],
+                start_new_session=True,
+            )
+            unrelated_identity = smoke.capture_spawn_identity(unrelated.pid)
+            try:
+                deadline = time.monotonic() + 2
+                while (
+                    not candidate_ready.exists() or not unrelated_ready.exists()
+                ) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(candidate_ready.exists())
+                self.assertTrue(unrelated_ready.exists())
+
+                cleanup = smoke.stop(proc, identity, baseline)
+                current = smoke._read_process_identity(unrelated.pid)
+
+                self.assertTrue(smoke._same_process(current, unrelated_identity))
+                self.assertIsNone(unrelated.poll())
+                self.assertFalse(unrelated_term.exists())
+                self.assertTrue(cleanup["ownership_quiesced"])
+                self.assertEqual(cleanup["residual_producer_count_final"], 0)
+            finally:
+                if proc.returncode is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        proc.wait(timeout=2)
+                    except ChildProcessError:
+                        pass
+                if unrelated.returncode is None:
+                    try:
+                        os.killpg(unrelated.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        unrelated.wait(timeout=2)
+                    except ChildProcessError:
+                        pass
+                    smoke._close_identity_pidfd(unrelated_identity)
+
+    def test_supervisor_control_failures_cleanup_candidate_bounded(self) -> None:
+        candidate = r"""
+import os, signal, sys, time
+ready = sys.argv[1]
+signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+with open(ready, "w", encoding="ascii") as output:
+    output.write("ready")
+while True:
+    time.sleep(1)
+"""
+        for mode, expected in (
+            ("eof", "supervisor_parent_eof"),
+            ("timeout", "supervisor_control_timeout"),
+            ("invalid", "supervisor_invalid_control"),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                ready = root / "candidate.ready"
+                timeout = 0.5 if mode == "timeout" else smoke.SUPERVISOR_CONTROL_TIMEOUT
+                with patch.object(smoke, "SUPERVISOR_CONTROL_TIMEOUT", timeout):
+                    handle = smoke.start_candidate_supervisor(
+                        [sys.executable, "-c", candidate, str(ready)],
+                        root,
+                        os.environ.copy(),
+                        root / "candidate.log",
+                    )
+                    deadline = time.monotonic() + 2
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(ready.exists())
+                    started = time.monotonic()
+                    if mode == "eof":
+                        handle.control.shutdown(socket.SHUT_WR)
+                        cleanup = smoke._finish_candidate_supervisor(handle, None)
+                    elif mode == "timeout":
+                        cleanup = smoke._finish_candidate_supervisor(handle, None)
+                    else:
+                        cleanup = smoke._finish_candidate_supervisor(handle, b"invalid")
+                    elapsed = time.monotonic() - started
+
+                self.assertLess(elapsed, 2.0)
+                self.assertEqual(cleanup["supervisor_error"]["code"], expected)
+                self.assertTrue(cleanup["proxy_exited"])
+                self.assertTrue(cleanup["ownership_quiesced"])
+                self.assertTrue(cleanup["candidate_ownership_quiesced"])
+                self.assertEqual(cleanup["residual_producer_count_final"], 0)
+                self.assertTrue(cleanup["supervisor_exited"])
+                self.assertTrue(cleanup["supervisor_reaped"])
+
     def test_stop_reports_unexpected_exit_and_graceful_stop(self) -> None:
         child = r"""
 import os, signal, sys, time
@@ -328,12 +491,14 @@ while True:
     time.sleep(1)
 """
         with tempfile.TemporaryDirectory() as tmp:
-            ready = Path(tmp) / "ready"
-            proc = subprocess.Popen(
+            root = Path(tmp)
+            ready = root / "ready"
+            supervisor = smoke.start_candidate_supervisor(
                 [sys.executable, "-c", child_ready, str(ready)],
-                start_new_session=True,
+                root,
+                os.environ.copy(),
+                root / "candidate.log",
             )
-            identity = smoke.capture_spawn_identity(proc.pid)
             try:
                 deadline = time.monotonic() + 2
                 while not ready.exists() and time.monotonic() < deadline:
@@ -341,7 +506,7 @@ while True:
                 self.assertTrue(ready.exists())
                 child_pid = int(ready.read_text())
 
-                cleanup = smoke.stop(proc, identity)
+                cleanup = smoke.stop_candidate_supervisor(supervisor)
                 self.assertGreaterEqual(
                     cleanup["residual_producer_count_before_kill"], 1
                 )
@@ -357,15 +522,11 @@ while True:
                 summary["process_cleanup"] = cleanup
                 self.assertIn("proxy_forced_kill", smoke.acceptance_errors(summary))
             finally:
-                if proc.returncode is None:
+                if smoke.process_identity_is_live(supervisor.pid):
                     try:
-                        smoke._signal_group(identity, signal.SIGKILL)
+                        smoke.stop_candidate_supervisor(supervisor)
                     except OSError:
-                        pass
-                    try:
-                        proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        self.fail("owned process group did not terminate")
+                        self.fail("exclusive supervisor did not terminate")
 
     def test_subreaper_setup_failure_prevents_candidate_spawn(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -408,8 +569,7 @@ while True:
             self.assertFalse(summary["subreaper_enabled"])
             self.assertEqual(summary["execution_error"]["code"], "EPERM")
 
-    def test_stop_owns_sets_id_and_double_fork_producers_past_scan(self) -> None:
-        enable_test_subreaper()
+    def test_exclusive_supervisor_owns_escaped_candidate_not_unrelated_child(self) -> None:
         child = r"""
 import os, signal, sys, time
 mode, ready, root_ready, trigger, late = sys.argv[1:]
@@ -455,14 +615,34 @@ with open(root_ready, "w", encoding="ascii") as output:
 while True:
     time.sleep(1)
 """
-        for mode in ("setsid", "double-fork"):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+        unrelated_child = r"""
+import os, signal, sys, time
+ready, term = sys.argv[1:]
+def terminated(*_):
+    with open(term, "w", encoding="ascii") as output:
+        output.write("term")
+    os._exit(73)
+signal.signal(signal.SIGTERM, terminated)
+with open(ready, "w", encoding="ascii") as output:
+    output.write("ready")
+while True:
+    time.sleep(1)
+"""
+        for mode, trial in (
+            (mode, trial)
+            for mode in ("setsid", "double-fork")
+            for trial in range(3)
+        ):
+            with self.subTest(mode=mode, trial=trial), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 ready = root / "producer.pid"
                 root_ready = root / "root.ready"
                 trigger = root / "post-scan.trigger"
                 late = root / "late-evidence"
-                proc = subprocess.Popen(
+                unrelated_ready = root / "unrelated.ready"
+                unrelated_term = root / "unrelated.term"
+                baseline = smoke._capture_direct_children()
+                supervisor = smoke.start_candidate_supervisor(
                     [
                         sys.executable,
                         "-c",
@@ -473,18 +653,35 @@ while True:
                         str(trigger),
                         str(late),
                     ],
+                    root,
+                    os.environ.copy(),
+                    root / "candidate.log",
+                )
+                unrelated = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        unrelated_child,
+                        str(unrelated_ready),
+                        str(unrelated_term),
+                    ],
                     start_new_session=True,
                 )
-                identity = smoke.capture_spawn_identity(proc.pid)
+                unrelated_identity = smoke.capture_spawn_identity(unrelated.pid)
                 producer_pid = None
                 try:
                     deadline = time.monotonic() + 2
-                    while not root_ready.exists() and time.monotonic() < deadline:
+                    while (
+                        not root_ready.exists() or not unrelated_ready.exists()
+                    ) and time.monotonic() < deadline:
                         time.sleep(0.01)
                     self.assertTrue(root_ready.exists())
+                    self.assertTrue(unrelated_ready.exists())
+                    self.assertNotIn(unrelated.pid, baseline)
                     producer_pid = int(ready.read_text())
 
-                    cleanup = smoke.stop(proc, identity)
+                    cleanup = smoke.stop_candidate_supervisor(supervisor)
+                    unrelated_current = smoke._read_process_identity(unrelated.pid)
                     scan_before = smoke.sensitive_marker_count(
                         root, (b"post-scan-private-marker",)
                     )
@@ -498,6 +695,17 @@ while True:
                     self.assertEqual(scan_before, 0)
                     self.assertFalse(late_write)
                     self.assertFalse(producer_live)
+                    self.assertTrue(cleanup["exclusive_supervisor"])
+                    self.assertTrue(cleanup["supervisor_exited"])
+                    self.assertTrue(cleanup["supervisor_reaped"])
+                    self.assertTrue(cleanup["candidate_ownership_quiesced"])
+                    self.assertTrue(cleanup["group_quiesced"])
+                    self.assertTrue(cleanup["session_quiesced"])
+                    self.assertTrue(
+                        smoke._same_process(unrelated_current, unrelated_identity)
+                    )
+                    self.assertIsNone(unrelated.poll())
+                    self.assertFalse(unrelated_term.exists())
                     self.assertTrue(cleanup["forced_kill"])
                     self.assertGreaterEqual(
                         cleanup["residual_producer_count_before_kill"], 1
@@ -510,12 +718,21 @@ while True:
                         "proxy_forced_kill", smoke.acceptance_errors(summary)
                     )
                 finally:
-                    if proc.returncode is None:
+                    if smoke.process_identity_is_live(supervisor.pid):
                         try:
-                            os.killpg(proc.pid, signal.SIGKILL)
+                            smoke.stop_candidate_supervisor(supervisor)
+                        except OSError:
+                            self.fail("exclusive supervisor did not terminate")
+                    if unrelated.returncode is None:
+                        try:
+                            os.killpg(unrelated.pid, signal.SIGKILL)
                         except ProcessLookupError:
                             pass
-                        proc.wait(timeout=2)
+                        try:
+                            unrelated.wait(timeout=2)
+                        except ChildProcessError:
+                            pass
+                    smoke._close_identity_pidfd(unrelated_identity)
                     if producer_pid is not None:
                         try:
                             os.kill(producer_pid, signal.SIGKILL)
@@ -536,7 +753,6 @@ while True:
                 "time.sleep(60)\n"
             )
             binary.chmod(0o700)
-            real_popen = subprocess.Popen
             for code in (errno.EMFILE, errno.EPERM):
                 with self.subTest(code=errno.errorcode[code]):
                     output = io.StringIO()
@@ -551,36 +767,22 @@ while True:
                         str(root),
                     ]
                     before_fds = fd_count()
-                    spawned: list[subprocess.Popen] = []
-
-                    def spawn(*args, **kwargs):
-                        proc = real_popen(*args, **kwargs)
-                        spawned.append(proc)
-                        return proc
-
-                    try:
-                        with (
-                            patch.object(sys, "argv", argv),
-                            patch.object(smoke.subprocess, "Popen", side_effect=spawn),
-                            patch.object(
-                                smoke,
-                                "_pidfd_open",
-                                side_effect=OSError(code, os.strerror(code)),
-                            ),
-                            redirect_stdout(output),
-                        ):
-                            result = smoke.main()
-                    finally:
-                        for proc in spawned:
-                            if proc.returncode is None:
-                                os.kill(proc.pid, signal.SIGKILL)
-                                proc.wait(timeout=2)
+                    with (
+                        patch.object(sys, "argv", argv),
+                        patch.object(
+                            smoke,
+                            "_pidfd_open",
+                            side_effect=OSError(code, os.strerror(code)),
+                        ),
+                        redirect_stdout(output),
+                    ):
+                        result = smoke.main()
 
                     summary = json.loads(output.getvalue())
                     cleanup = summary["process_cleanup"]
                     self.assertEqual(result, 1)
-                    self.assertEqual(len(spawned), 1)
-                    self.assertFalse(smoke.process_identity_is_live(spawned[0].pid))
+                    spawned_pid = cleanup["spawn_identity"]["pid"]
+                    self.assertFalse(smoke.process_identity_is_live(spawned_pid))
                     self.assertEqual(summary["result"], "FAIL")
                     self.assertEqual(
                         summary["execution_error"]["code"], errno.errorcode[code]
