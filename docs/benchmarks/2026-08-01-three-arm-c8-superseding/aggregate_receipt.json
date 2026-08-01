@@ -1,0 +1,144 @@
+{
+  "arms": {
+    "A": {
+      "contract_sha256": "288c62a626c8637ae0a6d7ea775d855150593ac4864688ba967656b9981dd16d",
+      "full_pass_numeric": 274,
+      "full_pass_rate_planned": 0.9448275862068966,
+      "infra_rows": 0,
+      "ledger_sha256": "f5429fa8dd4d5d0ee03428e8015bcc2e5f4c27c48338b5805c001a13437ad14a",
+      "mean_score_numeric": 0.9480968858131488,
+      "numeric_scores": 289,
+      "observability_receipt_sha256": "c1f9e214bd821262d7b2888ca8d19537958c84de4d338122e3b67f9a66d15ec5",
+      "planned_cases": 290,
+      "progress_field": 290,
+      "provenance_sha256": "60f48e129aa0bc77cab6b55fa2c71ab3660268b3f263761d16562f0287eb5b64",
+      "result_rows": 290,
+      "run_id": "guardmax-retry4-cap8-c8-20260801-001541",
+      "run_status": "succeeded",
+      "runner_sha256": "362ebdbc0ac6f681c9b2fc0e76f786a7f354b738f631586bd3e9ff20f713fb0c",
+      "runner_sha256_source": "arms/A/provenance.json",
+      "status_counts": {
+        "scored": 290
+      },
+      "summary_sha256": "beb44e98fa416a1f537f02875a7f8cc9dba92ae24818b2300161aa4b3268aa6e",
+      "unique_case_ids": 290
+    },
+    "B": {
+      "contract_sha256": "bc92d13fa9e5aaefdc4b43be94a87a08fac032f553c05bea8a9128016fb6008c",
+      "full_pass_numeric": 261,
+      "full_pass_rate_planned": 0.9,
+      "infra_rows": 0,
+      "ledger_sha256": "5451dfc837546a7e039dbeddc4708229bc06523dc059beb275abd36220d008db",
+      "mean_score_numeric": 0.9054209919261823,
+      "numeric_scores": 289,
+      "planned_cases": 290,
+      "progress_field": 290,
+      "result_rows": 290,
+      "run_id": "bc-rebench-20260729-B-c8",
+      "run_status": "succeeded",
+      "runner_sha256": "24c9c565f8769097c63adc5b082c3601a300025d4e3b406dc6c3d91fff4ebc79",
+      "runner_sha256_source": "baseline_20260731_receipt.json",
+      "status_counts": {
+        "scored": 290
+      },
+      "unique_case_ids": 290
+    },
+    "C": {
+      "contract_sha256": "de3301f96a571a343ab68a5359124967114ef530d5d40543ed51ab764844b684",
+      "full_pass_numeric": 279,
+      "full_pass_rate_planned": 0.9620689655172414,
+      "infra_rows": 0,
+      "ledger_sha256": "68cd2d4342ba34b234cbe43bcf567527caaed3e4f2f724b1f03028bc3efb2fbf",
+      "mean_score_numeric": 0.9653979238754326,
+      "numeric_scores": 289,
+      "planned_cases": 290,
+      "progress_field": 291,
+      "result_rows": 290,
+      "run_id": "bc-rebench-20260729-C-c8-retry3",
+      "run_status": "succeeded",
+      "runner_sha256": "24c9c565f8769097c63adc5b082c3601a300025d4e3b406dc6c3d91fff4ebc79",
+      "runner_sha256_source": "baseline_20260731_receipt.json",
+      "status_counts": {
+        "scored": 290
+      },
+      "unique_case_ids": 290
+    }
+  },
+  "content_free": true,
+  "eligibility": {
+    "aligned_non_numeric_case_ids": [
+      "prose.ocean3"
+    ],
+    "all_cases_have_numeric_scores": false,
+    "eligibility_note": "Eligibility requires terminal succeeded ledgers, planned unique coverage, no infra statuses, common suite identity, and identical non-numeric case IDs across arms. Paired results retain their explicit paired-N boundary.",
+    "ledger_complete_all_arms": true,
+    "no_infra_statuses": true,
+    "quality_comparison_eligible": true
+  },
+  "export_policy": {
+    "blob_stores_excluded": true,
+    "content_payloads_excluded": true,
+    "endpoint_addresses_excluded": true,
+    "private_databases_excluded": true
+  },
+  "generated_at": "2026-08-01T03:40:01.464354Z",
+  "provenance": {
+    "baseline_20260731_receipt_sha256": "6c7a798b4e7a9c5ea003deacb5da37c68655fcdeae3fa4fa7e7eb72fdd49a401",
+    "publisher_sha256": "f5210141ab8e6385c707f217974ff1170d48780cef46035ac643dbebb2f48dd0"
+  },
+  "public_assets": {
+    "aeon_3arm_comparison_redacted.zip": {
+      "bytes": 32070,
+      "sha256": "88840ccce3631dfa3b05b1f91ad9a6221bf20b2f15e15978f6c07f6c1b227fcd"
+    },
+    "comparison.json": {
+      "bytes": 16214,
+      "sha256": "333eb075bb0575501aa9b7fba38e20fcb3bc7320b4fa2ac78531c8c33faf4214"
+    },
+    "comparison_report.md": {
+      "bytes": 4208,
+      "sha256": "d9def14b52a5cec26208542d62af6e36ee3039fc2182d381e81a36277d70dea2"
+    },
+    "package_manifest.json": {
+      "bytes": 516,
+      "sha256": "ca2b828bd5d5d1c1738b785275e95c62af1630750f63a08bf4d9a54514f57a8f"
+    },
+    "sanitized_manifest.json": {
+      "bytes": 3996,
+      "sha256": "2a333f6a9a4f367db21ab9ac8697d08e7cc7b74c1a111e484dee83e0c1397062"
+    }
+  },
+  "schema_version": 3,
+  "suite": {
+    "hash": "015c06c71ec7f162",
+    "id": "aeon-suite-v2",
+    "paired_numeric_n": 289,
+    "planned_cases": 290
+  },
+  "supersession": {
+    "consequence": "The previous A score did not measure the intended quality-first Guard behavior and cannot answer the intended Guard-versus-B/C question.",
+    "fixed_source_merges": {
+      "c8_capacity": "3595f27d92146a9014f237eb40221ac2264fef33",
+      "retry_ladder": "cb08bb661bf7459953efa96cf18c21157798dfda"
+    },
+    "intermediate_unpublished_run": {
+      "exclusion_reason": "Profile max_in_flight=4 with benchmark concurrency=8 and queue=0 caused 900 queue_full_rejected observations and 225 infra rows.",
+      "included_as_benchmark_data": false
+    },
+    "invalidity_reasons": [
+      {
+        "code": "wrong_a_route",
+        "reason": "The A arm used aeon-legacy-bounded instead of the intended aeon-guard-max route."
+      },
+      {
+        "code": "retry_ladder_truncated",
+        "reason": "Global retry.max_attempts=1 truncated the configured four-rung ladder to one attempt."
+      }
+    ],
+    "previous_release": {
+      "tag": "aeon-3arm-c8-20260731",
+      "url": "https://github.com/RyderFreeman4Logos/gb10-services/releases/tag/aeon-3arm-c8-20260731"
+    },
+    "superseded": true
+  }
+}
