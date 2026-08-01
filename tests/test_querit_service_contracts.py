@@ -460,6 +460,43 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertEqual(raw_max["loop_guard"]["mode"], "disabled")
         self.assertEqual(len(raw_max["retry"]["ladder"]), 1)
 
+    def test_guard_loop_recovery_is_ephemeral_no_thinking_salvage(self) -> None:
+        config = tomllib.loads(CONFIG.read_text())
+        guarded = next(
+            profile
+            for profile in config["upstreams"]
+            if profile["name"] == "aeon-guard-max"
+        )
+        loop_guard = guarded["loop_guard"]
+        self.assertEqual(loop_guard["on_reasoning_loop"], "truncate_cot_then_answer")
+        self.assertEqual(loop_guard["cot_salvage_prefix_max_bytes"], 32768)
+        self.assertNotIn("cot_salvage_retry_thinking_budget", loop_guard)
+        self.assertEqual(guarded["thinking"]["budget_tokens"], 32768)
+        self.assertEqual(guarded["thinking"]["max_tokens"], 50000)
+        self.assertEqual(guarded["param_override"]["max_tokens"], 50000)
+        self.assertEqual(guarded["max_in_flight_requests"], 8)
+        self.assertEqual(guarded["max_queued_generation_requests"], 0)
+        self.assertEqual(config["retry"]["max_attempts"], 4)
+        self.assertEqual(
+            [
+                (rung["thinking_mode"], rung.get("thinking_token_budget"))
+                for rung in guarded["retry"]["ladder"]
+            ],
+            [
+                ("force_thinking", 32768),
+                ("force_thinking", 16384),
+                ("force_thinking", 8192),
+                ("force_disable", None),
+            ],
+        )
+        self.assertFalse(config["observability"]["capture_raw_payloads"])
+        evidence = config["evidence"]
+        self.assertFalse(evidence["include_raw_payloads"])
+        paired = evidence["shadow"]["paired_comparison"]
+        self.assertFalse(paired["include_raw_input"])
+        self.assertFalse(paired["include_raw_output"])
+        self.assertFalse(paired["include_raw_reasoning"])
+
     def test_guard_uses_vllm_native_thinking_budget_schema_everywhere(self) -> None:
         config = tomllib.loads(CONFIG.read_text())
         profiles = {profile["name"]: profile for profile in config["upstreams"]}

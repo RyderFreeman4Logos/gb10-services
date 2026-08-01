@@ -253,11 +253,10 @@ presence_penalty = 0.0
 [upstreams.loop_guard]
 enabled = true
 mode = "enforce"
-on_reasoning_loop = "bounded_answer_from_cot"
-# Preserve a larger bounded first-attempt private CoT prefix for #211 salvage.
+on_reasoning_loop = "truncate_cot_then_answer"
+# Loop recovery performs one no-thinking synthesis from captured private CoT;
+# it is not an ordinary retry-ladder step. Keep the ladder for other failures.
 cot_salvage_prefix_max_bytes = 32768
-# Give the bounded salvage retry enough thinking budget for a useful answer.
-cot_salvage_retry_thinking_budget = 8192
 normalized_input_window_secs = 120
 max_repeated_inputs = 1
 output_repeated_line_threshold = 24
@@ -565,7 +564,8 @@ enabled = true
 [observability]
 enabled = true
 sqlite_path = "/home/obj/.local/state/llm-guard-proxy/observability.sqlite3"
-capture_raw_payloads = true
+# Keep captured CoT retry-local rather than persisting raw payloads.
+capture_raw_payloads = false
 metrics_enabled = true
 health_upstream_probe_enabled = true
 health_upstream_probe_timeout_ms = 2000
@@ -580,7 +580,7 @@ prune_to_records = 80000
 
 [evidence]
 enabled = true
-include_raw_payloads = true
+include_raw_payloads = false
 include_request_headers = true
 sqlite_path = "/home/obj/.local/state/llm-guard-proxy-evidence/evidence.sqlite3"
 blob_cache_dir = "/home/obj/.cache/llm-guard-proxy-evidence/blobs"
@@ -601,9 +601,9 @@ compare_attempts = ["bounded-thinking", "no-thinking", "cot-salvage"]
 [evidence.shadow.paired_comparison]
 enabled = true
 variants = ["max-thinking", "bounded-thinking", "no-thinking"]
-include_raw_input = true
-include_raw_output = true
-include_raw_reasoning = true
+include_raw_input = false
+include_raw_output = false
+include_raw_reasoning = false
 sample_rate = 1.0
 max_raw_input_bytes = 131072
 max_raw_output_bytes = 131072
