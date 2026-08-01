@@ -342,6 +342,93 @@ while True:
                         pass
                     smoke._close_identity_pidfd(unrelated_identity)
 
+    def test_systemd_run_stdio_preserves_control_after_closing_nonstdio_fds(self) -> None:
+        candidate = r"""
+import os, signal, sys, time
+ready = sys.argv[1]
+signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+with open(ready, "w", encoding="ascii") as output:
+    output.write("ready")
+while True:
+    time.sleep(1)
+"""
+
+        def establish_scope(control, unit, pid, deadline):
+            self.assertEqual(
+                smoke._recv_supervisor_receipt(control, deadline),
+                {"kind": "scope_ready", "pid": pid},
+            )
+            return smoke.ScopeFence(unit, f"/{unit}", -1, -1)
+
+        def fence_scope(cleanup, _scope):
+            cleanup.update(
+                {
+                    "scope_fence_established": True,
+                    "scope_kill_all_sent": False,
+                    "scope_populated_final": 0,
+                    "scope_quiesced": True,
+                    "scope_error": None,
+                }
+            )
+            return cleanup
+
+        before_fds = fd_count()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ready = root / "candidate.ready"
+            bridge = root / "systemd-run"
+            bridge.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "args = sys.argv[1:]\n"
+                "command = args[args.index('--') + 1:]\n"
+                "os.closerange(3, os.sysconf('SC_OPEN_MAX'))\n"
+                "os.execv(command[0], command)\n",
+                encoding="utf-8",
+            )
+            bridge.chmod(0o700)
+            supervisor = None
+            candidate_pid = None
+            with (
+                patch.object(smoke, "SYSTEMD_RUN_BIN", str(bridge)),
+                patch.object(smoke, "_establish_scope_fence", establish_scope),
+                patch.object(smoke, "_fence_supervisor_scope", fence_scope),
+            ):
+                try:
+                    supervisor = smoke.start_candidate_supervisor(
+                        [sys.executable, "-c", candidate, str(ready)],
+                        root,
+                        os.environ.copy(),
+                        root / "candidate.log",
+                    )
+                    candidate_pid = supervisor.started_receipt["candidate_identity"][
+                        "pid"
+                    ]
+                    deadline = time.monotonic() + 2
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(ready.exists())
+
+                    started = time.monotonic()
+                    cleanup = smoke.stop_candidate_supervisor(supervisor)
+
+                    self.assertLess(time.monotonic() - started, 2.0)
+                    self.assertIsNone(cleanup["supervisor_error"])
+                    self.assertTrue(cleanup["candidate_ownership_quiesced"])
+                    self.assertTrue(cleanup["supervisor_exited"])
+                    self.assertTrue(cleanup["supervisor_reaped"])
+                    self.assertFalse(smoke.process_identity_is_live(candidate_pid))
+                finally:
+                    if supervisor is not None and smoke.process_identity_is_live(
+                        supervisor.pid
+                    ):
+                        smoke.stop_candidate_supervisor(supervisor)
+                    if candidate_pid is not None and smoke.process_identity_is_live(
+                        candidate_pid
+                    ):
+                        os.kill(candidate_pid, signal.SIGKILL)
+        self.assertEqual(fd_count(), before_fds)
+
     def test_parent_scope_fence_kills_candidate_after_supervisor_sigkill(self) -> None:
         candidate = r"""
 import os, signal, sys, time

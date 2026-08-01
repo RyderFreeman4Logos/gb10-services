@@ -1520,6 +1520,7 @@ def _emergency_supervisor_cleanup(
 def _exclusive_supervisor_worker(control_fd: int) -> int:
     try:
         control = socket.socket(fileno=control_fd)
+        control.set_inheritable(False)
     except OSError:
         return 2
     try:
@@ -1761,7 +1762,13 @@ def start_candidate_supervisor(
                     os.close(fd)
                 except OSError:
                     pass
-        os.set_inheritable(child_control.fileno(), True)
+        control_fd = child_control.fileno()
+        for stdio_fd in (0, 1):
+            if control_fd != stdio_fd:
+                os.dup2(control_fd, stdio_fd)
+            os.set_inheritable(stdio_fd, True)
+        if control_fd not in (0, 1):
+            child_control.close()
         try:
             os.execv(
                 SYSTEMD_RUN_BIN,
@@ -1778,7 +1785,7 @@ def start_candidate_supervisor(
                     sys.executable,
                     str(script),
                     "--exclusive-supervisor-fd",
-                    str(child_control.fileno()),
+                    "0",
                 ],
             )
         except Exception:
