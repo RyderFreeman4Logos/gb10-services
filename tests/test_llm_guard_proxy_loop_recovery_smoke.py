@@ -15,6 +15,7 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -37,6 +38,56 @@ def enable_test_subreaper() -> None:
 
 def fd_count() -> int:
     return len(os.listdir("/proc/self/fd"))
+
+
+def run_client_fixture(
+    chunks: tuple[bytes, ...],
+    *,
+    content_type: str,
+    chunk_delay: float = 0.0,
+    **client_kwargs: object,
+) -> tuple[dict, list[dict]]:
+    requests: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def do_POST(self) -> None:
+            length = int(self.headers["Content-Length"])
+            requests.append(json.loads(self.rfile.read(length)))
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for chunk in chunks:
+                time.sleep(chunk_delay)
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+            self.close_connection = True
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        result = smoke.client(
+            server.server_port,
+            "input",
+            "expected",
+            "reasoning-private-marker",
+            "prefix-private-marker",
+            **client_kwargs,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    return result, requests
 
 
 def write_forking_systemd_run_bridge(path: Path) -> None:
@@ -112,6 +163,8 @@ def attempt(
     return {
         "number": number,
         "phase": phase,
+        "role": "salvage" if salvage else "primary",
+        "admitted_monotonic_ns": number * 10,
         "thinking_budget": budget,
         "salvage_material_present": salvage,
         "private_prefix_present": private,
@@ -131,10 +184,56 @@ def passing_summary() -> dict:
                 private=True,
             ),
             attempt(3, "fresh", budget=smoke.THINKING_BUDGET),
+            {
+                **attempt(4, "commit_before_recovery", budget=smoke.THINKING_BUDGET),
+                "loop_evidence_started_monotonic_ns": 50,
+                "loop_threshold_monotonic_ns": 51,
+                "loop_evidence_completed_monotonic_ns": 52,
+            },
+            {
+                **attempt(5, "commit_during_recovery", budget=smoke.THINKING_BUDGET),
+                "loop_evidence_started_monotonic_ns": 60,
+                "loop_threshold_monotonic_ns": 70,
+                "loop_evidence_completed_monotonic_ns": 80,
+            },
+            {
+                **attempt(6, "commit_near_first_tick", budget=smoke.THINKING_BUDGET),
+                "loop_evidence_started_monotonic_ns": 90,
+                "loop_threshold_monotonic_ns": 100,
+                "loop_evidence_completed_monotonic_ns": 110,
+            },
         ],
         "fixture_errors": [],
         "positive_pass": True,
         "fresh_negative_pass": True,
+        "positive_client": {
+            "first_downstream_nonempty_monotonic_ns": 25,
+            "downstream_prelude_detected": False,
+        },
+        "commit_boundary_probes": {
+            "verified": True,
+            "blocker": None,
+            "scenarios": {
+                "before_recovery": {
+                    "first_downstream_nonempty_monotonic_ns": 45,
+                    "protocol_valid_terminal_failure": True,
+                    "protocol_error": None,
+                    "heartbeat_count": 1,
+                },
+                "during_recovery": {
+                    "first_downstream_nonempty_monotonic_ns": 75,
+                    "protocol_valid_terminal_failure": True,
+                    "protocol_error": None,
+                    "heartbeat_count": 1,
+                },
+                "near_first_tick": {
+                    "first_downstream_nonempty_monotonic_ns": 105,
+                    "protocol_valid_terminal_failure": True,
+                    "protocol_error": None,
+                    "heartbeat_count": 1,
+                },
+            },
+        },
         "execution_error": None,
         "subreaper_enabled": True,
         "exclusive_supervisor": True,
@@ -239,6 +338,267 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
             attempt(4, "positive", budget=0, salvage=True, private=True)
         )
         self.assertIn("salvage_count", smoke.acceptance_errors(duplicate_salvage))
+
+    def test_client_rejects_nonempty_prelude_before_stream_false_final(self) -> None:
+        final = json.dumps(
+            {"choices": [{"message": {"content": "expected"}}]},
+            separators=(",", ":"),
+        ).encode()
+        final_event = b"event: final\ndata: " + final + b"\n\n"
+        for name, chunks, content_type in (
+            (
+                "heartbeat",
+                (b": heartbeat\n\n", final_event),
+                "text/event-stream",
+            ),
+            (
+                "sse-comment",
+                (b": keepalive\n\n", final_event),
+                "text/event-stream",
+            ),
+            ("json-whitespace", (b" \n", final), "application/json"),
+        ):
+            with self.subTest(name=name):
+                result, requests = run_client_fixture(
+                    chunks, content_type=content_type
+                )
+                self.assertEqual(len(requests), 1)
+                self.assertFalse(requests[0]["stream"])
+                self.assertFalse(result["expected_final"])
+                self.assertTrue(result["downstream_prelude_detected"])
+                self.assertIsInstance(
+                    result["first_downstream_nonempty_monotonic_ns"], int
+                )
+
+    def test_final_acceptance_requires_downstream_commit_boundary(self) -> None:
+        summary = passing_summary()
+        summary["commit_boundary_probes"] = {
+            "verified": False,
+            "blocker": "heartbeat_before_recovery_not_observed",
+        }
+        self.assertIn(
+            "downstream_commit_boundary_unverified",
+            smoke.acceptance_errors(summary),
+        )
+
+    def test_final_acceptance_orders_every_attempt_against_first_downstream_byte(
+        self,
+    ) -> None:
+        summary = passing_summary()
+        for admitted, role, item in zip(
+            (10, 30, 40),
+            ("primary", "salvage", "primary"),
+            summary["attempts"][:3],
+            strict=True,
+        ):
+            item["admitted_monotonic_ns"] = admitted
+            item["role"] = role
+        summary["positive_client"] = {
+            "first_downstream_nonempty_monotonic_ns": 20,
+            "downstream_prelude_detected": True,
+        }
+        self.assertIn(
+            "salvage_after_downstream_commit",
+            smoke.acceptance_errors(summary),
+        )
+
+    def test_client_incrementally_frames_sse_and_bounds_input(self) -> None:
+        final = json.dumps(
+            {"choices": [{"message": {"content": "expected"}}]},
+            separators=(",", ":"),
+        ).encode()
+        frame = b"event: final\r\ndata: " + final + b"\r\n\r\n"
+        result, requests = run_client_fixture(
+            tuple(bytes((byte,)) for byte in frame),
+            content_type="text/event-stream",
+        )
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(result["expected_final"])
+        self.assertFalse(result["downstream_prelude_detected"])
+
+        error = b": heartbeat\r\n\r\nevent: error\r\ndata: {\"error\":{\"code\":\"failed\"}}\r\n\r\n"
+        result, requests = run_client_fixture(
+            tuple(bytes((byte,)) for byte in error),
+            content_type="text/event-stream",
+            stream=True,
+        )
+        self.assertTrue(requests[0]["stream"])
+        self.assertTrue(result["protocol_valid_terminal_failure"])
+        self.assertEqual(result["sse_error_event_count"], 1)
+        self.assertEqual(result["heartbeat_count"], 1)
+
+        done = (
+            b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        result, _ = run_client_fixture(
+            tuple(bytes((byte,)) for byte in done),
+            content_type="text/event-stream",
+            stream=True,
+        )
+        self.assertIsNone(result["protocol_error"])
+        self.assertEqual(result["sse_done_count"], 1)
+
+        result, _ = run_client_fixture(
+            (b"x" * 65,),
+            content_type="application/json",
+            max_response_bytes=64,
+        )
+        self.assertEqual(result["protocol_error"], "response_body_limit")
+
+        result, _ = run_client_fixture(
+            (final,),
+            content_type="application/json",
+            chunk_delay=0.1,
+            deadline_seconds=0.05,
+        )
+        self.assertEqual(result["protocol_error"], "response_deadline")
+
+    def test_isolated_config_preserves_recovery_and_shortens_heartbeat(self) -> None:
+        candidate = ROOT / "config" / "llm-guard-proxy" / "config.toml"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "state").mkdir()
+            derived_path, receipt = smoke.isolated_config(
+                candidate,
+                root,
+                smoke.free_port(),
+                smoke.free_port(),
+            )
+            derived = smoke.tomllib.loads(derived_path.read_text())
+        profile = next(
+            item for item in derived["upstreams"] if item["name"] == "aeon-guard-max"
+        )
+        self.assertEqual(derived["heartbeat"]["interval_secs"], 1)
+        self.assertEqual(profile["thinking"]["budget_tokens"], smoke.THINKING_BUDGET)
+        self.assertEqual(profile["thinking"]["max_tokens"], smoke.CALLER_MAX)
+        self.assertEqual(
+            profile["loop_guard"]["cot_salvage_prefix_max_bytes"], 32_768
+        )
+        self.assertEqual(receipt["isolated_heartbeat_interval_secs"], 1)
+
+    def test_commit_probe_acceptance_requires_committed_terminal_failure(self) -> None:
+        summary = passing_summary()
+        summary["commit_boundary_probes"] = {
+            "verified": True,
+            "scenarios": {
+                "before_recovery": {
+                    "phase": "commit_before_recovery",
+                    "first_downstream_nonempty_monotonic_ns": 45,
+                    "protocol_valid_terminal_failure": False,
+                    "heartbeat_count": 1,
+                }
+            },
+        }
+        self.assertIn(
+            "commit_probe_terminal_failure:before_recovery",
+            smoke.acceptance_errors(summary),
+        )
+
+        duplicate = passing_summary()
+        duplicate["attempts"].append(
+            attempt(99, "commit_before_recovery", budget=smoke.THINKING_BUDGET)
+        )
+        self.assertIn(
+            "commit_probe_attempt_count:before_recovery",
+            smoke.acceptance_errors(duplicate),
+        )
+
+        semantic_shadow = passing_summary()
+        shadow = attempt(
+            99, "commit_before_recovery", budget=1_024
+        )
+        shadow["role"] = "shadow"
+        semantic_shadow["attempts"].append(shadow)
+        salvage_shadow = attempt(
+            100,
+            "positive",
+            budget=0,
+            salvage=True,
+            private=True,
+        )
+        salvage_shadow["role"] = "shadow"
+        semantic_shadow["attempts"].append(salvage_shadow)
+        self.assertFalse(smoke.acceptance_errors(semantic_shadow))
+
+        recovery_probe = passing_summary()
+        recovery_probe["attempts"].append(
+            {
+                **attempt(99, "recovery_probe", budget=smoke.THINKING_BUDGET),
+                "role": "recovery_probe",
+            }
+        )
+        self.assertIn(
+            "commit_probe_recovery_probe",
+            smoke.acceptance_errors(recovery_probe),
+        )
+
+        race = passing_summary()
+        race["commit_boundary_probes"]["scenarios"]["near_first_tick"][
+            "first_downstream_nonempty_monotonic_ns"
+        ] = smoke.PROBE_TICK_TOLERANCE_NS + 1_000
+        self.assertIn(
+            "commit_probe_timeline_unobservable:near_first_tick",
+            smoke.acceptance_errors(race),
+        )
+
+        leak = passing_summary()
+        leak["commit_boundary_probes"]["scenarios"]["during_recovery"][
+            "private_prefix_marker_leak_count"
+        ] = 1
+        self.assertIn(
+            "commit_probe_marker_leak:during_recovery",
+            smoke.acceptance_errors(leak),
+        )
+
+    def test_fixture_classifies_attempts_by_phase_marker_not_global_index(self) -> None:
+        fixture = smoke.Fixture(
+            "reason",
+            "secret-marker",
+            "fresh",
+            "positive-output",
+            "fresh-output",
+            {"commit_before_recovery": "probe"},
+        )
+
+        def body(content: str, budget: int = smoke.THINKING_BUDGET) -> dict:
+            return {
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "max_tokens": smoke.CALLER_MAX,
+                "thinking": {"budget_tokens": budget},
+                "messages": [{"role": "user", "content": content}],
+            }
+
+        primary = fixture.inspect_chat(body("positive"))
+        fresh = fixture.inspect_chat(body("fresh"))
+        salvage_body = body("positive", 0)
+        salvage_body["messages"].append(
+            {
+                "role": "assistant",
+                "content": "Private bounded pre-loop reasoning notes: secret-marker",
+            }
+        )
+        salvage = fixture.inspect_chat(salvage_body)
+        shadow = fixture.inspect_chat(body("positive"))
+        probe = fixture.inspect_chat(body("probe"))
+
+        self.assertEqual(
+            [(item["phase"], item["role"]) for item in (primary, fresh, salvage, shadow, probe)],
+            [
+                ("positive", "primary"),
+                ("fresh", "primary"),
+                ("positive", "salvage"),
+                ("positive", "shadow"),
+                ("commit_before_recovery", "primary"),
+            ],
+        )
+        timestamps = [
+            item["admitted_monotonic_ns"]
+            for item in (primary, fresh, salvage, shadow, probe)
+        ]
+        self.assertEqual(timestamps, sorted(timestamps))
+        self.assertNotIn("secret-marker", json.dumps(fixture.snapshot()[0]))
 
     def test_final_snapshot_waits_for_handler_quiescence(self) -> None:
         fixture = smoke.Fixture("reason", "private", "fresh", "positive", "fresh-output")

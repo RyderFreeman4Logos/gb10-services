@@ -31,6 +31,16 @@ EXPECTED_FIRST_MAX = CALLER_MAX
 FIXTURE_BODY_LIMIT = 1 << 20
 FIXTURE_READ_TIMEOUT = 0.25
 FIXTURE_STOP_TIMEOUT = 2.0
+CLIENT_RESPONSE_LIMIT = 4 * 1024 * 1024
+CLIENT_DEADLINE = 45.0
+CLIENT_READ_CHUNK = 16 * 1024
+PROBE_HEARTBEAT_INTERVAL_SECS = 1
+PROBE_TICK_TOLERANCE_NS = 250_000_000
+COMMIT_PROBE_PHASES = {
+    "before_recovery": "commit_before_recovery",
+    "during_recovery": "commit_during_recovery",
+    "near_first_tick": "commit_near_first_tick",
+}
 PROCESS_TERM_GRACE = 1.0
 PROCESS_STOP_TIMEOUT = 4.0
 PROCESS_POLL_INTERVAL = 0.02
@@ -191,12 +201,14 @@ class Fixture:
         fresh_input_marker: str,
         positive_output_marker: str,
         fresh_output_marker: str,
+        probe_input_markers: dict[str, str] | None = None,
     ):
         self.reasoning_marker = reasoning_marker
         self.private_prefix_marker = private_prefix_marker
         self.fresh_input_marker = fresh_input_marker
         self.positive_output_marker = positive_output_marker
         self.fresh_output_marker = fresh_output_marker
+        self.probe_input_markers = probe_input_markers or {}
         self.lock = threading.Lock()
         self.handler_condition = threading.Condition(self.lock)
         self.active_handlers = 0
@@ -228,18 +240,55 @@ class Fixture:
         with self.lock:
             return [dict(attempt) for attempt in self.chat_attempts], list(self.errors)
 
-    def inspect_chat(self, body: dict) -> dict:
+    def record_attempt_event(self, number: int, field: str) -> None:
+        with self.lock:
+            self.chat_attempts[number - 1][field] = time.monotonic_ns()
+
+    def inspect_chat(self, body: dict, *, recovery_probe: bool = False) -> dict:
         text = json.dumps(body, sort_keys=True, separators=(",", ":"))
         messages = body.get("messages")
-        phase = "fresh" if isinstance(messages, list) and any(isinstance(message, dict) and message.get("content") == self.fresh_input_marker for message in messages) else "positive"
+        message_contents = {
+            message.get("content")
+            for message in messages
+            if isinstance(messages, list)
+            and isinstance(message, dict)
+            and isinstance(message.get("content"), str)
+        } if isinstance(messages, list) else set()
+        phase = "recovery_probe" if recovery_probe else "positive"
+        if not recovery_probe and self.fresh_input_marker in message_contents:
+            phase = "fresh"
+        for probe_phase, marker in self.probe_input_markers.items():
+            if not recovery_probe and marker in message_contents:
+                phase = probe_phase
+                break
         private_prefix_present = self.private_prefix_marker in text
         salvage_material = private_prefix_present and "Private bounded pre-loop reasoning notes" in text
         with self.lock:
             n = len(self.chat_attempts) + 1
+            phase_has_primary = any(
+                item["phase"] == phase and item["role"] == "primary"
+                for item in self.chat_attempts
+            )
+            phase_has_salvage = any(
+                item["phase"] == phase and item["role"] == "salvage"
+                for item in self.chat_attempts
+            )
+            role = (
+                "recovery_probe"
+                if recovery_probe
+                else "salvage"
+                if salvage_material and not phase_has_salvage
+                else "shadow"
+                if phase_has_primary
+                else "primary"
+            )
+            budget = effective_budget(body)
             attempt = {
                 "number": n,
                 "phase": phase,
-                "thinking_budget": effective_budget(body),
+                "role": role,
+                "admitted_monotonic_ns": time.monotonic_ns(),
+                "thinking_budget": budget,
                 "thinking_budget_canonical": budgets(body)[0],
                 "thinking_budget_native": budgets(body)[1],
                 "max_tokens": body.get("max_tokens"),
@@ -249,15 +298,24 @@ class Fixture:
                 "salvage_material_present": salvage_material,
                 "private_prefix_present": private_prefix_present,
                 "loop_tail_present": self.reasoning_marker in text,
+                "variant": (
+                    "cot-salvage"
+                    if salvage_material
+                    else "no-thinking"
+                    if budget == 0
+                    else "max-thinking"
+                    if budget == THINKING_BUDGET
+                    else "bounded-thinking"
+                ),
             }
             self.chat_attempts.append(attempt)
-            if n == 1:
+            if role == "primary":
                 if effective_budget(body) != THINKING_BUDGET:
-                    self.errors.append("first_thinking_budget")
+                    self.errors.append(f"primary_thinking_budget:{phase}")
                 if body.get("max_tokens") != EXPECTED_FIRST_MAX:
-                    self.errors.append("first_max_tokens")
+                    self.errors.append(f"primary_max_tokens:{phase}")
                 if body.get("stream") is not True or not attempt["stream_usage"]:
-                    self.errors.append("first_shielded_sse_contract")
+                    self.errors.append(f"primary_shielded_sse_contract:{phase}")
             if salvage_material:
                 if effective_budget(body) != 0:
                     self.errors.append("salvage_thinking_budget")
@@ -336,29 +394,70 @@ class Fixture:
                     fixture.record_error("unexpected_upstream_route")
                     self.send_json(404, {"error": {"message": "route"}})
                     return
-                attempt = fixture.inspect_chat(body)
+                attempt = fixture.inspect_chat(
+                    body,
+                    recovery_probe=self.headers.get("x-llm-guard-proxy-probe")
+                    == "local-recovery",
+                )
+                if attempt["role"] == "recovery_probe":
+                    self.send_json(
+                        200,
+                        {
+                            "choices": [
+                                {"message": {"role": "assistant", "content": "ready"}}
+                            ]
+                        },
+                    )
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
                 self.end_headers()
                 try:
-                    if attempt["number"] == 1:
+                    if attempt["role"] == "primary" and attempt["phase"] == "positive":
                         self.wfile.write(sse({"id": "fixture-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": f"{fixture.private_prefix_marker} derive the isolated invariant before answering\n"}, "finish_reason": None}]}))
                         self.wfile.flush()
                         repeated = fixture.reasoning_marker + " repeat loop line\n"
                         for _ in range(40):
                             self.wfile.write(sse({"id": "fixture-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": repeated}, "finish_reason": None}]}))
                             self.wfile.flush()
+                    elif attempt["role"] == "primary" and attempt["phase"].startswith("commit_"):
+                        phase = attempt["phase"]
+                        if phase == "commit_before_recovery":
+                            time.sleep(PROBE_HEARTBEAT_INTERVAL_SECS + 0.15)
+                        elif phase == "commit_near_first_tick":
+                            time.sleep(PROBE_HEARTBEAT_INTERVAL_SECS - 0.05)
+                        fixture.record_attempt_event(attempt["number"], "loop_evidence_started_monotonic_ns")
+                        self.wfile.write(sse({"id": f"fixture-{attempt['number']}", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": f"{fixture.private_prefix_marker} derive the isolated invariant before answering\n"}, "finish_reason": None}]}))
+                        self.wfile.flush()
+                        repeated = fixture.reasoning_marker + " repeat loop line\n"
+                        for index in range(40):
+                            self.wfile.write(sse({"id": f"fixture-{attempt['number']}", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": repeated}, "finish_reason": None}]}))
+                            self.wfile.flush()
+                            if index == 23:
+                                fixture.record_attempt_event(attempt["number"], "loop_threshold_monotonic_ns")
+                            if phase == "commit_during_recovery":
+                                time.sleep(0.035)
+                            elif phase == "commit_near_first_tick" and index >= 23:
+                                time.sleep(0.02)
+                        fixture.record_attempt_event(attempt["number"], "loop_evidence_completed_monotonic_ns")
                     else:
-                        text = fixture.positive_output_marker if attempt["salvage_material_present"] else fixture.fresh_output_marker
+                        text = fixture.positive_output_marker if attempt["phase"] == "positive" and attempt["salvage_material_present"] else fixture.fresh_output_marker
                         self.wfile.write(sse({"id": f"fixture-{attempt['number']}", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}]}))
                         self.wfile.write(sse({"id": f"fixture-{attempt['number']}", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}))
                         self.wfile.write(sse({"id": f"fixture-{attempt['number']}", "object": "chat.completion.chunk", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}))
                         self.wfile.write(b"data: [DONE]\n\n")
                         self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
-                    pass
+                    if attempt["phase"].startswith("commit_"):
+                        fixture.record_attempt_event(
+                            attempt["number"], "upstream_cancelled_monotonic_ns"
+                        )
+                        fixture.record_attempt_event(
+                            attempt["number"],
+                            "loop_evidence_completed_monotonic_ns",
+                        )
 
         return Handler
 
@@ -413,6 +512,13 @@ def isolated_config(candidate: Path, root: Path, fake_port: int, guard_port: int
         "evidence.shadow.paired_comparison.include_raw_reasoning": parsed["evidence"]["shadow"]["paired_comparison"]["include_raw_reasoning"],
     }
     require(not any(raw_flags.values()), "candidate_raw_capture_enabled")
+    raw, heartbeat_replacements = re.subn(
+        r"(?ms)^(\[heartbeat\]\n(?:(?!^\[).)*?^interval_secs = )\d+$",
+        rf"\g<1>{PROBE_HEARTBEAT_INTERVAL_SECS}",
+        raw,
+        count=1,
+    )
+    require(heartbeat_replacements == 1, "fixture_heartbeat_interval_missing")
     fake = f"http://127.0.0.1:{fake_port}/v1"
     raw = raw.replace("http://100.105.4.92:18010/v1", fake)
     raw = raw.replace("http://100.105.4.92:18012/v1", fake)
@@ -463,6 +569,11 @@ def isolated_config(candidate: Path, root: Path, fake_port: int, guard_port: int
         selected_profile["hot_restart"]["enabled"] is False,
         "fixture_hot_restart_enabled",
     )
+    require(
+        derived["heartbeat"]["mode"] == "sse"
+        and derived["heartbeat"]["interval_secs"] == PROBE_HEARTBEAT_INTERVAL_SECS,
+        "fixture_heartbeat_not_enabled",
+    )
     require(derived["shielding"] == parsed["shielding"], "fixture_changed_shielding")
     require(
         all(
@@ -484,6 +595,7 @@ def isolated_config(candidate: Path, root: Path, fake_port: int, guard_port: int
     return output, {
         "candidate_config_sha256": sha256(candidate),
         "isolated_config_sha256": sha256(output),
+        "isolated_heartbeat_interval_secs": PROBE_HEARTBEAT_INTERVAL_SECS,
         "raw_flags": raw_flags,
     }
 
@@ -801,33 +913,263 @@ def wait_port(port: int, supervisor: SupervisorHandle, deadline: float) -> None:
     fail("proxy_ready_timeout")
 
 
-def client(port: int, input_marker: str, expected_output: str, reasoning_marker: str, private_prefix_marker: str) -> dict:
-    body = {"model": "__listener_forced_aeon_guard_max__", "messages": [{"role": "user", "content": input_marker}], "max_tokens": CALLER_MAX, "stream": False}
+class _SSEFramer:
+    """Incremental, chunk-agnostic SSE framing with content-free receipts."""
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+        self.event_type: bytes | None = None
+        self.data_lines: list[bytes] = []
+        self.event_count = 0
+        self.comment_count = 0
+        self.heartbeat_count = 0
+        self.final_count = 0
+        self.error_count = 0
+        self.done_count = 0
+        self.prelude = False
+        self.protocol_error: str | None = None
+        self.final_payload: dict | None = None
+        self.terminal_failure = False
+        self.content_parts: list[str] = []
+        self.terminal_seen = False
+
+    def _fail(self, code: str) -> None:
+        if self.protocol_error is None:
+            self.protocol_error = code
+
+    def _dispatch(self) -> None:
+        if self.event_type is None and not self.data_lines:
+            return
+        event_type = self.event_type or b"message"
+        data = b"\n".join(self.data_lines)
+        self.event_type = None
+        self.data_lines = []
+        if self.terminal_seen:
+            self._fail("sse_after_terminal")
+            return
+        prior_event = self.event_count > 0 or self.comment_count > 0 or self.prelude
+        self.event_count += 1
+        if data == b"[DONE]":
+            self.done_count += 1
+            self.terminal_seen = True
+            self.prelude = True
+            return
+        try:
+            payload = json.loads(data) if data else None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._fail("sse_invalid_json")
+            return
+        if event_type == b"final":
+            self.final_count += 1
+            if prior_event:
+                self.prelude = True
+            if not isinstance(payload, dict):
+                self._fail("sse_invalid_final")
+                return
+            self.final_payload = payload
+            self.terminal_seen = True
+            return
+        if event_type == b"error" or (
+            isinstance(payload, dict) and isinstance(payload.get("error"), dict)
+        ):
+            self.error_count += 1
+            self.terminal_failure = isinstance(payload, dict)
+            self.terminal_seen = True
+            return
+        self.prelude = True
+        if not isinstance(payload, dict):
+            self._fail("sse_invalid_event")
+            return
+        choices = payload.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                for container_name in ("delta", "message"):
+                    container = choice.get(container_name)
+                    content = container.get("content") if isinstance(container, dict) else None
+                    if isinstance(content, str):
+                        self.content_parts.append(content)
+
+    def _line(self, line: bytes) -> None:
+        if line.startswith(b":"):
+            if self.terminal_seen:
+                self._fail("sse_after_terminal")
+            self.comment_count += 1
+            if line[1:].strip().startswith(b"heartbeat"):
+                self.heartbeat_count += 1
+            self.prelude = True
+            return
+        if not line:
+            if self.event_type is not None or self.data_lines:
+                self._dispatch()
+            elif self.event_count == 0 and self.comment_count == 0:
+                self.prelude = True
+            return
+        if self.terminal_seen:
+            self._fail("sse_after_terminal")
+            return
+        field, separator, value = line.partition(b":")
+        if not separator:
+            return
+        if value.startswith(b" "):
+            value = value[1:]
+        if field == b"event":
+            self.event_type = value
+        elif field == b"data":
+            self.data_lines.append(value)
+
+    def feed(self, chunk: bytes) -> None:
+        self.buffer.extend(chunk)
+        while True:
+            cr = self.buffer.find(b"\r")
+            lf = self.buffer.find(b"\n")
+            positions = [position for position in (cr, lf) if position >= 0]
+            if not positions:
+                return
+            end = min(positions)
+            if self.buffer[end] == 13 and end + 1 == len(self.buffer):
+                return
+            width = 2 if self.buffer[end : end + 2] == b"\r\n" else 1
+            line = bytes(self.buffer[:end])
+            del self.buffer[: end + width]
+            self._line(line)
+
+    def finish(self) -> None:
+        if self.buffer:
+            line = bytes(self.buffer)
+            if line.endswith(b"\r"):
+                line = line[:-1]
+            self.buffer.clear()
+            self._line(line)
+        if self.event_type is not None or self.data_lines:
+            self._dispatch()
+
+
+def _response_socket(response) -> socket.socket | None:
+    current = response
+    seen: set[int] = set()
+    for _ in range(6):
+        if isinstance(current, socket.socket):
+            return current
+        if current is None or id(current) in seen:
+            return None
+        seen.add(id(current))
+        for attribute in ("_sock", "raw", "fp"):
+            nested = getattr(current, attribute, None)
+            if nested is not None and id(nested) not in seen:
+                current = nested
+                break
+        else:
+            return None
+    return current if isinstance(current, socket.socket) else None
+
+
+def client(
+    port: int,
+    input_marker: str,
+    expected_output: str,
+    reasoning_marker: str,
+    private_prefix_marker: str,
+    *,
+    stream: bool = False,
+    max_response_bytes: int = CLIENT_RESPONSE_LIMIT,
+    deadline_seconds: float = CLIENT_DEADLINE,
+) -> dict:
+    body = {"model": "__listener_forced_aeon_guard_max__", "messages": [{"role": "user", "content": input_marker}], "max_tokens": CALLER_MAX, "stream": stream}
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=json.dumps(body, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"}, method="POST")
+    started_ns = time.monotonic_ns()
+    deadline = time.monotonic() + deadline_seconds
     try:
-        with urllib.request.urlopen(req, timeout=45) as response:
-            raw = response.read()
-            try:
-                data = json.loads(raw)
-                response_format = "json"
-            except json.JSONDecodeError:
-                data = None
-                response_format = "invalid"
-                for event in raw.decode("utf-8", "replace").split("\n\n"):
-                    if "event: final" not in event:
-                        continue
-                    encoded = "\n".join(line[5:].lstrip() for line in event.splitlines() if line.startswith("data:"))
-                    try:
-                        data = json.loads(encoded)
-                        response_format = "event_final"
-                    except json.JSONDecodeError:
-                        pass
-                    break
-            content = data.get("choices", [{}])[0].get("message", {}).get("content") if isinstance(data, dict) else None
-            return {"status": response.status, "format": response_format, "nonempty": isinstance(content, str) and bool(content), "expected_final": content == expected_output, "reasoning_marker_leak_count": raw.count(reasoning_marker.encode()), "private_prefix_marker_leak_count": raw.count(private_prefix_marker.encode())}
+        response = urllib.request.urlopen(req, timeout=deadline_seconds)
     except urllib.error.HTTPError as err:
-        raw = err.read()
-        return {"status": err.code, "nonempty": False, "expected_final": False, "reasoning_marker_leak_count": raw.count(reasoning_marker.encode()), "private_prefix_marker_leak_count": raw.count(private_prefix_marker.encode())}
+        response = err
+    status = int(response.status or 0)
+    content_type = response.headers.get_content_type()
+    raw = bytearray()
+    framer = _SSEFramer()
+    first_byte_ns: int | None = None
+    protocol_error: str | None = None
+    try:
+        sock = _response_socket(response)
+        if sock is None:
+            protocol_error = "client_deadline_socket_missing"
+        while protocol_error is None and sock is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                protocol_error = "response_deadline"
+                break
+            sock.settimeout(remaining)
+            reader = getattr(response, "read1", response.read)
+            chunk = reader(min(CLIENT_READ_CHUNK, max_response_bytes + 1 - len(raw)))
+            if not chunk:
+                break
+            if first_byte_ns is None:
+                first_byte_ns = time.monotonic_ns()
+            raw.extend(chunk)
+            if len(raw) > max_response_bytes:
+                protocol_error = "response_body_limit"
+                break
+            if content_type == "text/event-stream":
+                framer.feed(chunk)
+    except (TimeoutError, socket.timeout):
+        protocol_error = "response_deadline"
+    finally:
+        response.close()
+    if content_type == "text/event-stream" and protocol_error is None:
+        framer.finish()
+        protocol_error = framer.protocol_error
+
+    payload: dict | None = None
+    response_format = "invalid"
+    downstream_prelude = False
+    if content_type == "text/event-stream":
+        payload = framer.final_payload
+        response_format = "event_final" if payload is not None else "sse"
+        downstream_prelude = framer.prelude
+    elif protocol_error is None:
+        downstream_prelude = bool(raw) and raw[:1] != b"{"
+        try:
+            decoded = json.loads(raw)
+            payload = decoded if isinstance(decoded, dict) else None
+            response_format = "json" if payload is not None else "invalid"
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            protocol_error = "invalid_json_response"
+
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    message = choices[0].get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    http_error = status >= 400 and isinstance(payload, dict) and isinstance(payload.get("error"), dict)
+    terminal_failure = protocol_error is None and (framer.terminal_failure or http_error)
+    expected_final = (
+        not stream
+        and not downstream_prelude
+        and protocol_error is None
+        and content == expected_output
+    )
+    finished_ns = time.monotonic_ns()
+    return {
+        "status": status,
+        "format": response_format,
+        "nonempty": isinstance(content, str) and bool(content),
+        "expected_final": expected_final,
+        "protocol_valid_terminal_failure": terminal_failure,
+        "protocol_error": protocol_error,
+        "downstream_prelude_detected": downstream_prelude,
+        "first_downstream_nonempty_monotonic_ns": first_byte_ns,
+        "request_started_monotonic_ns": started_ns,
+        "request_finished_monotonic_ns": finished_ns,
+        "duration_ms": (finished_ns - started_ns) // 1_000_000,
+        "response_bytes": len(raw),
+        "sse_event_count": framer.event_count,
+        "sse_comment_count": framer.comment_count,
+        "heartbeat_count": framer.heartbeat_count,
+        "sse_final_event_count": framer.final_count,
+        "sse_error_event_count": framer.error_count,
+        "sse_done_count": framer.done_count,
+        "reasoning_marker_leak_count": raw.count(reasoning_marker.encode()),
+        "private_prefix_marker_leak_count": raw.count(private_prefix_marker.encode()),
+    }
 
 
 def _stable_error(exc: Exception, fallback: str) -> dict[str, str]:
@@ -2238,6 +2580,100 @@ def sensitive_marker_count(
         os.close(root_fd)
 
 
+def _commit_boundary_evidence_errors(summary: dict) -> list[str]:
+    errors: list[str] = []
+    attempts = summary.get("attempts", [])
+    for attempt in attempts:
+        timestamp = attempt.get("admitted_monotonic_ns")
+        if not isinstance(timestamp, int):
+            errors.append(f"attempt_timestamp_missing:{attempt.get('number', 0)}")
+    numbered = [attempt.get("number") for attempt in attempts]
+    if len(numbered) == len(set(numbered)):
+        ordered_admissions = [
+            attempt["admitted_monotonic_ns"]
+            for attempt in sorted(attempts, key=lambda item: item["number"])
+            if isinstance(attempt.get("admitted_monotonic_ns"), int)
+        ]
+        if len(ordered_admissions) == len(attempts) and any(
+            current < previous
+            for previous, current in zip(
+                ordered_admissions, ordered_admissions[1:]
+            )
+        ):
+            errors.append("attempt_timeline_nonmonotonic")
+
+    positive = summary.get("positive_client", {})
+    positive_first = positive.get("first_downstream_nonempty_monotonic_ns")
+    if not isinstance(positive_first, int):
+        errors.append("no_commit_control_first_byte_missing")
+    else:
+        for attempt in attempts:
+            if attempt.get("phase") != "positive" or attempt.get("role") != "salvage":
+                continue
+            salvage_admitted = attempt.get("admitted_monotonic_ns")
+            if not isinstance(salvage_admitted, int) or salvage_admitted >= positive_first:
+                errors.append("salvage_after_downstream_commit")
+    if positive.get("downstream_prelude_detected") is not False:
+        errors.append("positive_downstream_prelude")
+
+    boundary = summary.get("commit_boundary_probes", {})
+    scenarios = boundary.get("scenarios", {})
+    if any(attempt.get("role") == "recovery_probe" for attempt in attempts):
+        errors.append("commit_probe_recovery_probe")
+    for scenario, phase in COMMIT_PROBE_PHASES.items():
+        receipt = scenarios.get(scenario)
+        if not isinstance(receipt, dict):
+            errors.append(f"commit_probe_missing:{scenario}")
+            continue
+        phase_attempts = [attempt for attempt in attempts if attempt.get("phase") == phase]
+        business_attempts = [
+            attempt
+            for attempt in phase_attempts
+            if attempt.get("role") in {"primary", "salvage", "recovery_probe"}
+        ]
+        if len(business_attempts) != 1 or any(
+            attempt.get("role") == "salvage" for attempt in business_attempts
+        ):
+            errors.append(f"commit_probe_attempt_count:{scenario}")
+            continue
+        attempt = business_attempts[0]
+        first = receipt.get("first_downstream_nonempty_monotonic_ns")
+        admission = attempt.get("admitted_monotonic_ns")
+        if not isinstance(first, int) or not isinstance(admission, int) or admission > first:
+            errors.append(f"commit_probe_timeline_unobservable:{scenario}")
+            continue
+        if receipt.get("heartbeat_count", 0) < 1:
+            errors.append(f"commit_probe_heartbeat_missing:{scenario}")
+        if receipt.get("protocol_error") is not None:
+            errors.append(f"commit_probe_protocol_error:{scenario}")
+        if receipt.get("protocol_valid_terminal_failure") is not True:
+            errors.append(f"commit_probe_terminal_failure:{scenario}")
+        if any(
+            receipt.get(field, 0) != 0
+            for field in (
+                "reasoning_marker_leak_count",
+                "private_prefix_marker_leak_count",
+            )
+        ):
+            errors.append(f"commit_probe_marker_leak:{scenario}")
+
+        started = attempt.get("loop_evidence_started_monotonic_ns")
+        threshold = attempt.get("loop_threshold_monotonic_ns")
+        completed = attempt.get("loop_evidence_completed_monotonic_ns")
+        observable = all(isinstance(value, int) for value in (started, threshold, completed))
+        if not observable:
+            errors.append(f"commit_probe_timeline_unobservable:{scenario}")
+        elif scenario == "before_recovery" and not first < started:
+            errors.append(f"commit_probe_timeline_unobservable:{scenario}")
+        elif scenario == "during_recovery" and not threshold <= first <= completed:
+            errors.append(f"commit_probe_timeline_unobservable:{scenario}")
+        elif scenario == "near_first_tick" and not (
+            abs(first - threshold) <= PROBE_TICK_TOLERANCE_NS and first <= completed
+        ):
+            errors.append(f"commit_probe_timeline_unobservable:{scenario}")
+    return errors
+
+
 def acceptance_errors(summary: dict) -> list[str]:
     errors: list[str] = []
     if summary.get("execution_error") is not None:
@@ -2249,11 +2685,13 @@ def acceptance_errors(summary: dict) -> list[str]:
     errors.extend(summary.get("fixture_errors", []))
 
     attempts = summary.get("attempts", [])
-    salvages = [attempt for attempt in attempts if attempt["salvage_material_present"]]
+    salvages = [attempt for attempt in attempts if attempt.get("role") == "salvage"]
     fresh_attempts = [
         attempt
         for attempt in attempts
-        if attempt["phase"] == "fresh" and not attempt["salvage_material_present"]
+        if attempt["phase"] == "fresh"
+        and attempt.get("role") != "shadow"
+        and not attempt["salvage_material_present"]
     ]
     if len(salvages) != 1:
         errors.append("salvage_count")
@@ -2288,6 +2726,10 @@ def acceptance_errors(summary: dict) -> list[str]:
         errors.append("positive_client_failed")
     if not summary.get("fresh_negative_pass"):
         errors.append("fresh_client_failed")
+    boundary = summary.get("commit_boundary_probes", {})
+    if boundary.get("verified") is not True:
+        errors.append("downstream_commit_boundary_unverified")
+    errors.extend(_commit_boundary_evidence_errors(summary))
 
     process_cleanup = summary.get("process_cleanup", {})
     if not process_cleanup.get("exclusive_supervisor"):
@@ -2371,13 +2813,19 @@ def main() -> int:
     (root / "home").mkdir(mode=0o700)
     (root / "tmp").mkdir(mode=0o700)
     sensitive_markers = tuple("S" + secrets.token_hex(24) for _ in range(6))
-    reasoning_marker, private_prefix_marker, positive_input_marker, fresh_input_marker, positive_output_marker, fresh_output_marker = sensitive_markers
+    probe_markers = tuple(
+        "S" + secrets.token_hex(24) for _ in COMMIT_PROBE_PHASES
+    )
+    sensitive_markers += probe_markers
+    reasoning_marker, private_prefix_marker, positive_input_marker, fresh_input_marker, positive_output_marker, fresh_output_marker = sensitive_markers[:6]
+    probe_input_markers = dict(zip(COMMIT_PROBE_PHASES.values(), probe_markers, strict=True))
     fixture = Fixture(
         reasoning_marker,
         private_prefix_marker,
         fresh_input_marker,
         positive_output_marker,
         fresh_output_marker,
+        probe_input_markers,
     )
     fake_port, guard_port = free_port(), free_port()
     summary: dict = {
@@ -2397,6 +2845,7 @@ def main() -> int:
             "deadline_seconds": SCAN_TIMEOUT,
         },
         "scan_limits_enforced": False,
+        "commit_boundary_probes": {"verified": False, "scenarios": {}, "blocker": "BLOCKER:not_executed"},
     }
     supervisor = None
     process_cleanup = None
@@ -2441,6 +2890,17 @@ def main() -> int:
             reasoning_marker,
             private_prefix_marker,
         )
+        summary["commit_boundary_probes"]["scenarios"] = {
+            scenario: client(
+                guard_port,
+                probe_input_markers[phase],
+                "",
+                reasoning_marker,
+                private_prefix_marker,
+                stream=True,
+            )
+            for scenario, phase in COMMIT_PROBE_PHASES.items()
+        }
         summary["fresh_client"] = client(
             guard_port,
             fresh_input_marker,
@@ -2476,10 +2936,15 @@ def main() -> int:
     summary["attempts"] = attempts
     summary["fixture_errors"] = fixture_errors
     summary["salvage_count"] = sum(
-        attempt["salvage_material_present"] for attempt in attempts
+        attempt.get("role") == "salvage" for attempt in attempts
     )
     summary["fresh_request_count"] = sum(
         attempt["phase"] == "fresh" for attempt in attempts
+    )
+    boundary_errors = _commit_boundary_evidence_errors(summary)
+    summary["commit_boundary_probes"]["verified"] = not boundary_errors
+    summary["commit_boundary_probes"]["blocker"] = (
+        None if not boundary_errors else f"BLOCKER:{boundary_errors[0]}"
     )
 
     positive = summary.get("positive_client")
