@@ -786,10 +786,10 @@ def _wait_for_quiescence(
 
 def wait_port(port: int, supervisor: SupervisorHandle, deadline: float) -> None:
     while time.monotonic() < deadline:
-        current = _read_process_identity(supervisor.pid)
+        current = _read_process_identity(supervisor.scope.worker_identity.pid)
         if (
             current is None
-            or not _same_process(current, supervisor.identity)
+            or not _same_process(current, supervisor.scope.worker_identity)
             or current.state in {"X", "Z"}
         ):
             fail("supervisor_exit_before_ready")

@@ -60,6 +60,8 @@ def write_forking_systemd_run_bridge(path: Path) -> None:
         "if pid == 0:\n"
         "    os.closerange(3, os.sysconf('SC_OPEN_MAX'))\n"
         "    os.execv(real_systemd_run, [real_systemd_run, *args])\n"
+        "if os.environ.get('SCOPE_WRAPPER_EXIT_EARLY'):\n"
+        "    os._exit(0)\n"
         "_, status = os.waitpid(pid, 0)\n"
         "code = os.waitstatus_to_exitcode(status)\n"
         "os._exit(code if code >= 0 else 128 - code)\n",
@@ -499,6 +501,125 @@ while True:
                         candidate_pid
                     ):
                         os.kill(candidate_pid, signal.SIGKILL)
+        self.assertEqual(fd_count(), before_fds)
+
+    def test_wait_port_follows_scope_worker_after_wrapper_exit(self) -> None:
+        candidate = r"""
+import os, signal, socket, sys, time
+signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+time.sleep(0.25)
+with socket.socket() as listener:
+    listener.bind(("127.0.0.1", int(sys.argv[1])))
+    listener.listen()
+    while True:
+        time.sleep(1)
+"""
+        before_fds = fd_count()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bridge = root / "systemd-run"
+            write_forking_systemd_run_bridge(bridge)
+            supervisor = None
+            cleanup = None
+            with (
+                patch.object(smoke, "SYSTEMD_RUN_BIN", str(bridge)),
+                patch.dict(os.environ, {"SCOPE_WRAPPER_EXIT_EARLY": "1"}),
+            ):
+                try:
+                    port = smoke.free_port()
+                    supervisor = smoke.start_candidate_supervisor(
+                        [sys.executable, "-c", candidate, str(port)],
+                        root,
+                        os.environ.copy(),
+                        root / "candidate.log",
+                    )
+                    wrapper = smoke._read_process_identity(supervisor.pid)
+                    self.assertIsNotNone(wrapper)
+                    assert wrapper is not None
+                    self.assertEqual(wrapper.state, "Z")
+                    self.assertNotEqual(
+                        supervisor.pid, supervisor.scope.worker_identity.pid
+                    )
+
+                    smoke.wait_port(port, supervisor, time.monotonic() + 2)
+
+                    worker = smoke._read_process_identity(
+                        supervisor.scope.worker_identity.pid
+                    )
+                    self.assertIsNotNone(worker)
+                    assert worker is not None
+                    self.assertTrue(
+                        smoke._same_process(worker, supervisor.scope.worker_identity)
+                    )
+                    self.assertNotIn(worker.state, {"X", "Z"})
+                finally:
+                    if supervisor is not None:
+                        started = time.monotonic()
+                        cleanup = smoke.stop_candidate_supervisor(supervisor)
+                        self.assertLess(time.monotonic() - started, 2.0)
+            self.assertIsNotNone(cleanup)
+            assert cleanup is not None
+            self.assertTrue(cleanup["candidate_ownership_quiesced"])
+            self.assertTrue(cleanup["supervisor_reaped"])
+        self.assertEqual(fd_count(), before_fds)
+
+    def test_wait_port_fails_when_scope_worker_exits_with_live_wrapper(self) -> None:
+        before_fds = fd_count()
+        wrapper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"]
+        )
+        worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"]
+        )
+        wrapper_identity = smoke.capture_process_identity(wrapper.pid)
+        worker_identity = smoke.capture_process_identity(worker.pid)
+        control, peer = socket.socketpair()
+        supervisor = smoke.SupervisorHandle(
+            wrapper.pid,
+            wrapper_identity,
+            control,
+            {},
+            smoke.ScopeFence("test.scope", "/test.scope", -1, -1, worker_identity),
+        )
+        try:
+            worker.kill()
+            deadline = time.monotonic() + 2
+            current_worker = smoke._read_process_identity(worker.pid)
+            while (
+                current_worker is not None
+                and current_worker.state != "Z"
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+                current_worker = smoke._read_process_identity(worker.pid)
+            self.assertIsNotNone(current_worker)
+            assert current_worker is not None
+            self.assertEqual(current_worker.state, "Z")
+            current_wrapper = smoke._read_process_identity(wrapper.pid)
+            self.assertIsNotNone(current_wrapper)
+            assert current_wrapper is not None
+            self.assertTrue(smoke._same_process(current_wrapper, wrapper_identity))
+            self.assertNotIn(current_wrapper.state, {"X", "Z"})
+
+            started = time.monotonic()
+            with self.assertRaisesRegex(
+                RuntimeError, "^supervisor_exit_before_ready$"
+            ):
+                smoke.wait_port(
+                    smoke.free_port(), supervisor, time.monotonic() + 1
+                )
+            self.assertLess(time.monotonic() - started, 0.5)
+        finally:
+            for proc in (worker, wrapper):
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=2)
+            control.close()
+            peer.close()
+            smoke._close_identity_pidfd(worker_identity)
+            smoke._close_identity_pidfd(wrapper_identity)
         self.assertEqual(fd_count(), before_fds)
 
     def test_invalid_scope_worker_pid_fails_closed_and_cleans_scope(self) -> None:
