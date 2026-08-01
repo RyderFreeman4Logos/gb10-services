@@ -54,7 +54,6 @@ def passing_summary() -> dict:
                 budget=0,
                 salvage=True,
                 private=True,
-                loop=True,
             ),
             attempt(3, "fresh", budget=smoke.THINKING_BUDGET),
         ],
@@ -86,41 +85,31 @@ def passing_summary() -> dict:
 
 class LoopRecoveryFinalizationTests(unittest.TestCase):
     def test_final_acceptance_checks_every_attempt_privacy_and_budget(self) -> None:
+        self.assertFalse(smoke.acceptance_errors(passing_summary()))
+
         legal_shadow = passing_summary()
         legal_shadow["attempts"].append(
-            attempt(4, "positive", budget=smoke.THINKING_BUDGET)
+            attempt(4, "positive", budget=1024)
         )
         self.assertFalse(smoke.acceptance_errors(legal_shadow))
 
-        private_shadow = passing_summary()
-        private_shadow["attempts"].append(
-            attempt(
-                4,
-                "positive",
-                budget=smoke.THINKING_BUDGET,
-                private=True,
-                loop=True,
+        for field in ("private_prefix_present", "loop_tail_present"):
+            private_shadow = passing_summary()
+            private_shadow["attempts"].append(
+                attempt(4, "positive", budget=smoke.THINKING_BUDGET)
             )
-        )
-        self.assertIn(
-            "non_salvage_replayed_private_material:4",
-            smoke.acceptance_errors(private_shadow),
-        )
-
-        wrong_shadow_budget = passing_summary()
-        wrong_shadow_budget["attempts"].append(
-            attempt(4, "positive", budget=0)
-        )
-        self.assertIn(
-            "non_salvage_thinking_budget:4",
-            smoke.acceptance_errors(wrong_shadow_budget),
-        )
+            private_shadow["attempts"][-1][field] = True
+            with self.subTest(shadow_field=field):
+                self.assertIn(
+                    "non_salvage_replayed_private_material:4",
+                    smoke.acceptance_errors(private_shadow),
+                )
 
         for field, value, code in (
             ("phase", "fresh", "salvage_phase:2"),
             ("thinking_budget", 1, "salvage_thinking_budget:2"),
             ("private_prefix_present", False, "salvage_private_prefix:2"),
-            ("loop_tail_present", False, "salvage_loop_tail:2"),
+            ("loop_tail_present", True, "salvage_loop_tail:2"),
         ):
             invalid_salvage = passing_summary()
             invalid_salvage["attempts"][1][field] = value
@@ -137,7 +126,7 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
             attempt(
                 4,
                 "fresh",
-                budget=0,
+                budget=smoke.THINKING_BUDGET,
                 private=True,
                 loop=True,
             )
@@ -146,7 +135,15 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
             "fresh_request_replayed_private_material:4",
             smoke.acceptance_errors(late_replay),
         )
-        self.assertIn("fresh_thinking_budget:4", smoke.acceptance_errors(late_replay))
+
+        wrong_fresh_budget = passing_summary()
+        wrong_fresh_budget["attempts"].append(
+            attempt(4, "fresh", budget=0)
+        )
+        self.assertIn(
+            "fresh_thinking_budget:4",
+            smoke.acceptance_errors(wrong_fresh_budget),
+        )
 
         duplicate_salvage = passing_summary()
         duplicate_salvage["attempts"].append(

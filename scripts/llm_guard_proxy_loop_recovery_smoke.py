@@ -943,7 +943,7 @@ def acceptance_errors(summary: dict) -> list[str]:
                 errors.append(f"salvage_thinking_budget:{number}")
             if not attempt["private_prefix_present"]:
                 errors.append(f"salvage_private_prefix:{number}")
-            if not attempt["loop_tail_present"]:
+            if attempt["loop_tail_present"]:
                 errors.append(f"salvage_loop_tail:{number}")
             continue
         if attempt["private_prefix_present"] or attempt["loop_tail_present"]:
@@ -953,13 +953,11 @@ def acceptance_errors(summary: dict) -> list[str]:
                 else "non_salvage_replayed_private_material"
             )
             errors.append(f"{prefix}:{number}")
-        if attempt["thinking_budget"] != THINKING_BUDGET:
-            prefix = (
-                "fresh_thinking_budget"
-                if attempt["phase"] == "fresh"
-                else "non_salvage_thinking_budget"
-            )
-            errors.append(f"{prefix}:{number}")
+        if (
+            attempt["phase"] == "fresh"
+            and attempt["thinking_budget"] != THINKING_BUDGET
+        ):
+            errors.append(f"fresh_thinking_budget:{number}")
 
     if not summary.get("positive_pass"):
         errors.append("positive_client_failed")
