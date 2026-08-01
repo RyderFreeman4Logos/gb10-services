@@ -439,7 +439,7 @@ class Fixture:
                             },
                             separators=(",", ":"),
                         ).encode()
-                        self.wfile.write(b": fixture generic heartbeat\n\n")
+                        self.wfile.write(b": heartbeat fixture generic\n\n")
                         self.wfile.flush()
                         time.sleep(0.05)
                         self.wfile.write(b"event: error\ndata: " + error + b"\n\n")
