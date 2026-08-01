@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -80,8 +82,36 @@ class Fixture:
         self.positive_output_marker = positive_output_marker
         self.fresh_output_marker = fresh_output_marker
         self.lock = threading.Lock()
+        self.handler_condition = threading.Condition(self.lock)
+        self.active_handlers = 0
         self.chat_attempts: list[dict] = []
         self.errors: list[str] = []
+
+    def record_error(self, code: str) -> None:
+        with self.lock:
+            self.errors.append(code)
+
+    def handler_started(self) -> None:
+        with self.handler_condition:
+            self.active_handlers += 1
+
+    def handler_finished(self) -> None:
+        with self.handler_condition:
+            self.active_handlers -= 1
+            if self.active_handlers == 0:
+                self.handler_condition.notify_all()
+
+    def wait_for_handlers(self, timeout: float) -> bool:
+        with self.handler_condition:
+            return self.handler_condition.wait_for(
+                lambda: self.active_handlers == 0,
+                timeout=timeout,
+            )
+
+    def snapshot(self) -> tuple[list[dict], list[str]]:
+        with self.lock:
+            return [dict(attempt) for attempt in self.chat_attempts], list(self.errors)
+
     def inspect_chat(self, body: dict) -> dict:
         text = json.dumps(body, sort_keys=True, separators=(",", ":"))
         messages = body.get("messages")
@@ -151,7 +181,7 @@ class Fixture:
                     size = int(self.headers.get("Content-Length", "0"))
                     body = json.loads(self.rfile.read(size))
                 except Exception:
-                    fixture.errors.append("malformed_upstream_request")
+                    fixture.record_error("malformed_upstream_request")
                     self.send_json(400, {"error": {"message": "malformed"}})
                     return
                 if self.path.endswith("/embeddings"):
@@ -160,7 +190,7 @@ class Fixture:
                     self.send_json(200, {"object": "list", "data": [{"object": "embedding", "index": i, "embedding": [1.0] + [0.0] * 255} for i in range(count)], "model": "fixture", "usage": {"prompt_tokens": 1, "total_tokens": 1}})
                     return
                 if not self.path.endswith("/chat/completions") or not isinstance(body, dict):
-                    fixture.errors.append("unexpected_upstream_route")
+                    fixture.record_error("unexpected_upstream_route")
                     self.send_json(404, {"error": {"message": "route"}})
                     return
                 attempt = fixture.inspect_chat(body)
@@ -188,6 +218,31 @@ class Fixture:
                     pass
 
         return Handler
+
+
+class FixtureHTTPServer(ThreadingHTTPServer):
+    def __init__(self, server_address: tuple[str, int], handler: type[BaseHTTPRequestHandler], fixture: Fixture):
+        self.fixture = fixture
+        super().__init__(server_address, handler)
+
+    def process_request(self, request, client_address) -> None:
+        self.fixture.handler_started()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.fixture.handler_finished()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.fixture.handler_finished()
+
+    def handle_error(self, request, client_address) -> None:
+        exc = sys.exc_info()[1]
+        if not isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            self.fixture.record_error(f"handler_crash:{type(exc).__name__}")
 
 
 def isolated_config(candidate: Path, root: Path, fake_port: int, guard_port: int) -> tuple[Path, dict]:
@@ -328,27 +383,175 @@ def client(port: int, input_marker: str, expected_output: str, reasoning_marker:
         return {"status": err.code, "nonempty": False, "expected_final": False, "reasoning_marker_leak_count": raw.count(reasoning_marker.encode()), "private_prefix_marker_leak_count": raw.count(private_prefix_marker.encode())}
 
 
-def stop(proc: subprocess.Popen[bytes] | None) -> None:
-    if proc is None or proc.poll() is not None:
-        return
+def _stable_error(exc: Exception, fallback: str) -> dict[str, str]:
+    code = fallback
+    if isinstance(exc, OSError) and exc.errno is not None:
+        code = errno.errorcode.get(exc.errno, fallback)
+    elif isinstance(exc, RuntimeError) and re.fullmatch(r"[a-z0-9_:=-]+", str(exc)):
+        code = str(exc)
+    return {"class": type(exc).__name__, "code": code}
+
+
+def stop(proc: subprocess.Popen[bytes] | None) -> dict[str, object]:
+    cleanup: dict[str, object] = {
+        "proxy_exited": proc is None,
+        "unexpected_exit": False,
+        "graceful_stop": False,
+        "forced_kill": False,
+    }
+    if proc is None:
+        return cleanup
+    returncode = proc.poll()
+    if returncode is not None:
+        cleanup.update(proxy_exited=True, unexpected_exit=True, returncode=returncode)
+        return cleanup
     try:
         os.killpg(proc.pid, signal.SIGTERM)
-        proc.wait(timeout=8)
+    except ProcessLookupError:
+        cleanup["unexpected_exit"] = True
+    except OSError as exc:
+        cleanup["stop_error"] = _stable_error(exc, "proxy_sigterm_failed")
+        cleanup["proxy_exited"] = proc.poll() is not None
+        return cleanup
+    try:
+        returncode = proc.wait(timeout=8)
     except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait(timeout=8)
+        cleanup["forced_kill"] = True
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            cleanup["stop_error"] = _stable_error(exc, "proxy_sigkill_failed")
+        try:
+            returncode = proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            cleanup["stop_error"] = {
+                "class": "TimeoutExpired",
+                "code": "proxy_reap_timeout",
+            }
+            returncode = None
+    cleanup["returncode"] = returncode
+    cleanup["proxy_exited"] = returncode is not None
+    cleanup["graceful_stop"] = (
+        cleanup["proxy_exited"]
+        and returncode == 0
+        and not cleanup["unexpected_exit"]
+        and not cleanup["forced_kill"]
+        and "stop_error" not in cleanup
+    )
+    return cleanup
+
+
+def stop_fixture_server(
+    server: FixtureHTTPServer | None,
+    server_thread: threading.Thread | None,
+    fixture: Fixture,
+) -> dict[str, object]:
+    cleanup_errors: list[dict[str, str]] = []
+    cleanup: dict[str, object] = {
+        "server_stopped": server is None,
+        "unexpected_exit": False,
+        "handlers_quiesced": False,
+        "errors": cleanup_errors,
+    }
+    if server is not None:
+        cleanup["unexpected_exit"] = server_thread is None or not server_thread.is_alive()
+        if server_thread is not None and server_thread.is_alive():
+            try:
+                server.shutdown()
+            except Exception as exc:
+                cleanup_errors.append(_stable_error(exc, "fixture_shutdown_failed"))
+        try:
+            server.server_close()
+        except Exception as exc:
+            cleanup_errors.append(_stable_error(exc, "fixture_close_failed"))
+        if server_thread is not None:
+            try:
+                server_thread.join(timeout=8)
+            except RuntimeError as exc:
+                cleanup_errors.append(_stable_error(exc, "fixture_join_failed"))
+        cleanup["server_stopped"] = server_thread is None or not server_thread.is_alive()
+    cleanup["handlers_quiesced"] = fixture.wait_for_handlers(timeout=8)
+    return cleanup
 
 
 def sensitive_marker_count(root: Path, markers: tuple[bytes, ...]) -> int:
+    root_stat = root.lstat()
+    if stat.S_ISLNK(root_stat.st_mode):
+        raise OSError(errno.ELOOP, "privacy_scan_symlink")
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise OSError(errno.ENOTDIR, "privacy_scan_root_not_directory")
     total = 0
-    for path in root.rglob("*"):
-        if path.is_file():
-            try:
-                data = path.read_bytes()
-                total += sum(data.count(marker) for marker in markers)
-            except OSError:
-                pass
+    pending = [root]
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                entry_stat = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(entry_stat.st_mode):
+                    raise OSError(errno.ELOOP, "privacy_scan_symlink")
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    pending.append(Path(entry.path))
+                elif stat.S_ISREG(entry_stat.st_mode):
+                    data = Path(entry.path).read_bytes()
+                    total += sum(data.count(marker) for marker in markers)
+                else:
+                    raise OSError(errno.EINVAL, "privacy_scan_non_regular")
     return total
+
+
+def acceptance_errors(summary: dict) -> list[str]:
+    errors: list[str] = []
+    if summary.get("execution_error") is not None:
+        errors.append("execution_failed")
+    errors.extend(summary.get("fixture_errors", []))
+
+    attempts = summary.get("attempts", [])
+    salvages = [attempt for attempt in attempts if attempt["salvage_material_present"]]
+    fresh_attempts = [attempt for attempt in attempts if attempt["phase"] == "fresh"]
+    if len(salvages) != 1:
+        errors.append("salvage_count")
+    if not fresh_attempts:
+        errors.append("fresh_request_missing")
+    for fresh in fresh_attempts:
+        if fresh["private_prefix_present"] or fresh["salvage_material_present"] or fresh["loop_tail_present"]:
+            errors.append(f"fresh_request_replayed_private_material:{fresh['number']}")
+        if fresh["thinking_budget"] != THINKING_BUDGET:
+            errors.append(f"fresh_thinking_budget:{fresh['number']}")
+
+    if not summary.get("positive_pass"):
+        errors.append("positive_client_failed")
+    if not summary.get("fresh_negative_pass"):
+        errors.append("fresh_client_failed")
+
+    process_cleanup = summary.get("process_cleanup", {})
+    if process_cleanup.get("unexpected_exit"):
+        errors.append("proxy_unexpected_exit")
+    if process_cleanup.get("forced_kill"):
+        errors.append("proxy_forced_kill")
+    if not process_cleanup.get("proxy_exited"):
+        errors.append("proxy_not_exited")
+    if not process_cleanup.get("graceful_stop") or process_cleanup.get("stop_error"):
+        errors.append("proxy_not_gracefully_stopped")
+
+    fixture_cleanup = summary.get("fixture_cleanup", {})
+    if fixture_cleanup.get("unexpected_exit"):
+        errors.append("fixture_server_unexpected_exit")
+    if not fixture_cleanup.get("server_stopped"):
+        errors.append("fixture_server_not_stopped")
+    if not fixture_cleanup.get("handlers_quiesced"):
+        errors.append("fixture_handlers_not_quiesced")
+    if fixture_cleanup.get("errors"):
+        errors.append("fixture_cleanup_failed")
+
+    port_cleanup = summary.get("port_cleanup", {})
+    if not port_cleanup or not all(port_cleanup.values()):
+        errors.append("ports_not_rebindable")
+    if summary.get("scan_errors"):
+        errors.append("privacy_scan_failed")
+    elif summary.get("sensitive_marker_leak_count_all_fixture_files") != 0:
+        errors.append("fixture_marker_leak")
+    return errors
 
 
 def main() -> int:
@@ -383,14 +586,20 @@ def main() -> int:
         "response_api_boundary": "unsupported",
         "fixture_root_mode": oct(root.stat().st_mode & 0o777),
         "ports": {"fake": fake_port, "guard": guard_port},
+        "execution_error": None,
     }
     proc = None
     server = None
+    server_thread = None
     try:
         config, hashes = isolated_config(candidate, root, fake_port, guard_port)
         summary.update(hashes)
-        server = ThreadingHTTPServer(("127.0.0.1", fake_port), fixture.handler())
-        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server = FixtureHTTPServer(("127.0.0.1", fake_port), fixture.handler(), fixture)
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.05},
+            daemon=True,
+        )
         server_thread.start()
         env = {"HOME": str(root / "home"), "TMPDIR": str(root / "tmp"), "XDG_CACHE_HOME": str(root / "home" / ".cache"), "XDG_CONFIG_HOME": str(root / "home" / ".config"), "XDG_DATA_HOME": str(root / "home" / ".local" / "share"), "PATH": os.environ["PATH"]}
         with (root / "proxy.log").open("wb") as log:
@@ -411,53 +620,74 @@ def main() -> int:
                 reasoning_marker,
                 private_prefix_marker,
             )
-        salvages = [attempt for attempt in fixture.chat_attempts if attempt["salvage_material_present"]]
-        fresh_attempts = [attempt for attempt in fixture.chat_attempts if attempt["phase"] == "fresh"]
-        summary["salvage_count"] = len(salvages)
-        summary["fresh_request_count"] = len(fresh_attempts)
-        if len(salvages) != 1:
-            fixture.errors.append("salvage_count")
-        if not fresh_attempts:
-            fixture.errors.append("fresh_request_missing")
-        else:
-            fresh = fresh_attempts[0]
-            if fresh["private_prefix_present"] or fresh["salvage_material_present"] or fresh["loop_tail_present"]:
-                fixture.errors.append("fresh_request_replayed_private_material")
-            if fresh["thinking_budget"] != THINKING_BUDGET:
-                fixture.errors.append("fresh_thinking_budget")
-        summary["attempts"] = fixture.chat_attempts
-        summary["fixture_errors"] = fixture.errors
-        summary["positive_pass"] = summary["positive_client"]["status"] == 200 and summary["positive_client"]["nonempty"] and summary["positive_client"]["expected_final"] and summary["positive_client"]["reasoning_marker_leak_count"] == 0 and summary["positive_client"]["private_prefix_marker_leak_count"] == 0
-        summary["fresh_negative_pass"] = summary["fresh_client"]["status"] == 200 and summary["fresh_client"]["nonempty"] and summary["fresh_client"]["expected_final"] and summary["fresh_client"]["reasoning_marker_leak_count"] == 0 and summary["fresh_client"]["private_prefix_marker_leak_count"] == 0
-        if fixture.errors or not summary["positive_pass"] or not summary["fresh_negative_pass"]:
-            fail("acceptance_assertion_failed")
-        summary["result"] = "PASS"
     except Exception as exc:
-        summary["result"] = "FAIL"
-        summary["error_class"] = type(exc).__name__
-        summary["error_code"] = str(exc)[:160]
-    finally:
-        stop(proc)
-        if server:
-            server.shutdown()
-            server.server_close()
-        time.sleep(0.15)
-        summary["attempts"] = fixture.chat_attempts
-        summary["fixture_errors"] = fixture.errors
-        summary["process_cleanup"] = {"proxy_exited": proc is None or proc.poll() is not None}
-        summary["port_cleanup"] = {"guard_rebindable": _rebindable(guard_port), "fake_rebindable": _rebindable(fake_port)}
-        summary["sensitive_marker_leak_count_all_fixture_files"] = sensitive_marker_count(
-            root,
-            tuple(marker.encode() for marker in sensitive_markers),
-        )
-        if (
-            summary["sensitive_marker_leak_count_all_fixture_files"]
-            or not summary["process_cleanup"]["proxy_exited"]
-            or not all(summary["port_cleanup"].values())
-        ):
-            summary["result"] = "FAIL"
-            summary.setdefault("error_code", "cleanup_or_persistence_failed")
-        print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
+        summary["execution_error"] = _stable_error(exc, "execution_failed")
+
+    summary["process_cleanup"] = stop(proc)
+    summary["fixture_cleanup"] = stop_fixture_server(server, server_thread, fixture)
+    attempts, fixture_errors = fixture.snapshot()
+    summary["attempts"] = attempts
+    summary["fixture_errors"] = fixture_errors
+    summary["salvage_count"] = sum(
+        attempt["salvage_material_present"] for attempt in attempts
+    )
+    summary["fresh_request_count"] = sum(
+        attempt["phase"] == "fresh" for attempt in attempts
+    )
+
+    positive = summary.get("positive_client")
+    fresh = summary.get("fresh_client")
+    summary["positive_pass"] = (
+        isinstance(positive, dict)
+        and positive["status"] == 200
+        and positive["nonempty"]
+        and positive["expected_final"]
+        and positive["reasoning_marker_leak_count"] == 0
+        and positive["private_prefix_marker_leak_count"] == 0
+    )
+    summary["fresh_negative_pass"] = (
+        isinstance(fresh, dict)
+        and fresh["status"] == 200
+        and fresh["nonempty"]
+        and fresh["expected_final"]
+        and fresh["reasoning_marker_leak_count"] == 0
+        and fresh["private_prefix_marker_leak_count"] == 0
+    )
+    summary["port_cleanup"] = {
+        "guard_rebindable": _rebindable(guard_port),
+        "fake_rebindable": _rebindable(fake_port),
+    }
+
+    lifecycle_final = (
+        summary["process_cleanup"]["proxy_exited"]
+        and summary["fixture_cleanup"]["server_stopped"]
+        and summary["fixture_cleanup"]["handlers_quiesced"]
+    )
+    if lifecycle_final:
+        try:
+            summary["sensitive_marker_leak_count_all_fixture_files"] = sensitive_marker_count(
+                root,
+                tuple(marker.encode() for marker in sensitive_markers),
+            )
+            summary["scan_errors"] = 0
+        except Exception as exc:
+            summary["sensitive_marker_leak_count_all_fixture_files"] = None
+            summary["scan_errors"] = 1
+            summary["scan_error"] = _stable_error(exc, "privacy_scan_failed")
+    else:
+        summary["sensitive_marker_leak_count_all_fixture_files"] = None
+        summary["scan_errors"] = 1
+        summary["scan_error"] = {
+            "class": "FixtureLifecycleError",
+            "code": "fixture_not_final",
+        }
+
+    errors = acceptance_errors(summary)
+    summary["acceptance_errors"] = errors
+    summary["result"] = "PASS" if not errors else "FAIL"
+    if errors:
+        summary["error_code"] = errors[0]
+    print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
     return 0 if summary["result"] == "PASS" else 1
 
 
