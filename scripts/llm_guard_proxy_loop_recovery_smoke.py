@@ -69,11 +69,13 @@ class Fixture:
     def __init__(
         self,
         reasoning_marker: str,
+        private_prefix_marker: str,
         fresh_input_marker: str,
         positive_output_marker: str,
         fresh_output_marker: str,
     ):
         self.reasoning_marker = reasoning_marker
+        self.private_prefix_marker = private_prefix_marker
         self.fresh_input_marker = fresh_input_marker
         self.positive_output_marker = positive_output_marker
         self.fresh_output_marker = fresh_output_marker
@@ -84,7 +86,8 @@ class Fixture:
         text = json.dumps(body, sort_keys=True, separators=(",", ":"))
         messages = body.get("messages")
         phase = "fresh" if isinstance(messages, list) and any(isinstance(message, dict) and message.get("content") == self.fresh_input_marker for message in messages) else "positive"
-        salvage_material = "Private bounded pre-loop reasoning notes" in text and "derive the isolated invariant before answering" in text
+        private_prefix_present = self.private_prefix_marker in text
+        salvage_material = private_prefix_present and "Private bounded pre-loop reasoning notes" in text
         with self.lock:
             n = len(self.chat_attempts) + 1
             attempt = {
@@ -98,6 +101,7 @@ class Fixture:
                 "stream_usage": isinstance(body.get("stream_options"), dict)
                 and body["stream_options"].get("include_usage") is True,
                 "salvage_material_present": salvage_material,
+                "private_prefix_present": private_prefix_present,
                 "loop_tail_present": self.reasoning_marker in text,
             }
             self.chat_attempts.append(attempt)
@@ -167,7 +171,7 @@ class Fixture:
                 self.end_headers()
                 try:
                     if attempt["number"] == 1:
-                        self.wfile.write(sse({"id": "fixture-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": "derive the isolated invariant before answering\n"}, "finish_reason": None}]}))
+                        self.wfile.write(sse({"id": "fixture-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": f"{fixture.private_prefix_marker} derive the isolated invariant before answering\n"}, "finish_reason": None}]}))
                         self.wfile.flush()
                         repeated = fixture.reasoning_marker + " repeat loop line\n"
                         for _ in range(40):
@@ -295,7 +299,7 @@ def wait_port(port: int, proc: subprocess.Popen[bytes], deadline: float) -> None
     fail("proxy_ready_timeout")
 
 
-def client(port: int, input_marker: str, expected_output: str, reasoning_marker: str) -> dict:
+def client(port: int, input_marker: str, expected_output: str, reasoning_marker: str, private_prefix_marker: str) -> dict:
     body = {"model": "__listener_forced_aeon_guard_max__", "messages": [{"role": "user", "content": input_marker}], "max_tokens": CALLER_MAX, "stream": False}
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=json.dumps(body, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"}, method="POST")
     try:
@@ -318,9 +322,10 @@ def client(port: int, input_marker: str, expected_output: str, reasoning_marker:
                         pass
                     break
             content = data.get("choices", [{}])[0].get("message", {}).get("content") if isinstance(data, dict) else None
-            return {"status": response.status, "format": response_format, "nonempty": isinstance(content, str) and bool(content), "expected_final": content == expected_output, "reasoning_marker_leak_count": raw.count(reasoning_marker.encode())}
+            return {"status": response.status, "format": response_format, "nonempty": isinstance(content, str) and bool(content), "expected_final": content == expected_output, "reasoning_marker_leak_count": raw.count(reasoning_marker.encode()), "private_prefix_marker_leak_count": raw.count(private_prefix_marker.encode())}
     except urllib.error.HTTPError as err:
-        return {"status": err.code, "nonempty": False, "expected_final": False, "reasoning_marker_leak_count": 0}
+        raw = err.read()
+        return {"status": err.code, "nonempty": False, "expected_final": False, "reasoning_marker_leak_count": raw.count(reasoning_marker.encode()), "private_prefix_marker_leak_count": raw.count(private_prefix_marker.encode())}
 
 
 def stop(proc: subprocess.Popen[bytes] | None) -> None:
@@ -361,10 +366,11 @@ def main() -> int:
     (root / "state").mkdir(mode=0o700)
     (root / "home").mkdir(mode=0o700)
     (root / "tmp").mkdir(mode=0o700)
-    markers = tuple("S" + secrets.token_hex(24) for _ in range(5))
-    reasoning_marker, positive_input_marker, fresh_input_marker, positive_output_marker, fresh_output_marker = markers
+    sensitive_markers = tuple("S" + secrets.token_hex(24) for _ in range(6))
+    reasoning_marker, private_prefix_marker, positive_input_marker, fresh_input_marker, positive_output_marker, fresh_output_marker = sensitive_markers
     fixture = Fixture(
         reasoning_marker,
+        private_prefix_marker,
         fresh_input_marker,
         positive_output_marker,
         fresh_output_marker,
@@ -396,12 +402,14 @@ def main() -> int:
                 positive_input_marker,
                 positive_output_marker,
                 reasoning_marker,
+                private_prefix_marker,
             )
             summary["fresh_client"] = client(
                 guard_port,
                 fresh_input_marker,
                 fresh_output_marker,
                 reasoning_marker,
+                private_prefix_marker,
             )
         salvages = [attempt for attempt in fixture.chat_attempts if attempt["salvage_material_present"]]
         fresh_attempts = [attempt for attempt in fixture.chat_attempts if attempt["phase"] == "fresh"]
@@ -413,14 +421,14 @@ def main() -> int:
             fixture.errors.append("fresh_request_missing")
         else:
             fresh = fresh_attempts[0]
-            if fresh["salvage_material_present"] or fresh["loop_tail_present"]:
+            if fresh["private_prefix_present"] or fresh["salvage_material_present"] or fresh["loop_tail_present"]:
                 fixture.errors.append("fresh_request_replayed_private_material")
             if fresh["thinking_budget"] != THINKING_BUDGET:
                 fixture.errors.append("fresh_thinking_budget")
         summary["attempts"] = fixture.chat_attempts
         summary["fixture_errors"] = fixture.errors
-        summary["positive_pass"] = summary["positive_client"]["status"] == 200 and summary["positive_client"]["nonempty"] and summary["positive_client"]["expected_final"] and summary["positive_client"]["reasoning_marker_leak_count"] == 0
-        summary["fresh_negative_pass"] = summary["fresh_client"]["status"] == 200 and summary["fresh_client"]["nonempty"] and summary["fresh_client"]["expected_final"] and summary["fresh_client"]["reasoning_marker_leak_count"] == 0
+        summary["positive_pass"] = summary["positive_client"]["status"] == 200 and summary["positive_client"]["nonempty"] and summary["positive_client"]["expected_final"] and summary["positive_client"]["reasoning_marker_leak_count"] == 0 and summary["positive_client"]["private_prefix_marker_leak_count"] == 0
+        summary["fresh_negative_pass"] = summary["fresh_client"]["status"] == 200 and summary["fresh_client"]["nonempty"] and summary["fresh_client"]["expected_final"] and summary["fresh_client"]["reasoning_marker_leak_count"] == 0 and summary["fresh_client"]["private_prefix_marker_leak_count"] == 0
         if fixture.errors or not summary["positive_pass"] or not summary["fresh_negative_pass"]:
             fail("acceptance_assertion_failed")
         summary["result"] = "PASS"
@@ -440,7 +448,7 @@ def main() -> int:
         summary["port_cleanup"] = {"guard_rebindable": _rebindable(guard_port), "fake_rebindable": _rebindable(fake_port)}
         summary["sensitive_marker_leak_count_all_fixture_files"] = sensitive_marker_count(
             root,
-            tuple(marker.encode() for marker in markers),
+            tuple(marker.encode() for marker in sensitive_markers),
         )
         if (
             summary["sensitive_marker_leak_count_all_fixture_files"]

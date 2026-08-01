@@ -31,7 +31,7 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 * `vllm-querit-4b-reranker.service`: single canonical BF16 pooling production owner on `18013`, with a 32,768-token context, 4,800 MiB KV cache, equal 18 GiB Docker memory/swap caps, and the live-proven AEON scheduler profile `--max-num-batched-tokens 16384`, `--max-num-seqs 32`, `--max-num-partial-prefills 1`, and `--max-long-partial-prefills 1`. Every startup completes the bounded rerank-readiness probe before its unit-owned generation verifier runs; that verifier binds the exact Docker generation without querying the still-starting `Type=simple` service's active state.
 * `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
 * `llm-guard-proxy` routes by request `model` to AEON chat (`aeon-ultimate`, `qwen3.6-27b-decensor-by-aeon`, `qwen3.6-27b-decensored`), embedding (`qwen3-embedding-8b`, `Qwen/Qwen3-Embedding-8B`), or reranker (`qwen3-reranker-8b`, `Qwen/Qwen3-Reranker-8B`).
-* `llm-guard-proxy` default chat (`:18009`) is force_disable with a single no-thinking rung. Opt-in legacy bounded chat (`:18014`) and guarded max-thinking (`:18011`) keep multi-rung ladders and loop salvage. The legacy 18002/18003 ports are guard-owned downstream listeners, not raw vLLM publishes.
+* `llm-guard-proxy` default chat (`:18009`) is force_disable with a single no-thinking rung. Opt-in legacy bounded chat (`:18014`) keeps its multi-rung ladder and `bounded_answer_from_cot`; guarded max-thinking (`:18011`) uses `truncate_cot_then_answer` for one retry-local no-thinking synthesis. The legacy 18002/18003 ports are guard-owned downstream listeners, not raw vLLM publishes.
 * `llm-guard-proxy` also hot-reloads `config.toml`. Use `[server]` to change default/chat request parallelism and per-`[[upstreams]]` `max_in_flight_requests` / `max_queued_generation_requests` to tune embedding/reranker independently without restarting vLLM, trading total throughput against single-stream latency.
 
 ### llm-guard-proxy Enabled Features
@@ -69,30 +69,29 @@ chat-only mutation disabled for embedding/reranker profiles:
   `no_thinking_marker_policy = "force"`. Embedding and reranker models still
   route on `:18009` by `model` name. Opt-in **legacy bounded** chat lives on
   forced listener `:18014` (`aeon-legacy-bounded`: `bounded_thinking` 32768,
-  `respect_no_thinking_markers`, loop_guard enforce + retry ladder). Experimental
-  max-thinking arms remain on `:18011` (guarded) and `:18015` (raw).
+  `respect_no_thinking_markers`, loop_guard enforce + retry ladder, and
+  `bounded_answer_from_cot`). Guarded max-thinking on `:18011` uses
+  `truncate_cot_then_answer` for exactly one no-thinking synthesis from
+  retry-local truncated CoT; `:18015` remains raw max-thinking.
 * **Shielded retry ladder**: default chat uses a single no-thinking rung.
   Legacy `:18014` and guarded `:18011` retain multi-rung ladders.
 * **Loop guard**: disabled on the default `:18009` chat path (matches the
-  benchmarked force_disable arm). Legacy `:18014` and guarded `:18011` still
-  enforce loop detection, including embedding-backed semantic scoring and
-  `on_reasoning_loop = "bounded_answer_from_cot"` salvage where configured.
+  benchmarked force_disable arm). Legacy `:18014` keeps
+  `bounded_answer_from_cot`; guarded `:18011` uses
+  `truncate_cot_then_answer` and never exposes captured private CoT to the
+  client or a fresh request.
 * **Observability**: SQLite observability, Prometheus metrics, upstream health
-  probing, debug summaries, and raw observability payload capture are enabled.
-  `/debug/recent-requests` currently has no admin token configured; treat it as
-  Tailscale-private metadata/debug output.
-* **Evidence ledger**: evidence recording runs in quality-debug mode for loop
-  detector improvement. Ordinary attempts store redacted raw payloads and
-  selected request headers (`include_raw_payloads = true`,
-  `include_request_headers = true`). Shadow evidence is enabled for looped
-  attempts with bounded-thinking, no-thinking, and CoT-salvage comparison
-  attempts; the original looping attempt is also kept running for evidence so
-  imperfect loop detection can be audited. Paired comparison sampling is enabled
-  for 100% of successful primary requests across max-thinking,
-  bounded-thinking, and no-thinking variants, storing redacted raw input,
-  output, and reasoning/CoT for offline quality comparison. Evidence retention
-  is increased to a 10 GiB/200k-record envelope and paired raw artifacts retain
-  up to 8 GiB or 14 days.
+  probing, and debug summaries are enabled, but raw payload capture is disabled
+  (`capture_raw_payloads = false`). `/debug/recent-requests` currently has no
+  admin token configured; treat it as Tailscale-private metadata/debug output.
+* **Evidence ledger**: evidence recording keeps metadata-only/redacted summaries
+  and selected request headers (`include_raw_payloads = false`,
+  `include_request_headers = true`). Captured CoT is retry-local and is not
+  persisted by shadow or paired comparisons. Paired sampling remains enabled for
+  successful primary requests, but raw input, output, and reasoning are disabled
+  (`include_raw_input = false`, `include_raw_output = false`, and
+  `include_raw_reasoning = false`). Evidence retention remains bounded at
+  10 GiB/200k records; no paired raw artifacts are retained.
 * **Streaming heartbeat and Cloudflare mode**: SSE heartbeats are emitted every
   15 seconds and `[cloudflare].enabled = true`.
 
