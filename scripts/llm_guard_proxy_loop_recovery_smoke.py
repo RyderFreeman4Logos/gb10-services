@@ -35,21 +35,30 @@ PROCESS_TERM_GRACE = 1.0
 PROCESS_STOP_TIMEOUT = 4.0
 PROCESS_POLL_INTERVAL = 0.02
 SCAN_CHUNK_SIZE = 64 * 1024
+SCAN_MAX_ENTRIES = 2_048
+SCAN_MAX_FILE_BYTES = 64 * 1024 * 1024
+SCAN_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+SCAN_TIMEOUT = 6.0
 SYS_PIDFD_SEND_SIGNAL = 424
 SYS_PIDFD_OPEN = 434
+PR_SET_CHILD_SUBREAPER = 36
+PR_GET_CHILD_SUBREAPER = 37
 
 
 class ProcessIdentity(NamedTuple):
     pid: int
     state: str
+    ppid: int
     pgrp: int
     session: int
     starttime: int
     pidfd: int | None = None
+    pidfd_errno: int | None = None
 
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _LIBC.syscall.restype = ctypes.c_long
+_LIBC.prctl.restype = ctypes.c_int
 
 
 def _linux_syscall(number: int, *args) -> int:
@@ -79,6 +88,20 @@ def _pidfd_send_signal(pidfd: int, signum: int) -> None:
         ctypes.c_void_p(),
         0,
     )
+
+
+def _enable_child_subreaper() -> None:
+    if sys.platform != "linux":
+        raise OSError(errno.ENOSYS, "child_subreaper_unsupported")
+    if _LIBC.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        value = ctypes.get_errno()
+        raise OSError(value, "child_subreaper_setup_failed")
+    enabled = ctypes.c_int()
+    if _LIBC.prctl(PR_GET_CHILD_SUBREAPER, ctypes.byref(enabled), 0, 0, 0) != 0:
+        value = ctypes.get_errno()
+        raise OSError(value, "child_subreaper_verify_failed")
+    if enabled.value != 1:
+        raise OSError(errno.EIO, "child_subreaper_not_enabled")
 
 
 def fail(message: str) -> None:
@@ -441,6 +464,7 @@ def _read_process_identity(pid: int) -> ProcessIdentity | None:
     return ProcessIdentity(
         pid=parsed_pid,
         state=fields[0],
+        ppid=int(fields[1]),
         pgrp=int(fields[2]),
         session=int(fields[3]),
         starttime=int(fields[19]),
@@ -448,33 +472,48 @@ def _read_process_identity(pid: int) -> ProcessIdentity | None:
 
 
 def _same_process(left: ProcessIdentity | None, right: ProcessIdentity) -> bool:
-    return left is not None and (
-        left.pid,
-        left.starttime,
-        left.pgrp,
-        left.session,
-    ) == (right.pid, right.starttime, right.pgrp, right.session)
+    return left is not None and (left.pid, left.starttime) == (
+        right.pid,
+        right.starttime,
+    )
 
 
 def capture_spawn_identity(pid: int) -> ProcessIdentity:
     before = _read_process_identity(pid)
     if before is None:
         raise ProcessLookupError(pid)
-    pidfd = _pidfd_open(pid)
-    after = _read_process_identity(pid)
-    if not _same_process(after, before):
-        os.close(pidfd)
-        raise OSError(errno.ESTALE, "spawn_identity_changed")
     if before.pgrp != pid or before.session != pid:
-        os.close(pidfd)
+        raise RuntimeError("proxy_not_session_leader")
+    pidfd = None
+    pidfd_errno = None
+    try:
+        pidfd = _pidfd_open(pid)
+    except OSError as exc:
+        pidfd_errno = exc.errno or errno.EIO
+    try:
+        after = _read_process_identity(pid)
+    except Exception:
+        if pidfd is not None:
+            os.close(pidfd)
+        raise
+    if not _same_process(after, before):
+        if pidfd is not None:
+            os.close(pidfd)
+        raise OSError(errno.ESTALE, "spawn_identity_changed")
+    assert after is not None
+    if after.pgrp != pid or after.session != pid:
+        if pidfd is not None:
+            os.close(pidfd)
         raise RuntimeError("proxy_not_session_leader")
     return ProcessIdentity(
-        pid=before.pid,
-        state=before.state,
-        pgrp=before.pgrp,
-        session=before.session,
-        starttime=before.starttime,
+        pid=after.pid,
+        state=after.state,
+        ppid=after.ppid,
+        pgrp=after.pgrp,
+        session=after.session,
+        starttime=after.starttime,
         pidfd=pidfd,
+        pidfd_errno=pidfd_errno,
     )
 
 
@@ -497,22 +536,107 @@ def _child_exited(pid: int) -> bool:
         raise RuntimeError("proxy_identity_reaped") from exc
 
 
-def _producer_sets(
-    identity: ProcessIdentity,
-) -> tuple[dict[int, ProcessIdentity], dict[int, ProcessIdentity]]:
-    group: dict[int, ProcessIdentity] = {}
-    session: dict[int, ProcessIdentity] = {}
+def _process_table() -> dict[int, ProcessIdentity]:
+    processes: dict[int, ProcessIdentity] = {}
     with os.scandir("/proc") as entries:
         for entry in entries:
             if not entry.name.isdecimal():
                 continue
             current = _read_process_identity(int(entry.name))
-            if current is None or current.state in {"X", "Z"}:
-                continue
-            if current.pgrp == identity.pgrp:
-                group[current.pid] = current
-            if current.session == identity.session:
-                session[current.pid] = current
+            if current is not None:
+                processes[current.pid] = current
+    return processes
+
+
+def _capture_direct_children() -> dict[int, ProcessIdentity]:
+    parent = os.getpid()
+    return {
+        pid: identity
+        for pid, identity in _process_table().items()
+        if identity.ppid == parent
+    }
+
+
+def _owned_processes(
+    root: ProcessIdentity,
+    baseline: dict[int, ProcessIdentity],
+    known: dict[int, ProcessIdentity],
+) -> dict[int, ProcessIdentity]:
+    table = _process_table()
+    owned: dict[int, ProcessIdentity] = {}
+    for pid, remembered in known.items():
+        current = table.get(pid)
+        if _same_process(current, remembered):
+            assert current is not None
+            owned[pid] = current
+    current_root = table.get(root.pid)
+    if _same_process(current_root, root):
+        assert current_root is not None
+        owned[root.pid] = current_root
+
+    parent = os.getpid()
+    for pid, current in table.items():
+        baseline_identity = baseline.get(pid)
+        if current.ppid == parent and (
+            baseline_identity is None or not _same_process(current, baseline_identity)
+        ):
+            owned[pid] = current
+
+    changed = True
+    while changed:
+        changed = False
+        for pid, current in table.items():
+            if pid not in owned and current.ppid in owned:
+                owned[pid] = current
+                changed = True
+
+    for pid, current in owned.items():
+        remembered = known.get(pid)
+        if remembered is not None and remembered.pidfd is not None:
+            current = current._replace(
+                pidfd=remembered.pidfd,
+                pidfd_errno=remembered.pidfd_errno,
+            )
+            owned[pid] = current
+        known[pid] = current
+    return owned
+
+
+def _reap_adopted(
+    owned: dict[int, ProcessIdentity], root_pid: int
+) -> None:
+    parent = os.getpid()
+    for identity in owned.values():
+        if (
+            identity.pid == root_pid
+            or identity.ppid != parent
+            or identity.state != "Z"
+        ):
+            continue
+        current = _read_process_identity(identity.pid)
+        if not _same_process(current, identity):
+            continue
+        assert current is not None
+        if current.ppid != parent:
+            continue
+        try:
+            os.waitpid(identity.pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
+def _producer_sets(
+    identity: ProcessIdentity,
+) -> tuple[dict[int, ProcessIdentity], dict[int, ProcessIdentity]]:
+    group: dict[int, ProcessIdentity] = {}
+    session: dict[int, ProcessIdentity] = {}
+    for current in _process_table().values():
+        if current.state in {"X", "Z"}:
+            continue
+        if current.pgrp == identity.pgrp:
+            group[current.pid] = current
+        if current.session == identity.session:
+            session[current.pid] = current
     return group, session
 
 
@@ -527,10 +651,30 @@ def _signal_group(identity: ProcessIdentity, signum: int) -> bool:
 
 
 def _signal_identity(identity: ProcessIdentity, signum: int) -> bool:
+    close_pidfd = False
     try:
-        pidfd = _pidfd_open(identity.pid)
+        if identity.pidfd is not None:
+            pidfd = identity.pidfd
+        else:
+            pidfd = _pidfd_open(identity.pid)
+            close_pidfd = True
     except ProcessLookupError:
         return False
+    except OSError:
+        current = _read_process_identity(identity.pid)
+        if not _same_process(current, identity):
+            return False
+        assert current is not None
+        if current.ppid != os.getpid():
+            raise
+        try:
+            os.kill(identity.pid, signum)
+        except ProcessLookupError:
+            return False
+        after = _read_process_identity(identity.pid)
+        if after is not None and not _same_process(after, identity):
+            raise OSError(errno.ESTALE, "owned_process_identity_changed")
+        return True
     try:
         if not _same_process(_read_process_identity(identity.pid), identity):
             return False
@@ -539,21 +683,54 @@ def _signal_identity(identity: ProcessIdentity, signum: int) -> bool:
     except ProcessLookupError:
         return False
     finally:
-        os.close(pidfd)
+        if close_pidfd:
+            os.close(pidfd)
 
 
 def _wait_for_quiescence(
     identity: ProcessIdentity,
+    baseline: dict[int, ProcessIdentity],
+    known: dict[int, ProcessIdentity],
     deadline: float,
-) -> tuple[bool, dict[int, ProcessIdentity], dict[int, ProcessIdentity]]:
+    signum: int,
+    signalled: set[tuple[int, int]],
+) -> tuple[
+    bool,
+    dict[int, ProcessIdentity],
+    dict[int, ProcessIdentity],
+    dict[int, ProcessIdentity],
+    bool,
+    Exception | None,
+]:
+    sent = False
+    signal_error = None
     while True:
+        owned = _owned_processes(identity, baseline, known)
+        _reap_adopted(owned, identity.pid)
+        owned = _owned_processes(identity, baseline, known)
+        for member in owned.values():
+            key = (member.pid, member.starttime)
+            if member.state in {"X", "Z"} or key in signalled:
+                continue
+            try:
+                member_sent = _signal_identity(member, signum)
+                sent = member_sent or sent
+                if member_sent:
+                    signalled.add(key)
+            except OSError as exc:
+                signal_error = signal_error or exc
         root_exited = _child_exited(identity.pid)
         group, session = _producer_sets(identity)
-        if root_exited and not session:
-            return True, group, session
+        live_owned = {
+            pid: member
+            for pid, member in owned.items()
+            if member.state not in {"X", "Z"}
+        }
+        if root_exited and not live_owned:
+            return True, group, session, owned, sent, signal_error
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return False, group, session
+            return False, group, session, owned, sent, signal_error
         time.sleep(min(PROCESS_POLL_INTERVAL, remaining))
 
 
@@ -610,6 +787,7 @@ def _stable_error(exc: Exception, fallback: str) -> dict[str, str]:
 def stop(
     proc: subprocess.Popen[bytes] | None,
     identity: ProcessIdentity | None = None,
+    baseline_children: dict[int, ProcessIdentity] | None = None,
 ) -> dict[str, object]:
     cleanup: dict[str, object] = {
         "proxy_exited": proc is None,
@@ -619,10 +797,12 @@ def stop(
         "term_sent": False,
         "kill_sent": False,
         "spawn_identity_captured": identity is not None,
+        "pidfd_available": identity is not None and identity.pidfd is not None,
+        "ownership_quiesced": proc is None,
         "group_quiesced": proc is None,
         "session_quiesced": proc is None,
-        "residual_producer_count_before_kill": 0,
-        "residual_producer_count_final": 0,
+        "residual_producer_count_before_kill": 0 if proc is None else None,
+        "residual_producer_count_final": 0 if proc is None else None,
     }
     if proc is None:
         return cleanup
@@ -633,52 +813,103 @@ def stop(
             identity = capture_spawn_identity(proc.pid)
         except Exception as exc:
             cleanup["stop_error"] = _stable_error(exc, "spawn_identity_missing")
+            cleanup["unexpected_exit"] = proc.poll() is not None
+            try:
+                if proc.returncode is None:
+                    proc.terminate()
+                    cleanup["term_sent"] = True
+                    try:
+                        proc.wait(timeout=min(PROCESS_TERM_GRACE, PROCESS_STOP_TIMEOUT))
+                    except subprocess.TimeoutExpired:
+                        cleanup["forced_kill"] = True
+                        proc.kill()
+                        cleanup["kill_sent"] = True
+                        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except Exception as cleanup_exc:
+                cleanup.setdefault(
+                    "cleanup_error",
+                    _stable_error(cleanup_exc, "direct_child_cleanup_failed"),
+                )
+            cleanup["returncode"] = proc.returncode
+            cleanup["proxy_exited"] = proc.returncode is not None
             return cleanup
+    cleanup["spawn_identity_captured"] = True
+    cleanup["pidfd_available"] = identity.pidfd is not None
+    if identity.pidfd_errno is not None:
+        cleanup["stop_error"] = _stable_error(
+            OSError(identity.pidfd_errno, os.strerror(identity.pidfd_errno)),
+            "pidfd_unavailable",
+        )
     cleanup["spawn_identity"] = {
         "pid": identity.pid,
+        "ppid": identity.ppid,
         "starttime": identity.starttime,
         "pgid": identity.pgrp,
         "session": identity.session,
     }
 
+    baseline = baseline_children or {}
+    known = {identity.pid: identity}
     group: dict[int, ProcessIdentity] = {}
     session_members: dict[int, ProcessIdentity] = {}
+    owned: dict[int, ProcessIdentity] = {}
     quiesced = False
+    ownership_scan_ok = False
     try:
         cleanup["unexpected_exit"] = _child_exited(identity.pid)
         group, session_members = _producer_sets(identity)
         cleanup["term_sent"] = _signal_group(identity, signal.SIGTERM)
-        for member in session_members.values():
-            if member.pgrp != identity.pgrp:
-                cleanup["term_sent"] = (
-                    _signal_identity(member, signal.SIGTERM)
-                    or cleanup["term_sent"]
-                )
         term_deadline = min(deadline, time.monotonic() + PROCESS_TERM_GRACE)
-        quiesced, group, session_members = _wait_for_quiescence(
-            identity, term_deadline
+        quiesced, group, session_members, owned, sent, signal_error = (
+            _wait_for_quiescence(
+                identity,
+                baseline,
+                known,
+                term_deadline,
+                signal.SIGTERM,
+                set(),
+            )
         )
+        ownership_scan_ok = True
+        cleanup["term_sent"] = sent or cleanup["term_sent"]
+        if signal_error is not None:
+            cleanup.setdefault(
+                "stop_error", _stable_error(signal_error, "proxy_sigterm_failed")
+            )
+        if quiesced:
+            cleanup["residual_producer_count_before_kill"] = 0
     except Exception as exc:
-        cleanup["stop_error"] = _stable_error(exc, "proxy_sigterm_failed")
+        cleanup.setdefault("stop_error", _stable_error(exc, "proxy_sigterm_failed"))
 
     if not quiesced:
         cleanup["forced_kill"] = True
-        cleanup["residual_producer_count_before_kill"] = len(session_members)
+        if ownership_scan_ok:
+            cleanup["residual_producer_count_before_kill"] = sum(
+                member.state not in {"X", "Z"} for member in owned.values()
+            )
         try:
             cleanup["kill_sent"] = _signal_group(identity, signal.SIGKILL)
-            for member in session_members.values():
-                cleanup["kill_sent"] = (
-                    _signal_identity(member, signal.SIGKILL)
-                    or cleanup["kill_sent"]
-                )
         except Exception as exc:
             cleanup.setdefault(
                 "stop_error", _stable_error(exc, "proxy_sigkill_failed")
             )
         try:
-            quiesced, group, session_members = _wait_for_quiescence(
-                identity, deadline
+            quiesced, group, session_members, owned, sent, signal_error = (
+                _wait_for_quiescence(
+                    identity,
+                    baseline,
+                    known,
+                    deadline,
+                    signal.SIGKILL,
+                    set(),
+                )
             )
+            ownership_scan_ok = True
+            cleanup["kill_sent"] = sent or cleanup["kill_sent"]
+            if signal_error is not None:
+                cleanup.setdefault(
+                    "stop_error", _stable_error(signal_error, "proxy_sigkill_failed")
+                )
         except Exception as exc:
             cleanup.setdefault(
                 "stop_error", _stable_error(exc, "proxy_quiescence_failed")
@@ -698,12 +929,26 @@ def stop(
     except Exception as exc:
         cleanup.setdefault("stop_error", _stable_error(exc, "proxy_reap_failed"))
 
+    final_owned: dict[int, ProcessIdentity] = owned
     try:
+        while True:
+            final_owned = _owned_processes(identity, baseline, known)
+            _reap_adopted(final_owned, identity.pid)
+            final_owned = _owned_processes(identity, baseline, known)
+            if not final_owned or time.monotonic() >= deadline:
+                break
+            time.sleep(
+                min(PROCESS_POLL_INTERVAL, max(0.0, deadline - time.monotonic()))
+            )
         final_group, final_session = _producer_sets(identity)
         cleanup["group_quiesced"] = not final_group
         cleanup["session_quiesced"] = not final_session
-        cleanup["residual_producer_count_final"] = len(final_session)
+        cleanup["ownership_quiesced"] = not final_owned
+        cleanup["residual_producer_count_final"] = sum(
+            member.state not in {"X", "Z"} for member in final_owned.values()
+        )
     except Exception as exc:
+        cleanup["ownership_quiesced"] = False
         cleanup["group_quiesced"] = False
         cleanup["session_quiesced"] = False
         cleanup.setdefault(
@@ -721,6 +966,8 @@ def stop(
         and not cleanup["unexpected_exit"]
         and not cleanup["forced_kill"]
         and cleanup["spawn_identity_captured"]
+        and cleanup["pidfd_available"]
+        and cleanup["ownership_quiesced"]
         and cleanup["group_quiesced"]
         and cleanup["session_quiesced"]
         and "stop_error" not in cleanup
@@ -813,25 +1060,74 @@ def _require_stable_stat(
         raise OSError(errno.ESTALE, code)
 
 
-def sensitive_marker_count(root: Path, markers: tuple[bytes, ...]) -> int:
+def sensitive_marker_count(
+    root: Path,
+    markers: tuple[bytes, ...],
+    stats: dict[str, int | float | bool] | None = None,
+) -> int:
     if not markers or any(not isinstance(marker, bytes) or not marker for marker in markers):
         raise ValueError("privacy_scan_invalid_marker")
+    started = time.monotonic()
+    deadline = started + SCAN_TIMEOUT
+    entry_count = 0
+    logical_bytes = 0
+    largest_file_bytes = 0
+    if stats is not None:
+        stats.clear()
+        stats.update(
+            {
+                "completed": False,
+                "entry_count": 0,
+                "logical_bytes": 0,
+                "largest_file_bytes": 0,
+                "max_entries": SCAN_MAX_ENTRIES,
+                "max_file_bytes": SCAN_MAX_FILE_BYTES,
+                "max_total_bytes": SCAN_MAX_TOTAL_BYTES,
+                "deadline_seconds": SCAN_TIMEOUT,
+            }
+        )
     common_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
     directory_flags = common_flags | os.O_DIRECTORY
     file_flags = common_flags | os.O_NONBLOCK
 
+    def check_deadline() -> None:
+        if time.monotonic() >= deadline:
+            raise OSError(errno.ETIMEDOUT, "privacy_scan_deadline")
+
+    def count_entry() -> None:
+        nonlocal entry_count
+        check_deadline()
+        entry_count += 1
+        if stats is not None:
+            stats["entry_count"] = entry_count
+        if entry_count > SCAN_MAX_ENTRIES:
+            raise OSError(errno.E2BIG, "privacy_scan_entry_limit")
+
     def scan_file(parent_fd: int, name: str, before: os.stat_result) -> int:
+        nonlocal largest_file_bytes, logical_bytes
+        check_deadline()
         fd = os.open(name, file_flags, dir_fd=parent_fd)
         try:
             opened = os.fstat(fd)
             if not stat.S_ISREG(opened.st_mode):
                 raise OSError(errno.EINVAL, "privacy_scan_non_regular")
             _require_stable_stat(before, opened, "privacy_scan_file_replaced")
+            if opened.st_size > SCAN_MAX_FILE_BYTES:
+                raise OSError(errno.EFBIG, "privacy_scan_file_limit")
+            if logical_bytes > SCAN_MAX_TOTAL_BYTES - opened.st_size:
+                raise OSError(errno.EFBIG, "privacy_scan_total_limit")
+            logical_bytes += opened.st_size
+            largest_file_bytes = max(largest_file_bytes, opened.st_size)
+            if stats is not None:
+                stats["logical_bytes"] = logical_bytes
+                stats["largest_file_bytes"] = largest_file_bytes
             remaining = opened.st_size
             tails = {marker: b"" for marker in markers}
             count = 0
             while remaining:
+                check_deadline()
                 chunk = os.read(fd, min(SCAN_CHUNK_SIZE, remaining))
+                check_deadline()
                 if not chunk:
                     raise OSError(errno.ESTALE, "privacy_scan_file_truncated")
                 remaining -= len(chunk)
@@ -841,6 +1137,7 @@ def sensitive_marker_count(root: Path, markers: tuple[bytes, ...]) -> int:
                     tails[marker] = (
                         combined[-(len(marker) - 1) :] if len(marker) > 1 else b""
                     )
+            check_deadline()
             if os.read(fd, 1):
                 raise OSError(errno.ESTALE, "privacy_scan_file_grew")
             _require_stable_stat(
@@ -856,8 +1153,10 @@ def sensitive_marker_count(root: Path, markers: tuple[bytes, ...]) -> int:
 
     def scan_directory(fd: int, before: os.stat_result) -> int:
         total = 0
+        check_deadline()
         with os.scandir(fd) as entries:
             for entry in entries:
+                count_entry()
                 entry_before = entry.stat(follow_symlinks=False)
                 if stat.S_ISLNK(entry_before.st_mode):
                     raise OSError(errno.ELOOP, "privacy_scan_symlink")
@@ -901,6 +1200,7 @@ def sensitive_marker_count(root: Path, markers: tuple[bytes, ...]) -> int:
         )
         return total
 
+    check_deadline()
     root_fd = os.open(root, directory_flags)
     try:
         root_before = os.fstat(root_fd)
@@ -912,6 +1212,14 @@ def sensitive_marker_count(root: Path, markers: tuple[bytes, ...]) -> int:
             os.stat(root, follow_symlinks=False),
             "privacy_scan_root_replaced",
         )
+        finished = time.monotonic()
+        if finished >= deadline:
+            raise OSError(errno.ETIMEDOUT, "privacy_scan_deadline")
+        if stats is not None:
+            stats["completed"] = True
+            stats["elapsed_milliseconds"] = int(
+                (finished - started) * 1_000
+            )
         return total
     finally:
         os.close(root_fd)
@@ -921,6 +1229,8 @@ def acceptance_errors(summary: dict) -> list[str]:
     errors: list[str] = []
     if summary.get("execution_error") is not None:
         errors.append("execution_failed")
+    if not summary.get("subreaper_enabled"):
+        errors.append("child_subreaper_not_enabled")
     errors.extend(summary.get("fixture_errors", []))
 
     attempts = summary.get("attempts", [])
@@ -971,9 +1281,13 @@ def acceptance_errors(summary: dict) -> list[str]:
         errors.append("proxy_forced_kill")
     if not process_cleanup.get("spawn_identity_captured"):
         errors.append("proxy_spawn_identity_missing")
-    if process_cleanup.get("residual_producer_count_before_kill"):
+    if not process_cleanup.get("pidfd_available"):
+        errors.append("proxy_pidfd_unavailable")
+    if not process_cleanup.get("ownership_quiesced"):
+        errors.append("proxy_ownership_not_quiesced")
+    if process_cleanup.get("residual_producer_count_before_kill") != 0:
         errors.append("proxy_residual_producer_detected")
-    if process_cleanup.get("residual_producer_count_final"):
+    if process_cleanup.get("residual_producer_count_final") != 0:
         errors.append("proxy_residual_producer_final")
     if not process_cleanup.get("group_quiesced"):
         errors.append("proxy_group_not_quiesced")
@@ -1003,6 +1317,8 @@ def acceptance_errors(summary: dict) -> list[str]:
         errors.append("privacy_scan_failed")
     elif summary.get("sensitive_marker_leak_count_all_fixture_files") != 0:
         errors.append("fixture_marker_leak")
+    if not summary.get("scan_limits_enforced"):
+        errors.append("privacy_scan_limits_unverified")
     return errors
 
 
@@ -1039,14 +1355,26 @@ def main() -> int:
         "fixture_root_mode": oct(root.stat().st_mode & 0o777),
         "ports": {"fake": fake_port, "guard": guard_port},
         "execution_error": None,
+        "subreaper_enabled": False,
+        "scan_limits": {
+            "max_entries": SCAN_MAX_ENTRIES,
+            "max_file_bytes": SCAN_MAX_FILE_BYTES,
+            "max_total_bytes": SCAN_MAX_TOTAL_BYTES,
+            "deadline_seconds": SCAN_TIMEOUT,
+        },
+        "scan_limits_enforced": False,
     }
     proc = None
     process_identity = None
+    baseline_children: dict[int, ProcessIdentity] = {}
     server = None
     server_thread = None
     try:
         config, hashes = isolated_config(candidate, root, fake_port, guard_port)
         summary.update(hashes)
+        _enable_child_subreaper()
+        summary["subreaper_enabled"] = True
+        baseline_children = _capture_direct_children()
         server = FixtureHTTPServer(("127.0.0.1", fake_port), fixture.handler(), fixture)
         server_thread = threading.Thread(
             target=server.serve_forever,
@@ -1058,6 +1386,11 @@ def main() -> int:
         with (root / "proxy.log").open("wb") as log:
             proc = subprocess.Popen([str(binary), "--config", str(config), "--guardian-runtime-dir", str(root / "guardian-runtime")], cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             process_identity = capture_spawn_identity(proc.pid)
+            if process_identity.pidfd_errno is not None:
+                raise OSError(
+                    process_identity.pidfd_errno,
+                    os.strerror(process_identity.pidfd_errno),
+                )
             wait_port(guard_port, proc, time.monotonic() + 20)
             summary["candidate_full_toml_release_binary_parsed"] = True
             summary["positive_client"] = client(
@@ -1077,7 +1410,7 @@ def main() -> int:
     except Exception as exc:
         summary["execution_error"] = _stable_error(exc, "execution_failed")
 
-    summary["process_cleanup"] = stop(proc, process_identity)
+    summary["process_cleanup"] = stop(proc, process_identity, baseline_children)
     summary["fixture_cleanup"] = stop_fixture_server(server, server_thread, fixture)
     attempts, fixture_errors = fixture.snapshot()
     summary["attempts"] = attempts
@@ -1113,7 +1446,9 @@ def main() -> int:
     }
 
     lifecycle_final = (
-        summary["process_cleanup"]["proxy_exited"]
+        summary["subreaper_enabled"]
+        and summary["process_cleanup"]["proxy_exited"]
+        and summary["process_cleanup"]["ownership_quiesced"]
         and summary["process_cleanup"]["group_quiesced"]
         and summary["process_cleanup"]["session_quiesced"]
         and summary["process_cleanup"]["residual_producer_count_final"] == 0
@@ -1122,12 +1457,26 @@ def main() -> int:
         and summary["fixture_cleanup"]["handlers_quiesced"]
     )
     if lifecycle_final:
+        scan_stats: dict[str, int | float | bool] = {}
+        summary["scan_stats"] = scan_stats
         try:
             summary["sensitive_marker_leak_count_all_fixture_files"] = sensitive_marker_count(
                 root,
                 tuple(marker.encode() for marker in sensitive_markers),
+                scan_stats,
             )
             summary["scan_errors"] = 0
+            summary["scan_limits_enforced"] = bool(
+                scan_stats.get("completed")
+                and scan_stats.get("entry_count", SCAN_MAX_ENTRIES + 1)
+                <= SCAN_MAX_ENTRIES
+                and scan_stats.get("logical_bytes", SCAN_MAX_TOTAL_BYTES + 1)
+                <= SCAN_MAX_TOTAL_BYTES
+                and scan_stats.get("largest_file_bytes", SCAN_MAX_FILE_BYTES + 1)
+                <= SCAN_MAX_FILE_BYTES
+                and scan_stats.get("elapsed_milliseconds", SCAN_TIMEOUT * 1_000 + 1)
+                < SCAN_TIMEOUT * 1_000
+            )
         except Exception as exc:
             summary["sensitive_marker_leak_count_all_fixture_files"] = None
             summary["scan_errors"] = 1

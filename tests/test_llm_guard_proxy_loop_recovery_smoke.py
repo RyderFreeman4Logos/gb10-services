@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ctypes
 import errno
+import io
 import importlib.util
+import json
 import os
 import signal
 import socket
@@ -11,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -23,6 +27,16 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC and SPEC.loader
 smoke = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(smoke)
+
+
+def enable_test_subreaper() -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "test_subreaper_setup_failed")
+
+
+def fd_count() -> int:
+    return len(os.listdir("/proc/self/fd"))
 
 
 def attempt(
@@ -61,12 +75,15 @@ def passing_summary() -> dict:
         "positive_pass": True,
         "fresh_negative_pass": True,
         "execution_error": None,
+        "subreaper_enabled": True,
         "process_cleanup": {
             "proxy_exited": True,
             "unexpected_exit": False,
             "graceful_stop": True,
             "forced_kill": False,
             "spawn_identity_captured": True,
+            "pidfd_available": True,
+            "ownership_quiesced": True,
             "group_quiesced": True,
             "session_quiesced": True,
             "residual_producer_count_before_kill": 0,
@@ -80,6 +97,7 @@ def passing_summary() -> dict:
         "port_cleanup": {"guard_rebindable": True, "fake_rebindable": True},
         "sensitive_marker_leak_count_all_fixture_files": 0,
         "scan_errors": 0,
+        "scan_limits_enforced": True,
     }
 
 
@@ -226,6 +244,13 @@ while True:
 
                     cleanup = smoke.stop(proc, identity)
                     self.assertTrue(cleanup["proxy_exited"])
+                    self.assertTrue(cleanup["spawn_identity_captured"])
+                    self.assertTrue(cleanup["pidfd_available"])
+                    self.assertTrue(cleanup["ownership_quiesced"])
+                    self.assertEqual(
+                        cleanup["residual_producer_count_before_kill"], 0
+                    )
+                    self.assertEqual(cleanup["residual_producer_count_final"], 0)
                     self.assertTrue(cleanup["group_quiesced"])
                     self.assertTrue(cleanup["session_quiesced"])
                     self.assertFalse(cleanup["forced_kill"])
@@ -258,6 +283,10 @@ while True:
                 identity = smoke.capture_spawn_identity(proc.pid)
                 cleanup = smoke.stop(proc, identity)
             self.assertTrue(cleanup["spawn_identity_captured"])
+            self.assertTrue(cleanup["pidfd_available"])
+            self.assertTrue(cleanup["ownership_quiesced"])
+            self.assertEqual(cleanup["residual_producer_count_before_kill"], 0)
+            self.assertEqual(cleanup["residual_producer_count_final"], 0)
             self.assertFalse(cleanup["graceful_stop"])
             self.assertFalse(cleanup["forced_kill"])
             self.assertEqual(cleanup["returncode"], -signal.SIGTERM)
@@ -320,6 +349,7 @@ while True:
                 self.assertFalse(cleanup["graceful_stop"])
                 self.assertTrue(cleanup["group_quiesced"])
                 self.assertTrue(cleanup["session_quiesced"])
+                self.assertTrue(cleanup["ownership_quiesced"])
                 self.assertEqual(cleanup["residual_producer_count_final"], 0)
                 self.assertFalse(smoke.process_identity_is_live(child_pid))
 
@@ -336,6 +366,238 @@ while True:
                         proc.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         self.fail("owned process group did not terminate")
+
+    def test_subreaper_setup_failure_prevents_candidate_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            marker = base / "spawned"
+            binary = base / "candidate"
+            binary.write_text(
+                "#!/usr/bin/env python3\n"
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('spawned')\n"
+            )
+            binary.chmod(0o700)
+            output = io.StringIO()
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "smoke",
+                        "--candidate-config",
+                        str(ROOT / "config" / "llm-guard-proxy" / "config.toml"),
+                        "--binary",
+                        str(binary),
+                        "--root",
+                        str(base / "run"),
+                    ],
+                ),
+                patch.object(
+                    smoke,
+                    "_enable_child_subreaper",
+                    side_effect=PermissionError(errno.EPERM, "denied"),
+                ),
+                redirect_stdout(output),
+            ):
+                result = smoke.main()
+
+            self.assertEqual(result, 1)
+            self.assertFalse(marker.exists())
+            summary = json.loads(output.getvalue())
+            self.assertFalse(summary["subreaper_enabled"])
+            self.assertEqual(summary["execution_error"]["code"], "EPERM")
+
+    def test_stop_owns_sets_id_and_double_fork_producers_past_scan(self) -> None:
+        enable_test_subreaper()
+        child = r"""
+import os, signal, sys, time
+mode, ready, root_ready, trigger, late = sys.argv[1:]
+
+def producer():
+    os.setsid()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    receipt = ready + ".tmp"
+    with open(receipt, "w", encoding="ascii") as output:
+        output.write(str(os.getpid()))
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(receipt, ready)
+    while not os.path.exists(trigger):
+        time.sleep(0.01)
+    with open(late, "wb") as output:
+        output.write(b"post-scan-private-marker")
+        output.flush()
+        os.fsync(output.fileno())
+    while True:
+        time.sleep(1)
+
+if mode == "setsid":
+    spawned = os.fork()
+    if spawned == 0:
+        producer()
+else:
+    middle = os.fork()
+    if middle == 0:
+        spawned = os.fork()
+        if spawned == 0:
+            producer()
+        os._exit(0)
+    os.waitpid(middle, 0)
+
+while not os.path.exists(ready):
+    time.sleep(0.01)
+signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+with open(root_ready, "w", encoding="ascii") as output:
+    output.write("ready")
+    output.flush()
+    os.fsync(output.fileno())
+while True:
+    time.sleep(1)
+"""
+        for mode in ("setsid", "double-fork"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                ready = root / "producer.pid"
+                root_ready = root / "root.ready"
+                trigger = root / "post-scan.trigger"
+                late = root / "late-evidence"
+                proc = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        child,
+                        mode,
+                        str(ready),
+                        str(root_ready),
+                        str(trigger),
+                        str(late),
+                    ],
+                    start_new_session=True,
+                )
+                identity = smoke.capture_spawn_identity(proc.pid)
+                producer_pid = None
+                try:
+                    deadline = time.monotonic() + 2
+                    while not root_ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(root_ready.exists())
+                    producer_pid = int(ready.read_text())
+
+                    cleanup = smoke.stop(proc, identity)
+                    scan_before = smoke.sensitive_marker_count(
+                        root, (b"post-scan-private-marker",)
+                    )
+                    trigger.write_bytes(b"continue")
+                    late_deadline = time.monotonic() + 0.3
+                    while not late.exists() and time.monotonic() < late_deadline:
+                        time.sleep(0.01)
+                    late_write = late.exists()
+                    producer_live = smoke.process_identity_is_live(producer_pid)
+
+                    self.assertEqual(scan_before, 0)
+                    self.assertFalse(late_write)
+                    self.assertFalse(producer_live)
+                    self.assertTrue(cleanup["forced_kill"])
+                    self.assertGreaterEqual(
+                        cleanup["residual_producer_count_before_kill"], 1
+                    )
+                    self.assertTrue(cleanup["ownership_quiesced"])
+                    self.assertEqual(cleanup["residual_producer_count_final"], 0)
+                    summary = passing_summary()
+                    summary["process_cleanup"] = cleanup
+                    self.assertIn(
+                        "proxy_forced_kill", smoke.acceptance_errors(summary)
+                    )
+                finally:
+                    if proc.returncode is None:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        proc.wait(timeout=2)
+                    if producer_pid is not None:
+                        try:
+                            os.kill(producer_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            os.waitpid(producer_pid, 0)
+                        except ChildProcessError:
+                            pass
+
+    def test_pidfd_capture_failures_still_reap_owned_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            binary = base / "candidate"
+            binary.write_text(
+                "#!/usr/bin/env python3\n"
+                "import time\n"
+                "time.sleep(60)\n"
+            )
+            binary.chmod(0o700)
+            real_popen = subprocess.Popen
+            for code in (errno.EMFILE, errno.EPERM):
+                with self.subTest(code=errno.errorcode[code]):
+                    output = io.StringIO()
+                    root = base / f"run-{errno.errorcode[code]}"
+                    argv = [
+                        "smoke",
+                        "--candidate-config",
+                        str(ROOT / "config" / "llm-guard-proxy" / "config.toml"),
+                        "--binary",
+                        str(binary),
+                        "--root",
+                        str(root),
+                    ]
+                    before_fds = fd_count()
+                    spawned: list[subprocess.Popen] = []
+
+                    def spawn(*args, **kwargs):
+                        proc = real_popen(*args, **kwargs)
+                        spawned.append(proc)
+                        return proc
+
+                    try:
+                        with (
+                            patch.object(sys, "argv", argv),
+                            patch.object(smoke.subprocess, "Popen", side_effect=spawn),
+                            patch.object(
+                                smoke,
+                                "_pidfd_open",
+                                side_effect=OSError(code, os.strerror(code)),
+                            ),
+                            redirect_stdout(output),
+                        ):
+                            result = smoke.main()
+                    finally:
+                        for proc in spawned:
+                            if proc.returncode is None:
+                                os.kill(proc.pid, signal.SIGKILL)
+                                proc.wait(timeout=2)
+
+                    summary = json.loads(output.getvalue())
+                    cleanup = summary["process_cleanup"]
+                    self.assertEqual(result, 1)
+                    self.assertEqual(len(spawned), 1)
+                    self.assertFalse(smoke.process_identity_is_live(spawned[0].pid))
+                    self.assertEqual(summary["result"], "FAIL")
+                    self.assertEqual(
+                        summary["execution_error"]["code"], errno.errorcode[code]
+                    )
+                    self.assertTrue(cleanup["proxy_exited"])
+                    self.assertTrue(cleanup["spawn_identity_captured"])
+                    self.assertFalse(cleanup["pidfd_available"])
+                    self.assertTrue(cleanup["ownership_quiesced"])
+                    self.assertEqual(
+                        cleanup["residual_producer_count_before_kill"], 0
+                    )
+                    self.assertEqual(cleanup["residual_producer_count_final"], 0)
+                    self.assertEqual(
+                        cleanup["stop_error"]["code"], errno.errorcode[code]
+                    )
+                    self.assertTrue(all(summary["port_cleanup"].values()))
+                    self.assertEqual(fd_count(), before_fds)
 
     def test_marker_scan_fails_closed_on_walk_read_and_symlink_errors(self) -> None:
         marker = (b"private-marker",)
@@ -354,7 +616,13 @@ while True:
             evidence.write_bytes(
                 b"x" * (smoke.SCAN_CHUNK_SIZE - 3) + marker[0] + b"safe"
             )
-            self.assertEqual(smoke.sensitive_marker_count(root, marker), 1)
+            stats: dict[str, int | float | bool] = {}
+            self.assertEqual(smoke.sensitive_marker_count(root, marker, stats), 1)
+            self.assertTrue(stats["completed"])
+            self.assertLessEqual(stats["entry_count"], smoke.SCAN_MAX_ENTRIES)
+            self.assertLessEqual(stats["logical_bytes"], smoke.SCAN_MAX_TOTAL_BYTES)
+            self.assertLessEqual(stats["largest_file_bytes"], smoke.SCAN_MAX_FILE_BYTES)
+            self.assertLess(stats["elapsed_milliseconds"], smoke.SCAN_TIMEOUT * 1_000)
 
             not_directory = root / "not-a-directory"
             not_directory.write_bytes(b"safe metadata")
@@ -369,6 +637,78 @@ while True:
         summary = passing_summary()
         summary["scan_errors"] = 1
         self.assertIn("privacy_scan_failed", smoke.acceptance_errors(summary))
+
+    def test_marker_scan_rejects_sparse_oversize_before_reading(self) -> None:
+        marker = (b"private-marker",)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sparse = root / "sparse-evidence"
+            with sparse.open("wb") as output:
+                output.truncate(1 << 40)
+            before_fds = fd_count()
+            started = time.monotonic()
+            with (
+                patch.object(
+                    smoke.os,
+                    "read",
+                    side_effect=AssertionError("oversized file was read"),
+                ),
+                self.assertRaises(OSError) as raised,
+            ):
+                smoke.sensitive_marker_count(root, marker)
+            elapsed = time.monotonic() - started
+
+            self.assertEqual(raised.exception.errno, errno.EFBIG)
+            self.assertLess(elapsed, 0.5)
+            self.assertEqual(fd_count(), before_fds)
+            self.assertNotIn(sparse.name, str(raised.exception))
+            self.assertNotIn(marker[0].decode(), str(raised.exception))
+
+    def test_marker_scan_rejects_total_logical_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "first").write_bytes(b"a" * 40)
+            (root / "second").write_bytes(b"b" * 40)
+            before_fds = fd_count()
+            with (
+                patch.object(smoke, "SCAN_MAX_FILE_BYTES", 64),
+                patch.object(smoke, "SCAN_MAX_TOTAL_BYTES", 64),
+                self.assertRaises(OSError) as raised,
+            ):
+                smoke.sensitive_marker_count(root, (b"private-marker",))
+
+            self.assertEqual(raised.exception.errno, errno.EFBIG)
+            self.assertEqual(fd_count(), before_fds)
+            self.assertNotIn("first", str(raised.exception))
+            self.assertNotIn("second", str(raised.exception))
+
+    def test_marker_scan_rejects_excess_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for number in range(smoke.SCAN_MAX_ENTRIES + 1):
+                (root / f"entry-{number}").touch()
+            before_fds = fd_count()
+            with self.assertRaises(OSError) as raised:
+                smoke.sensitive_marker_count(root, (b"private-marker",))
+
+            self.assertEqual(raised.exception.errno, errno.E2BIG)
+            self.assertEqual(fd_count(), before_fds)
+            self.assertNotIn("entry-", str(raised.exception))
+
+    def test_marker_scan_enforces_absolute_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "evidence").write_bytes(b"safe")
+            before_fds = fd_count()
+            ticks = iter((10.0, 10.0 + smoke.SCAN_TIMEOUT + 1.0))
+            with (
+                patch.object(smoke.time, "monotonic", side_effect=lambda: next(ticks)),
+                self.assertRaises(OSError) as raised,
+            ):
+                smoke.sensitive_marker_count(root, (b"private-marker",))
+
+            self.assertEqual(raised.exception.errno, errno.ETIMEDOUT)
+            self.assertEqual(fd_count(), before_fds)
 
     def test_marker_scan_fails_closed_on_replacement_races(self) -> None:
         marker = (b"private-marker",)
