@@ -22,10 +22,27 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import NamedTuple
 
 CALLER_MAX = 50_000
 THINKING_BUDGET = 32_768
 EXPECTED_FIRST_MAX = CALLER_MAX
+FIXTURE_BODY_LIMIT = 1 << 20
+FIXTURE_READ_TIMEOUT = 0.25
+FIXTURE_STOP_TIMEOUT = 2.0
+PROCESS_TERM_GRACE = 1.0
+PROCESS_STOP_TIMEOUT = 4.0
+PROCESS_POLL_INTERVAL = 0.02
+SCAN_CHUNK_SIZE = 64 * 1024
+
+
+class ProcessIdentity(NamedTuple):
+    pid: int
+    state: str
+    pgrp: int
+    session: int
+    starttime: int
+    pidfd: int | None = None
 
 
 def fail(message: str) -> None:
@@ -149,8 +166,6 @@ class Fixture:
                     self.errors.append("salvage_answer_budget")
                 if body.get("stream") is not True:
                     self.errors.append("salvage_not_sse")
-                if attempt["loop_tail_present"]:
-                    self.errors.append("salvage_replayed_loop_tail")
             return attempt
 
     def handler(self):
@@ -158,6 +173,10 @@ class Fixture:
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+
+            def setup(self) -> None:
+                super().setup()
+                self.connection.settimeout(FIXTURE_READ_TIMEOUT)
 
             def log_message(self, format: str, *args: object) -> None:
                 return
@@ -167,8 +186,10 @@ class Fixture:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(raw)
+                self.close_connection = True
 
             def do_GET(self) -> None:
                 if self.path.endswith("/models"):
@@ -177,12 +198,35 @@ class Fixture:
                     self.send_json(404, {"error": {"message": "fixture route"}})
 
             def do_POST(self) -> None:
+                raw_length = self.headers.get("Content-Length")
+                if raw_length is None or re.fullmatch(r"[0-9]+", raw_length) is None:
+                    fixture.record_error("fixture_invalid_content_length")
+                    self.close_connection = True
+                    return
+                size = int(raw_length)
+                if size > FIXTURE_BODY_LIMIT:
+                    fixture.record_error("fixture_invalid_content_length")
+                    self.close_connection = True
+                    return
                 try:
-                    size = int(self.headers.get("Content-Length", "0"))
-                    body = json.loads(self.rfile.read(size))
-                except Exception:
+                    raw = self.rfile.read(size)
+                except TimeoutError:
+                    fixture.record_error("fixture_body_timeout")
+                    self.close_connection = True
+                    return
+                except OSError:
+                    fixture.record_error("fixture_body_read_error")
+                    self.close_connection = True
+                    return
+                if len(raw) != size:
+                    fixture.record_error("fixture_short_body")
+                    self.close_connection = True
+                    return
+                try:
+                    body = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
                     fixture.record_error("malformed_upstream_request")
-                    self.send_json(400, {"error": {"message": "malformed"}})
+                    self.close_connection = True
                     return
                 if self.path.endswith("/embeddings"):
                     values = body.get("input")
@@ -221,6 +265,9 @@ class Fixture:
 
 
 class FixtureHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
+
     def __init__(self, server_address: tuple[str, int], handler: type[BaseHTTPRequestHandler], fixture: Fixture):
         self.fixture = fixture
         super().__init__(server_address, handler)
@@ -342,10 +389,142 @@ def isolated_config(candidate: Path, root: Path, fake_port: int, guard_port: int
     }
 
 
+def _read_process_identity(pid: int) -> ProcessIdentity | None:
+    try:
+        raw = (Path("/proc") / str(pid) / "stat").read_text(encoding="ascii")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    left = raw.find("(")
+    right = raw.rfind(")")
+    fields = raw[right + 1 :].split() if 0 < left < right else []
+    if len(fields) < 20:
+        raise OSError(errno.EIO, "invalid_proc_stat")
+    parsed_pid = int(raw[:left].strip())
+    if parsed_pid != pid:
+        raise OSError(errno.ESTALE, "proc_pid_changed")
+    return ProcessIdentity(
+        pid=parsed_pid,
+        state=fields[0],
+        pgrp=int(fields[2]),
+        session=int(fields[3]),
+        starttime=int(fields[19]),
+    )
+
+
+def _same_process(left: ProcessIdentity | None, right: ProcessIdentity) -> bool:
+    return left is not None and (
+        left.pid,
+        left.starttime,
+        left.pgrp,
+        left.session,
+    ) == (right.pid, right.starttime, right.pgrp, right.session)
+
+
+def capture_spawn_identity(pid: int) -> ProcessIdentity:
+    before = _read_process_identity(pid)
+    if before is None:
+        raise ProcessLookupError(pid)
+    pidfd = os.pidfd_open(pid)
+    after = _read_process_identity(pid)
+    if not _same_process(after, before):
+        os.close(pidfd)
+        raise OSError(errno.ESTALE, "spawn_identity_changed")
+    if before.pgrp != pid or before.session != pid:
+        os.close(pidfd)
+        raise RuntimeError("proxy_not_session_leader")
+    return ProcessIdentity(
+        pid=before.pid,
+        state=before.state,
+        pgrp=before.pgrp,
+        session=before.session,
+        starttime=before.starttime,
+        pidfd=pidfd,
+    )
+
+
+def process_identity_is_live(pid: int) -> bool:
+    current = _read_process_identity(pid)
+    return current is not None and current.state not in {"X", "Z"}
+
+
+def _child_exited(pid: int) -> bool:
+    try:
+        return (
+            os.waitid(
+                os.P_PID,
+                pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+            is not None
+        )
+    except ChildProcessError as exc:
+        raise RuntimeError("proxy_identity_reaped") from exc
+
+
+def _producer_sets(
+    identity: ProcessIdentity,
+) -> tuple[dict[int, ProcessIdentity], dict[int, ProcessIdentity]]:
+    group: dict[int, ProcessIdentity] = {}
+    session: dict[int, ProcessIdentity] = {}
+    with os.scandir("/proc") as entries:
+        for entry in entries:
+            if not entry.name.isdecimal():
+                continue
+            current = _read_process_identity(int(entry.name))
+            if current is None or current.state in {"X", "Z"}:
+                continue
+            if current.pgrp == identity.pgrp:
+                group[current.pid] = current
+            if current.session == identity.session:
+                session[current.pid] = current
+    return group, session
+
+
+def _signal_group(identity: ProcessIdentity, signum: int) -> bool:
+    if not _same_process(_read_process_identity(identity.pid), identity):
+        return False
+    try:
+        os.killpg(identity.pgrp, signum)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def _signal_identity(identity: ProcessIdentity, signum: int) -> bool:
+    try:
+        pidfd = os.pidfd_open(identity.pid)
+    except ProcessLookupError:
+        return False
+    try:
+        if not _same_process(_read_process_identity(identity.pid), identity):
+            return False
+        signal.pidfd_send_signal(pidfd, signum)
+        return True
+    except ProcessLookupError:
+        return False
+    finally:
+        os.close(pidfd)
+
+
+def _wait_for_quiescence(
+    identity: ProcessIdentity,
+    deadline: float,
+) -> tuple[bool, dict[int, ProcessIdentity], dict[int, ProcessIdentity]]:
+    while True:
+        root_exited = _child_exited(identity.pid)
+        group, session = _producer_sets(identity)
+        if root_exited and not session:
+            return True, group, session
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, group, session
+        time.sleep(min(PROCESS_POLL_INTERVAL, remaining))
+
+
 def wait_port(port: int, proc: subprocess.Popen[bytes], deadline: float) -> None:
     while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            fail(f"proxy_exit_before_ready={proc.returncode}")
+        if _child_exited(proc.pid):
+            fail("proxy_exit_before_ready")
         with socket.socket() as sock:
             sock.settimeout(0.15)
             if sock.connect_ex(("127.0.0.1", port)) == 0:
@@ -392,45 +571,112 @@ def _stable_error(exc: Exception, fallback: str) -> dict[str, str]:
     return {"class": type(exc).__name__, "code": code}
 
 
-def stop(proc: subprocess.Popen[bytes] | None) -> dict[str, object]:
+def stop(
+    proc: subprocess.Popen[bytes] | None,
+    identity: ProcessIdentity | None = None,
+) -> dict[str, object]:
     cleanup: dict[str, object] = {
         "proxy_exited": proc is None,
         "unexpected_exit": False,
         "graceful_stop": False,
         "forced_kill": False,
+        "term_sent": False,
+        "kill_sent": False,
+        "spawn_identity_captured": identity is not None,
+        "group_quiesced": proc is None,
+        "session_quiesced": proc is None,
+        "residual_producer_count_before_kill": 0,
+        "residual_producer_count_final": 0,
     }
     if proc is None:
         return cleanup
-    returncode = proc.poll()
-    if returncode is not None:
-        cleanup.update(proxy_exited=True, unexpected_exit=True, returncode=returncode)
-        return cleanup
+
+    deadline = time.monotonic() + PROCESS_STOP_TIMEOUT
+    if identity is None:
+        try:
+            identity = capture_spawn_identity(proc.pid)
+        except Exception as exc:
+            cleanup["stop_error"] = _stable_error(exc, "spawn_identity_missing")
+            return cleanup
+    cleanup["spawn_identity"] = {
+        "pid": identity.pid,
+        "starttime": identity.starttime,
+        "pgid": identity.pgrp,
+        "session": identity.session,
+    }
+
+    group: dict[int, ProcessIdentity] = {}
+    session_members: dict[int, ProcessIdentity] = {}
+    quiesced = False
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        cleanup["unexpected_exit"] = True
-    except OSError as exc:
+        cleanup["unexpected_exit"] = _child_exited(identity.pid)
+        group, session_members = _producer_sets(identity)
+        cleanup["term_sent"] = _signal_group(identity, signal.SIGTERM)
+        for member in session_members.values():
+            if member.pgrp != identity.pgrp:
+                cleanup["term_sent"] = (
+                    _signal_identity(member, signal.SIGTERM)
+                    or cleanup["term_sent"]
+                )
+        term_deadline = min(deadline, time.monotonic() + PROCESS_TERM_GRACE)
+        quiesced, group, session_members = _wait_for_quiescence(
+            identity, term_deadline
+        )
+    except Exception as exc:
         cleanup["stop_error"] = _stable_error(exc, "proxy_sigterm_failed")
-        cleanup["proxy_exited"] = proc.poll() is not None
-        return cleanup
-    try:
-        returncode = proc.wait(timeout=8)
-    except subprocess.TimeoutExpired:
+
+    if not quiesced:
         cleanup["forced_kill"] = True
+        cleanup["residual_producer_count_before_kill"] = len(session_members)
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except OSError as exc:
-            cleanup["stop_error"] = _stable_error(exc, "proxy_sigkill_failed")
+            cleanup["kill_sent"] = _signal_group(identity, signal.SIGKILL)
+            for member in session_members.values():
+                cleanup["kill_sent"] = (
+                    _signal_identity(member, signal.SIGKILL)
+                    or cleanup["kill_sent"]
+                )
+        except Exception as exc:
+            cleanup.setdefault(
+                "stop_error", _stable_error(exc, "proxy_sigkill_failed")
+            )
         try:
-            returncode = proc.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            cleanup["stop_error"] = {
-                "class": "TimeoutExpired",
-                "code": "proxy_reap_timeout",
-            }
-            returncode = None
+            quiesced, group, session_members = _wait_for_quiescence(
+                identity, deadline
+            )
+        except Exception as exc:
+            cleanup.setdefault(
+                "stop_error", _stable_error(exc, "proxy_quiescence_failed")
+            )
+
+    cleanup["group_quiesced"] = quiesced and not group
+    cleanup["session_quiesced"] = quiesced and not session_members
+    returncode = None
+    try:
+        if _child_exited(identity.pid):
+            returncode = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        else:
+            cleanup.setdefault(
+                "stop_error",
+                {"class": "TimeoutExpired", "code": "proxy_reap_timeout"},
+            )
+    except Exception as exc:
+        cleanup.setdefault("stop_error", _stable_error(exc, "proxy_reap_failed"))
+
+    try:
+        final_group, final_session = _producer_sets(identity)
+        cleanup["group_quiesced"] = not final_group
+        cleanup["session_quiesced"] = not final_session
+        cleanup["residual_producer_count_final"] = len(final_session)
+    except Exception as exc:
+        cleanup["group_quiesced"] = False
+        cleanup["session_quiesced"] = False
+        cleanup.setdefault(
+            "stop_error", _stable_error(exc, "proxy_final_quiescence_failed")
+        )
+    finally:
+        if identity.pidfd is not None:
+            os.close(identity.pidfd)
+
     cleanup["returncode"] = returncode
     cleanup["proxy_exited"] = returncode is not None
     cleanup["graceful_stop"] = (
@@ -438,6 +684,9 @@ def stop(proc: subprocess.Popen[bytes] | None) -> dict[str, object]:
         and returncode == 0
         and not cleanup["unexpected_exit"]
         and not cleanup["forced_kill"]
+        and cleanup["spawn_identity_captured"]
+        and cleanup["group_quiesced"]
+        and cleanup["session_quiesced"]
         and "stop_error" not in cleanup
     )
     return cleanup
@@ -448,56 +697,188 @@ def stop_fixture_server(
     server_thread: threading.Thread | None,
     fixture: Fixture,
 ) -> dict[str, object]:
+    deadline = time.monotonic() + FIXTURE_STOP_TIMEOUT
     cleanup_errors: list[dict[str, str]] = []
     cleanup: dict[str, object] = {
         "server_stopped": server is None,
+        "shutdown_stopped": True,
         "unexpected_exit": False,
         "handlers_quiesced": False,
         "errors": cleanup_errors,
     }
+    shutdown_thread = None
+    shutdown_errors: list[dict[str, str]] = []
     if server is not None:
         cleanup["unexpected_exit"] = server_thread is None or not server_thread.is_alive()
         if server_thread is not None and server_thread.is_alive():
-            try:
-                server.shutdown()
-            except Exception as exc:
-                cleanup_errors.append(_stable_error(exc, "fixture_shutdown_failed"))
+            def shutdown() -> None:
+                try:
+                    server.shutdown()
+                except Exception as exc:
+                    shutdown_errors.append(
+                        _stable_error(exc, "fixture_shutdown_failed")
+                    )
+
+            shutdown_thread = threading.Thread(target=shutdown, daemon=True)
+            shutdown_thread.start()
+            shutdown_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if shutdown_thread.is_alive():
+                cleanup_errors.append(
+                    {"class": "TimeoutError", "code": "fixture_shutdown_timeout"}
+                )
         try:
             server.server_close()
         except Exception as exc:
             cleanup_errors.append(_stable_error(exc, "fixture_close_failed"))
         if server_thread is not None:
             try:
-                server_thread.join(timeout=8)
+                server_thread.join(timeout=max(0.0, deadline - time.monotonic()))
             except RuntimeError as exc:
                 cleanup_errors.append(_stable_error(exc, "fixture_join_failed"))
+            if server_thread.is_alive():
+                cleanup_errors.append(
+                    {"class": "TimeoutError", "code": "fixture_join_timeout"}
+                )
+        if shutdown_thread is not None and shutdown_thread.is_alive():
+            shutdown_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if shutdown_thread is not None and not shutdown_thread.is_alive():
+            cleanup_errors.extend(shutdown_errors)
+        cleanup["shutdown_stopped"] = (
+            shutdown_thread is None or not shutdown_thread.is_alive()
+        )
         cleanup["server_stopped"] = server_thread is None or not server_thread.is_alive()
-    cleanup["handlers_quiesced"] = fixture.wait_for_handlers(timeout=8)
+    cleanup["handlers_quiesced"] = fixture.wait_for_handlers(
+        timeout=max(0.0, deadline - time.monotonic())
+    )
+    if not cleanup["handlers_quiesced"]:
+        cleanup_errors.append(
+            {"class": "TimeoutError", "code": "fixture_handler_timeout"}
+        )
     return cleanup
 
 
+def _stat_fingerprint(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _require_stable_stat(
+    before: os.stat_result,
+    after: os.stat_result,
+    code: str,
+) -> None:
+    if _stat_fingerprint(before) != _stat_fingerprint(after):
+        raise OSError(errno.ESTALE, code)
+
+
 def sensitive_marker_count(root: Path, markers: tuple[bytes, ...]) -> int:
-    root_stat = root.lstat()
-    if stat.S_ISLNK(root_stat.st_mode):
-        raise OSError(errno.ELOOP, "privacy_scan_symlink")
-    if not stat.S_ISDIR(root_stat.st_mode):
-        raise OSError(errno.ENOTDIR, "privacy_scan_root_not_directory")
-    total = 0
-    pending = [root]
-    while pending:
-        with os.scandir(pending.pop()) as entries:
+    if not markers or any(not isinstance(marker, bytes) or not marker for marker in markers):
+        raise ValueError("privacy_scan_invalid_marker")
+    common_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    directory_flags = common_flags | os.O_DIRECTORY
+    file_flags = common_flags | os.O_NONBLOCK
+
+    def scan_file(parent_fd: int, name: str, before: os.stat_result) -> int:
+        fd = os.open(name, file_flags, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise OSError(errno.EINVAL, "privacy_scan_non_regular")
+            _require_stable_stat(before, opened, "privacy_scan_file_replaced")
+            remaining = opened.st_size
+            tails = {marker: b"" for marker in markers}
+            count = 0
+            while remaining:
+                chunk = os.read(fd, min(SCAN_CHUNK_SIZE, remaining))
+                if not chunk:
+                    raise OSError(errno.ESTALE, "privacy_scan_file_truncated")
+                remaining -= len(chunk)
+                for marker in markers:
+                    combined = tails[marker] + chunk
+                    count += combined.count(marker)
+                    tails[marker] = (
+                        combined[-(len(marker) - 1) :] if len(marker) > 1 else b""
+                    )
+            if os.read(fd, 1):
+                raise OSError(errno.ESTALE, "privacy_scan_file_grew")
+            _require_stable_stat(
+                opened, os.fstat(fd), "privacy_scan_file_mutated"
+            )
+            parent_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            _require_stable_stat(
+                opened, parent_after, "privacy_scan_file_name_replaced"
+            )
+            return count
+        finally:
+            os.close(fd)
+
+    def scan_directory(fd: int, before: os.stat_result) -> int:
+        total = 0
+        with os.scandir(fd) as entries:
             for entry in entries:
-                entry_stat = entry.stat(follow_symlinks=False)
-                if stat.S_ISLNK(entry_stat.st_mode):
+                entry_before = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(entry_before.st_mode):
                     raise OSError(errno.ELOOP, "privacy_scan_symlink")
-                if stat.S_ISDIR(entry_stat.st_mode):
-                    pending.append(Path(entry.path))
-                elif stat.S_ISREG(entry_stat.st_mode):
-                    data = Path(entry.path).read_bytes()
-                    total += sum(data.count(marker) for marker in markers)
+                if stat.S_ISDIR(entry_before.st_mode):
+                    child_fd = os.open(entry.name, directory_flags, dir_fd=fd)
+                    try:
+                        opened = os.fstat(child_fd)
+                        if not stat.S_ISDIR(opened.st_mode):
+                            raise OSError(
+                                errno.ENOTDIR, "privacy_scan_directory_replaced"
+                            )
+                        _require_stable_stat(
+                            entry_before,
+                            opened,
+                            "privacy_scan_directory_replaced",
+                        )
+                        total += scan_directory(child_fd, opened)
+                        _require_stable_stat(
+                            opened,
+                            os.fstat(child_fd),
+                            "privacy_scan_directory_mutated",
+                        )
+                        parent_after = os.stat(
+                            entry.name,
+                            dir_fd=fd,
+                            follow_symlinks=False,
+                        )
+                        _require_stable_stat(
+                            opened,
+                            parent_after,
+                            "privacy_scan_directory_name_replaced",
+                        )
+                    finally:
+                        os.close(child_fd)
+                elif stat.S_ISREG(entry_before.st_mode):
+                    total += scan_file(fd, entry.name, entry_before)
                 else:
                     raise OSError(errno.EINVAL, "privacy_scan_non_regular")
-    return total
+        _require_stable_stat(
+            before, os.fstat(fd), "privacy_scan_directory_mutated"
+        )
+        return total
+
+    root_fd = os.open(root, directory_flags)
+    try:
+        root_before = os.fstat(root_fd)
+        if not stat.S_ISDIR(root_before.st_mode):
+            raise OSError(errno.ENOTDIR, "privacy_scan_root_not_directory")
+        total = scan_directory(root_fd, root_before)
+        _require_stable_stat(
+            root_before,
+            os.stat(root, follow_symlinks=False),
+            "privacy_scan_root_replaced",
+        )
+        return total
+    finally:
+        os.close(root_fd)
 
 
 def acceptance_errors(summary: dict) -> list[str]:
@@ -508,16 +889,41 @@ def acceptance_errors(summary: dict) -> list[str]:
 
     attempts = summary.get("attempts", [])
     salvages = [attempt for attempt in attempts if attempt["salvage_material_present"]]
-    fresh_attempts = [attempt for attempt in attempts if attempt["phase"] == "fresh"]
+    fresh_attempts = [
+        attempt
+        for attempt in attempts
+        if attempt["phase"] == "fresh" and not attempt["salvage_material_present"]
+    ]
     if len(salvages) != 1:
         errors.append("salvage_count")
     if not fresh_attempts:
         errors.append("fresh_request_missing")
-    for fresh in fresh_attempts:
-        if fresh["private_prefix_present"] or fresh["salvage_material_present"] or fresh["loop_tail_present"]:
-            errors.append(f"fresh_request_replayed_private_material:{fresh['number']}")
-        if fresh["thinking_budget"] != THINKING_BUDGET:
-            errors.append(f"fresh_thinking_budget:{fresh['number']}")
+    for attempt in attempts:
+        number = attempt["number"]
+        if attempt["salvage_material_present"]:
+            if attempt["phase"] != "positive":
+                errors.append(f"salvage_phase:{number}")
+            if attempt["thinking_budget"] != 0:
+                errors.append(f"salvage_thinking_budget:{number}")
+            if not attempt["private_prefix_present"]:
+                errors.append(f"salvage_private_prefix:{number}")
+            if not attempt["loop_tail_present"]:
+                errors.append(f"salvage_loop_tail:{number}")
+            continue
+        if attempt["private_prefix_present"] or attempt["loop_tail_present"]:
+            prefix = (
+                "fresh_request_replayed_private_material"
+                if attempt["phase"] == "fresh"
+                else "non_salvage_replayed_private_material"
+            )
+            errors.append(f"{prefix}:{number}")
+        if attempt["thinking_budget"] != THINKING_BUDGET:
+            prefix = (
+                "fresh_thinking_budget"
+                if attempt["phase"] == "fresh"
+                else "non_salvage_thinking_budget"
+            )
+            errors.append(f"{prefix}:{number}")
 
     if not summary.get("positive_pass"):
         errors.append("positive_client_failed")
@@ -529,6 +935,16 @@ def acceptance_errors(summary: dict) -> list[str]:
         errors.append("proxy_unexpected_exit")
     if process_cleanup.get("forced_kill"):
         errors.append("proxy_forced_kill")
+    if not process_cleanup.get("spawn_identity_captured"):
+        errors.append("proxy_spawn_identity_missing")
+    if process_cleanup.get("residual_producer_count_before_kill"):
+        errors.append("proxy_residual_producer_detected")
+    if process_cleanup.get("residual_producer_count_final"):
+        errors.append("proxy_residual_producer_final")
+    if not process_cleanup.get("group_quiesced"):
+        errors.append("proxy_group_not_quiesced")
+    if not process_cleanup.get("session_quiesced"):
+        errors.append("proxy_session_not_quiesced")
     if not process_cleanup.get("proxy_exited"):
         errors.append("proxy_not_exited")
     if not process_cleanup.get("graceful_stop") or process_cleanup.get("stop_error"):
@@ -537,6 +953,8 @@ def acceptance_errors(summary: dict) -> list[str]:
     fixture_cleanup = summary.get("fixture_cleanup", {})
     if fixture_cleanup.get("unexpected_exit"):
         errors.append("fixture_server_unexpected_exit")
+    if not fixture_cleanup.get("shutdown_stopped"):
+        errors.append("fixture_shutdown_not_stopped")
     if not fixture_cleanup.get("server_stopped"):
         errors.append("fixture_server_not_stopped")
     if not fixture_cleanup.get("handlers_quiesced"):
@@ -589,6 +1007,7 @@ def main() -> int:
         "execution_error": None,
     }
     proc = None
+    process_identity = None
     server = None
     server_thread = None
     try:
@@ -604,6 +1023,7 @@ def main() -> int:
         env = {"HOME": str(root / "home"), "TMPDIR": str(root / "tmp"), "XDG_CACHE_HOME": str(root / "home" / ".cache"), "XDG_CONFIG_HOME": str(root / "home" / ".config"), "XDG_DATA_HOME": str(root / "home" / ".local" / "share"), "PATH": os.environ["PATH"]}
         with (root / "proxy.log").open("wb") as log:
             proc = subprocess.Popen([str(binary), "--config", str(config), "--guardian-runtime-dir", str(root / "guardian-runtime")], cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            process_identity = capture_spawn_identity(proc.pid)
             wait_port(guard_port, proc, time.monotonic() + 20)
             summary["candidate_full_toml_release_binary_parsed"] = True
             summary["positive_client"] = client(
@@ -623,7 +1043,7 @@ def main() -> int:
     except Exception as exc:
         summary["execution_error"] = _stable_error(exc, "execution_failed")
 
-    summary["process_cleanup"] = stop(proc)
+    summary["process_cleanup"] = stop(proc, process_identity)
     summary["fixture_cleanup"] = stop_fixture_server(server, server_thread, fixture)
     attempts, fixture_errors = fixture.snapshot()
     summary["attempts"] = attempts
@@ -660,7 +1080,11 @@ def main() -> int:
 
     lifecycle_final = (
         summary["process_cleanup"]["proxy_exited"]
+        and summary["process_cleanup"]["group_quiesced"]
+        and summary["process_cleanup"]["session_quiesced"]
+        and summary["process_cleanup"]["residual_producer_count_final"] == 0
         and summary["fixture_cleanup"]["server_stopped"]
+        and summary["fixture_cleanup"]["shutdown_stopped"]
         and summary["fixture_cleanup"]["handlers_quiesced"]
     )
     if lifecycle_final:

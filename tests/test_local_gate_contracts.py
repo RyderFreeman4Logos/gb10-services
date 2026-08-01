@@ -67,7 +67,10 @@ class LocalGateContractTests(unittest.TestCase):
             'f"{fixture.private_prefix_marker} derive the isolated invariant before answering\\n"',
             '"private_prefix_present": private_prefix_present',
             '"private_prefix_marker_leak_count": raw.count(private_prefix_marker.encode())',
-            'fresh["private_prefix_present"]',
+            'attempt["private_prefix_present"]',
+            '"non_salvage_replayed_private_material"',
+            '"group_quiesced"',
+            "os.O_NOFOLLOW",
             "tuple(marker.encode() for marker in sensitive_markers)",
         ):
             self.assertIn(contract, smoke)
