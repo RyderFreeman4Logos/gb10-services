@@ -323,9 +323,9 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertEqual(server["generation_queue_timeout_ms"], 1_800_000)
 
         profiles = {profile["name"]: profile for profile in config["upstreams"]}
-        # :18011 is experimental; do not let its post-body queue displace the
-        # default :18009 path from Guard's MemoryHigh residency envelope.
-        self.assertEqual(profiles["aeon-guard-max"]["max_in_flight_requests"], 4)
+        # :18011 admits c8 directly while its empty post-body queue preserves
+        # isolation from the default :18009 path.
+        self.assertEqual(profiles["aeon-guard-max"]["max_in_flight_requests"], 8)
         self.assertEqual(profiles["aeon-guard-max"]["max_queued_generation_requests"], 0)
         self.assertEqual(profiles["qwen3-embedding-8b"]["max_in_flight_requests"], 8)
         self.assertEqual(
