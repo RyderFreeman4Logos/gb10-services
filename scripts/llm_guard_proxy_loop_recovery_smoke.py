@@ -1649,7 +1649,7 @@ def _collect_supervisor_scope(
 ) -> dict[str, object]:
     started_ns = time.monotonic_ns()
     unit_collected = False
-    cgroup_collected = _scope_cgroup_collected(control_group)
+    cgroup_collected: bool | None = None
     error: dict[str, str] | None = None
     try:
         unit_collected, cgroup_collected = _wait_scope_collected(

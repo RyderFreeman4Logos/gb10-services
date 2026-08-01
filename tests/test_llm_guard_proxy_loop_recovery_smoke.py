@@ -883,6 +883,46 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
             smoke.acceptance_errors(collection_error),
         )
 
+    def test_scope_collection_probe_permission_error_is_stable(self) -> None:
+        cleanup: dict[str, object] = {}
+        unit = "guard-collect-permission.scope"
+        control_group = f"/private/{unit}"
+        denied = PermissionError(errno.EACCES, control_group)
+        collected_state = subprocess.CompletedProcess(
+            [],
+            0,
+            "not-found\n",
+            "",
+        )
+
+        started = time.monotonic()
+        with (
+            patch.object(smoke.subprocess, "run", return_value=collected_state),
+            patch.object(smoke, "_scope_cgroup_collected", side_effect=denied),
+        ):
+            result = smoke._collect_supervisor_scope(
+                cleanup,
+                unit,
+                control_group,
+            )
+        elapsed = time.monotonic() - started
+
+        self.assertIs(result, cleanup)
+        self.assertEqual(cleanup["scope_unit"], unit)
+        self.assertFalse(cleanup["scope_unit_collected"])
+        self.assertIsNone(cleanup["scope_cgroup_collected"])
+        self.assertFalse(cleanup["scope_collected"])
+        self.assertEqual(
+            cleanup["scope_collection_error"],
+            {"class": "PermissionError", "code": "EACCES"},
+        )
+        duration_ms = cleanup["scope_collection_duration_ms"]
+        self.assertIsInstance(duration_ms, int)
+        assert isinstance(duration_ms, int)
+        self.assertGreaterEqual(duration_ms, 0)
+        self.assertLess(duration_ms, 500)
+        self.assertLess(elapsed, 0.5)
+
     def test_scope_collection_bridge_is_bounded_exact_and_closes_fds_once(self) -> None:
         for mode, collected, error_code in (
             ("delayed", True, None),
