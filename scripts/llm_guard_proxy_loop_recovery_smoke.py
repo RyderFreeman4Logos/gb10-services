@@ -1583,11 +1583,11 @@ def _wait_scope_collected(
             raise RuntimeError("scope_collect_timeout") from exc
         if result.returncode != 0:
             raise RuntimeError("scope_collect_systemctl_failed")
-        state = result.stdout.strip()
-        if state not in {"loaded", "not-found"}:
+        state = tuple(result.stdout.splitlines())
+        if state not in {("loaded",), ("not-found",)}:
             raise RuntimeError("scope_collect_state_invalid")
         cgroup_collected = _scope_cgroup_collected(control_group)
-        if state == "not-found" and cgroup_collected is not False:
+        if state == ("not-found",) and cgroup_collected is not False:
             return True, cgroup_collected
         time.sleep(min(PROCESS_POLL_INTERVAL, max(0.0, deadline - time.monotonic())))
 

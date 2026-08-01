@@ -141,7 +141,11 @@ if sys.argv[1:] != [
     raise SystemExit(91)
 mode = os.environ["SCOPE_COLLECT_MODE"]
 if mode == "error":
+    print("scope collection diagnostics must not enter receipts", file=sys.stderr)
     raise SystemExit(17)
+if mode == "malformed":
+    print(" not-found ")
+    raise SystemExit(0)
 counter = pathlib.Path(os.environ["SCOPE_COLLECT_COUNTER"])
 count = int(counter.read_text()) + 1 if counter.exists() else 1
 counter.write_text(str(count))
@@ -796,6 +800,7 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
             ("delayed", True, None),
             ("no_collect", False, "scope_collect_timeout"),
             ("error", False, "scope_collect_systemctl_failed"),
+            ("malformed", False, "scope_collect_state_invalid"),
         ):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -858,6 +863,7 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
                         collection_error["code"],
                         error_code,
                     )
+                    self.assertNotIn("scope collection diagnostics", repr(cleanup))
                 for fd in (scope.events_fd, scope.kill_fd):
                     with self.assertRaises(OSError) as closed:
                         os.fstat(fd)
