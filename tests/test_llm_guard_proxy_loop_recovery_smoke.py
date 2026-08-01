@@ -58,7 +58,9 @@ def run_client_fixture(
 
         def do_POST(self) -> None:
             length = int(self.headers["Content-Length"])
-            requests.append(json.loads(self.rfile.read(length)))
+            request = json.loads(self.rfile.read(length))
+            request["_fixture_path"] = self.path
+            requests.append(request)
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Connection", "close")
@@ -194,78 +196,100 @@ def attempt(
     salvage: bool = False,
     private: bool = False,
     loop: bool = False,
+    endpoint: str = "chat_completions",
+    role: str | None = None,
+    admitted: int | None = None,
+    upstream_first_event: int | None = None,
 ) -> dict:
-    return {
+    item = {
         "number": number,
+        "endpoint": endpoint,
         "phase": phase,
-        "role": "salvage" if salvage else "primary",
-        "admitted_monotonic_ns": number * 10,
+        "role": role or ("salvage" if salvage else "primary"),
+        "admitted_monotonic_ns": admitted if admitted is not None else number * 10,
         "thinking_budget": budget,
+        "stream": True,
+        "stream_usage": endpoint == "chat_completions",
         "salvage_material_present": salvage,
         "private_prefix_present": private,
         "loop_tail_present": loop,
     }
+    if upstream_first_event is not None:
+        item["upstream_first_event_monotonic_ns"] = upstream_first_event
+    return item
 
 
 def passing_summary() -> dict:
+    tick_ns = smoke.PROBE_HEARTBEAT_INTERVAL_SECS * 1_000_000_000
     return {
         "attempts": [
-            attempt(1, "positive", budget=smoke.THINKING_BUDGET),
+            attempt(
+                1,
+                "shielded_hold",
+                budget=smoke.THINKING_BUDGET,
+                admitted=10,
+                upstream_first_event=tick_ns + 10,
+            ),
             attempt(
                 2,
-                "positive",
+                "shielded_hold",
                 budget=0,
                 salvage=True,
                 private=True,
+                admitted=tick_ns + 20,
             ),
-            attempt(3, "fresh", budget=smoke.THINKING_BUDGET),
-            {
-                **attempt(4, "commit_before_recovery", budget=smoke.THINKING_BUDGET),
-                "loop_evidence_started_monotonic_ns": 50,
-                "loop_threshold_monotonic_ns": 51,
-                "loop_evidence_completed_monotonic_ns": 52,
-            },
-            {
-                **attempt(5, "commit_during_recovery", budget=smoke.THINKING_BUDGET),
-                "loop_evidence_started_monotonic_ns": 60,
-                "loop_threshold_monotonic_ns": 70,
-                "loop_evidence_completed_monotonic_ns": 80,
-            },
-            {
-                **attempt(6, "commit_near_first_tick", budget=smoke.THINKING_BUDGET),
-                "loop_evidence_started_monotonic_ns": 90,
-                "loop_threshold_monotonic_ns": 100,
-                "loop_evidence_completed_monotonic_ns": 110,
-            },
+            attempt(
+                3,
+                "generic_committed_stream",
+                endpoint="completions",
+                budget=0,
+                admitted=tick_ns + 40,
+            ),
+            attempt(
+                4,
+                "fresh",
+                budget=smoke.THINKING_BUDGET,
+                admitted=tick_ns + 60,
+            ),
         ],
         "fixture_errors": [],
-        "positive_pass": True,
+        "shielded_hold_pass": True,
         "fresh_negative_pass": True,
-        "positive_client": {
-            "first_downstream_nonempty_monotonic_ns": 25,
-            "downstream_prelude_detected": False,
-        },
-        "commit_boundary_probes": {
+        "operational_contract": {
             "verified": True,
             "blocker": None,
-            "scenarios": {
-                "before_recovery": {
-                    "first_downstream_nonempty_monotonic_ns": 45,
-                    "protocol_valid_terminal_failure": True,
+            "arms": {
+                "shielded_hold": {
+                    "endpoint": "/v1/chat/completions",
+                    "caller_stream": False,
+                    "status": 200,
+                    "content_type": "application/json",
+                    "nonempty": True,
+                    "valid_json": True,
+                    "expected_final": True,
+                    "first_downstream_nonempty_monotonic_ns": tick_ns + 30,
+                    "downstream_prelude_detected": False,
                     "protocol_error": None,
-                    "heartbeat_count": 1,
+                    "heartbeat_count": 0,
+                    "reasoning_marker_leak_count": 0,
+                    "private_prefix_marker_leak_count": 0,
                 },
-                "during_recovery": {
-                    "first_downstream_nonempty_monotonic_ns": 75,
+                "generic_committed_stream": {
+                    "endpoint": "/v1/completions",
+                    "caller_stream": True,
+                    "status": 200,
+                    "content_type": "text/event-stream",
+                    "nonempty": True,
+                    "expected_final": False,
+                    "first_downstream_nonempty_monotonic_ns": tick_ns + 50,
+                    "downstream_prelude_detected": True,
                     "protocol_valid_terminal_failure": True,
                     "protocol_error": None,
                     "heartbeat_count": 1,
-                },
-                "near_first_tick": {
-                    "first_downstream_nonempty_monotonic_ns": 105,
-                    "protocol_valid_terminal_failure": True,
-                    "protocol_error": None,
-                    "heartbeat_count": 1,
+                    "sse_error_event_count": 1,
+                    "sse_done_count": 1,
+                    "reasoning_marker_leak_count": 0,
+                    "private_prefix_marker_leak_count": 0,
                 },
             },
         },
@@ -318,19 +342,24 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
 
         legal_shadow = passing_summary()
         legal_shadow["attempts"].append(
-            attempt(4, "positive", budget=1024)
+            attempt(5, "shielded_hold", budget=1024, role="shadow")
         )
         self.assertFalse(smoke.acceptance_errors(legal_shadow))
 
         for field in ("private_prefix_present", "loop_tail_present"):
             private_shadow = passing_summary()
             private_shadow["attempts"].append(
-                attempt(4, "positive", budget=smoke.THINKING_BUDGET)
+                attempt(
+                    5,
+                    "shielded_hold",
+                    budget=smoke.THINKING_BUDGET,
+                    role="shadow",
+                )
             )
             private_shadow["attempts"][-1][field] = True
             with self.subTest(shadow_field=field):
                 self.assertIn(
-                    "non_salvage_replayed_private_material:4",
+                    "non_salvage_replayed_private_material:5",
                     smoke.acceptance_errors(private_shadow),
                 )
 
@@ -350,33 +379,40 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
         late_error["fixture_errors"].append("late_fixture_error")
         self.assertIn("late_fixture_error", smoke.acceptance_errors(late_error))
 
+        legal_fresh_shadow = passing_summary()
+        legal_fresh_shadow["attempts"].append(
+            attempt(5, "fresh", budget=0, role="shadow")
+        )
+        self.assertFalse(smoke.acceptance_errors(legal_fresh_shadow))
+
         late_replay = passing_summary()
         late_replay["attempts"].append(
             attempt(
-                4,
+                5,
                 "fresh",
                 budget=smoke.THINKING_BUDGET,
                 private=True,
                 loop=True,
+                role="shadow",
             )
         )
         self.assertIn(
-            "fresh_request_replayed_private_material:4",
+            "fresh_request_replayed_private_material:5",
             smoke.acceptance_errors(late_replay),
         )
 
         wrong_fresh_budget = passing_summary()
         wrong_fresh_budget["attempts"].append(
-            attempt(4, "fresh", budget=0)
+            attempt(5, "fresh", budget=0)
         )
         self.assertIn(
-            "fresh_thinking_budget:4",
+            "fresh_thinking_budget:5",
             smoke.acceptance_errors(wrong_fresh_budget),
         )
 
         duplicate_salvage = passing_summary()
         duplicate_salvage["attempts"].append(
-            attempt(4, "positive", budget=0, salvage=True, private=True)
+            attempt(5, "shielded_hold", budget=0, salvage=True, private=True)
         )
         self.assertIn("salvage_count", smoke.acceptance_errors(duplicate_salvage))
 
@@ -411,37 +447,60 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
                     result["first_downstream_nonempty_monotonic_ns"], int
                 )
 
-    def test_final_acceptance_requires_downstream_commit_boundary(self) -> None:
+    def test_final_acceptance_requires_two_arm_operational_contract(self) -> None:
         summary = passing_summary()
-        summary["commit_boundary_probes"] = {
+        summary["operational_contract"] = {
             "verified": False,
-            "blocker": "heartbeat_before_recovery_not_observed",
+            "blocker": "shielded_hold_not_observed",
         }
         self.assertIn(
-            "downstream_commit_boundary_unverified",
+            "operational_contract_unverified",
             smoke.acceptance_errors(summary),
         )
 
-    def test_final_acceptance_orders_every_attempt_against_first_downstream_byte(
+    def test_operational_contract_rejects_post_commit_business_attempts(
         self,
     ) -> None:
-        summary = passing_summary()
-        for admitted, role, item in zip(
-            (10, 30, 40),
-            ("primary", "salvage", "primary"),
-            summary["attempts"][:3],
-            strict=True,
-        ):
-            item["admitted_monotonic_ns"] = admitted
-            item["role"] = role
-        summary["positive_client"] = {
-            "first_downstream_nonempty_monotonic_ns": 20,
-            "downstream_prelude_detected": True,
-        }
-        self.assertIn(
-            "salvage_after_downstream_commit",
-            smoke.acceptance_errors(summary),
+        late_primary = passing_summary()
+        shielded_first = late_primary["operational_contract"]["arms"][
+            "shielded_hold"
+        ]["first_downstream_nonempty_monotonic_ns"]
+        late_primary["attempts"].append(
+            attempt(
+                5,
+                "shielded_hold",
+                budget=smoke.THINKING_BUDGET,
+                admitted=shielded_first + 1,
+            )
         )
+        self.assertIn(
+            "shielded_hold_post_commit_attempt:5",
+            smoke.acceptance_errors(late_primary),
+        )
+
+        late_salvage = passing_summary()
+        late_salvage["attempts"][1]["admitted_monotonic_ns"] = shielded_first + 1
+        self.assertIn(
+            "shielded_hold_salvage_after_first_byte",
+            smoke.acceptance_errors(late_salvage),
+        )
+
+        generic_retry = passing_summary()
+        generic_first = generic_retry["operational_contract"]["arms"][
+            "generic_committed_stream"
+        ]["first_downstream_nonempty_monotonic_ns"]
+        generic_retry["attempts"].append(
+            attempt(
+                5,
+                "generic_committed_stream",
+                endpoint="completions",
+                budget=0,
+                admitted=generic_first + 1,
+            )
+        )
+        errors = smoke.acceptance_errors(generic_retry)
+        self.assertIn("generic_committed_stream_attempt_count", errors)
+        self.assertIn("generic_committed_stream_post_commit_attempt:5", errors)
 
     def test_client_incrementally_frames_sse_and_bounds_input(self) -> None:
         final = json.dumps(
@@ -457,7 +516,11 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
         self.assertTrue(result["expected_final"])
         self.assertFalse(result["downstream_prelude_detected"])
 
-        error = b": heartbeat\r\n\r\nevent: error\r\ndata: {\"error\":{\"code\":\"failed\"}}\r\n\r\n"
+        error = (
+            b": heartbeat\r\n\r\n"
+            b"event: error\r\ndata: {\"error\":{\"code\":\"failed\"}}\r\n\r\n"
+            b"data: [DONE]\r\n\r\n"
+        )
         result, requests = run_client_fixture(
             tuple(bytes((byte,)) for byte in error),
             content_type="text/event-stream",
@@ -466,7 +529,20 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
         self.assertTrue(requests[0]["stream"])
         self.assertTrue(result["protocol_valid_terminal_failure"])
         self.assertEqual(result["sse_error_event_count"], 1)
+        self.assertEqual(result["sse_done_count"], 1)
         self.assertEqual(result["heartbeat_count"], 1)
+        self.assertTrue(result["downstream_prelude_detected"])
+
+        generic_result, generic_requests = run_client_fixture(
+            (error,),
+            content_type="text/event-stream",
+            stream=True,
+            endpoint="/v1/completions",
+        )
+        self.assertTrue(generic_result["protocol_valid_terminal_failure"])
+        self.assertEqual(generic_requests[0]["_fixture_path"], "/v1/completions")
+        self.assertEqual(generic_requests[0]["prompt"], "input")
+        self.assertNotIn("messages", generic_requests[0])
 
         done = (
             b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}\n\n'
@@ -574,88 +650,62 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
         )
         self.assertEqual(receipt["isolated_heartbeat_interval_secs"], 1)
 
-    def test_commit_probe_acceptance_requires_committed_terminal_failure(self) -> None:
-        summary = passing_summary()
-        summary["commit_boundary_probes"] = {
-            "verified": True,
-            "scenarios": {
-                "before_recovery": {
-                    "phase": "commit_before_recovery",
-                    "first_downstream_nonempty_monotonic_ns": 45,
-                    "protocol_valid_terminal_failure": False,
-                    "heartbeat_count": 1,
-                }
-            },
-        }
-        self.assertIn(
-            "commit_probe_terminal_failure:before_recovery",
-            smoke.acceptance_errors(summary),
-        )
-
-        duplicate = passing_summary()
-        duplicate["attempts"].append(
-            attempt(99, "commit_before_recovery", budget=smoke.THINKING_BUDGET)
+    def test_operational_acceptance_requires_valid_two_arm_protocols(self) -> None:
+        shielded_prelude = passing_summary()
+        shielded_prelude["operational_contract"]["arms"]["shielded_hold"].update(
+            {"heartbeat_count": 1, "downstream_prelude_detected": True}
         )
         self.assertIn(
-            "commit_probe_attempt_count:before_recovery",
-            smoke.acceptance_errors(duplicate),
+            "shielded_hold_downstream_prelude",
+            smoke.acceptance_errors(shielded_prelude),
         )
 
-        semantic_shadow = passing_summary()
-        shadow = attempt(
-            99, "commit_before_recovery", budget=1_024
+        early_loop = passing_summary()
+        early_loop["attempts"][0]["upstream_first_event_monotonic_ns"] = 100
+        self.assertIn(
+            "shielded_hold_not_delayed_across_heartbeat",
+            smoke.acceptance_errors(early_loop),
         )
-        shadow["role"] = "shadow"
-        semantic_shadow["attempts"].append(shadow)
-        salvage_shadow = attempt(
-            100,
-            "positive",
-            budget=0,
-            salvage=True,
-            private=True,
+
+        generic_uncommitted = passing_summary()
+        generic_uncommitted["operational_contract"]["arms"][
+            "generic_committed_stream"
+        ]["downstream_prelude_detected"] = False
+        self.assertIn(
+            "generic_committed_stream_prelude_missing",
+            smoke.acceptance_errors(generic_uncommitted),
         )
-        salvage_shadow["role"] = "shadow"
-        semantic_shadow["attempts"].append(salvage_shadow)
-        self.assertFalse(smoke.acceptance_errors(semantic_shadow))
+
+        generic_success = passing_summary()
+        generic_success["operational_contract"]["arms"][
+            "generic_committed_stream"
+        ]["protocol_valid_terminal_failure"] = False
+        self.assertIn(
+            "generic_committed_stream_terminal_failure_missing",
+            smoke.acceptance_errors(generic_success),
+        )
 
         recovery_probe = passing_summary()
         recovery_probe["attempts"].append(
-            {
-                **attempt(99, "recovery_probe", budget=smoke.THINKING_BUDGET),
-                "role": "recovery_probe",
-            }
+            attempt(
+                5,
+                "shielded_hold",
+                budget=smoke.THINKING_BUDGET,
+                role="recovery_probe",
+            )
         )
         self.assertIn(
-            "commit_probe_recovery_probe",
+            "shielded_hold_recovery_probe",
             smoke.acceptance_errors(recovery_probe),
         )
 
-        race = passing_summary()
-        race["commit_boundary_probes"]["scenarios"]["near_first_tick"][
-            "first_downstream_nonempty_monotonic_ns"
-        ] = smoke.PROBE_TICK_TOLERANCE_NS + 1_000
-        self.assertIn(
-            "commit_probe_timeline_unobservable:near_first_tick",
-            smoke.acceptance_errors(race),
-        )
-
-        leak = passing_summary()
-        leak["commit_boundary_probes"]["scenarios"]["during_recovery"][
-            "private_prefix_marker_leak_count"
-        ] = 1
-        self.assertIn(
-            "commit_probe_marker_leak:during_recovery",
-            smoke.acceptance_errors(leak),
-        )
-
-    def test_fixture_classifies_attempts_by_phase_marker_not_global_index(self) -> None:
+    def test_fixture_classifies_endpoint_phase_and_semantic_role(self) -> None:
         fixture = smoke.Fixture(
             "reason",
             "secret-marker",
             "fresh",
             "positive-output",
             "fresh-output",
-            {"commit_before_recovery": "probe"},
         )
 
         def body(content: str, budget: int = smoke.THINKING_BUDGET) -> dict:
@@ -667,35 +717,47 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
                 "messages": [{"role": "user", "content": content}],
             }
 
-        primary = fixture.inspect_chat(body("positive"))
-        fresh = fixture.inspect_chat(body("fresh"))
-        salvage_body = body("positive", 0)
+        primary = fixture.inspect_request("chat_completions", body("raw-chat-secret"))
+        fresh = fixture.inspect_request("chat_completions", body("fresh"))
+        salvage_body = body("raw-chat-secret", 0)
         salvage_body["messages"].append(
             {
                 "role": "assistant",
                 "content": "Private bounded pre-loop reasoning notes: secret-marker",
             }
         )
-        salvage = fixture.inspect_chat(salvage_body)
-        shadow = fixture.inspect_chat(body("positive"))
-        probe = fixture.inspect_chat(body("probe"))
+        salvage = fixture.inspect_request("chat_completions", salvage_body)
+        shadow = fixture.inspect_request("chat_completions", body("raw-chat-secret"))
+        generic = fixture.inspect_request(
+            "completions", {"stream": True, "prompt": "raw-prompt-secret"}
+        )
+        probe = fixture.inspect_request(
+            "chat_completions", body("raw-chat-secret"), recovery_probe=True
+        )
 
         self.assertEqual(
-            [(item["phase"], item["role"]) for item in (primary, fresh, salvage, shadow, probe)],
             [
-                ("positive", "primary"),
-                ("fresh", "primary"),
-                ("positive", "salvage"),
-                ("positive", "shadow"),
-                ("commit_before_recovery", "primary"),
+                (item["endpoint"], item["phase"], item["role"])
+                for item in (primary, fresh, salvage, shadow, generic, probe)
+            ],
+            [
+                ("chat_completions", "shielded_hold", "primary"),
+                ("chat_completions", "fresh", "primary"),
+                ("chat_completions", "shielded_hold", "salvage"),
+                ("chat_completions", "shielded_hold", "shadow"),
+                ("completions", "generic_committed_stream", "primary"),
+                ("chat_completions", "shielded_hold", "recovery_probe"),
             ],
         )
         timestamps = [
             item["admitted_monotonic_ns"]
-            for item in (primary, fresh, salvage, shadow, probe)
+            for item in (primary, fresh, salvage, shadow, generic, probe)
         ]
         self.assertEqual(timestamps, sorted(timestamps))
-        self.assertNotIn("secret-marker", json.dumps(fixture.snapshot()[0]))
+        receipt = json.dumps(fixture.snapshot()[0])
+        self.assertNotIn("secret-marker", receipt)
+        self.assertNotIn("raw-chat-secret", receipt)
+        self.assertNotIn("raw-prompt-secret", receipt)
 
     def test_final_snapshot_waits_for_handler_quiescence(self) -> None:
         fixture = smoke.Fixture("reason", "private", "fresh", "positive", "fresh-output")

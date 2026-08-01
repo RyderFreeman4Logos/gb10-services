@@ -35,12 +35,6 @@ CLIENT_RESPONSE_LIMIT = 4 * 1024 * 1024
 CLIENT_DEADLINE = 45.0
 CLIENT_READ_CHUNK = 16 * 1024
 PROBE_HEARTBEAT_INTERVAL_SECS = 1
-PROBE_TICK_TOLERANCE_NS = 250_000_000
-COMMIT_PROBE_PHASES = {
-    "before_recovery": "commit_before_recovery",
-    "during_recovery": "commit_during_recovery",
-    "near_first_tick": "commit_near_first_tick",
-}
 PROCESS_TERM_GRACE = 1.0
 PROCESS_STOP_TIMEOUT = 4.0
 PROCESS_POLL_INTERVAL = 0.02
@@ -201,20 +195,18 @@ class Fixture:
         reasoning_marker: str,
         private_prefix_marker: str,
         fresh_input_marker: str,
-        positive_output_marker: str,
+        shielded_output_marker: str,
         fresh_output_marker: str,
-        probe_input_markers: dict[str, str] | None = None,
     ):
         self.reasoning_marker = reasoning_marker
         self.private_prefix_marker = private_prefix_marker
         self.fresh_input_marker = fresh_input_marker
-        self.positive_output_marker = positive_output_marker
+        self.shielded_output_marker = shielded_output_marker
         self.fresh_output_marker = fresh_output_marker
-        self.probe_input_markers = probe_input_markers or {}
         self.lock = threading.Lock()
         self.handler_condition = threading.Condition(self.lock)
         self.active_handlers = 0
-        self.chat_attempts: list[dict] = []
+        self.attempts: list[dict] = []
         self.errors: list[str] = []
 
     def record_error(self, code: str) -> None:
@@ -240,13 +232,19 @@ class Fixture:
 
     def snapshot(self) -> tuple[list[dict], list[str]]:
         with self.lock:
-            return [dict(attempt) for attempt in self.chat_attempts], list(self.errors)
+            return [dict(attempt) for attempt in self.attempts], list(self.errors)
 
     def record_attempt_event(self, number: int, field: str) -> None:
         with self.lock:
-            self.chat_attempts[number - 1][field] = time.monotonic_ns()
+            self.attempts[number - 1][field] = time.monotonic_ns()
 
-    def inspect_chat(self, body: dict, *, recovery_probe: bool = False) -> dict:
+    def inspect_request(
+        self,
+        endpoint: str,
+        body: dict,
+        *,
+        recovery_probe: bool = False,
+    ) -> dict:
         text = json.dumps(body, sort_keys=True, separators=(",", ":"))
         messages = body.get("messages")
         message_contents = {
@@ -256,28 +254,30 @@ class Fixture:
             and isinstance(message, dict)
             and isinstance(message.get("content"), str)
         } if isinstance(messages, list) else set()
-        phase = "recovery_probe" if recovery_probe else "positive"
-        if not recovery_probe and self.fresh_input_marker in message_contents:
+        phase = (
+            "generic_committed_stream"
+            if endpoint == "completions"
+            else "shielded_hold"
+        )
+        if endpoint == "chat_completions" and self.fresh_input_marker in message_contents:
             phase = "fresh"
-        for probe_phase, marker in self.probe_input_markers.items():
-            if not recovery_probe and marker in message_contents:
-                phase = probe_phase
-                break
         private_prefix_present = self.private_prefix_marker in text
         salvage_material = private_prefix_present and "Private bounded pre-loop reasoning notes" in text
         with self.lock:
-            n = len(self.chat_attempts) + 1
+            n = len(self.attempts) + 1
             phase_has_primary = any(
                 item["phase"] == phase and item["role"] == "primary"
-                for item in self.chat_attempts
+                for item in self.attempts
             )
             phase_has_salvage = any(
                 item["phase"] == phase and item["role"] == "salvage"
-                for item in self.chat_attempts
+                for item in self.attempts
             )
             role = (
                 "recovery_probe"
                 if recovery_probe
+                else "primary"
+                if endpoint == "completions"
                 else "salvage"
                 if salvage_material and not phase_has_salvage
                 else "shadow"
@@ -287,6 +287,7 @@ class Fixture:
             budget = effective_budget(body)
             attempt = {
                 "number": n,
+                "endpoint": endpoint,
                 "phase": phase,
                 "role": role,
                 "admitted_monotonic_ns": time.monotonic_ns(),
@@ -294,7 +295,7 @@ class Fixture:
                 "thinking_budget_canonical": budgets(body)[0],
                 "thinking_budget_native": budgets(body)[1],
                 "max_tokens": body.get("max_tokens"),
-                "stream": body.get("stream"),
+                "stream": body.get("stream") is True,
                 "stream_usage": isinstance(body.get("stream_options"), dict)
                 and body["stream_options"].get("include_usage") is True,
                 "salvage_material_present": salvage_material,
@@ -310,14 +311,16 @@ class Fixture:
                     else "bounded-thinking"
                 ),
             }
-            self.chat_attempts.append(attempt)
-            if role == "primary":
+            self.attempts.append(attempt)
+            if endpoint == "chat_completions" and role == "primary":
                 if effective_budget(body) != THINKING_BUDGET:
                     self.errors.append(f"primary_thinking_budget:{phase}")
                 if body.get("max_tokens") != EXPECTED_FIRST_MAX:
                     self.errors.append(f"primary_max_tokens:{phase}")
                 if body.get("stream") is not True or not attempt["stream_usage"]:
                     self.errors.append(f"primary_shielded_sse_contract:{phase}")
+            if endpoint == "completions" and body.get("stream") is not True:
+                self.errors.append("generic_upstream_not_streaming")
             if salvage_material:
                 if effective_budget(body) != 0:
                     self.errors.append("salvage_thinking_budget")
@@ -392,11 +395,19 @@ class Fixture:
                     count = len(values) if isinstance(values, list) else 1
                     self.send_json(200, {"object": "list", "data": [{"object": "embedding", "index": i, "embedding": [1.0] + [0.0] * 255} for i in range(count)], "model": "fixture", "usage": {"prompt_tokens": 1, "total_tokens": 1}})
                     return
-                if not self.path.endswith("/chat/completions") or not isinstance(body, dict):
+                endpoint = (
+                    "chat_completions"
+                    if self.path.endswith("/chat/completions")
+                    else "completions"
+                    if self.path.endswith("/completions")
+                    else None
+                )
+                if endpoint is None or not isinstance(body, dict):
                     fixture.record_error("unexpected_upstream_route")
                     self.send_json(404, {"error": {"message": "route"}})
                     return
-                attempt = fixture.inspect_chat(
+                attempt = fixture.inspect_request(
+                    endpoint,
                     body,
                     recovery_probe=self.headers.get("x-llm-guard-proxy-probe")
                     == "local-recovery",
@@ -417,49 +428,47 @@ class Fixture:
                 self.send_header("Connection", "close")
                 self.end_headers()
                 try:
-                    if attempt["role"] == "primary" and attempt["phase"] == "positive":
-                        self.wfile.write(sse({"id": "fixture-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": f"{fixture.private_prefix_marker} derive the isolated invariant before answering\n"}, "finish_reason": None}]}))
+                    if endpoint == "completions":
+                        error = json.dumps(
+                            {
+                                "error": {
+                                    "message": "fixture generic terminal failure",
+                                    "type": "fixture_generic_terminal_failure",
+                                    "code": "fixture_generic_terminal_failure",
+                                }
+                            },
+                            separators=(",", ":"),
+                        ).encode()
+                        self.wfile.write(b": fixture generic heartbeat\n\n")
                         self.wfile.flush()
-                        repeated = fixture.reasoning_marker + " repeat loop line\n"
-                        for _ in range(40):
-                            self.wfile.write(sse({"id": "fixture-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": repeated}, "finish_reason": None}]}))
-                            self.wfile.flush()
-                    elif attempt["role"] == "primary" and attempt["phase"].startswith("commit_"):
-                        phase = attempt["phase"]
-                        if phase == "commit_before_recovery":
-                            time.sleep(PROBE_HEARTBEAT_INTERVAL_SECS + 0.15)
-                        elif phase == "commit_near_first_tick":
-                            time.sleep(PROBE_HEARTBEAT_INTERVAL_SECS - 0.05)
-                        fixture.record_attempt_event(attempt["number"], "loop_evidence_started_monotonic_ns")
+                        time.sleep(0.05)
+                        self.wfile.write(b"event: error\ndata: " + error + b"\n\n")
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    elif (
+                        attempt["role"] == "primary"
+                        and attempt["phase"] == "shielded_hold"
+                    ):
+                        time.sleep(PROBE_HEARTBEAT_INTERVAL_SECS + 0.15)
+                        fixture.record_attempt_event(
+                            attempt["number"],
+                            "upstream_first_event_monotonic_ns",
+                        )
                         self.wfile.write(sse({"id": f"fixture-{attempt['number']}", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": f"{fixture.private_prefix_marker} derive the isolated invariant before answering\n"}, "finish_reason": None}]}))
                         self.wfile.flush()
                         repeated = fixture.reasoning_marker + " repeat loop line\n"
-                        for index in range(40):
+                        for _ in range(40):
                             self.wfile.write(sse({"id": f"fixture-{attempt['number']}", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": repeated}, "finish_reason": None}]}))
                             self.wfile.flush()
-                            if index == 23:
-                                fixture.record_attempt_event(attempt["number"], "loop_threshold_monotonic_ns")
-                            if phase == "commit_during_recovery":
-                                time.sleep(0.035)
-                            elif phase == "commit_near_first_tick" and index >= 23:
-                                time.sleep(0.02)
-                        fixture.record_attempt_event(attempt["number"], "loop_evidence_completed_monotonic_ns")
                     else:
-                        text = fixture.positive_output_marker if attempt["phase"] == "positive" and attempt["salvage_material_present"] else fixture.fresh_output_marker
+                        text = fixture.shielded_output_marker if attempt["phase"] == "shielded_hold" and attempt["salvage_material_present"] else fixture.fresh_output_marker
                         self.wfile.write(sse({"id": f"fixture-{attempt['number']}", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}]}))
                         self.wfile.write(sse({"id": f"fixture-{attempt['number']}", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}))
                         self.wfile.write(sse({"id": f"fixture-{attempt['number']}", "object": "chat.completion.chunk", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}))
                         self.wfile.write(b"data: [DONE]\n\n")
                         self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
-                    if attempt["phase"].startswith("commit_"):
-                        fixture.record_attempt_event(
-                            attempt["number"], "upstream_cancelled_monotonic_ns"
-                        )
-                        fixture.record_attempt_event(
-                            attempt["number"],
-                            "loop_evidence_completed_monotonic_ns",
-                        )
+                    pass
 
         return Handler
 
@@ -947,6 +956,15 @@ class _SSEFramer:
         self.event_type = None
         self.data_lines = []
         if self.terminal_seen:
+            if (
+                self.error_count == 1
+                and self.done_count == 0
+                and event_type == b"message"
+                and data == b"[DONE]"
+            ):
+                self.event_count += 1
+                self.done_count = 1
+                return
             self._fail("sse_after_terminal")
             return
         prior_event = self.event_count > 0 or self.comment_count > 0 or self.prelude
@@ -1009,6 +1027,14 @@ class _SSEFramer:
                 self.prelude = True
             return
         if self.terminal_seen:
+            if (
+                self.error_count == 1
+                and self.done_count == 0
+                and not self.data_lines
+                and line in {b"data: [DONE]", b"data:[DONE]"}
+            ):
+                self.data_lines.append(b"[DONE]")
+                return
             self._fail("sse_after_terminal")
             return
         field, separator, value = line.partition(b":")
@@ -1075,11 +1101,24 @@ def client(
     private_prefix_marker: str,
     *,
     stream: bool = False,
+    endpoint: str = "/v1/chat/completions",
     max_response_bytes: int = CLIENT_RESPONSE_LIMIT,
     deadline_seconds: float = CLIENT_DEADLINE,
 ) -> dict:
-    body = {"model": "__listener_forced_aeon_guard_max__", "messages": [{"role": "user", "content": input_marker}], "max_tokens": CALLER_MAX, "stream": stream}
-    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=json.dumps(body, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"}, method="POST")
+    require(
+        endpoint in {"/v1/chat/completions", "/v1/completions"},
+        "unsupported_client_endpoint",
+    )
+    body = {
+        "model": "__listener_forced_aeon_guard_max__",
+        "max_tokens": CALLER_MAX,
+        "stream": stream,
+    }
+    if endpoint == "/v1/completions":
+        body["prompt"] = input_marker
+    else:
+        body["messages"] = [{"role": "user", "content": input_marker}]
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{endpoint}", data=json.dumps(body, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"}, method="POST")
     started_ns = time.monotonic_ns()
     deadline = time.monotonic() + deadline_seconds
     try:
@@ -1147,7 +1186,14 @@ def client(
     message = choices[0].get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
     content = message.get("content") if isinstance(message, dict) else None
     http_error = status >= 400 and isinstance(payload, dict) and isinstance(payload.get("error"), dict)
-    terminal_failure = protocol_error is None and (framer.terminal_failure or http_error)
+    terminal_failure = protocol_error is None and (
+        (
+            framer.terminal_failure
+            and framer.error_count == 1
+            and framer.done_count == 1
+        )
+        or http_error
+    )
     expected_final = (
         not stream
         and not downstream_prelude
@@ -1156,9 +1202,13 @@ def client(
     )
     finished_ns = time.monotonic_ns()
     return {
+        "endpoint": endpoint,
+        "caller_stream": stream,
         "status": status,
+        "content_type": content_type,
         "format": response_format,
-        "nonempty": isinstance(content, str) and bool(content),
+        "nonempty": bool(raw),
+        "valid_json": response_format == "json" and payload is not None,
         "expected_final": expected_final,
         "protocol_valid_terminal_failure": terminal_failure,
         "protocol_error": protocol_error,
@@ -2667,97 +2717,184 @@ def sensitive_marker_count(
         os.close(root_fd)
 
 
-def _commit_boundary_evidence_errors(summary: dict) -> list[str]:
+def _operational_contract_evidence_errors(summary: dict) -> list[str]:
     errors: list[str] = []
     attempts = summary.get("attempts", [])
     for attempt in attempts:
         timestamp = attempt.get("admitted_monotonic_ns")
         if not isinstance(timestamp, int):
             errors.append(f"attempt_timestamp_missing:{attempt.get('number', 0)}")
-    numbered = [attempt.get("number") for attempt in attempts]
-    if len(numbered) == len(set(numbered)):
-        ordered_admissions = [
-            attempt["admitted_monotonic_ns"]
-            for attempt in sorted(attempts, key=lambda item: item["number"])
-            if isinstance(attempt.get("admitted_monotonic_ns"), int)
-        ]
-        if len(ordered_admissions) == len(attempts) and any(
-            current < previous
-            for previous, current in zip(
-                ordered_admissions, ordered_admissions[1:]
-            )
-        ):
-            errors.append("attempt_timeline_nonmonotonic")
 
-    positive = summary.get("positive_client", {})
-    positive_first = positive.get("first_downstream_nonempty_monotonic_ns")
-    if not isinstance(positive_first, int):
-        errors.append("no_commit_control_first_byte_missing")
+    contract = summary.get("operational_contract", {})
+    arms = contract.get("arms", {}) if isinstance(contract, dict) else {}
+    business_roles = {"primary", "salvage", "recovery_probe"}
+
+    shielded = arms.get("shielded_hold")
+    if not isinstance(shielded, dict):
+        errors.append("shielded_hold_receipt_missing")
+        shielded = {}
+    shielded_attempts = [
+        attempt for attempt in attempts if attempt.get("phase") == "shielded_hold"
+    ]
+    shielded_business = [
+        attempt
+        for attempt in shielded_attempts
+        if attempt.get("role") in business_roles
+    ]
+    primaries = [
+        attempt for attempt in shielded_business if attempt.get("role") == "primary"
+    ]
+    salvages = [
+        attempt for attempt in shielded_business if attempt.get("role") == "salvage"
+    ]
+    recovery_probes = [
+        attempt
+        for attempt in shielded_business
+        if attempt.get("role") == "recovery_probe"
+    ]
+    if len(primaries) != 1:
+        errors.append("shielded_hold_primary_count")
+    if len(salvages) != 1:
+        errors.append("shielded_hold_salvage_count")
+    if len(shielded_business) != 2:
+        errors.append("shielded_hold_business_attempt_count")
+    if recovery_probes:
+        errors.append("shielded_hold_recovery_probe")
+
+    shielded_first = shielded.get("first_downstream_nonempty_monotonic_ns")
+    if not isinstance(shielded_first, int):
+        errors.append("shielded_hold_first_byte_missing")
     else:
-        for attempt in attempts:
-            if attempt.get("phase") != "positive" or attempt.get("role") != "salvage":
-                continue
-            salvage_admitted = attempt.get("admitted_monotonic_ns")
-            if not isinstance(salvage_admitted, int) or salvage_admitted >= positive_first:
-                errors.append("salvage_after_downstream_commit")
-    if positive.get("downstream_prelude_detected") is not False:
-        errors.append("positive_downstream_prelude")
+        for attempt in shielded_business:
+            admitted = attempt.get("admitted_monotonic_ns")
+            if not isinstance(admitted, int) or admitted >= shielded_first:
+                errors.append(
+                    f"shielded_hold_post_commit_attempt:{attempt.get('number', 0)}"
+                )
+        if salvages and (
+            not isinstance(salvages[0].get("admitted_monotonic_ns"), int)
+            or salvages[0]["admitted_monotonic_ns"] >= shielded_first
+        ):
+            errors.append("shielded_hold_salvage_after_first_byte")
 
-    boundary = summary.get("commit_boundary_probes", {})
-    scenarios = boundary.get("scenarios", {})
-    if any(attempt.get("role") == "recovery_probe" for attempt in attempts):
-        errors.append("commit_probe_recovery_probe")
-    for scenario, phase in COMMIT_PROBE_PHASES.items():
-        receipt = scenarios.get(scenario)
-        if not isinstance(receipt, dict):
-            errors.append(f"commit_probe_missing:{scenario}")
-            continue
-        phase_attempts = [attempt for attempt in attempts if attempt.get("phase") == phase]
-        business_attempts = [
-            attempt
-            for attempt in phase_attempts
-            if attempt.get("role") in {"primary", "salvage", "recovery_probe"}
-        ]
-        if len(business_attempts) != 1 or any(
-            attempt.get("role") == "salvage" for attempt in business_attempts
+    if primaries:
+        primary = primaries[0]
+        admitted = primary.get("admitted_monotonic_ns")
+        first_event = primary.get("upstream_first_event_monotonic_ns")
+        if (
+            not isinstance(admitted, int)
+            or not isinstance(first_event, int)
+            or first_event - admitted
+            < PROBE_HEARTBEAT_INTERVAL_SECS * 1_000_000_000
         ):
-            errors.append(f"commit_probe_attempt_count:{scenario}")
-            continue
-        attempt = business_attempts[0]
-        first = receipt.get("first_downstream_nonempty_monotonic_ns")
-        admission = attempt.get("admitted_monotonic_ns")
-        if not isinstance(first, int) or not isinstance(admission, int) or admission > first:
-            errors.append(f"commit_probe_timeline_unobservable:{scenario}")
-            continue
-        if receipt.get("heartbeat_count", 0) < 1:
-            errors.append(f"commit_probe_heartbeat_missing:{scenario}")
-        if receipt.get("protocol_error") is not None:
-            errors.append(f"commit_probe_protocol_error:{scenario}")
-        if receipt.get("protocol_valid_terminal_failure") is not True:
-            errors.append(f"commit_probe_terminal_failure:{scenario}")
-        if any(
-            receipt.get(field, 0) != 0
-            for field in (
-                "reasoning_marker_leak_count",
-                "private_prefix_marker_leak_count",
-            )
+            errors.append("shielded_hold_not_delayed_across_heartbeat")
+        if primary.get("endpoint") != "chat_completions" or primary.get("stream") is not True:
+            errors.append("shielded_hold_upstream_stream_contract")
+        if primary.get("stream_usage") is not True:
+            errors.append("shielded_hold_upstream_usage_contract")
+        if primary.get("thinking_budget") != THINKING_BUDGET:
+            errors.append("shielded_hold_primary_thinking_budget")
+    if salvages:
+        salvage = salvages[0]
+        if salvage.get("endpoint") != "chat_completions" or salvage.get("stream") is not True:
+            errors.append("shielded_hold_salvage_stream_contract")
+        if (
+            salvage.get("thinking_budget") != 0
+            or salvage.get("private_prefix_present") is not True
+            or salvage.get("loop_tail_present") is not False
         ):
-            errors.append(f"commit_probe_marker_leak:{scenario}")
+            errors.append("shielded_hold_salvage_contract")
 
-        started = attempt.get("loop_evidence_started_monotonic_ns")
-        threshold = attempt.get("loop_threshold_monotonic_ns")
-        completed = attempt.get("loop_evidence_completed_monotonic_ns")
-        observable = all(isinstance(value, int) for value in (started, threshold, completed))
-        if not observable:
-            errors.append(f"commit_probe_timeline_unobservable:{scenario}")
-        elif scenario == "before_recovery" and not first < started:
-            errors.append(f"commit_probe_timeline_unobservable:{scenario}")
-        elif scenario == "during_recovery" and not threshold <= first <= completed:
-            errors.append(f"commit_probe_timeline_unobservable:{scenario}")
-        elif scenario == "near_first_tick" and not (
-            abs(first - threshold) <= PROBE_TICK_TOLERANCE_NS and first <= completed
-        ):
-            errors.append(f"commit_probe_timeline_unobservable:{scenario}")
+    if (
+        shielded.get("endpoint") != "/v1/chat/completions"
+        or shielded.get("caller_stream") is not False
+    ):
+        errors.append("shielded_hold_caller_contract")
+    if (
+        shielded.get("status") != 200
+        or shielded.get("content_type") != "application/json"
+        or shielded.get("valid_json") is not True
+        or shielded.get("expected_final") is not True
+        or shielded.get("nonempty") is not True
+    ):
+        errors.append("shielded_hold_json_success_missing")
+    if (
+        shielded.get("heartbeat_count") != 0
+        or shielded.get("downstream_prelude_detected") is not False
+    ):
+        errors.append("shielded_hold_downstream_prelude")
+    if shielded.get("protocol_error") is not None:
+        errors.append("shielded_hold_protocol_error")
+    if any(
+        shielded.get(field, 0) != 0
+        for field in (
+            "reasoning_marker_leak_count",
+            "private_prefix_marker_leak_count",
+        )
+    ):
+        errors.append("shielded_hold_marker_leak")
+
+    generic = arms.get("generic_committed_stream")
+    if not isinstance(generic, dict):
+        errors.append("generic_committed_stream_receipt_missing")
+        generic = {}
+    generic_attempts = [
+        attempt
+        for attempt in attempts
+        if attempt.get("phase") == "generic_committed_stream"
+        and attempt.get("role") in business_roles
+    ]
+    if len(generic_attempts) != 1 or any(
+        attempt.get("role") != "primary" for attempt in generic_attempts
+    ):
+        errors.append("generic_committed_stream_attempt_count")
+    if any(attempt.get("role") == "recovery_probe" for attempt in generic_attempts):
+        errors.append("generic_committed_stream_recovery_probe")
+    generic_first = generic.get("first_downstream_nonempty_monotonic_ns")
+    if not isinstance(generic_first, int):
+        errors.append("generic_committed_stream_first_byte_missing")
+    else:
+        for attempt in generic_attempts:
+            admitted = attempt.get("admitted_monotonic_ns")
+            if not isinstance(admitted, int) or admitted >= generic_first:
+                errors.append(
+                    "generic_committed_stream_post_commit_attempt:"
+                    f"{attempt.get('number', 0)}"
+                )
+    if generic_attempts and (
+        generic_attempts[0].get("endpoint") != "completions"
+        or generic_attempts[0].get("stream") is not True
+    ):
+        errors.append("generic_committed_stream_upstream_contract")
+    if (
+        generic.get("endpoint") != "/v1/completions"
+        or generic.get("caller_stream") is not True
+        or generic.get("status") != 200
+        or generic.get("content_type") != "text/event-stream"
+    ):
+        errors.append("generic_committed_stream_caller_contract")
+    if (
+        generic.get("first_downstream_nonempty_monotonic_ns") is None
+        or generic.get("downstream_prelude_detected") is not True
+        or generic.get("heartbeat_count", 0) < 1
+    ):
+        errors.append("generic_committed_stream_prelude_missing")
+    if generic.get("protocol_error") is not None:
+        errors.append("generic_committed_stream_protocol_error")
+    if (
+        generic.get("protocol_valid_terminal_failure") is not True
+        or generic.get("sse_error_event_count") != 1
+        or generic.get("sse_done_count") != 1
+    ):
+        errors.append("generic_committed_stream_terminal_failure_missing")
+    if any(
+        generic.get(field, 0) != 0
+        for field in (
+            "reasoning_marker_leak_count",
+            "private_prefix_marker_leak_count",
+        )
+    ):
+        errors.append("generic_committed_stream_marker_leak")
     return errors
 
 
@@ -2772,12 +2909,17 @@ def acceptance_errors(summary: dict) -> list[str]:
     errors.extend(summary.get("fixture_errors", []))
 
     attempts = summary.get("attempts", [])
-    salvages = [attempt for attempt in attempts if attempt.get("role") == "salvage"]
+    salvages = [
+        attempt
+        for attempt in attempts
+        if attempt.get("phase") == "shielded_hold"
+        and attempt.get("role") == "salvage"
+    ]
     fresh_attempts = [
         attempt
         for attempt in attempts
         if attempt["phase"] == "fresh"
-        and attempt.get("role") != "shadow"
+        and attempt.get("role") == "primary"
         and not attempt["salvage_material_present"]
     ]
     if len(salvages) != 1:
@@ -2787,7 +2929,7 @@ def acceptance_errors(summary: dict) -> list[str]:
     for attempt in attempts:
         number = attempt["number"]
         if attempt["salvage_material_present"]:
-            if attempt["phase"] != "positive":
+            if attempt["phase"] != "shielded_hold":
                 errors.append(f"salvage_phase:{number}")
             if attempt["thinking_budget"] != 0:
                 errors.append(f"salvage_thinking_budget:{number}")
@@ -2805,18 +2947,19 @@ def acceptance_errors(summary: dict) -> list[str]:
             errors.append(f"{prefix}:{number}")
         if (
             attempt["phase"] == "fresh"
+            and attempt.get("role") == "primary"
             and attempt["thinking_budget"] != THINKING_BUDGET
         ):
             errors.append(f"fresh_thinking_budget:{number}")
 
-    if not summary.get("positive_pass"):
-        errors.append("positive_client_failed")
+    if not summary.get("shielded_hold_pass"):
+        errors.append("shielded_hold_client_failed")
     if not summary.get("fresh_negative_pass"):
         errors.append("fresh_client_failed")
-    boundary = summary.get("commit_boundary_probes", {})
-    if boundary.get("verified") is not True:
-        errors.append("downstream_commit_boundary_unverified")
-    errors.extend(_commit_boundary_evidence_errors(summary))
+    contract = summary.get("operational_contract", {})
+    if contract.get("verified") is not True:
+        errors.append("operational_contract_unverified")
+    errors.extend(_operational_contract_evidence_errors(summary))
 
     process_cleanup = summary.get("process_cleanup", {})
     if not process_cleanup.get("exclusive_supervisor"):
@@ -2908,19 +3051,14 @@ def main() -> int:
     (root / "home").mkdir(mode=0o700)
     (root / "tmp").mkdir(mode=0o700)
     sensitive_markers = tuple("S" + secrets.token_hex(24) for _ in range(6))
-    probe_markers = tuple(
-        "S" + secrets.token_hex(24) for _ in COMMIT_PROBE_PHASES
-    )
-    sensitive_markers += probe_markers
-    reasoning_marker, private_prefix_marker, positive_input_marker, fresh_input_marker, positive_output_marker, fresh_output_marker = sensitive_markers[:6]
-    probe_input_markers = dict(zip(COMMIT_PROBE_PHASES.values(), probe_markers, strict=True))
+    reasoning_marker, private_prefix_marker, shielded_input_marker, fresh_input_marker, shielded_output_marker, fresh_output_marker = sensitive_markers
+    generic_input_marker = shielded_input_marker
     fixture = Fixture(
         reasoning_marker,
         private_prefix_marker,
         fresh_input_marker,
-        positive_output_marker,
+        shielded_output_marker,
         fresh_output_marker,
-        probe_input_markers,
     )
     fake_port, guard_port = free_port(), free_port()
     summary: dict = {
@@ -2940,7 +3078,11 @@ def main() -> int:
             "deadline_seconds": SCAN_TIMEOUT,
         },
         "scan_limits_enforced": False,
-        "commit_boundary_probes": {"verified": False, "scenarios": {}, "blocker": "BLOCKER:not_executed"},
+        "operational_contract": {
+            "verified": False,
+            "arms": {},
+            "blocker": "BLOCKER:not_executed",
+        },
     }
     supervisor = None
     process_cleanup = None
@@ -2978,24 +3120,24 @@ def main() -> int:
         server_thread.start()
         wait_port(guard_port, supervisor, time.monotonic() + 20)
         summary["candidate_full_toml_release_binary_parsed"] = True
-        summary["positive_client"] = client(
+        summary["operational_contract"]["arms"]["shielded_hold"] = client(
             guard_port,
-            positive_input_marker,
-            positive_output_marker,
+            shielded_input_marker,
+            shielded_output_marker,
             reasoning_marker,
             private_prefix_marker,
         )
-        summary["commit_boundary_probes"]["scenarios"] = {
-            scenario: client(
-                guard_port,
-                probe_input_markers[phase],
-                "",
-                reasoning_marker,
-                private_prefix_marker,
-                stream=True,
-            )
-            for scenario, phase in COMMIT_PROBE_PHASES.items()
-        }
+        summary["operational_contract"]["arms"][
+            "generic_committed_stream"
+        ] = client(
+            guard_port,
+            generic_input_marker,
+            "",
+            reasoning_marker,
+            private_prefix_marker,
+            stream=True,
+            endpoint="/v1/completions",
+        )
         summary["fresh_client"] = client(
             guard_port,
             fresh_input_marker,
@@ -3031,26 +3173,42 @@ def main() -> int:
     summary["attempts"] = attempts
     summary["fixture_errors"] = fixture_errors
     summary["salvage_count"] = sum(
-        attempt.get("role") == "salvage" for attempt in attempts
+        attempt.get("phase") == "shielded_hold"
+        and attempt.get("role") == "salvage"
+        for attempt in attempts
+    )
+    summary["shielded_hold_request_count"] = sum(
+        attempt.get("phase") == "shielded_hold"
+        and attempt.get("role") in {"primary", "salvage", "recovery_probe"}
+        for attempt in attempts
     )
     summary["fresh_request_count"] = sum(
-        attempt["phase"] == "fresh" for attempt in attempts
+        attempt.get("phase") == "fresh" and attempt.get("role") == "primary"
+        for attempt in attempts
     )
-    boundary_errors = _commit_boundary_evidence_errors(summary)
-    summary["commit_boundary_probes"]["verified"] = not boundary_errors
-    summary["commit_boundary_probes"]["blocker"] = (
-        None if not boundary_errors else f"BLOCKER:{boundary_errors[0]}"
+    summary["generic_committed_stream_request_count"] = sum(
+        attempt.get("phase") == "generic_committed_stream"
+        and attempt.get("role") in {"primary", "salvage", "recovery_probe"}
+        for attempt in attempts
+    )
+    operational_errors = _operational_contract_evidence_errors(summary)
+    summary["operational_contract"]["verified"] = not operational_errors
+    summary["operational_contract"]["blocker"] = (
+        None if not operational_errors else f"BLOCKER:{operational_errors[0]}"
     )
 
-    positive = summary.get("positive_client")
+    shielded = summary["operational_contract"]["arms"].get("shielded_hold")
     fresh = summary.get("fresh_client")
-    summary["positive_pass"] = (
-        isinstance(positive, dict)
-        and positive["status"] == 200
-        and positive["nonempty"]
-        and positive["expected_final"]
-        and positive["reasoning_marker_leak_count"] == 0
-        and positive["private_prefix_marker_leak_count"] == 0
+    summary["shielded_hold_pass"] = (
+        isinstance(shielded, dict)
+        and shielded["status"] == 200
+        and shielded["nonempty"]
+        and shielded["valid_json"]
+        and shielded["expected_final"]
+        and shielded["heartbeat_count"] == 0
+        and not shielded["downstream_prelude_detected"]
+        and shielded["reasoning_marker_leak_count"] == 0
+        and shielded["private_prefix_marker_leak_count"] == 0
     )
     summary["fresh_negative_pass"] = (
         isinstance(fresh, dict)
