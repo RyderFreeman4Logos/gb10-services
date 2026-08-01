@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 JUSTFILE = ROOT / "justfile"
 LEFTHOOK = ROOT / "lefthook.yml"
 SYSTEMD_VERIFY = ROOT / "scripts" / "verify_systemd_units.py"
+LOOP_RECOVERY_SMOKE = ROOT / "scripts" / "llm_guard_proxy_loop_recovery_smoke.py"
 
 
 class LocalGateContractTests(unittest.TestCase):
@@ -49,6 +50,13 @@ class LocalGateContractTests(unittest.TestCase):
         self.assertNotIn("scripts/hooks/review-check.sh", lefthook)
         self.assertNotIn("use_stdin: true", lefthook)
         self.assertIn("run: just pre-push", lefthook)
+
+    def test_justfile_exposes_guard_loop_recovery_operational_gate(self) -> None:
+        justfile = JUSTFILE.read_text()
+        self.assertTrue(LOOP_RECOVERY_SMOKE.is_file())
+        self.assertIn("guard-loop-recovery-smoke:", justfile)
+        self.assertIn("LLM_GUARD_PROXY_BINARY", justfile)
+        self.assertIn(str(LOOP_RECOVERY_SMOKE.relative_to(ROOT)), justfile)
 
     def test_systemd_gate_uses_unprivileged_user_manager_semantics(self) -> None:
         helper = SYSTEMD_VERIFY.read_text()
