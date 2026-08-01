@@ -81,27 +81,27 @@
     "endpoint_addresses_excluded": true,
     "private_databases_excluded": true
   },
-  "generated_at": "2026-08-01T03:40:01.464354Z",
+  "generated_at": "2026-08-01T04:13:35.420816Z",
   "provenance": {
     "baseline_20260731_receipt_sha256": "6c7a798b4e7a9c5ea003deacb5da37c68655fcdeae3fa4fa7e7eb72fdd49a401",
-    "publisher_sha256": "f5210141ab8e6385c707f217974ff1170d48780cef46035ac643dbebb2f48dd0"
+    "publisher_sha256": "b3132c37ab193f77836d33d4065a84a11d51a62e718e1f0c07eae0af60f62231"
   },
   "public_assets": {
     "aeon_3arm_comparison_redacted.zip": {
-      "bytes": 32070,
-      "sha256": "88840ccce3631dfa3b05b1f91ad9a6221bf20b2f15e15978f6c07f6c1b227fcd"
+      "bytes": 32333,
+      "sha256": "de5d6fbf11f4ebc217bd849c6431749b9871176924d27c9ded6069a96697bed8"
     },
     "comparison.json": {
-      "bytes": 16214,
-      "sha256": "333eb075bb0575501aa9b7fba38e20fcb3bc7320b4fa2ac78531c8c33faf4214"
+      "bytes": 16418,
+      "sha256": "a21dd20500588d461dd31f9cbc76eebcd308ab97eda5b7547b20f0771f722542"
     },
     "comparison_report.md": {
-      "bytes": 4208,
-      "sha256": "d9def14b52a5cec26208542d62af6e36ee3039fc2182d381e81a36277d70dea2"
+      "bytes": 4404,
+      "sha256": "e83b4049ff1e8e4a6a613737c62c547e81c73d7172b9098f423cef676de3f73f"
     },
     "package_manifest.json": {
       "bytes": 516,
-      "sha256": "ca2b828bd5d5d1c1738b785275e95c62af1630750f63a08bf4d9a54514f57a8f"
+      "sha256": "924db5d2de6ba465f4d83e7b97d80935dd52068d96dd47a275636a2fbfa67531"
     },
     "sanitized_manifest.json": {
       "bytes": 3996,

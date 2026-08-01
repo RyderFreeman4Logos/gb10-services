@@ -1,6 +1,6 @@
 # AEON 三臂基准对比报告（内容脱敏）
 
-生成时间：`2026-08-01T03:40:01.464354Z`。
+生成时间：`2026-08-01T04:13:35.420816Z`。
 
 ## 取代 2026-07-31 版本
 
@@ -43,7 +43,7 @@
 
 ## 回答样本延迟（仅有 speed metadata 的已回答行）
 
-| 臂 | e2e ms N / mean / p50 / p95 | TTFT ms N / mean / p50 / p95 | decode tok/s N / mean / p50 / p95 | 输出 tokens N / mean / p50 / p95 |
+| 臂 | e2e ms N / mean / p50 / p95 | TTFT ms N / mean / p50 / p95 | 客户端观测 decode tok/s 元数据 N / mean / p50 / p95 | 输出 tokens N / mean / p50 / p95 |
 |---|---|---|---|---|
 | A (aeon-guard-max) | 290 / 209275.50 / 110335.70 / 807897.22 | 288 / 199014.39 / 109668.42 / 702702.78 | 288 / 17054115.63 / 7436700.76 / 62435311.48 | 290 / 2903.53 / 1449.50 / 9915.30 |
 | B (aeon-direct-no-think) | 290 / 20462.52 / 8316.30 / 66555.88 | 290 / 3207.86 / 1476.36 / 11156.59 | 290 / 172.46 / 32.15 / 46.22 | 290 / 550.33 / 192.00 / 1924.65 |
@@ -51,6 +51,7 @@
 
 ## 证据边界与脱敏导出
 
+- decode_tps is client-observed speed metadata without raw timing evidence in the public package and MUST NOT be interpreted as verified GPU/model generation throughput.
 - `no_answer_n` 是没有数值 score 的终态结果数；本次完整 ledger 中它与 unscored 数相同。发布程序未读取或导出内容载荷、原始模型字段、blob、私钥、Pod 数据库或 runner 日志。
 - 公开 ZIP 包含本报告、比较 JSON、脱敏 manifest、每臂的结构化结果 CSV 和 ZIP 内 manifest；不含数据库、端点地址或任何内容载荷。ZIP CRC 与成员路径已程序化检查。
 - 没有将此临时运行目录或任何仓库变更提交到 Git。
