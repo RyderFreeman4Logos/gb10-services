@@ -2928,9 +2928,11 @@ def acceptance_errors(summary: dict) -> list[str]:
         errors.append("fresh_request_missing")
     for attempt in attempts:
         number = attempt["number"]
-        if attempt["salvage_material_present"]:
+        if attempt.get("role") == "salvage":
             if attempt["phase"] != "shielded_hold":
                 errors.append(f"salvage_phase:{number}")
+            if not attempt["salvage_material_present"]:
+                errors.append(f"salvage_material_missing:{number}")
             if attempt["thinking_budget"] != 0:
                 errors.append(f"salvage_thinking_budget:{number}")
             if not attempt["private_prefix_present"]:
@@ -2938,7 +2940,14 @@ def acceptance_errors(summary: dict) -> list[str]:
             if attempt["loop_tail_present"]:
                 errors.append(f"salvage_loop_tail:{number}")
             continue
-        if attempt["private_prefix_present"] or attempt["loop_tail_present"]:
+        if any(
+            attempt[field]
+            for field in (
+                "salvage_material_present",
+                "private_prefix_present",
+                "loop_tail_present",
+            )
+        ):
             prefix = (
                 "fresh_request_replayed_private_material"
                 if attempt["phase"] == "fresh"

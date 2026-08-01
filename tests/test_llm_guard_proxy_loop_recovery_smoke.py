@@ -340,13 +340,19 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
     def test_final_acceptance_checks_every_attempt_privacy_and_budget(self) -> None:
         self.assertFalse(smoke.acceptance_errors(passing_summary()))
 
-        legal_shadow = passing_summary()
-        legal_shadow["attempts"].append(
-            attempt(5, "shielded_hold", budget=1024, role="shadow")
-        )
-        self.assertFalse(smoke.acceptance_errors(legal_shadow))
+        for budget in (1024, smoke.THINKING_BUDGET):
+            legal_shadow = passing_summary()
+            legal_shadow["attempts"].append(
+                attempt(5, "shielded_hold", budget=budget, role="shadow")
+            )
+            with self.subTest(legal_shadow_budget=budget):
+                self.assertFalse(smoke.acceptance_errors(legal_shadow))
 
-        for field in ("private_prefix_present", "loop_tail_present"):
+        for field in (
+            "salvage_material_present",
+            "private_prefix_present",
+            "loop_tail_present",
+        ):
             private_shadow = passing_summary()
             private_shadow["attempts"].append(
                 attempt(
@@ -363,9 +369,29 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
                     smoke.acceptance_errors(private_shadow),
                 )
 
+        for role in ("shadow", "recovery_probe", "primary", "unknown"):
+            private_replay = passing_summary()
+            replay = dict(private_replay["attempts"][1])
+            replay.update(
+                number=5,
+                admitted_monotonic_ns=replay["admitted_monotonic_ns"] + 1,
+                role=role,
+            )
+            private_replay["attempts"].append(replay)
+            with self.subTest(private_salvage_role=role):
+                self.assertIn(
+                    "non_salvage_replayed_private_material:5",
+                    smoke.acceptance_errors(private_replay),
+                )
+
         for field, value, code in (
             ("phase", "fresh", "salvage_phase:2"),
             ("thinking_budget", 1, "salvage_thinking_budget:2"),
+            (
+                "salvage_material_present",
+                False,
+                "salvage_material_missing:2",
+            ),
             ("private_prefix_present", False, "salvage_private_prefix:2"),
             ("loop_tail_present", True, "salvage_loop_tail:2"),
         ):
