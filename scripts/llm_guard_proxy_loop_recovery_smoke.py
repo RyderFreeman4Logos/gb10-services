@@ -1101,7 +1101,12 @@ def client(
             if remaining <= 0:
                 protocol_error = "response_deadline"
                 break
-            sock.settimeout(remaining)
+            try:
+                sock.settimeout(remaining)
+            except OSError:
+                if sock.fileno() < 0 and response.isclosed():
+                    break
+                raise
             reader = getattr(response, "read1", response.read)
             chunk = reader(min(CLIENT_READ_CHUNK, max_response_bytes + 1 - len(raw)))
             if not chunk:

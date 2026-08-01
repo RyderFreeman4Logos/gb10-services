@@ -491,6 +491,62 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
         )
         self.assertEqual(result["protocol_error"], "response_deadline")
 
+    def test_client_treats_only_closed_response_socket_as_eof(self) -> None:
+        final = json.dumps(
+            {"choices": [{"message": {"content": "expected"}}]},
+            separators=(",", ":"),
+        ).encode()
+
+        class Headers:
+            @staticmethod
+            def get_content_type() -> str:
+                return "application/json"
+
+        class ClosingResponse:
+            status = 200
+            headers = Headers()
+
+            def __init__(self, response_closed: bool) -> None:
+                self.sock = socket.socket()
+                self.response_closed = response_closed
+                self.read_calls = 0
+                self.closed_after_nonempty = False
+
+            def read1(self, _size: int) -> bytes:
+                self.read_calls += 1
+                self.sock.close()
+                self.closed_after_nonempty = bool(final) and self.sock.fileno() == -1
+                return final
+
+            read = read1
+
+            def isclosed(self) -> bool:
+                return self.response_closed
+
+            def close(self) -> None:
+                self.sock.close()
+
+        response = ClosingResponse(response_closed=True)
+        with (
+            patch.object(smoke.urllib.request, "urlopen", return_value=response),
+            patch.object(smoke, "_response_socket", return_value=response.sock),
+        ):
+            result = smoke.client(1, "input", "expected", "reasoning", "private")
+        self.assertTrue(response.closed_after_nonempty)
+        self.assertEqual(response.read_calls, 1)
+        self.assertTrue(result["expected_final"])
+
+        incomplete = ClosingResponse(response_closed=False)
+        with (
+            patch.object(smoke.urllib.request, "urlopen", return_value=incomplete),
+            patch.object(smoke, "_response_socket", return_value=incomplete.sock),
+            self.assertRaises(OSError) as caught,
+        ):
+            smoke.client(1, "input", "expected", "reasoning", "private")
+        self.assertTrue(incomplete.closed_after_nonempty)
+        self.assertFalse(incomplete.response_closed)
+        self.assertEqual(caught.exception.errno, errno.EBADF)
+
     def test_isolated_config_preserves_recovery_and_shortens_heartbeat(self) -> None:
         candidate = ROOT / "config" / "llm-guard-proxy" / "config.toml"
         with tempfile.TemporaryDirectory() as tmp:
