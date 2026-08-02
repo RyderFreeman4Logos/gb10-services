@@ -54,12 +54,20 @@ class LocalGateContractTests(unittest.TestCase):
 
     def test_justfile_exposes_guard_loop_recovery_operational_gate(self) -> None:
         justfile = JUSTFILE.read_text()
+        smoke = LOOP_RECOVERY_SMOKE.read_text()
         self.assertTrue(LOOP_RECOVERY_SMOKE.is_file())
         self.assertIn("guard-loop-recovery-smoke:", justfile)
         self.assertIn("guard-loop-recovery-unit", justfile)
         self.assertIn("LLM_GUARD_PROXY_BINARY", justfile)
-        self.assertIn("--expected-binary-sha256", justfile)
+        self.assertIn('XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required', justfile)
+        self.assertNotIn("--expected-binary-sha256", justfile)
         self.assertIn(
+            "fbefc454c4dc498d943d6e6293a984efe28eb474aacce2518b9d2e777161316d",
+            smoke,
+        )
+        self.assertIn("bd123c50a5d5df497e1e48f224619f6e15312f5e", smoke)
+        self.assertIn("488e72e5f62f1e6733828c39c0e2414467b59c40", smoke)
+        self.assertNotIn(
             "fbefc454c4dc498d943d6e6293a984efe28eb474aacce2518b9d2e777161316d",
             justfile,
         )
@@ -97,14 +105,18 @@ class LocalGateContractTests(unittest.TestCase):
             "server.server_activate()",
         ):
             self.assertLess(prerequisite, smoke.index(later, prerequisite))
-        self.assertIn("authorization, received_fds = _recv_supervisor_launch", smoke)
+        self.assertNotIn("_recv_supervisor_launch", smoke)
+        self.assertIn("--service-type=exec", smoke)
+        self.assertIn("--property=KillMode=control-group", smoke)
+        self.assertNotIn('"--scope"', smoke)
+        self.assertNotIn('"pids.max"', smoke)
         self.assertIn('executable=f"/proc/self/fd/{executable_fd}"', smoke)
         self.assertIn('control.recv(SUPERVISOR_MESSAGE_LIMIT + 1) != b"launch"', smoke)
         self.assertNotIn('launch.get("argv")', smoke)
         self.assertIn("os.fchdir(cwd_fd)", smoke)
         self.assertIn("stdout=log_fd", smoke)
         self.assertIn("pass_fds=(executable_fd, config_fd)", smoke)
-        self.assertIn("lock_candidate_runtime(", smoke)
+        self.assertNotIn("lock_candidate_runtime(", smoke)
         self.assertIn("require_candidate_runtime(supervisor, guard_port)", smoke)
 
     def test_active_guard_docs_match_private_metadata_only_policy(self) -> None:

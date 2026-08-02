@@ -46,24 +46,6 @@ def fd_count() -> int:
     return len(os.listdir("/proc/self/fd"))
 
 
-def start_direct_supervisor_worker() -> tuple[subprocess.Popen[bytes], socket.socket]:
-    parent, child = socket.socketpair(
-        socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
-    )
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            str(ROOT / "scripts" / "llm_guard_proxy_loop_recovery_smoke.py"),
-            "--exclusive-supervisor-fd",
-            str(child.fileno()),
-        ],
-        pass_fds=(child.fileno(),),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    child.close()
-    return proc, parent
 
 
 def post_fixture(
@@ -98,38 +80,8 @@ def raw_fixture_request(port: int, request: bytes) -> bytes:
         return bytes(response)
 
 
-def send_direct_launch(
-    control: socket.socket,
-    packet: dict[str, object],
-    executable_fd: int | None = None,
-) -> None:
-    payload = json.dumps(packet, sort_keys=True, separators=(",", ":")).encode()
-    ancillary = (
-        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, bytes(ctypes.c_int(executable_fd)))]
-        if executable_fd is not None
-        else []
-    )
-    sent = control.sendmsg([payload], ancillary)
-    if sent != len(payload):
-        raise RuntimeError("direct_supervisor_launch_truncated")
 
 
-def finish_direct_supervisor(
-    proc: subprocess.Popen[bytes], control: socket.socket, started: bool
-) -> None:
-    try:
-        if started and proc.poll() is None:
-            smoke._send_supervisor_packet(
-                control, b"stop", time.monotonic() + 2
-            )
-            smoke._recv_supervisor_receipt(control, time.monotonic() + 4)
-    finally:
-        control.close()
-        try:
-            proc.wait(timeout=4)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=2)
 
 
 def start_test_candidate_supervisor(
@@ -141,16 +93,16 @@ def start_test_candidate_supervisor(
     *,
     binary: Path,
 ):
-    return smoke.start_candidate_supervisor(
-        argv,
-        cwd,
-        {**env, "GB10_TEST_CONFIG": str(TEST_CONFIG)},
-        log_path,
-        inherited_fds,
-        binary=binary,
-        expected_binary_sha256=smoke.sha256(binary),
-        config_path=TEST_CONFIG,
-    )
+    with patch.object(smoke, "ACCEPTED_RELEASE_SHA256", smoke.sha256(binary)):
+        return smoke.start_candidate_supervisor(
+            argv,
+            cwd,
+            {**env, "GB10_TEST_CONFIG": str(TEST_CONFIG)},
+            log_path,
+            inherited_fds,
+            binary=binary,
+            config_path=TEST_CONFIG,
+        )
 
 
 def run_client_fixture(
@@ -205,35 +157,6 @@ def run_client_fixture(
     return result, requests
 
 
-def write_forking_systemd_run_bridge(path: Path) -> None:
-    real_systemd_run = smoke.SYSTEMD_RUN_BIN
-    path.write_text(
-        "#!/usr/bin/env python3\n"
-        "import os, sys\n"
-        "from pathlib import Path\n"
-        f"real_systemd_run = {real_systemd_run!r}\n"
-        "args = sys.argv[1:]\n"
-        "if worker := os.environ.get('SCOPE_READY_TEST_WORKER'):\n"
-        "    separator = args.index('--')\n"
-        "    args[separator + 1:] = [\n"
-        "        sys.executable, worker,\n"
-        "        os.environ['SCOPE_READY_TEST_MARKER'],\n"
-        "        os.environ['SCOPE_READY_TEST_PID'],\n"
-        "    ]\n"
-        "if marker := os.environ.get('SCOPE_WRAPPER_MARKER'):\n"
-        "    Path(marker).write_text(str(os.getpid()), encoding='ascii')\n"
-        "pid = os.fork()\n"
-        "if pid == 0:\n"
-        "    os.closerange(3, os.sysconf('SC_OPEN_MAX'))\n"
-        "    os.execv(real_systemd_run, [real_systemd_run, *args])\n"
-        "if os.environ.get('SCOPE_WRAPPER_EXIT_EARLY'):\n"
-        "    os._exit(0)\n"
-        "_, status = os.waitpid(pid, 0)\n"
-        "code = os.waitstatus_to_exitcode(status)\n"
-        "os._exit(code if code >= 0 else 128 - code)\n",
-        encoding="utf-8",
-    )
-    path.chmod(0o700)
 
 
 def write_systemctl_collection_bridge(path: Path) -> None:
@@ -270,38 +193,6 @@ print("not-found" if mode == "delayed" and count >= 3 else "loaded")
     path.chmod(0o700)
 
 
-def write_invalid_scope_ready_worker(path: Path) -> None:
-    path.write_text(
-        """from __future__ import annotations
-import json
-import os
-import socket
-import sys
-from pathlib import Path
-
-control_group = next(
-    line.split("::", 1)[1]
-    for line in Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines()
-    if line.startswith("0::")
-)
-Path(sys.argv[1]).write_text(
-    json.dumps({"pid": os.getpid(), "control_group": control_group}),
-    encoding="ascii",
-)
-control = socket.socket(fileno=0)
-control.send(json.dumps({
-    "kind": "scope_entered",
-    "pid": json.loads(sys.argv[2]),
-    "control_group": control_group,
-}).encode())
-try:
-    while control.recv(4096):
-        pass
-except OSError:
-    pass
-""",
-        encoding="utf-8",
-    )
 
 
 def attempt(
@@ -417,22 +308,11 @@ def passing_summary() -> dict:
         "execution_error": None,
         "subreaper_enabled": True,
         "exclusive_supervisor": True,
-        "runtime_pids_locked_tasks": 4,
         "process_cleanup": {
             "exclusive_supervisor": True,
             "supervisor_exited": True,
             "supervisor_reaped": True,
             "candidate_ownership_quiesced": True,
-            "scope_fence_established": True,
-            "scope_populated_final": 0,
-            "scope_removed": False,
-            "scope_unit_collected": True,
-            "scope_cgroup_collected": True,
-            "scope_collected": True,
-            "scope_collection_error": None,
-            "scope_collection_duration_ms": 1,
-            "scope_quiesced": True,
-            "scope_error": None,
             "supervisor_error": None,
             "proxy_exited": True,
             "unexpected_exit": False,
@@ -588,6 +468,182 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 smoke.run_offline_self_test(binary, "0" * 64)
             self.assertFalse(marker.exists())
 
+    def test_product_release_authority_rejects_matching_alternate_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "alternate-guard"
+            marker = root / "alternate-ran"
+            self.write_self_test(
+                binary,
+                body=(
+                    "from pathlib import Path\n"
+                    f"Path({str(marker)!r}).write_text('ran')\n"
+                    f"print({json.dumps(offline_receipt())!r})\n"
+                ),
+            )
+            alternate_digest = smoke.sha256(binary)
+            self.assertNotEqual(alternate_digest, smoke.ACCEPTED_RELEASE_SHA256)
+            with self.assertRaisesRegex(RuntimeError, "binary_digest_mismatch"):
+                fd = smoke._accepted_release_fd(binary)
+                os.close(fd)
+            self.assertFalse(marker.exists())
+            output = io.StringIO()
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "smoke",
+                        "--candidate-config",
+                        str(TEST_CONFIG),
+                        "--binary",
+                        str(binary),
+                        "--root",
+                        str(root / "run"),
+                    ],
+                ),
+                patch.object(
+                    smoke.subprocess,
+                    "Popen",
+                    side_effect=AssertionError("service started"),
+                ),
+                redirect_stdout(output),
+            ):
+                self.assertEqual(smoke.main(), 1)
+            self.assertEqual(
+                json.loads(output.getvalue())["error_code"],
+                "binary_digest_mismatch",
+            )
+            self.assertFalse(marker.exists())
+
+    def test_alternate_wrapper_is_rejected_before_pids_or_listener_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wrapper = root / "alternate-wrapper"
+            marker = root / "pids-rewrite-or-listener-handoff"
+            self.write_self_test(
+                wrapper,
+                body=(
+                    "from pathlib import Path\n"
+                    f"Path({str(marker)!r}).write_text('attempted')\n"
+                    f"print({json.dumps(offline_receipt())!r})\n"
+                ),
+            )
+            with self.assertRaisesRegex(RuntimeError, "binary_digest_mismatch"):
+                fd = smoke._accepted_release_fd(wrapper)
+                os.close(fd)
+            self.assertFalse(marker.exists())
+
+    def test_direct_service_worker_requires_systemd_mainpid_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "accepted-fixture"
+            self.write_self_test(binary)
+            fd = os.open(binary, os.O_RDONLY | os.O_CLOEXEC)
+            args = smoke.argparse.Namespace(binary=binary)
+            with (
+                patch.object(smoke, "_accepted_release_fd", return_value=fd),
+                patch.object(smoke, "_run_harness") as run_harness,
+                self.assertRaisesRegex(RuntimeError, "systemd_service_required"),
+            ):
+                smoke._service_worker_entry(args)
+            run_harness.assert_not_called()
+
+    def test_transient_service_command_has_native_finite_cleanup_contract(self) -> None:
+        command = smoke._systemd_service_command(
+            "llm-guard-loop-recovery-test.service",
+            [sys.executable, "worker.py"],
+        )
+        self.assertIn("--service-type=exec", command)
+        self.assertIn("--property=KillMode=control-group", command)
+        self.assertIn("--property=SendSIGKILL=yes", command)
+        self.assertIn("--property=CollectMode=inactive-or-failed", command)
+        self.assertTrue(any(item.startswith("--property=RuntimeMaxSec=") for item in command))
+        self.assertTrue(any(item.startswith("--property=TimeoutStopSec=") for item in command))
+        self.assertNotIn("--scope", command)
+        self.assertFalse(any("Delegate=" in item for item in command))
+
+    @unittest.skipUnless(
+        Path(smoke.SYSTEMD_RUN_BIN).is_file() and Path(smoke.SYSTEMCTL_BIN).is_file(),
+        "systemd tools unavailable",
+    )
+    def test_killing_transient_service_worker_collects_double_fork_descendant(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            unit = f"llm-guard-loop-recovery-test-{os.getpid()}-{secrets.token_hex(4)}.service"
+            worker = (
+                "import os,pathlib,signal,sys; root=pathlib.Path(sys.argv[1]); "
+                "child=os.fork(); "
+                "(os.setsid(), (lambda second: os._exit(0) if second else None)(os.fork()), "
+                "(root/'descendant.pid').write_text(str(os.getpid())), signal.pause()) "
+                "if child == 0 else (os.waitpid(child, 0), "
+                "(root/'main.pid').write_text(str(os.getpid())), print('READY', flush=True), "
+                "signal.pause())"
+            )
+            proc = subprocess.Popen(
+                smoke._systemd_service_command(
+                    unit, [sys.executable, "-c", worker, str(root)]
+                ),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            main_pid = descendant_pid = None
+            try:
+                assert proc.stdout is not None
+                self.assertEqual(proc.stdout.readline().strip(), "READY")
+                main_pid = int((root / "main.pid").read_text())
+                descendant_pid = int((root / "descendant.pid").read_text())
+                shown_main = subprocess.run(
+                    [
+                        smoke.SYSTEMCTL_BIN,
+                        "--user",
+                        "show",
+                        f"--property=MainPID",
+                        "--value",
+                        "--",
+                        unit,
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                self.assertEqual(shown_main, str(main_pid))
+                os.kill(main_pid, signal.SIGKILL)
+                proc.communicate(timeout=5)
+                self.assertFalse(smoke.process_identity_is_live(main_pid))
+                self.assertFalse(smoke.process_identity_is_live(descendant_pid))
+                loaded = subprocess.run(
+                    [
+                        smoke.SYSTEMCTL_BIN,
+                        "--user",
+                        "show",
+                        "--property=LoadState",
+                        "--value",
+                        "--",
+                        unit,
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                self.assertEqual(loaded, "not-found")
+            finally:
+                if proc.poll() is None:
+                    subprocess.run(
+                        [smoke.SYSTEMCTL_BIN, "--user", "stop", "--", unit],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    proc.kill()
+                    proc.communicate(timeout=2)
+                for pid in (main_pid, descendant_pid):
+                    if pid is not None and smoke.process_identity_is_live(pid):
+                        os.kill(pid, signal.SIGKILL)
+
     def test_memfd_creation_failure_closes_source_fd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             binary = Path(tmp) / "guard"
@@ -621,6 +677,27 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
             started = time.monotonic()
             receipt, _ = smoke.run_offline_self_test(binary, smoke.sha256(binary))
         self.assertGreaterEqual(time.monotonic() - started, 0.1)
+        self.assertEqual(receipt, offline_receipt())
+
+    def test_accepted_offline_metadata_cleanup_stderr_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "guard"
+            self.write_self_test(
+                binary,
+                body=(
+                    "import sys\n"
+                    "print('llm_guard_proxy_request_cleanup request_id=req-123-1 "
+                    "status=succeeded terminal_reason=succeeded cleanup_latency_ms=0 "
+                    "http_status=200 downstream_mode=streaming upstream_mode=streaming "
+                    "evidence_written=false', file=sys.stderr)\n"
+                    "print('llm_guard_proxy_request_cleanup request_id=req-124-2 "
+                    "status=failed terminal_reason=upstream_stream_error cleanup_latency_ms=0 "
+                    "http_status=200 downstream_mode=streaming upstream_mode=streaming "
+                    "evidence_written=false', file=sys.stderr)\n"
+                    f"print({json.dumps(offline_receipt())!r})\n"
+                ),
+            )
+            receipt, _ = smoke.run_offline_self_test(binary, smoke.sha256(binary))
         self.assertEqual(receipt, offline_receipt())
 
     def test_complete_output_timeout_reaps_all_descendants(self) -> None:
@@ -675,103 +752,8 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 for pid in survived:
                     os.kill(pid, signal.SIGKILL)
 
-    def test_direct_supervisor_outside_scope_rejects_before_offline_execution(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            marker = root / "offline-ran"
-            binary = root / "candidate"
-            self.write_self_test(
-                binary,
-                body=(
-                    "import pathlib\n"
-                    f"pathlib.Path({str(marker)!r}).write_text('ran')\n"
-                    f"print({json.dumps(offline_receipt())!r})\n"
-                ),
-            )
-            proc, control = start_direct_supervisor_worker()
-            executable_fd = os.open(binary, os.O_RDONLY | os.O_CLOEXEC)
-            receipts = []
-            try:
-                send_direct_launch(
-                    control,
-                    {
-                        "kind": "authorize",
-                        "argv0": str(binary),
-                        "test_failpoint": None,
-                        "control_timeout": 5,
-                    },
-                    executable_fd,
-                )
-                while len(receipts) < 2:
-                    try:
-                        receipts.append(
-                            smoke._recv_supervisor_receipt(
-                                control, time.monotonic() + 1
-                            )
-                        )
-                    except (EOFError, OSError, TimeoutError):
-                        break
-            finally:
-                os.close(executable_fd)
-                control.close()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=2)
-            self.assertNotIn("scope_ready", {item.get("kind") for item in receipts})
-            self.assertFalse(marker.exists())
 
-    def test_scope_authority_requires_matching_kernel_capabilities(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            scope_path = root / "matching-name.scope"
-            scope_path.mkdir()
-            events = scope_path / "cgroup.events"
-            kill = scope_path / "cgroup.kill"
-            wrong = root / "wrong.kill"
-            events.write_text("populated 1\n", encoding="ascii")
-            kill.write_bytes(b"")
-            wrong.write_bytes(b"")
-            events_fd = os.open(events, os.O_RDONLY)
-            kill_fd = os.open(kill, os.O_WRONLY)
-            wrong_fd = os.open(wrong, os.O_WRONLY)
-            try:
-                with (
-                    patch.object(smoke, "CGROUP_ROOT", root),
-                    patch.object(
-                        smoke,
-                        "_process_control_group",
-                        return_value="/matching-name.scope",
-                    ),
-                ):
-                    self.assertEqual(
-                        smoke._verify_worker_scope_capabilities(events_fd, kill_fd),
-                        "/matching-name.scope",
-                    )
-                    with self.assertRaisesRegex(
-                        RuntimeError, "^scope_fence_capability_invalid$"
-                    ):
-                        smoke._verify_worker_scope_capabilities(events_fd, wrong_fd)
-            finally:
-                for fd in (events_fd, kill_fd, wrong_fd):
-                    os.close(fd)
 
-    def test_matching_name_scope_spoof_without_capabilities_is_rejected(self) -> None:
-        parent, child = socket.socketpair(
-            socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
-        )
-        try:
-            child.send(b'{"kind":"authorize"}')
-            with self.assertRaisesRegex(
-                ValueError, "^supervisor_launch_capability_invalid$"
-            ):
-                smoke._recv_supervisor_launch(parent, time.monotonic() + 1)
-        finally:
-            parent.close()
-            child.close()
 
     def test_launch_packet_cannot_substitute_authorized_runtime_contract(self) -> None:
         self.assertEqual(
@@ -890,15 +872,17 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            authorization = smoke.authorize_candidate_supervisor(
-                binary,
-                smoke.sha256(binary),
-                [str(binary), str(legitimate), str(TEST_CONFIG)],
-                root,
-                {"PATH": "/usr/bin:/bin"},
-                root / "candidate.log",
-                TEST_CONFIG,
-            )
+            with patch.object(
+                smoke, "ACCEPTED_RELEASE_SHA256", smoke.sha256(binary)
+            ):
+                authorization = smoke.authorize_candidate_supervisor(
+                    binary,
+                    [str(binary), str(legitimate), str(TEST_CONFIG)],
+                    root,
+                    {"PATH": "/usr/bin:/bin"},
+                    root / "candidate.log",
+                    TEST_CONFIG,
+                )
             hostile_bytes = (
                 "#!/usr/bin/python3\n"
                 "import pathlib, signal, time\n"
@@ -982,8 +966,6 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                     "candidate_identity": smoke._identity_receipt(identity),
                     "binary_identity": expected._asdict(),
                 },
-                smoke.ScopeFence("test.scope", "/test.scope", -1, -1, identity),
-                smoke.RuntimeCgroup("/test.scope/runtime", -1, -1, -1),
             )
             try:
                 with self.assertRaises(RuntimeError):
@@ -998,37 +980,6 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 proc.wait(timeout=2)
                 smoke._close_identity_pidfd(identity)
 
-    def test_runtime_pids_lock_rejects_preexisting_child_and_closes_fds(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            procs = root / "cgroup.procs"
-            current = root / "pids.current"
-            maximum = root / "pids.max"
-            current.write_text("1\n", encoding="ascii")
-            maximum.write_text("0\n", encoding="ascii")
-            descriptors = (
-                os.open(procs, os.O_RDONLY | os.O_CREAT, 0o600),
-                os.open(current, os.O_RDONLY),
-                os.open(maximum, os.O_RDWR),
-            )
-            runtime = smoke.RuntimeCgroup("/test/runtime", *descriptors)
-            try:
-                procs.write_text("123\n456\n", encoding="ascii")
-                with self.assertRaisesRegex(
-                    RuntimeError, "^runtime_cgroup_not_exclusive$"
-                ):
-                    smoke._lock_runtime_cgroup(runtime, 123)
-                self.assertEqual(maximum.read_text(), "0\n")
-
-                procs.write_text("123\n", encoding="ascii")
-                self.assertEqual(smoke._lock_runtime_cgroup(runtime, 123), 1)
-                self.assertEqual(maximum.read_text(), "1\n")
-            finally:
-                smoke._close_runtime_cgroup(runtime)
-            for fd in descriptors:
-                with self.assertRaises(OSError) as closed:
-                    os.fstat(fd)
-                self.assertEqual(closed.exception.errno, errno.EBADF)
 
     def test_process_failures_stop_before_network(self) -> None:
         cases = {
@@ -1063,8 +1014,6 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 str(ROOT / "config" / "llm-guard-proxy" / "config.toml"),
                 "--binary",
                 str(binary),
-                "--expected-binary-sha256",
-                smoke.sha256(binary),
                 "--root",
                 str(root / "run"),
             ]
@@ -1596,6 +1545,10 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
         self.assertEqual(derived["heartbeat"]["interval_secs"], 1)
         self.assertEqual(profile["thinking"]["budget_tokens"], smoke.THINKING_BUDGET)
         self.assertEqual(profile["thinking"]["max_tokens"], smoke.CALLER_MAX)
+        self.assertFalse(derived["evidence"]["shadow"]["enabled"])
+        self.assertFalse(
+            derived["evidence"]["shadow"]["paired_comparison"]["enabled"]
+        )
         self.assertEqual(
             profile["loop_guard"]["cot_salvage_prefix_max_bytes"], 32_768
         )
@@ -1843,6 +1796,35 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
             smoke.acceptance_errors(summary),
         )
 
+    def test_fixture_records_first_byte_timeout_once_and_zero_byte_never(self) -> None:
+        fixture = smoke.Fixture(
+            "reason", "private", "fresh", "positive", "fresh-output"
+        )
+        server = smoke.FixtureHTTPServer(
+            ("127.0.0.1", 0), fixture.handler(), fixture
+        )
+        server.server_activate()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with socket.create_connection(("127.0.0.1", server.server_port), timeout=2):
+                time.sleep(smoke.FIXTURE_READ_TIMEOUT * 2)
+            with socket.create_connection(
+                ("127.0.0.1", server.server_port), timeout=2
+            ) as client:
+                client.sendall(b"G")
+                time.sleep(smoke.FIXTURE_READ_TIMEOUT * 2)
+            self.assertTrue(fixture.wait_for_handlers(2))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        attempts, errors = fixture.snapshot()
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0]["endpoint"], "unknown")
+        self.assertEqual(errors.count("fixture_request_parse_error"), 1)
+
     def test_fixture_listener_requires_explicit_activation(self) -> None:
         fixture = smoke.Fixture(
             "reason", "private", "fresh", "positive", "fresh-output"
@@ -1917,86 +1899,7 @@ while True:
             smoke.stop_fixture_server(server, thread, fixture)
         self.assertEqual(fixture.snapshot()[0], [])
 
-    def test_runtime_pids_constraint_rejects_child_before_fixture_traffic(self) -> None:
-        candidate = r"""
-import errno, os, signal, socket, sys, time
-port, result = int(sys.argv[1]), sys.argv[2]
-signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
-with socket.socket() as listener:
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(("127.0.0.1", port))
-    listener.listen()
-    listener.accept()[0].close()
-    try:
-        child = os.fork()
-    except OSError as exc:
-        open(result, "w", encoding="ascii").write(str(exc.errno))
-    else:
-        if child == 0:
-            os._exit(0)
-        open(result, "w", encoding="ascii").write("forked")
-    while True:
-        time.sleep(1)
-"""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            port = smoke.free_port()
-            result = root / "fork.result"
-            supervisor = start_test_candidate_supervisor(
-                [sys.executable, "-c", candidate, str(port), str(result)],
-                root,
-                os.environ.copy(),
-                root / "candidate.log",
-                binary=self.fake_guard,
-            )
-            try:
-                smoke.wait_port(port, supervisor, time.monotonic() + 2)
-                locked = smoke.lock_candidate_runtime(supervisor, port)
-                with socket.create_connection(("127.0.0.1", port), timeout=1):
-                    pass
-                deadline = time.monotonic() + 2
-                while not result.exists() and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                self.assertTrue(result.exists())
-                self.assertEqual(result.read_text(), str(errno.EAGAIN))
-                self.assertGreater(locked, 0)
-                smoke.require_candidate_runtime(supervisor, port)
-            finally:
-                smoke.stop_candidate_supervisor(supervisor)
 
-    def test_runtime_pids_lock_rejects_preexisting_wrong_child(self) -> None:
-        candidate = r"""
-import os, signal, socket, sys, time
-port = int(sys.argv[1])
-signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
-if os.fork() == 0:
-    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
-    while True:
-        time.sleep(1)
-with socket.socket() as listener:
-    listener.bind(("127.0.0.1", port))
-    listener.listen()
-    while True:
-        time.sleep(1)
-"""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            port = smoke.free_port()
-            supervisor = start_test_candidate_supervisor(
-                [sys.executable, "-c", candidate, str(port)],
-                root,
-                os.environ.copy(),
-                root / "candidate.log",
-                binary=self.fake_guard,
-            )
-            try:
-                smoke.wait_port(port, supervisor, time.monotonic() + 2)
-                with self.assertRaisesRegex(
-                    RuntimeError, "^runtime_cgroup_not_exclusive$"
-                ):
-                    smoke.lock_candidate_runtime(supervisor, port)
-            finally:
-                smoke.stop_candidate_supervisor(supervisor)
 
     def test_final_snapshot_waits_for_handler_quiescence(self) -> None:
         fixture = smoke.Fixture("reason", "private", "fresh", "positive", "fresh-output")
@@ -2047,12 +1950,6 @@ with socket.socket() as listener:
                 "candidate_ownership_quiesced",
                 "candidate_ownership_not_quiesced",
             ),
-            (
-                "process_cleanup",
-                "scope_fence_established",
-                "cleanup_scope_fence_missing",
-            ),
-            ("process_cleanup", "scope_quiesced", "cleanup_scope_not_quiesced"),
         ):
             summary = passing_summary()
             target = summary if scope is None else summary[scope]
@@ -2066,149 +1963,6 @@ with socket.socket() as listener:
             "code": "supervisor_control_timeout",
         }
         self.assertIn("supervisor_cleanup_failed", smoke.acceptance_errors(summary))
-
-        populated = passing_summary()
-        populated["process_cleanup"]["scope_populated_final"] = 1
-        self.assertIn("cleanup_scope_populated", smoke.acceptance_errors(populated))
-
-        scope_error = passing_summary()
-        scope_error["process_cleanup"]["scope_error"] = {
-            "class": "TimeoutError",
-            "code": "scope_quiescence_timeout",
-        }
-        self.assertIn("cleanup_scope_failed", smoke.acceptance_errors(scope_error))
-
-    def test_final_acceptance_requires_scope_collection(self) -> None:
-        not_collected = passing_summary()
-        not_collected["process_cleanup"]["scope_collected"] = False
-        self.assertIn(
-            "cleanup_scope_not_collected",
-            smoke.acceptance_errors(not_collected),
-        )
-
-        collection_error = passing_summary()
-        collection_error["process_cleanup"]["scope_collection_error"] = {
-            "class": "RuntimeError",
-            "code": "scope_collect_systemctl_failed",
-        }
-        self.assertIn(
-            "cleanup_scope_collection_failed",
-            smoke.acceptance_errors(collection_error),
-        )
-
-    def test_scope_collection_probe_permission_error_is_stable(self) -> None:
-        cleanup: dict[str, object] = {}
-        unit = "guard-collect-permission.scope"
-        control_group = f"/private/{unit}"
-        denied = PermissionError(errno.EACCES, control_group)
-        collected_state = subprocess.CompletedProcess(
-            [],
-            0,
-            "not-found\n",
-            "",
-        )
-
-        started = time.monotonic()
-        with (
-            patch.object(smoke.subprocess, "run", return_value=collected_state),
-            patch.object(smoke, "_scope_cgroup_collected", side_effect=denied),
-        ):
-            result = smoke._collect_supervisor_scope(
-                cleanup,
-                unit,
-                control_group,
-            )
-        elapsed = time.monotonic() - started
-
-        self.assertIs(result, cleanup)
-        self.assertEqual(cleanup["scope_unit"], unit)
-        self.assertFalse(cleanup["scope_unit_collected"])
-        self.assertIsNone(cleanup["scope_cgroup_collected"])
-        self.assertFalse(cleanup["scope_collected"])
-        self.assertEqual(
-            cleanup["scope_collection_error"],
-            {"class": "PermissionError", "code": "EACCES"},
-        )
-        duration_ms = cleanup["scope_collection_duration_ms"]
-        self.assertIsInstance(duration_ms, int)
-        assert isinstance(duration_ms, int)
-        self.assertGreaterEqual(duration_ms, 0)
-        self.assertLess(duration_ms, 500)
-        self.assertLess(elapsed, 0.5)
-
-    def test_scope_collection_bridge_is_bounded_exact_and_closes_fds_once(self) -> None:
-        for mode, collected, error_code in (
-            ("delayed", True, None),
-            ("no_collect", False, "scope_collect_timeout"),
-            ("error", False, "scope_collect_systemctl_failed"),
-            ("malformed", False, "scope_collect_state_invalid"),
-        ):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                bridge = root / "systemctl"
-                counter = root / "counter"
-                write_systemctl_collection_bridge(bridge)
-                unit = f"guard-collect-{secrets.token_hex(12)}.scope"
-                events = root / "cgroup.events"
-                kill = root / "cgroup.kill"
-                events.write_text("populated 0\n", encoding="ascii")
-                kill.write_bytes(b"")
-                scope = smoke.ScopeFence(
-                    unit,
-                    f"/test/{unit}",
-                    os.open(events, os.O_RDONLY | os.O_CLOEXEC),
-                    os.open(kill, os.O_WRONLY | os.O_CLOEXEC),
-                    smoke.ProcessIdentity(
-                        os.getpid(),
-                        "R",
-                        os.getppid(),
-                        os.getpgrp(),
-                        os.getsid(0),
-                        1,
-                    ),
-                )
-                env = {
-                    "SCOPE_COLLECT_EXPECTED_UNIT": unit,
-                    "SCOPE_COLLECT_COUNTER": str(counter),
-                    "SCOPE_COLLECT_MODE": mode,
-                }
-                cleanup: dict[str, object] = {}
-                started = time.monotonic()
-                with (
-                    patch.object(smoke, "SYSTEMCTL_BIN", str(bridge), create=True),
-                    patch.object(smoke, "SCOPE_COLLECT_TIMEOUT", 0.12, create=True),
-                    patch.dict(os.environ, env),
-                    patch.object(
-                        smoke,
-                        "_close_scope_fence",
-                        wraps=smoke._close_scope_fence,
-                    ) as close_scope,
-                ):
-                    smoke._fence_supervisor_scope(cleanup, scope)
-                elapsed = time.monotonic() - started
-
-                self.assertLess(elapsed, 0.5)
-                self.assertEqual(close_scope.call_count, 1)
-                self.assertEqual(cleanup["scope_unit"], unit)
-                self.assertFalse(cleanup["scope_removed"])
-                self.assertEqual(cleanup["scope_collected"], collected)
-                self.assertTrue(cleanup["scope_quiesced"])
-                self.assertTrue(cleanup["candidate_ownership_quiesced"])
-                if error_code is None:
-                    self.assertIsNone(cleanup["scope_collection_error"])
-                else:
-                    collection_error = cleanup["scope_collection_error"]
-                    self.assertIsInstance(collection_error, dict)
-                    assert isinstance(collection_error, dict)
-                    self.assertEqual(
-                        collection_error["code"],
-                        error_code,
-                    )
-                    self.assertNotIn("scope collection diagnostics", repr(cleanup))
-                for fd in (scope.events_fd, scope.kill_fd):
-                    with self.assertRaises(OSError) as closed:
-                        os.fstat(fd)
-                    self.assertEqual(closed.exception.errno, errno.EBADF)
 
     def test_direct_stop_never_claims_unrelated_post_baseline_child(self) -> None:
         child = r"""
@@ -2293,488 +2047,11 @@ while True:
                         pass
                     smoke._close_identity_pidfd(unrelated_identity)
 
-    def test_systemd_run_distinct_wrapper_preserves_stdio_control(self) -> None:
-        candidate = r"""
-import os, signal, sys, time
-ready = sys.argv[1]
-signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
-with open(ready, "w", encoding="ascii") as output:
-    output.write("ready")
-while True:
-    time.sleep(1)
-"""
 
-        before_fds = fd_count()
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            ready = root / "candidate.ready"
-            bridge = root / "systemd-run"
-            wrapper_marker = root / "wrapper.pid"
-            write_forking_systemd_run_bridge(bridge)
-            supervisor = None
-            candidate_pid = None
-            worker_pid = None
-            scope_path = None
-            with (
-                patch.object(smoke, "SYSTEMD_RUN_BIN", str(bridge)),
-                patch.dict(
-                    os.environ,
-                    {"SCOPE_WRAPPER_MARKER": str(wrapper_marker)},
-                ),
-            ):
-                try:
-                    supervisor = start_test_candidate_supervisor(
-                        [sys.executable, "-c", candidate, str(ready)],
-                        root,
-                        os.environ.copy(),
-                        root / "candidate.log",
-                        binary=self.fake_guard,
-                    )
-                    candidate_pid = supervisor.started_receipt["candidate_identity"][
-                        "pid"
-                    ]
-                    worker_pid = supervisor.scope.worker_identity.pid
-                    scope_path = smoke.CGROUP_ROOT / supervisor.scope.control_group.removeprefix(
-                        "/"
-                    )
-                    self.assertEqual(int(wrapper_marker.read_text()), supervisor.pid)
-                    self.assertNotEqual(supervisor.pid, worker_pid)
-                    self.assertEqual(
-                        supervisor.started_receipt["scope_worker_pid"], worker_pid
-                    )
-                    self.assertEqual(
-                        supervisor.started_receipt["scope_worker_starttime"],
-                        supervisor.scope.worker_identity.starttime,
-                    )
-                    self.assertEqual(
-                        supervisor.started_receipt["candidate_identity"]["ppid"],
-                        worker_pid,
-                    )
-                    self.assertTrue(
-                        smoke._same_process(
-                            smoke._read_process_identity(worker_pid),
-                            supervisor.scope.worker_identity,
-                        )
-                    )
-                    members = {
-                        int(pid)
-                        for pid in (scope_path / "cgroup.procs").read_text().split()
-                    }
-                    self.assertEqual(members, set())
-                    self.assertEqual(
-                        {
-                            int(pid)
-                            for pid in (
-                                scope_path / "supervisor" / "cgroup.procs"
-                            ).read_text().split()
-                        },
-                        {worker_pid},
-                    )
-                    self.assertEqual(
-                        {
-                            int(pid)
-                            for pid in (
-                                scope_path / "runtime" / "cgroup.procs"
-                            ).read_text().split()
-                        },
-                        {candidate_pid},
-                    )
-                    deadline = time.monotonic() + 2
-                    while not ready.exists() and time.monotonic() < deadline:
-                        time.sleep(0.01)
-                    self.assertTrue(ready.exists())
 
-                    started = time.monotonic()
-                    cleanup = smoke.stop_candidate_supervisor(supervisor)
 
-                    self.assertLess(time.monotonic() - started, 2.0)
-                    self.assertIsNone(cleanup["supervisor_error"])
-                    self.assertTrue(cleanup["candidate_ownership_quiesced"])
-                    self.assertTrue(cleanup["supervisor_exited"])
-                    self.assertTrue(cleanup["supervisor_reaped"])
-                    self.assertTrue(cleanup["scope_collected"])
-                    self.assertIsNone(cleanup["scope_collection_error"])
-                    self.assertFalse(smoke.process_identity_is_live(candidate_pid))
-                    self.assertFalse(smoke.process_identity_is_live(worker_pid))
-                    with self.assertRaises(ChildProcessError):
-                        os.waitpid(supervisor.pid, os.WNOHANG)
-                    deadline = time.monotonic() + 2
-                    while scope_path.exists() and time.monotonic() < deadline:
-                        time.sleep(0.01)
-                    self.assertFalse(scope_path.exists())
-                finally:
-                    if supervisor is not None and smoke.process_identity_is_live(
-                        supervisor.pid
-                    ):
-                        smoke.stop_candidate_supervisor(supervisor)
-                    if candidate_pid is not None and smoke.process_identity_is_live(
-                        candidate_pid
-                    ):
-                        os.kill(candidate_pid, signal.SIGKILL)
-        self.assertEqual(fd_count(), before_fds)
 
-    def test_wait_port_follows_scope_worker_after_wrapper_exit(self) -> None:
-        candidate = r"""
-import os, signal, socket, sys, time
-signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
-time.sleep(0.25)
-with socket.socket() as listener:
-    listener.bind(("127.0.0.1", int(sys.argv[1])))
-    listener.listen()
-    while True:
-        time.sleep(1)
-"""
-        before_fds = fd_count()
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            bridge = root / "systemd-run"
-            write_forking_systemd_run_bridge(bridge)
-            supervisor = None
-            cleanup = None
-            with (
-                patch.object(smoke, "SYSTEMD_RUN_BIN", str(bridge)),
-                patch.dict(os.environ, {"SCOPE_WRAPPER_EXIT_EARLY": "1"}),
-            ):
-                try:
-                    port = smoke.free_port()
-                    supervisor = start_test_candidate_supervisor(
-                        [sys.executable, "-c", candidate, str(port)],
-                        root,
-                        os.environ.copy(),
-                        root / "candidate.log",
-                        binary=self.fake_guard,
-                    )
-                    wrapper = smoke._read_process_identity(supervisor.pid)
-                    self.assertIsNotNone(wrapper)
-                    assert wrapper is not None
-                    self.assertEqual(wrapper.state, "Z")
-                    self.assertNotEqual(
-                        supervisor.pid, supervisor.scope.worker_identity.pid
-                    )
 
-                    smoke.wait_port(port, supervisor, time.monotonic() + 2)
-
-                    worker = smoke._read_process_identity(
-                        supervisor.scope.worker_identity.pid
-                    )
-                    self.assertIsNotNone(worker)
-                    assert worker is not None
-                    self.assertTrue(
-                        smoke._same_process(worker, supervisor.scope.worker_identity)
-                    )
-                    self.assertNotIn(worker.state, {"X", "Z"})
-                finally:
-                    if supervisor is not None:
-                        started = time.monotonic()
-                        cleanup = smoke.stop_candidate_supervisor(supervisor)
-                        self.assertLess(time.monotonic() - started, 2.0)
-            self.assertIsNotNone(cleanup)
-            assert cleanup is not None
-            self.assertTrue(cleanup["candidate_ownership_quiesced"])
-            self.assertTrue(cleanup["supervisor_reaped"])
-        self.assertEqual(fd_count(), before_fds)
-
-    def test_wait_port_fails_when_scope_worker_exits_with_live_wrapper(self) -> None:
-        before_fds = fd_count()
-        wrapper = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"]
-        )
-        worker = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"]
-        )
-        wrapper_identity = smoke.capture_process_identity(wrapper.pid)
-        worker_identity = smoke.capture_process_identity(worker.pid)
-        control, peer = socket.socketpair()
-        supervisor = smoke.SupervisorHandle(
-            wrapper.pid,
-            wrapper_identity,
-            control,
-            {},
-            smoke.ScopeFence("test.scope", "/test.scope", -1, -1, worker_identity),
-            smoke.RuntimeCgroup("/test.scope/runtime", -1, -1, -1),
-        )
-        try:
-            worker.kill()
-            deadline = time.monotonic() + 2
-            current_worker = smoke._read_process_identity(worker.pid)
-            while (
-                current_worker is not None
-                and current_worker.state != "Z"
-                and time.monotonic() < deadline
-            ):
-                time.sleep(0.01)
-                current_worker = smoke._read_process_identity(worker.pid)
-            self.assertIsNotNone(current_worker)
-            assert current_worker is not None
-            self.assertEqual(current_worker.state, "Z")
-            current_wrapper = smoke._read_process_identity(wrapper.pid)
-            self.assertIsNotNone(current_wrapper)
-            assert current_wrapper is not None
-            self.assertTrue(smoke._same_process(current_wrapper, wrapper_identity))
-            self.assertNotIn(current_wrapper.state, {"X", "Z"})
-
-            started = time.monotonic()
-            with self.assertRaisesRegex(
-                RuntimeError, "^supervisor_exit_before_ready$"
-            ):
-                smoke.wait_port(
-                    smoke.free_port(), supervisor, time.monotonic() + 1
-                )
-            self.assertLess(time.monotonic() - started, 0.5)
-        finally:
-            for proc in (worker, wrapper):
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                proc.wait(timeout=2)
-            control.close()
-            peer.close()
-            smoke._close_identity_pidfd(worker_identity)
-            smoke._close_identity_pidfd(wrapper_identity)
-        self.assertEqual(fd_count(), before_fds)
-
-    def test_invalid_scope_worker_pid_fails_closed_and_cleans_scope(self) -> None:
-        before_fds = fd_count()
-        for name, value, expected_code in (
-            ("malformed", json.dumps("not-a-pid"), "scope_worker_identity_invalid"),
-            ("bool", "true", "scope_worker_identity_invalid"),
-            ("foreign", None, "scope_identity_invalid"),
-        ):
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                bridge = root / "systemd-run"
-                worker = root / "invalid_worker.py"
-                wrapper_marker = root / "wrapper.pid"
-                worker_marker = root / "worker.json"
-                write_forking_systemd_run_bridge(bridge)
-                write_invalid_scope_ready_worker(worker)
-                foreign = None
-                if value is None:
-                    foreign = subprocess.Popen(
-                        [sys.executable, "-c", "import time; time.sleep(30)"]
-                    )
-                    value = str(foreign.pid)
-                environment = {
-                    "SCOPE_WRAPPER_MARKER": str(wrapper_marker),
-                    "SCOPE_READY_TEST_WORKER": str(worker),
-                    "SCOPE_READY_TEST_MARKER": str(worker_marker),
-                    "SCOPE_READY_TEST_PID": value,
-                }
-                try:
-                    with (
-                        patch.object(smoke, "SYSTEMD_RUN_BIN", str(bridge)),
-                        patch.dict(os.environ, environment),
-                        self.assertRaises(smoke.SupervisorStartError) as caught,
-                    ):
-                        start_test_candidate_supervisor(
-                            [sys.executable, "-c", "raise SystemExit(99)"],
-                            root,
-                            os.environ.copy(),
-                            root / "candidate.log",
-                            binary=self.fake_guard,
-                        )
-                    self.assertEqual(caught.exception.error["code"], "ESTALE")
-                    self.assertIsInstance(caught.exception.__cause__, OSError)
-                    self.assertEqual(caught.exception.__cause__.args[1], expected_code)
-                    self.assertTrue(caught.exception.cleanup["supervisor_exited"])
-                    self.assertTrue(caught.exception.cleanup["supervisor_reaped"])
-                    self.assertTrue(caught.exception.cleanup["scope_collected"])
-                    self.assertIsNone(
-                        caught.exception.cleanup["scope_collection_error"]
-                    )
-                    wrapper_pid = int(wrapper_marker.read_text())
-                    worker_info = json.loads(worker_marker.read_text())
-                    worker_pid = worker_info["pid"]
-                    scope_path = smoke.CGROUP_ROOT / worker_info[
-                        "control_group"
-                    ].removeprefix("/")
-                    deadline = time.monotonic() + 2
-                    while (
-                        smoke._read_process_identity(worker_pid) is not None
-                        or scope_path.exists()
-                    ) and time.monotonic() < deadline:
-                        time.sleep(0.01)
-                    self.assertIsNone(smoke._read_process_identity(wrapper_pid))
-                    self.assertIsNone(smoke._read_process_identity(worker_pid))
-                    self.assertFalse(scope_path.exists())
-                    with self.assertRaises(ChildProcessError):
-                        os.waitpid(wrapper_pid, os.WNOHANG)
-                    if foreign is not None:
-                        self.assertIsNone(foreign.poll())
-                finally:
-                    if foreign is not None:
-                        foreign.terminate()
-                        foreign.wait(timeout=2)
-        self.assertEqual(fd_count(), before_fds)
-
-    def test_parent_scope_fence_kills_candidate_after_supervisor_sigkill(self) -> None:
-        candidate = r"""
-import os, signal, sys, time
-ready = sys.argv[1]
-producer = os.fork()
-if producer == 0:
-    os.setsid()
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    while True:
-        time.sleep(1)
-with open(ready, "w", encoding="ascii") as output:
-    output.write(f"{os.getpid()} {producer}")
-    output.flush()
-    os.fsync(output.fileno())
-while True:
-    time.sleep(1)
-"""
-        unrelated_child = r"""
-import os, signal, sys, time
-ready, term = sys.argv[1:]
-signal.signal(signal.SIGTERM, lambda *_: (open(term, "w").write("term"), os._exit(73)))
-open(ready, "w").write("ready")
-while True:
-    time.sleep(1)
-"""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            ready = root / "candidate.ready"
-            unrelated_ready = root / "unrelated.ready"
-            unrelated_term = root / "unrelated.term"
-            supervisor = start_test_candidate_supervisor(
-                [sys.executable, "-c", candidate, str(ready)],
-                root,
-                os.environ.copy(),
-                root / "candidate.log",
-                binary=self.fake_guard,
-            )
-            unrelated = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-c",
-                    unrelated_child,
-                    str(unrelated_ready),
-                    str(unrelated_term),
-                ],
-                start_new_session=True,
-            )
-            candidate_pids: list[int] = []
-            try:
-                deadline = time.monotonic() + 2
-                while (
-                    not ready.exists() or not unrelated_ready.exists()
-                ) and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                self.assertTrue(ready.exists())
-                self.assertTrue(unrelated_ready.exists())
-                candidate_pids = [int(pid) for pid in ready.read_text().split()]
-
-                os.kill(supervisor.pid, signal.SIGKILL)
-                started = time.monotonic()
-                cleanup = smoke._finish_candidate_supervisor(supervisor, None)
-
-                self.assertLess(time.monotonic() - started, 2.0)
-                self.assertTrue(supervisor.started_receipt["scope_fence_established"])
-                self.assertTrue(cleanup["scope_fence_established"])
-                self.assertTrue(cleanup["scope_kill_all_sent"])
-                self.assertEqual(cleanup["scope_populated_final"], 0)
-                self.assertTrue(cleanup["scope_quiesced"])
-                self.assertTrue(cleanup["scope_collected"])
-                self.assertIsNone(cleanup["scope_collection_error"])
-                self.assertTrue(cleanup["candidate_ownership_quiesced"])
-                self.assertTrue(cleanup["supervisor_reaped"])
-                self.assertTrue(cleanup["forced_kill"])
-                for pid in candidate_pids:
-                    self.assertFalse(smoke.process_identity_is_live(pid))
-                self.assertIsNone(unrelated.poll())
-                self.assertFalse(unrelated_term.exists())
-            finally:
-                if smoke.process_identity_is_live(supervisor.pid):
-                    try:
-                        smoke.stop_candidate_supervisor(supervisor)
-                    except OSError:
-                        pass
-                for pid in candidate_pids:
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                if unrelated.poll() is None:
-                    os.killpg(unrelated.pid, signal.SIGKILL)
-                    unrelated.wait(timeout=2)
-
-    def test_parent_scope_fence_collects_worker_killed_during_offline_test(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            marker = root / "offline.pids"
-            binary = root / "candidate"
-            binary.write_text(
-                "#!/usr/bin/python3\n"
-                "import os, signal, time\n"
-                "child = os.fork()\n"
-                "if child == 0:\n"
-                "    os.setsid()\n"
-                "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-                "    time.sleep(30)\n"
-                f"open({str(marker)!r}, 'w').write(f'{{os.getpid()}} {{child}}')\n"
-                "time.sleep(30)\n",
-                encoding="utf-8",
-            )
-            binary.chmod(0o700)
-            runner_code = (
-                "import importlib.util, json, pathlib, sys\n"
-                f"spec=importlib.util.spec_from_file_location('smoke', {str(ROOT / 'scripts' / 'llm_guard_proxy_loop_recovery_smoke.py')!r})\n"
-                "module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)\n"
-                "binary=pathlib.Path(sys.argv[1]); config=pathlib.Path(sys.argv[2]); root=pathlib.Path(sys.argv[3])\n"
-                "try:\n"
-                " module.authorize_candidate_supervisor(binary, module.sha256(binary), [str(binary), str(config)], root, {'PATH':'/usr/bin:/bin'}, root/'candidate.log', config)\n"
-                "except module.SupervisorStartError as exc:\n"
-                " print(json.dumps(exc.cleanup, separators=(',', ':')))\n"
-            )
-            runner = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-c",
-                    runner_code,
-                    str(binary),
-                    str(TEST_CONFIG),
-                    str(root),
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-            )
-            offline_pids: list[int] = []
-            try:
-                deadline = time.monotonic() + 5
-                while not marker.exists() and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                self.assertTrue(marker.exists())
-                offline_pids = [int(value) for value in marker.read_text().split()]
-                worker = smoke._read_process_identity(offline_pids[0])
-                self.assertIsNotNone(worker)
-                assert worker is not None
-                worker_pid = worker.ppid
-                scope_group = smoke._process_control_group(worker_pid)
-                scope_path = smoke.CGROUP_ROOT / scope_group.removeprefix("/")
-                os.kill(worker_pid, signal.SIGKILL)
-                stdout, _ = runner.communicate(timeout=10)
-                cleanup = json.loads(stdout)
-                self.assertTrue(cleanup["scope_quiesced"])
-                self.assertTrue(cleanup["scope_collected"])
-                self.assertFalse(scope_path.exists())
-                for pid in offline_pids:
-                    self.assertFalse(smoke.process_identity_is_live(pid))
-            finally:
-                if runner.poll() is None:
-                    runner.kill()
-                    runner.wait(timeout=2)
-                if runner.stdout is not None:
-                    runner.stdout.close()
-                for pid in offline_pids:
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
 
     def test_supervisor_control_failures_cleanup_candidate_bounded(self) -> None:
         candidate = r"""
@@ -2825,8 +2102,6 @@ while True:
                 self.assertEqual(cleanup["residual_producer_count_final"], 0)
                 self.assertTrue(cleanup["supervisor_exited"])
                 self.assertTrue(cleanup["supervisor_reaped"])
-                self.assertTrue(cleanup["scope_collected"])
-                self.assertIsNone(cleanup["scope_collection_error"])
 
     def test_stop_reports_unexpected_exit_and_graceful_stop(self) -> None:
         child = r"""
@@ -3003,21 +2278,14 @@ while True:
             )
             binary.chmod(0o700)
             output = io.StringIO()
+            args = smoke.argparse.Namespace(
+                candidate_config=TEST_CONFIG,
+                binary=binary,
+                root=base / "run",
+            )
             with (
                 patch.object(
-                    sys,
-                    "argv",
-                    [
-                        "smoke",
-                        "--candidate-config",
-                        str(ROOT / "config" / "llm-guard-proxy" / "config.toml"),
-                        "--binary",
-                        str(binary),
-                        "--expected-binary-sha256",
-                        smoke.sha256(binary),
-                        "--root",
-                        str(base / "run"),
-                    ],
+                    smoke, "ACCEPTED_RELEASE_SHA256", smoke.sha256(binary)
                 ),
                 patch.object(
                     smoke,
@@ -3026,7 +2294,7 @@ while True:
                 ),
                 redirect_stdout(output),
             ):
-                result = smoke.main()
+                result = smoke._run_harness(args)
 
             self.assertEqual(result, 1)
             self.assertFalse(marker.exists())
@@ -3226,20 +2494,18 @@ while True:
                 with self.subTest(code=errno.errorcode[code]):
                     output = io.StringIO()
                     root = base / f"run-{errno.errorcode[code]}"
-                    argv = [
-                        "smoke",
-                        "--candidate-config",
-                        str(ROOT / "config" / "llm-guard-proxy" / "config.toml"),
-                        "--binary",
-                        str(binary),
-                        "--expected-binary-sha256",
-                        smoke.sha256(binary),
-                        "--root",
-                        str(root),
-                    ]
+                    args = smoke.argparse.Namespace(
+                        candidate_config=TEST_CONFIG,
+                        binary=binary,
+                        root=root,
+                    )
                     before_fds = fd_count()
                     with (
-                        patch.object(sys, "argv", argv),
+                        patch.object(
+                            smoke,
+                            "ACCEPTED_RELEASE_SHA256",
+                            smoke.sha256(binary),
+                        ),
                         patch.object(
                             smoke,
                             "_SUPERVISOR_TEST_FAILPOINT",
@@ -3247,7 +2513,7 @@ while True:
                         ),
                         redirect_stdout(output),
                     ):
-                        result = smoke.main()
+                        result = smoke._run_harness(args)
 
                     summary = json.loads(output.getvalue())
                     cleanup = summary["process_cleanup"]
