@@ -58,6 +58,11 @@ class LocalGateContractTests(unittest.TestCase):
         self.assertIn("guard-loop-recovery-smoke:", justfile)
         self.assertIn("guard-loop-recovery-unit", justfile)
         self.assertIn("LLM_GUARD_PROXY_BINARY", justfile)
+        self.assertIn("--expected-binary-sha256", justfile)
+        self.assertIn(
+            "fbefc454c4dc498d943d6e6293a984efe28eb474aacce2518b9d2e777161316d",
+            justfile,
+        )
         self.assertIn(str(LOOP_RECOVERY_SMOKE.relative_to(ROOT)), justfile)
 
     def test_loop_recovery_smoke_scans_private_prefix_marker_at_every_sink(self) -> None:
@@ -84,17 +89,22 @@ class LocalGateContractTests(unittest.TestCase):
     def test_guard_offline_self_test_precedes_f1_network_and_binds_runtime(self) -> None:
         smoke = LOOP_RECOVERY_SMOKE.read_text()
         prerequisite = smoke.index(
-            "authorization = authorize_candidate_supervisor(binary, str(binary))"
+            "authorization = authorize_candidate_supervisor("
         )
         for later in (
-            "free_port(), free_port()",
             "FixtureHTTPServer(",
-            "isolated_config(candidate, root, fake_port, guard_port)",
             "launch_candidate_supervisor(",
+            "server.server_activate()",
         ):
             self.assertLess(prerequisite, smoke.index(later, prerequisite))
-        self.assertIn("authorization, executable_fd = _recv_supervisor_launch", smoke)
+        self.assertIn("authorization, received_fds = _recv_supervisor_launch", smoke)
         self.assertIn('executable=f"/proc/self/fd/{executable_fd}"', smoke)
+        self.assertIn('control.recv(SUPERVISOR_MESSAGE_LIMIT + 1) != b"launch"', smoke)
+        self.assertNotIn('launch.get("argv")', smoke)
+        self.assertIn("os.fchdir(cwd_fd)", smoke)
+        self.assertIn("stdout=log_fd", smoke)
+        self.assertIn("pass_fds=(executable_fd, config_fd)", smoke)
+        self.assertIn("lock_candidate_runtime(", smoke)
         self.assertIn("require_candidate_runtime(supervisor, guard_port)", smoke)
 
     def test_active_guard_docs_match_private_metadata_only_policy(self) -> None:

@@ -46,6 +46,7 @@ SUPERVISOR_CONTROL_TIMEOUT = 180.0
 SUPERVISOR_CLEANUP_TIMEOUT = PROCESS_STOP_TIMEOUT + 2.0
 SUPERVISOR_EMERGENCY_TIMEOUT = PROCESS_STOP_TIMEOUT * 2 + 2.0
 SUPERVISOR_MESSAGE_LIMIT = 16 * 1024
+SUPERVISOR_CONFIG_FD = 198
 SCAN_CHUNK_SIZE = 64 * 1024
 SCAN_MAX_ENTRIES = 2_048
 SCAN_MAX_FILE_BYTES = 64 * 1024 * 1024
@@ -105,12 +106,28 @@ class ScopeFence(NamedTuple):
     worker_identity: ProcessIdentity
 
 
+class RuntimeCgroup:
+    def __init__(
+        self,
+        control_group: str,
+        procs_fd: int,
+        pids_current_fd: int,
+        pids_max_fd: int,
+    ) -> None:
+        self.control_group = control_group
+        self.procs_fd = procs_fd
+        self.pids_current_fd = pids_current_fd
+        self.pids_max_fd = pids_max_fd
+        self.locked_tasks = 0
+
+
 class SupervisorHandle(NamedTuple):
     pid: int
     identity: ProcessIdentity
     control: socket.socket
     started_receipt: dict[str, object]
     scope: ScopeFence
+    runtime_cgroup: RuntimeCgroup
 
 
 class AuthorizedSupervisor:
@@ -240,17 +257,25 @@ def _require_sealed_executable(fd: int) -> None:
     )
 
 
-def _sealed_executable_fd(path: Path) -> int:
-    source_fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-    sealed_fd = os.memfd_create(
-        "llm-guard-loop-recovery",
-        os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+def _sealed_file_fd(
+    path: Path, expected_sha256: str, *, executable: bool
+) -> int:
+    require(
+        re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is not None,
+        "expected_binary_digest_invalid",
     )
+    source_fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    sealed_fd: int | None = None
     try:
+        sealed_fd = os.memfd_create(
+            "llm-guard-loop-recovery",
+            os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+        )
         before = os.fstat(source_fd)
         require(
-            stat.S_ISREG(before.st_mode) and before.st_mode & 0o111 != 0,
-            "binary_not_executable",
+            stat.S_ISREG(before.st_mode)
+            and (not executable or before.st_mode & 0o111 != 0),
+            "binary_not_executable" if executable else "config_not_regular",
         )
         digest = hashlib.sha256()
         while block := os.read(source_fd, 1024 * 1024):
@@ -264,16 +289,27 @@ def _sealed_executable_fd(path: Path) -> int:
         os.fchmod(sealed_fd, stat.S_IMODE(before.st_mode))
         fcntl.fcntl(sealed_fd, fcntl.F_ADD_SEALS, EXECUTABLE_SEALS)
         _require_sealed_executable(sealed_fd)
-        require(
-            _executable_identity_fd(sealed_fd).sha256 == digest.hexdigest(),
-            "binary_copy_drift",
-        )
+        os.lseek(sealed_fd, 0, os.SEEK_SET)
+        copied = hashlib.sha256()
+        for block in iter(lambda: os.read(sealed_fd, 1024 * 1024), b""):
+            copied.update(block)
+        require(copied.hexdigest() == digest.hexdigest(), "binary_copy_drift")
+        require(digest.hexdigest() == expected_sha256, "binary_digest_mismatch")
         return sealed_fd
     except Exception:
-        os.close(sealed_fd)
+        if sealed_fd is not None:
+            os.close(sealed_fd)
         raise
     finally:
         os.close(source_fd)
+
+
+def _sealed_executable_fd(path: Path, expected_sha256: str) -> int:
+    return _sealed_file_fd(path, expected_sha256, executable=True)
+
+
+def _sealed_config_fd(path: Path) -> int:
+    return _sealed_file_fd(path, sha256(path), executable=False)
 
 
 def executable_identity(path: Path, *, nofollow: bool = True) -> ExecutableIdentity:
@@ -592,8 +628,10 @@ def _run_offline_self_test_fd(
     return receipt, identity
 
 
-def run_offline_self_test(binary: Path) -> tuple[dict, ExecutableIdentity]:
-    fd = _sealed_executable_fd(binary)
+def run_offline_self_test(
+    binary: Path, expected_sha256: str
+) -> tuple[dict, ExecutableIdentity]:
+    fd = _sealed_executable_fd(binary, expected_sha256)
     try:
         return _run_offline_self_test_fd(fd, str(binary))
     finally:
@@ -665,16 +703,16 @@ class Fixture:
         with self.lock:
             self.attempts[number - 1][field] = time.monotonic_ns()
 
-    def record_request(self, path: str) -> dict:
+    def record_request(self, path: str | None = None) -> dict:
         endpoint = (
             "chat_completions"
-            if path.endswith("/chat/completions")
+            if path is not None and path.endswith("/chat/completions")
             else "completions"
-            if path.endswith("/completions")
+            if path is not None and path.endswith("/completions")
             else "embeddings"
-            if path.endswith("/embeddings")
+            if path is not None and path.endswith("/embeddings")
             else "models"
-            if path.endswith("/models")
+            if path is not None and path.endswith("/models")
             else "unknown"
         )
         with self.lock:
@@ -697,6 +735,21 @@ class Fixture:
             }
             self.attempts.append(attempt)
             return attempt
+
+    def classify_request_path(self, attempt: dict, path: str) -> None:
+        endpoint = (
+            "chat_completions"
+            if path.endswith("/chat/completions")
+            else "completions"
+            if path.endswith("/completions")
+            else "embeddings"
+            if path.endswith("/embeddings")
+            else "models"
+            if path.endswith("/models")
+            else "unknown"
+        )
+        with self.lock:
+            attempt["endpoint"] = endpoint
 
     def inspect_request(
         self,
@@ -814,6 +867,39 @@ class Fixture:
             def log_message(self, format: str, *args: object) -> None:
                 return
 
+            def handle_one_request(self) -> None:
+                try:
+                    self.raw_requestline = self.rfile.readline(65537)
+                    if not self.raw_requestline:
+                        self.close_connection = True
+                        return
+                    self.fixture_attempt = fixture.record_request()
+                    if len(self.raw_requestline) > 65536:
+                        fixture.record_error("fixture_request_parse_error")
+                        self.requestline = ""
+                        self.request_version = ""
+                        self.command = ""
+                        self.send_error(414)
+                        return
+                    if not self.parse_request():
+                        return
+                    method = getattr(self, "do_" + self.command, None)
+                    if method is None:
+                        self.send_error(501, "Unsupported method (%r)" % self.command)
+                        return
+                    method()
+                    self.wfile.flush()
+                except TimeoutError:
+                    self.close_connection = True
+
+            def parse_request(self) -> bool:
+                parsed = super().parse_request()
+                if not parsed:
+                    fixture.record_error("fixture_request_parse_error")
+                    return False
+                fixture.classify_request_path(self.fixture_attempt, self.path)
+                return True
+
             def send_json(self, status: int, payload: dict) -> None:
                 raw = json.dumps(payload, separators=(",", ":")).encode()
                 self.send_response(status)
@@ -825,17 +911,17 @@ class Fixture:
                 self.close_connection = True
 
             def do_GET(self) -> None:
-                attempt = fixture.record_request(self.path)
+                attempt = self.fixture_attempt
                 if self.path.endswith("/models"):
                     with fixture.lock:
-                        attempt.update(phase="startup", role="metadata")
+                        attempt.update(role="metadata")
                     self.send_json(200, {"object": "list", "data": [{"id": "aeon-ultimate", "object": "model"}]})
                 else:
                     fixture.record_error("unexpected_upstream_route")
                     self.send_json(404, {"error": {"message": "fixture route"}})
 
             def do_POST(self) -> None:
-                attempt = fixture.record_request(self.path)
+                attempt = self.fixture_attempt
                 raw_length = self.headers.get("Content-Length")
                 if raw_length is None or re.fullmatch(r"[0-9]+", raw_length) is None:
                     fixture.record_error("fixture_invalid_content_length")
@@ -1467,7 +1553,112 @@ def require_candidate_runtime(
             _socket_owner_pids(inodes) == {candidate["pid"]},
             "candidate_listener_owner_mismatch",
         )
+    if supervisor.runtime_cgroup.locked_tasks:
+        _require_runtime_cgroup_locked(supervisor)
     return actual
+
+
+def _read_cgroup_fd(fd: int) -> str:
+    return os.pread(fd, 4096, 0).decode("ascii").strip()
+
+
+def _runtime_members(runtime: RuntimeCgroup) -> set[int]:
+    try:
+        return {int(value) for value in _read_cgroup_fd(runtime.procs_fd).split()}
+    except ValueError as exc:
+        raise OSError(errno.EIO, "runtime_cgroup_members_invalid") from exc
+
+
+def _open_runtime_cgroup(
+    scope: ScopeFence, control_group: str, candidate_pid: int
+) -> RuntimeCgroup:
+    require(
+        control_group == f"{scope.control_group}/runtime",
+        "candidate_scope_identity_invalid",
+    )
+    path = CGROUP_ROOT / control_group.removeprefix("/")
+    require(
+        stat.S_ISDIR(path.lstat().st_mode), "candidate_runtime_cgroup_invalid"
+    )
+    descriptors: list[int] = []
+    try:
+        for name, flags in (
+            ("cgroup.procs", os.O_RDONLY),
+            ("pids.current", os.O_RDONLY),
+            ("pids.max", os.O_RDWR),
+        ):
+            descriptors.append(
+                os.open(path / name, flags | os.O_CLOEXEC | os.O_NOFOLLOW)
+            )
+        runtime = RuntimeCgroup(control_group, *descriptors)
+        require(
+            _process_control_group(candidate_pid) == control_group
+            and candidate_pid in _runtime_members(runtime),
+            "candidate_runtime_cgroup_membership_invalid",
+        )
+        return runtime
+    except Exception:
+        for fd in descriptors:
+            os.close(fd)
+        raise
+
+
+def _close_runtime_cgroup(runtime: RuntimeCgroup) -> None:
+    for fd in (runtime.procs_fd, runtime.pids_current_fd, runtime.pids_max_fd):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _require_runtime_cgroup_locked(supervisor: SupervisorHandle) -> None:
+    runtime = supervisor.runtime_cgroup
+    candidate = supervisor.started_receipt["candidate_identity"]
+    assert isinstance(candidate, dict)
+    _require_runtime_cgroup_state(runtime, candidate["pid"])
+
+
+def _require_runtime_cgroup_state(
+    runtime: RuntimeCgroup, candidate_pid: int
+) -> None:
+    require(
+        runtime.locked_tasks > 0
+        and _runtime_members(runtime) == {candidate_pid}
+        and _read_cgroup_fd(runtime.pids_max_fd) == str(runtime.locked_tasks)
+        and _read_cgroup_fd(runtime.pids_current_fd) == str(runtime.locked_tasks),
+        "runtime_pids_constraint_drift",
+    )
+
+
+def _lock_runtime_cgroup(runtime: RuntimeCgroup, candidate_pid: int) -> int:
+    require(
+        runtime.locked_tasks == 0 and _runtime_members(runtime) == {candidate_pid},
+        "runtime_cgroup_not_exclusive",
+    )
+    try:
+        current = int(_read_cgroup_fd(runtime.pids_current_fd))
+    except ValueError as exc:
+        raise OSError(errno.EIO, "runtime_pids_current_invalid") from exc
+    require(current > 0, "runtime_pids_current_invalid")
+    payload = str(current).encode("ascii")
+    os.lseek(runtime.pids_max_fd, 0, os.SEEK_SET)
+    require(
+        os.write(runtime.pids_max_fd, payload) == len(payload),
+        "runtime_pids_max_write_failed",
+    )
+    runtime.locked_tasks = current
+    _require_runtime_cgroup_state(runtime, candidate_pid)
+    return current
+
+
+def lock_candidate_runtime(
+    supervisor: SupervisorHandle, port: int
+) -> int:
+    require_candidate_runtime(supervisor, port)
+    runtime = supervisor.runtime_cgroup
+    candidate = supervisor.started_receipt["candidate_identity"]
+    assert isinstance(candidate, dict)
+    return _lock_runtime_cgroup(runtime, candidate["pid"])
 
 
 def wait_port(port: int, supervisor: SupervisorHandle, deadline: float) -> None:
@@ -2115,7 +2306,7 @@ def _send_supervisor_packet(
     control: socket.socket,
     packet: bytes | dict[str, object],
     deadline: float,
-    executable_fd: int | None = None,
+    fds: tuple[int, ...] = (),
 ) -> None:
     payload = (
         packet
@@ -2133,10 +2324,10 @@ def _send_supervisor_packet(
             (
                 socket.SOL_SOCKET,
                 socket.SCM_RIGHTS,
-                array.array("i", [executable_fd]),
+                array.array("i", fds),
             )
         ]
-        if executable_fd is not None
+        if fds
         else []
     )
     if control.sendmsg([payload], ancillary) != len(payload):
@@ -2145,14 +2336,14 @@ def _send_supervisor_packet(
 
 def _recv_supervisor_launch(
     control: socket.socket, deadline: float
-) -> tuple[dict[str, object], int]:
+) -> tuple[dict[str, object], list[int]]:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError("supervisor_launch_timeout")
     control.settimeout(remaining)
     payload, ancillary, flags, _ = control.recvmsg(
         SUPERVISOR_MESSAGE_LIMIT + 1,
-        socket.CMSG_SPACE(array.array("i").itemsize),
+        socket.CMSG_SPACE(array.array("i").itemsize * 8),
     )
     received = array.array("i")
     for level, kind, data in ancillary:
@@ -2163,15 +2354,17 @@ def _recv_supervisor_launch(
             not payload
             or len(payload) > SUPERVISOR_MESSAGE_LIMIT
             or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
-            or len(received) != 1
+            or not received
         ):
             raise ValueError("supervisor_launch_capability_invalid")
         launch = json.loads(payload)
         if not isinstance(launch, dict):
             raise ValueError("supervisor_launch_invalid")
-        executable_fd = received.pop()
-        os.set_inheritable(executable_fd, False)
-        return launch, executable_fd
+        descriptors = received.tolist()
+        received = array.array("i")
+        for fd in descriptors:
+            os.set_inheritable(fd, False)
+        return launch, descriptors
     finally:
         for fd in received:
             os.close(fd)
@@ -2309,7 +2502,7 @@ def _establish_scope_fence(
     worker_pid = receipt.get("pid")
     worker_control_group = receipt.get("control_group")
     if (
-        receipt.get("kind") != "scope_ready"
+        receipt.get("kind") != "scope_entered"
         or type(worker_pid) is not int
         or worker_pid <= 1
         or not isinstance(worker_control_group, str)
@@ -2378,6 +2571,49 @@ def _require_scope_fence_live(scope: ScopeFence) -> None:
         and _process_control_group(current.pid) == scope.control_group,
         "scope_fence_authority_invalid",
     )
+
+
+def _verify_worker_scope_capabilities(events_fd: int, kill_fd: int) -> str:
+    control_group = _process_control_group(os.getpid())
+    cgroup_path = CGROUP_ROOT / control_group.removeprefix("/")
+    reference_events = os.open(
+        cgroup_path / "cgroup.events",
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    reference_kill = os.open(
+        cgroup_path / "cgroup.kill",
+        os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        events_stat = os.fstat(events_fd)
+        reference_events_stat = os.fstat(reference_events)
+        kill_stat = os.fstat(kill_fd)
+        reference_kill_stat = os.fstat(reference_kill)
+        require(
+            (events_stat.st_dev, events_stat.st_ino, events_stat.st_mode)
+            == (
+                reference_events_stat.st_dev,
+                reference_events_stat.st_ino,
+                reference_events_stat.st_mode,
+            )
+            and (kill_stat.st_dev, kill_stat.st_ino, kill_stat.st_mode)
+            == (
+                reference_kill_stat.st_dev,
+                reference_kill_stat.st_ino,
+                reference_kill_stat.st_mode,
+            )
+            and fcntl.fcntl(events_fd, fcntl.F_GETFL) & os.O_ACCMODE
+            == os.O_RDONLY
+            and fcntl.fcntl(kill_fd, fcntl.F_GETFL) & os.O_ACCMODE
+            == os.O_WRONLY,
+            "scope_fence_capability_invalid",
+        )
+        populated, removed = _scope_population(events_fd)
+        require(not removed and populated == 1, "scope_fence_capability_invalid")
+        return control_group
+    finally:
+        os.close(reference_events)
+        os.close(reference_kill)
 
 
 def _fence_supervisor_scope(
@@ -2658,29 +2894,20 @@ def _emergency_supervisor_cleanup(
     return _finalize_supervisor_cleanup(cleanup, status, error)
 
 
-def _exclusive_supervisor_worker(
-    control_fd: int, expected_scope_unit: str | None
-) -> int:
-    executable_fd: int | None = None
+def _exclusive_supervisor_worker(control_fd: int) -> int:
+    received_fds: list[int] = []
+    reserved = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+    if reserved != SUPERVISOR_CONFIG_FD:
+        os.dup2(reserved, SUPERVISOR_CONFIG_FD, inheritable=False)
+        os.close(reserved)
     try:
         control = socket.socket(fileno=control_fd)
         control.set_inheritable(False)
     except OSError:
+        os.close(SUPERVISOR_CONFIG_FD)
         return 2
     try:
         control_group = _process_control_group(os.getpid())
-        parts = Path(control_group).parts
-        require(
-            expected_scope_unit is not None
-            and re.fullmatch(
-                r"llm-guard-loop-recovery-[1-9][0-9]*-[0-9a-f]{16}\.scope",
-                expected_scope_unit,
-            )
-            is not None
-            and bool(parts)
-            and parts[-1] == expected_scope_unit,
-            "exclusive_supervisor_scope_required",
-        )
         cgroup_path = CGROUP_ROOT / control_group.removeprefix("/")
         require(
             stat.S_ISDIR(cgroup_path.lstat().st_mode)
@@ -2694,27 +2921,92 @@ def _exclusive_supervisor_worker(
         _send_supervisor_packet(
             control,
             {
-                "kind": "scope_ready",
+                "kind": "scope_entered",
                 "pid": os.getpid(),
                 "control_group": control_group,
             },
             time.monotonic() + SUPERVISOR_START_TIMEOUT,
         )
-        authorization, executable_fd = _recv_supervisor_launch(
+        authorization, received_fds = _recv_supervisor_launch(
             control, time.monotonic() + SUPERVISOR_START_TIMEOUT
         )
-        argv0 = authorization.get("argv0")
+        if len(received_fds) != 6:
+            raise ValueError("supervisor_authorization_capabilities_invalid")
+        executable_fd, config_fd, log_fd, cwd_fd, events_fd, kill_fd = received_fds
+        argv = authorization.get("argv")
+        cwd = authorization.get("cwd")
+        env = authorization.get("env")
+        log_path = authorization.get("log_path")
+        expected_sha256 = authorization.get("expected_binary_sha256")
         test_failpoint = authorization.get("test_failpoint")
         control_timeout = authorization.get("control_timeout")
         if (
             authorization.get("kind") != "authorize"
-            or not isinstance(argv0, str)
+            or not isinstance(argv, list)
+            or not argv
+            or not all(isinstance(value, str) for value in argv)
+            or not isinstance(cwd, str)
+            or not Path(cwd).is_absolute()
+            or not isinstance(env, dict)
+            or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in env.items()
+            )
+            or argv.count(f"/proc/self/fd/{SUPERVISOR_CONFIG_FD}")
+            + sum(
+                value == f"/proc/self/fd/{SUPERVISOR_CONFIG_FD}"
+                for value in env.values()
+            )
+            != 1
+            or not isinstance(log_path, str)
+            or not Path(log_path).is_absolute()
+            or not isinstance(expected_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
             or test_failpoint
             not in {None, "subreaper:EPERM", "pidfd:EMFILE", "pidfd:EPERM"}
             or not isinstance(control_timeout, (int, float))
             or not 0 < control_timeout <= 3600
         ):
             raise ValueError("supervisor_authorization_invalid")
+        _verify_worker_scope_capabilities(events_fd, kill_fd)
+        _require_sealed_executable(executable_fd)
+        _require_sealed_executable(config_fd)
+        require(
+            _executable_identity_fd(executable_fd).sha256 == expected_sha256,
+            "binary_digest_mismatch",
+        )
+        log_stat = os.fstat(log_fd)
+        path_stat = os.stat(log_path, follow_symlinks=False)
+        cwd_stat = os.fstat(cwd_fd)
+        cwd_path_stat = os.stat(cwd, follow_symlinks=False)
+        require(
+            stat.S_ISREG(log_stat.st_mode)
+            and (log_stat.st_dev, log_stat.st_ino)
+            == (path_stat.st_dev, path_stat.st_ino),
+            "supervisor_log_capability_invalid",
+        )
+        require(
+            stat.S_ISDIR(cwd_stat.st_mode)
+            and (cwd_stat.st_dev, cwd_stat.st_ino)
+            == (cwd_path_stat.st_dev, cwd_path_stat.st_ino),
+            "supervisor_cwd_capability_invalid",
+        )
+        os.dup2(config_fd, SUPERVISOR_CONFIG_FD, inheritable=False)
+        os.close(config_fd)
+        received_fds.remove(config_fd)
+        config_fd = SUPERVISOR_CONFIG_FD
+        for fd in (events_fd, kill_fd):
+            os.close(fd)
+            received_fds.remove(fd)
+        _send_supervisor_packet(
+            control,
+            {
+                "kind": "scope_ready",
+                "pid": os.getpid(),
+                "control_group": control_group,
+            },
+            time.monotonic() + SUPERVISOR_START_TIMEOUT,
+        )
     except Exception as exc:
         error = _stable_error(exc, "supervisor_authorization_failed")
         try:
@@ -2732,8 +3024,11 @@ def _exclusive_supervisor_worker(
         except Exception:
             pass
         control.close()
-        if executable_fd is not None:
-            os.close(executable_fd)
+        for fd in {*received_fds, SUPERVISOR_CONFIG_FD}:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         return 2
     if isinstance(test_failpoint, str) and test_failpoint.startswith("subreaper:"):
         _, code_name = test_failpoint.split(":", 1)
@@ -2747,8 +3042,13 @@ def _exclusive_supervisor_worker(
     assert executable_fd is not None
     _exclusive_supervisor_main(
         control,
-        argv0,
+        argv,
+        Path(cwd),
+        env,
         executable_fd,
+        config_fd,
+        log_fd,
+        cwd_fd,
         test_failpoint,
     )
     return 1
@@ -2756,21 +3056,24 @@ def _exclusive_supervisor_worker(
 
 def _exclusive_supervisor_main(
     control: socket.socket,
-    argv0: str,
+    argv: list[str],
+    cwd: Path,
+    env: dict[str, str],
     executable_fd: int,
+    config_fd: int,
+    log_fd: int,
+    cwd_fd: int,
     runtime_failpoint: str | None,
 ) -> None:
     global _EXCLUSIVE_SUPERVISOR_PID
     proc: subprocess.Popen[bytes] | None = None
     identity: ProcessIdentity | None = None
-    log = None
     started = False
     subreaper_enabled = False
     supervisor_error: dict[str, str] | None = None
     stop_requested = False
     offline_self_test: dict | None = None
     binary_identity: ExecutableIdentity | None = None
-    argv: list[str] | None = None
 
     def request_stop(_signum: int, _frame: object) -> None:
         nonlocal stop_requested
@@ -2783,7 +3086,7 @@ def _exclusive_supervisor_main(
         _EXCLUSIVE_SUPERVISOR_PID = os.getpid()
         signal.signal(signal.SIGTERM, request_stop)
         offline_self_test, binary_identity = _run_offline_self_test_fd(
-            executable_fd, argv0
+            executable_fd, argv[0]
         )
         supervisor_identity = _read_process_identity(os.getpid())
         if supervisor_identity is None:
@@ -2800,27 +3103,9 @@ def _exclusive_supervisor_main(
             },
             time.monotonic() + SUPERVISOR_START_TIMEOUT,
         )
-        launch = _recv_supervisor_receipt(
-            control, time.monotonic() + SUPERVISOR_CONTROL_TIMEOUT
-        )
-        argv = launch.get("argv")
-        cwd = launch.get("cwd")
-        env = launch.get("env")
-        log_path = launch.get("log_path")
-        if (
-            launch.get("kind") != "launch"
-            or not isinstance(argv, list)
-            or not argv
-            or not all(isinstance(value, str) for value in argv)
-            or not isinstance(cwd, str)
-            or not isinstance(env, dict)
-            or not all(
-                isinstance(key, str) and isinstance(value, str)
-                for key, value in env.items()
-            )
-            or not isinstance(log_path, str)
-        ):
-            raise ValueError("supervisor_launch_invalid")
+        control.settimeout(SUPERVISOR_CONTROL_TIMEOUT)
+        if control.recv(SUPERVISOR_MESSAGE_LIMIT + 1) != b"launch":
+            raise RuntimeError("supervisor_launch_invalid")
         if isinstance(runtime_failpoint, str) and runtime_failpoint.startswith(
             "pidfd:"
         ):
@@ -2830,16 +3115,55 @@ def _exclusive_supervisor_main(
                 raise OSError(code, os.strerror(code))
 
             globals()["_pidfd_open"] = injected_pidfd_failure
-        log = Path(log_path).open("wb")
+        try:
+            outer_control_group = _process_control_group(os.getpid())
+            outer_path = CGROUP_ROOT / outer_control_group.removeprefix("/")
+            supervisor_path = outer_path / "supervisor"
+            runtime_path = outer_path / "runtime"
+            supervisor_path.mkdir(mode=0o700)
+            runtime_path.mkdir(mode=0o700)
+            (supervisor_path / "cgroup.procs").write_text(
+                str(os.getpid()), encoding="ascii"
+            )
+            require(
+                _process_control_group(os.getpid())
+                == f"{outer_control_group}/supervisor",
+                "supervisor_cgroup_migration_failed",
+            )
+            (outer_path / "cgroup.subtree_control").write_text(
+                "+pids", encoding="ascii"
+            )
+            require(
+                "pids"
+                in (outer_path / "cgroup.subtree_control").read_text().split()
+                and all(
+                    (runtime_path / name).is_file()
+                    for name in ("cgroup.procs", "pids.current", "pids.max")
+                ),
+                "runtime_pids_controller_unavailable",
+            )
+        except OSError as exc:
+            fail(
+                "runtime_pids_controller_unavailable:"
+                + errno.errorcode.get(exc.errno or errno.EIO, "EIO").lower()
+            )
+
+        def enter_runtime_cgroup() -> None:
+            (runtime_path / "cgroup.procs").write_text(
+                str(os.getpid()), encoding="ascii"
+            )
+
+        os.fchdir(cwd_fd)
         proc = subprocess.Popen(
             argv,
             executable=f"/proc/self/fd/{executable_fd}",
-            pass_fds=(executable_fd,),
-            cwd=Path(cwd),
+            pass_fds=(executable_fd, config_fd),
+            cwd=None,
             env=env,
-            stdout=log,
+            stdout=log_fd,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            preexec_fn=enter_runtime_cgroup,
         )
         identity = capture_spawn_identity(proc.pid)
         if identity.pidfd_errno is not None:
@@ -2850,6 +3174,11 @@ def _exclusive_supervisor_main(
         require(
             runtime_identity == binary_identity,
             "runtime_binary_identity_drift",
+        )
+        runtime_control_group = f"{outer_control_group}/runtime"
+        require(
+            _process_control_group(identity.pid) == runtime_control_group,
+            "candidate_scope_identity_invalid",
         )
         _send_supervisor_packet(
             control,
@@ -2862,6 +3191,7 @@ def _exclusive_supervisor_main(
                 "supervisor_identity": _identity_receipt(supervisor_identity),
                 "offline_self_test": offline_self_test,
                 "binary_identity": binary_identity._asdict(),
+                "runtime_control_group": runtime_control_group,
             },
             time.monotonic() + SUPERVISOR_START_TIMEOUT,
         )
@@ -2935,8 +3265,9 @@ def _exclusive_supervisor_main(
             )
         except Exception:
             pass
-        if log is not None:
-            log.close()
+        os.close(log_fd)
+        os.close(cwd_fd)
+        os.close(config_fd)
         os.close(executable_fd)
         control.close()
         os._exit(0 if cleanup["candidate_ownership_quiesced"] else 1)
@@ -2944,7 +3275,12 @@ def _exclusive_supervisor_main(
 
 def authorize_candidate_supervisor(
     binary: Path,
-    argv0: str,
+    expected_binary_sha256: str,
+    argv: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    log_path: Path,
+    config_path: Path,
     inherited_fds: tuple[int, ...] = (),
 ) -> AuthorizedSupervisor:
     if threading.active_count() != 1:
@@ -2989,12 +3325,12 @@ def authorize_candidate_supervisor(
                     f"--unit={unit}",
                     "--property=KillMode=control-group",
                     "--property=SendSIGKILL=yes",
+                    "--property=Delegate=pids",
                     "--",
                     sys.executable,
                     str(script),
                     "--exclusive-supervisor-fd",
                     "0",
-                    unit,
                 ],
             )
         except Exception:
@@ -3005,27 +3341,89 @@ def authorize_candidate_supervisor(
     scope: ScopeFence | None = None
     wrapper_identity: ProcessIdentity | None = None
     executable_fd: int | None = None
+    config_fd: int | None = None
+    log_fd: int | None = None
+    cwd_fd: int | None = None
     try:
+        require(
+            re.fullmatch(r"[0-9a-f]{64}", expected_binary_sha256) is not None,
+            "expected_binary_digest_invalid",
+        )
+        config_path_text = str(config_path)
+        require(
+            argv.count(config_path_text)
+            + sum(value == config_path_text for value in env.values())
+            == 1,
+            "runtime_config_contract_invalid",
+        )
+        authorized_argv = [
+            f"/proc/self/fd/{SUPERVISOR_CONFIG_FD}"
+            if value == config_path_text
+            else value
+            for value in argv
+        ]
+        authorized_env = {
+            key: (
+                f"/proc/self/fd/{SUPERVISOR_CONFIG_FD}"
+                if value == config_path_text
+                else value
+            )
+            for key, value in env.items()
+        }
         scope = _establish_scope_fence(parent_control, unit, pid, deadline)
         wrapper_identity = capture_process_identity(pid)
-        executable_fd = _sealed_executable_fd(binary)
+        executable_fd = _sealed_executable_fd(binary, expected_binary_sha256)
+        config_fd = _sealed_config_fd(config_path)
+        log_fd = os.open(
+            log_path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_TRUNC
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW,
+            0o600,
+        )
+        cwd_fd = os.open(
+            cwd, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
         _send_supervisor_packet(
             parent_control,
             {
                 "kind": "authorize",
-                "argv0": argv0,
+                "argv": authorized_argv,
+                "cwd": str(cwd),
+                "env": authorized_env,
+                "log_path": str(log_path),
+                "expected_binary_sha256": expected_binary_sha256,
                 "test_failpoint": _SUPERVISOR_TEST_FAILPOINT,
                 "control_timeout": SUPERVISOR_CONTROL_TIMEOUT,
             },
             deadline,
-            executable_fd,
+            (
+                executable_fd,
+                config_fd,
+                log_fd,
+                cwd_fd,
+                scope.events_fd,
+                scope.kill_fd,
+            ),
         )
-        os.close(executable_fd)
-        executable_fd = None
+        for fd in (executable_fd, config_fd, log_fd, cwd_fd):
+            assert fd is not None
+            os.close(fd)
+        executable_fd = config_fd = log_fd = cwd_fd = None
+        scope_ready = _recv_supervisor_receipt(parent_control, deadline)
+        if (
+            scope_ready.get("kind") != "scope_ready"
+            or (scope_ready.get("pid"), scope_ready.get("control_group"))
+            != (scope.worker_identity.pid, scope.control_group)
+        ):
+            raise OSError(errno.ESTALE, "scope_capability_receipt_invalid")
         receipt = _recv_supervisor_receipt(parent_control, deadline)
     except Exception as exc:
-        if executable_fd is not None:
-            os.close(executable_fd)
+        for fd in (executable_fd, config_fd, log_fd, cwd_fd):
+            if fd is not None:
+                os.close(fd)
         error = _stable_error(exc, "supervisor_start_receipt_failed")
         scope_cleanup: dict[str, object] = {}
         if scope is not None:
@@ -3110,10 +3508,6 @@ def authorize_candidate_supervisor(
 
 def launch_candidate_supervisor(
     authorization: AuthorizedSupervisor,
-    argv: list[str],
-    cwd: Path,
-    env: dict[str, str],
-    log_path: Path,
 ) -> SupervisorHandle:
     require(not authorization.consumed, "supervisor_authorization_consumed")
     authorization.consumed = True
@@ -3122,13 +3516,7 @@ def launch_candidate_supervisor(
         _require_scope_fence_live(authorization.scope)
         _send_supervisor_packet(
             authorization.control,
-            {
-                "kind": "launch",
-                "argv": argv,
-                "cwd": str(cwd),
-                "env": env,
-                "log_path": str(log_path),
-            },
+            b"launch",
             deadline,
         )
         receipt = _recv_supervisor_receipt(authorization.control, deadline)
@@ -3176,6 +3564,7 @@ def launch_candidate_supervisor(
             bool(receipt.get("exclusive_supervisor")),
         )
 
+    runtime_cgroup: RuntimeCgroup | None = None
     try:
         current_wrapper = _read_process_identity(authorization.pid)
         current_worker = _read_process_identity(
@@ -3211,8 +3600,18 @@ def launch_candidate_supervisor(
             candidate_identity["starttime"],
         ):
             raise OSError(errno.ESTALE, "candidate_lineage_invalid")
-        if _process_control_group(candidate_pid) != authorization.scope.control_group:
+        runtime_control_group = receipt.get("runtime_control_group")
+        if not isinstance(runtime_control_group, str):
             raise OSError(errno.ESTALE, "candidate_scope_identity_invalid")
+        runtime_cgroup = _open_runtime_cgroup(
+            authorization.scope, runtime_control_group, candidate_pid
+        )
+        if _process_control_group(candidate_pid) != runtime_control_group:
+            raise OSError(errno.ESTALE, "candidate_scope_identity_invalid")
+        if _process_control_group(current_worker.pid) != (
+            f"{authorization.scope.control_group}/supervisor"
+        ):
+            raise OSError(errno.ESTALE, "scope_worker_identity_changed")
         if not receipt.get("exclusive_supervisor") or not receipt.get(
             "subreaper_enabled"
         ):
@@ -3227,6 +3626,8 @@ def launch_candidate_supervisor(
             nofollow=False,
         )
     except Exception as exc:
+        if runtime_cgroup is not None:
+            _close_runtime_cgroup(runtime_cgroup)
         error = _stable_error(exc, "supervisor_identity_capture_failed")
         scope_cleanup = _fence_supervisor_scope({}, authorization.scope)
         cleanup = _emergency_supervisor_cleanup(
@@ -3249,12 +3650,14 @@ def launch_candidate_supervisor(
             "scope_worker_starttime": authorization.scope.worker_identity.starttime,
         }
     )
+    assert runtime_cgroup is not None
     return SupervisorHandle(
         authorization.pid,
         authorization.identity,
         authorization.control,
         receipt,
         authorization.scope,
+        runtime_cgroup,
     )
 
 
@@ -3266,13 +3669,20 @@ def start_candidate_supervisor(
     inherited_fds: tuple[int, ...] = (),
     *,
     binary: Path,
+    expected_binary_sha256: str,
+    config_path: Path,
 ) -> SupervisorHandle:
     authorization = authorize_candidate_supervisor(
-        binary, argv[0], inherited_fds
+        binary,
+        expected_binary_sha256,
+        argv,
+        cwd,
+        env,
+        log_path,
+        config_path,
+        inherited_fds,
     )
-    return launch_candidate_supervisor(
-        authorization, argv, cwd, env, log_path
-    )
+    return launch_candidate_supervisor(authorization)
 
 
 def stop_authorized_supervisor(
@@ -3320,7 +3730,9 @@ def _finish_candidate_supervisor(
         )
         handle.control.close()
         _close_identity_pidfd(handle.identity)
-        return _fence_supervisor_scope(cleanup, handle.scope)
+        cleanup = _fence_supervisor_scope(cleanup, handle.scope)
+        _close_runtime_cgroup(handle.runtime_cgroup)
+        return cleanup
     except Exception as exc:
         error = control_error or _stable_error(
             exc, "supervisor_cleanup_receipt_failed"
@@ -3330,6 +3742,7 @@ def _finish_candidate_supervisor(
             handle.pid, handle.identity, handle.control, error
         )
         cleanup.update(scope_cleanup)
+        _close_runtime_cgroup(handle.runtime_cgroup)
         return cleanup
 
 
@@ -3840,6 +4253,10 @@ def acceptance_errors(summary: dict) -> list[str]:
         errors.append("child_subreaper_not_enabled")
     if not summary.get("exclusive_supervisor"):
         errors.append("exclusive_supervisor_missing")
+    if not isinstance(summary.get("runtime_pids_locked_tasks"), int) or summary.get(
+        "runtime_pids_locked_tasks", 0
+    ) <= 0:
+        errors.append("runtime_pids_constraint_missing")
     errors.extend(summary.get("fixture_errors", []))
 
     attempts = summary.get("attempts", [])
@@ -3982,13 +4399,48 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--candidate-config", required=True, type=Path)
     ap.add_argument("--binary", required=True, type=Path)
+    ap.add_argument("--expected-binary-sha256", required=True)
     ap.add_argument("--root", required=True, type=Path)
     args = ap.parse_args()
     candidate = args.candidate_config.resolve(strict=True)
     binary = args.binary.resolve(strict=True)
     require(binary.is_file() and os.access(binary, os.X_OK), "binary_not_executable")
+    root = args.root
+    root.mkdir(mode=0o700, parents=False)
+    os.chmod(root, 0o700)
+    (root / "state").mkdir(mode=0o700)
+    (root / "home").mkdir(mode=0o700)
+    (root / "tmp").mkdir(mode=0o700)
+    sensitive_markers = tuple("S" + secrets.token_hex(24) for _ in range(6))
+    reasoning_marker, private_prefix_marker, shielded_input_marker, fresh_input_marker, shielded_output_marker, fresh_output_marker = sensitive_markers
+    generic_input_marker = shielded_input_marker
+    fixture = Fixture(
+        reasoning_marker,
+        private_prefix_marker,
+        fresh_input_marker,
+        shielded_output_marker,
+        fresh_output_marker,
+    )
+    fake_port, guard_port = free_port(), free_port()
+    config, hashes = isolated_config(candidate, root, fake_port, guard_port)
+    env = {"HOME": str(root / "home"), "TMPDIR": str(root / "tmp"), "XDG_CACHE_HOME": str(root / "home" / ".cache"), "XDG_CONFIG_HOME": str(root / "home" / ".config"), "XDG_DATA_HOME": str(root / "home" / ".local" / "share"), "PATH": os.environ["PATH"]}
+    runtime_argv = [
+        str(binary),
+        "--config",
+        str(config),
+        "--guardian-runtime-dir",
+        str(root / "guardian-runtime"),
+    ]
     try:
-        authorization = authorize_candidate_supervisor(binary, str(binary))
+        authorization = authorize_candidate_supervisor(
+            binary,
+            args.expected_binary_sha256,
+            runtime_argv,
+            root,
+            env,
+            root / "proxy.log",
+            config,
+        )
     except SupervisorStartError as exc:
         summary = {
             "binary_path": str(binary),
@@ -4004,29 +4456,11 @@ def main() -> int:
         }
         print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
         return 1
-    try:
-        offline_self_test = authorization.receipt["offline_self_test"]
-        binary_identity = _executable_identity_receipt(
-            authorization.receipt["binary_identity"]
-        )
-        root = args.root
-        root.mkdir(mode=0o700, parents=False)
-        os.chmod(root, 0o700)
-        (root / "state").mkdir(mode=0o700)
-        (root / "home").mkdir(mode=0o700)
-        (root / "tmp").mkdir(mode=0o700)
-        sensitive_markers = tuple("S" + secrets.token_hex(24) for _ in range(6))
-        reasoning_marker, private_prefix_marker, shielded_input_marker, fresh_input_marker, shielded_output_marker, fresh_output_marker = sensitive_markers
-        generic_input_marker = shielded_input_marker
-        fixture = Fixture(
-            reasoning_marker,
-            private_prefix_marker,
-            fresh_input_marker,
-            shielded_output_marker,
-            fresh_output_marker,
-        )
-        fake_port, guard_port = free_port(), free_port()
-        summary: dict = {
+    offline_self_test = authorization.receipt["offline_self_test"]
+    binary_identity = _executable_identity_receipt(
+        authorization.receipt["binary_identity"]
+    )
+    summary: dict = {
             "binary_path": str(binary),
             "binary_sha256": binary_identity.sha256,
             "offline_self_test": offline_self_test,
@@ -4052,34 +4486,15 @@ def main() -> int:
                 "arms": {},
                 "blocker": "BLOCKER:not_executed",
             },
-        }
-    except Exception as exc:
-        stop_authorized_supervisor(
-            authorization, _stable_error(exc, "fixture_setup_failed")
-        )
-        raise
+    }
+    summary.update(hashes)
     supervisor = None
     process_cleanup = None
     server = None
     server_thread = None
     try:
-        config, hashes = isolated_config(candidate, root, fake_port, guard_port)
-        summary.update(hashes)
         server = FixtureHTTPServer(("127.0.0.1", fake_port), fixture.handler(), fixture)
-        env = {"HOME": str(root / "home"), "TMPDIR": str(root / "tmp"), "XDG_CACHE_HOME": str(root / "home" / ".cache"), "XDG_CONFIG_HOME": str(root / "home" / ".config"), "XDG_DATA_HOME": str(root / "home" / ".local" / "share"), "PATH": os.environ["PATH"]}
-        supervisor = launch_candidate_supervisor(
-            authorization,
-            [
-                str(binary),
-                "--config",
-                str(config),
-                "--guardian-runtime-dir",
-                str(root / "guardian-runtime"),
-            ],
-            root,
-            env,
-            root / "proxy.log",
-        )
+        supervisor = launch_candidate_supervisor(authorization)
         summary["subreaper_enabled"] = bool(
             supervisor.started_receipt["subreaper_enabled"]
         )
@@ -4089,7 +4504,9 @@ def main() -> int:
         runtime_identity = require_candidate_runtime(supervisor)
         summary["runtime_binary_sha256"] = runtime_identity.sha256
         wait_port(guard_port, supervisor, time.monotonic() + 20)
-        require_candidate_runtime(supervisor, guard_port)
+        summary["runtime_pids_locked_tasks"] = lock_candidate_runtime(
+            supervisor, guard_port
+        )
         server.server_activate()
         server_thread = threading.Thread(
             target=server.serve_forever,
@@ -4262,9 +4679,21 @@ def main() -> int:
 
     errors = acceptance_errors(summary)
     summary["acceptance_errors"] = errors
-    summary["result"] = "PASS" if not errors else "FAIL"
+    execution_error = summary.get("execution_error")
+    execution_code = (
+        execution_error.get("code") if isinstance(execution_error, dict) else None
+    )
+    blocked = isinstance(execution_code, str) and (
+        execution_code.startswith("runtime_pids_")
+        or execution_code
+        in {
+            "runtime_cgroup_not_exclusive",
+            "supervisor_cgroup_migration_failed",
+        }
+    )
+    summary["result"] = "PASS" if not errors else "BLOCKED" if blocked else "FAIL"
     if errors:
-        summary["error_code"] = errors[0]
+        summary["error_code"] = execution_code if blocked else errors[0]
     print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
     return 0 if summary["result"] == "PASS" else 1
 
@@ -4280,10 +4709,8 @@ def _rebindable(port: int) -> bool:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) in {3, 4} and sys.argv[1] == "--exclusive-supervisor-fd":
+    if len(sys.argv) == 3 and sys.argv[1] == "--exclusive-supervisor-fd":
         raise SystemExit(
-            _exclusive_supervisor_worker(
-                int(sys.argv[2]), sys.argv[3] if len(sys.argv) == 4 else None
-            )
+            _exclusive_supervisor_worker(int(sys.argv[2]))
         )
     raise SystemExit(main())

@@ -4,6 +4,7 @@ import ctypes
 import errno
 import io
 import importlib.util
+import inspect
 import json
 import os
 import secrets
@@ -32,6 +33,7 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC and SPEC.loader
 smoke = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(smoke)
+TEST_CONFIG = ROOT / "config" / "llm-guard-proxy" / "config.toml"
 
 
 def enable_test_subreaper() -> None:
@@ -86,6 +88,16 @@ def post_fixture(
         pass
 
 
+def raw_fixture_request(port: int, request: bytes) -> bytes:
+    with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+        client.sendall(request)
+        client.shutdown(socket.SHUT_WR)
+        response = bytearray()
+        while chunk := client.recv(4096):
+            response.extend(chunk)
+        return bytes(response)
+
+
 def send_direct_launch(
     control: socket.socket,
     packet: dict[str, object],
@@ -118,6 +130,27 @@ def finish_direct_supervisor(
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=2)
+
+
+def start_test_candidate_supervisor(
+    argv: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    log_path: Path,
+    inherited_fds: tuple[int, ...] = (),
+    *,
+    binary: Path,
+):
+    return smoke.start_candidate_supervisor(
+        argv,
+        cwd,
+        {**env, "GB10_TEST_CONFIG": str(TEST_CONFIG)},
+        log_path,
+        inherited_fds,
+        binary=binary,
+        expected_binary_sha256=smoke.sha256(binary),
+        config_path=TEST_CONFIG,
+    )
 
 
 def run_client_fixture(
@@ -257,7 +290,7 @@ Path(sys.argv[1]).write_text(
 )
 control = socket.socket(fileno=0)
 control.send(json.dumps({
-    "kind": "scope_ready",
+    "kind": "scope_entered",
     "pid": json.loads(sys.argv[2]),
     "control_group": control_group,
 }).encode())
@@ -384,6 +417,7 @@ def passing_summary() -> dict:
         "execution_error": None,
         "subreaper_enabled": True,
         "exclusive_supervisor": True,
+        "runtime_pids_locked_tasks": 4,
         "process_cleanup": {
             "exclusive_supervisor": True,
             "supervisor_exited": True,
@@ -530,10 +564,46 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 f"print({json.dumps(offline_receipt())!r})\n"
             )
             self.write_self_test(binary, body=body)
-            receipt, identity = smoke.run_offline_self_test(binary)
+            receipt, identity = smoke.run_offline_self_test(
+                binary, smoke.sha256(binary)
+            )
             digest = smoke.sha256(binary)
         self.assertEqual(receipt, offline_receipt())
         self.assertEqual(identity.sha256, digest)
+
+    def test_expected_release_digest_is_checked_before_offline_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "guard"
+            marker = root / "offline-ran"
+            self.write_self_test(
+                binary,
+                body=(
+                    "from pathlib import Path\n"
+                    f"Path({str(marker)!r}).write_text('ran')\n"
+                    f"print({json.dumps(offline_receipt())!r})\n"
+                ),
+            )
+            with self.assertRaisesRegex(RuntimeError, "binary_digest_mismatch"):
+                smoke.run_offline_self_test(binary, "0" * 64)
+            self.assertFalse(marker.exists())
+
+    def test_memfd_creation_failure_closes_source_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "guard"
+            self.write_self_test(binary)
+            before = fd_count()
+            with (
+                patch.object(
+                    smoke.os,
+                    "memfd_create",
+                    side_effect=OSError(errno.EMFILE, "injected"),
+                ),
+                self.assertRaises(OSError) as caught,
+            ):
+                smoke._sealed_executable_fd(binary, smoke.sha256(binary))
+            self.assertEqual(caught.exception.errno, errno.EMFILE)
+            self.assertEqual(fd_count(), before)
 
     def test_complete_output_waits_for_zero_exit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -549,7 +619,7 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 ),
             )
             started = time.monotonic()
-            receipt, _ = smoke.run_offline_self_test(binary)
+            receipt, _ = smoke.run_offline_self_test(binary, smoke.sha256(binary))
         self.assertGreaterEqual(time.monotonic() - started, 0.1)
         self.assertEqual(receipt, offline_receipt())
 
@@ -591,7 +661,7 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 patch.object(smoke, "PROCESS_STOP_TIMEOUT", 1.0),
                 self.assertRaisesRegex(RuntimeError, "offline_self_test_timeout"),
             ):
-                smoke.run_offline_self_test(binary)
+                smoke.run_offline_self_test(binary, smoke.sha256(binary))
             elapsed = time.monotonic() - started
             pids = (int(root_pid.read_text()), int(child_pid.read_text()))
             survived = [pid for pid in pids if smoke.process_identity_is_live(pid)]
@@ -654,6 +724,134 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
             self.assertNotIn("scope_ready", {item.get("kind") for item in receipts})
             self.assertFalse(marker.exists())
 
+    def test_scope_authority_requires_matching_kernel_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope_path = root / "matching-name.scope"
+            scope_path.mkdir()
+            events = scope_path / "cgroup.events"
+            kill = scope_path / "cgroup.kill"
+            wrong = root / "wrong.kill"
+            events.write_text("populated 1\n", encoding="ascii")
+            kill.write_bytes(b"")
+            wrong.write_bytes(b"")
+            events_fd = os.open(events, os.O_RDONLY)
+            kill_fd = os.open(kill, os.O_WRONLY)
+            wrong_fd = os.open(wrong, os.O_WRONLY)
+            try:
+                with (
+                    patch.object(smoke, "CGROUP_ROOT", root),
+                    patch.object(
+                        smoke,
+                        "_process_control_group",
+                        return_value="/matching-name.scope",
+                    ),
+                ):
+                    self.assertEqual(
+                        smoke._verify_worker_scope_capabilities(events_fd, kill_fd),
+                        "/matching-name.scope",
+                    )
+                    with self.assertRaisesRegex(
+                        RuntimeError, "^scope_fence_capability_invalid$"
+                    ):
+                        smoke._verify_worker_scope_capabilities(events_fd, wrong_fd)
+            finally:
+                for fd in (events_fd, kill_fd, wrong_fd):
+                    os.close(fd)
+
+    def test_matching_name_scope_spoof_without_capabilities_is_rejected(self) -> None:
+        parent, child = socket.socketpair(
+            socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
+        )
+        try:
+            child.send(b'{"kind":"authorize"}')
+            with self.assertRaisesRegex(
+                ValueError, "^supervisor_launch_capability_invalid$"
+            ):
+                smoke._recv_supervisor_launch(parent, time.monotonic() + 1)
+        finally:
+            parent.close()
+            child.close()
+
+    def test_launch_packet_cannot_substitute_authorized_runtime_contract(self) -> None:
+        self.assertEqual(
+            tuple(inspect.signature(smoke.launch_candidate_supervisor).parameters),
+            ("authorization",),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "guard"
+            hostile = root / "hostile-ran"
+            self.write_self_test(binary)
+            executable_fd = smoke._sealed_executable_fd(
+                binary, smoke.sha256(binary)
+            )
+            config_fd = smoke._sealed_config_fd(TEST_CONFIG)
+            log_fd = os.open(root / "candidate.log", os.O_WRONLY | os.O_CREAT, 0o600)
+            cwd_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            parent, child = socket.socketpair(
+                socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
+            )
+            pid = os.fork()
+            if pid == 0:
+                parent.close()
+                os.dup2(config_fd, smoke.SUPERVISOR_CONFIG_FD, inheritable=False)
+                if config_fd != smoke.SUPERVISOR_CONFIG_FD:
+                    os.close(config_fd)
+                smoke._exclusive_supervisor_main(
+                    child,
+                    [str(binary), f"/proc/self/fd/{smoke.SUPERVISOR_CONFIG_FD}"],
+                    root,
+                    {"PATH": "/usr/bin:/bin"},
+                    executable_fd,
+                    smoke.SUPERVISOR_CONFIG_FD,
+                    log_fd,
+                    cwd_fd,
+                    None,
+                )
+                os._exit(99)
+            child.close()
+            for fd in (executable_fd, config_fd, log_fd, cwd_fd):
+                os.close(fd)
+            try:
+                authorized = smoke._recv_supervisor_receipt(
+                    parent, time.monotonic() + 5
+                )
+                self.assertEqual(authorized["kind"], "authorized")
+                smoke._send_supervisor_packet(
+                    parent,
+                    {
+                        "kind": "launch",
+                        "argv": ["hostile", str(hostile)],
+                        "cwd": "/",
+                        "env": {},
+                        "log_path": str(hostile),
+                    },
+                    time.monotonic() + 1,
+                )
+                rejected = smoke._recv_supervisor_receipt(
+                    parent, time.monotonic() + 5
+                )
+                self.assertEqual(rejected["kind"], "startup_failed")
+                self.assertEqual(
+                    rejected["supervisor_error"]["code"],
+                    "supervisor_launch_invalid",
+                )
+                self.assertFalse(hostile.exists())
+                waited, status = os.waitpid(pid, 0)
+                self.assertEqual(waited, pid)
+                self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+            finally:
+                parent.close()
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+
     def test_runtime_launch_uses_sealed_bytes_after_in_place_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -693,7 +891,13 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 stderr=subprocess.DEVNULL,
             )
             authorization = smoke.authorize_candidate_supervisor(
-                binary, str(binary)
+                binary,
+                smoke.sha256(binary),
+                [str(binary), str(legitimate), str(TEST_CONFIG)],
+                root,
+                {"PATH": "/usr/bin:/bin"},
+                root / "candidate.log",
+                TEST_CONFIG,
             )
             hostile_bytes = (
                 "#!/usr/bin/python3\n"
@@ -707,13 +911,7 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 output.write(hostile_bytes)
             supervisor = None
             try:
-                supervisor = smoke.launch_candidate_supervisor(
-                    authorization,
-                    [str(binary), str(legitimate)],
-                    root,
-                    {"PATH": "/usr/bin:/bin"},
-                    root / "candidate.log",
-                )
+                supervisor = smoke.launch_candidate_supervisor(authorization)
                 deadline = time.monotonic() + 1
                 while (
                     not legitimate.exists()
@@ -737,7 +935,7 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
             binary = Path(tmp) / "candidate"
             self.write_self_test(binary)
             expected = smoke.sha256(binary)
-            fd = smoke._sealed_executable_fd(binary)
+            fd = smoke._sealed_executable_fd(binary, smoke.sha256(binary))
             try:
                 with binary.open("r+b", buffering=0) as output:
                     output.truncate(0)
@@ -785,6 +983,7 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                     "binary_identity": expected._asdict(),
                 },
                 smoke.ScopeFence("test.scope", "/test.scope", -1, -1, identity),
+                smoke.RuntimeCgroup("/test.scope/runtime", -1, -1, -1),
             )
             try:
                 with self.assertRaises(RuntimeError):
@@ -798,6 +997,38 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                     pass
                 proc.wait(timeout=2)
                 smoke._close_identity_pidfd(identity)
+
+    def test_runtime_pids_lock_rejects_preexisting_child_and_closes_fds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            procs = root / "cgroup.procs"
+            current = root / "pids.current"
+            maximum = root / "pids.max"
+            current.write_text("1\n", encoding="ascii")
+            maximum.write_text("0\n", encoding="ascii")
+            descriptors = (
+                os.open(procs, os.O_RDONLY | os.O_CREAT, 0o600),
+                os.open(current, os.O_RDONLY),
+                os.open(maximum, os.O_RDWR),
+            )
+            runtime = smoke.RuntimeCgroup("/test/runtime", *descriptors)
+            try:
+                procs.write_text("123\n456\n", encoding="ascii")
+                with self.assertRaisesRegex(
+                    RuntimeError, "^runtime_cgroup_not_exclusive$"
+                ):
+                    smoke._lock_runtime_cgroup(runtime, 123)
+                self.assertEqual(maximum.read_text(), "0\n")
+
+                procs.write_text("123\n", encoding="ascii")
+                self.assertEqual(smoke._lock_runtime_cgroup(runtime, 123), 1)
+                self.assertEqual(maximum.read_text(), "1\n")
+            finally:
+                smoke._close_runtime_cgroup(runtime)
+            for fd in descriptors:
+                with self.assertRaises(OSError) as closed:
+                    os.fstat(fd)
+                self.assertEqual(closed.exception.errno, errno.EBADF)
 
     def test_process_failures_stop_before_network(self) -> None:
         cases = {
@@ -821,7 +1052,7 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                     patch.object(smoke, "free_port", side_effect=AssertionError("network")),
                     self.assertRaises(RuntimeError) as caught,
                 ):
-                    smoke.run_offline_self_test(binary)
+                    smoke.run_offline_self_test(binary, smoke.sha256(binary))
                 self.assertNotIn("network", str(caught.exception))
 
             binary = root / "main-invalid"
@@ -832,17 +1063,17 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 str(ROOT / "config" / "llm-guard-proxy" / "config.toml"),
                 "--binary",
                 str(binary),
+                "--expected-binary-sha256",
+                smoke.sha256(binary),
                 "--root",
                 str(root / "run"),
             ]
             with (
                 patch.object(sys, "argv", argv),
-                patch.object(smoke, "free_port") as free_port,
                 redirect_stdout(io.StringIO()),
             ):
                 result = smoke.main()
             self.assertEqual(result, 1)
-            free_port.assert_not_called()
 
     def test_receipt_schema_and_f1_invariants_fail_closed(self) -> None:
         mutations = (
@@ -894,7 +1125,7 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 binary = Path(tmp) / name
                 self.write_self_test(binary, body=f"print({payload!r})\n")
                 with self.subTest(name=name), self.assertRaises(RuntimeError):
-                    smoke.run_offline_self_test(binary)
+                    smoke.run_offline_self_test(binary, smoke.sha256(binary))
 
     def test_executable_replacement_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -902,7 +1133,7 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
             binary = root / "guard"
             replacement = root / "replacement"
             self.write_self_test(binary)
-            _, identity = smoke.run_offline_self_test(binary)
+            _, identity = smoke.run_offline_self_test(binary, smoke.sha256(binary))
             self.write_self_test(replacement, body="print('replacement')\n")
             os.replace(replacement, binary)
             with self.assertRaises(RuntimeError):
@@ -931,7 +1162,7 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                     patch.object(smoke, "OFFLINE_SELF_TEST_TIMEOUT", timeout),
                     self.assertRaises(RuntimeError),
                 ):
-                    smoke.run_offline_self_test(binary)
+                    smoke.run_offline_self_test(binary, smoke.sha256(binary))
                 pid = int(pid_file.read_text())
                 with self.assertRaises(ChildProcessError):
                     os.waitpid(pid, os.WNOHANG)
@@ -955,7 +1186,7 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 patch.object(smoke, "OFFLINE_SELF_TEST_TIMEOUT", 0.2),
                 self.assertRaises(RuntimeError),
             ):
-                smoke.run_offline_self_test(binary)
+                smoke.run_offline_self_test(binary, smoke.sha256(binary))
             pid = int(child_pid.read_text())
             survived = smoke.process_identity_is_live(pid)
             try:
@@ -1544,6 +1775,74 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
         self.assertEqual(probe["role"], "recovery_probe")
         self.assertNotEqual(forged["role"], "recovery_probe")
 
+    def test_fixture_records_every_post_byte_attempt_once_at_parse_boundary(
+        self,
+    ) -> None:
+        fixture = smoke.Fixture(
+            "reason", "private", "fresh", "positive", "fresh-output"
+        )
+        server = smoke.FixtureHTTPServer(
+            ("127.0.0.1", 0), fixture.handler(), fixture
+        )
+        server.server_activate()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        exact = json.dumps(smoke.READINESS_PROBE_BODY, separators=(",", ":")).encode()
+        forged = json.dumps(
+            {"model": "aeon-ultimate", "messages": []}, separators=(",", ":")
+        ).encode()
+        requests = (
+            b"HEAD /v1/embeddings HTTP/1.1\r\nHost: fixture\r\n\r\n",
+            b"not-http\r\n\r\n",
+            b"G" * 65537 + b"\r\n",
+            b"GET /v1/models HTTP/1.1\r\nHost: fixture\r\n\r\n",
+            (
+                b"POST /v1/chat/completions HTTP/1.1\r\n"
+                b"Host: fixture\r\nContent-Type: application/json\r\n"
+                b"x-llm-guard-proxy-probe: local-recovery\r\n"
+                + f"Content-Length: {len(forged)}\r\n\r\n".encode()
+                + forged
+            ),
+            (
+                b"POST /v1/chat/completions HTTP/1.1\r\n"
+                b"Host: fixture\r\nContent-Type: application/json\r\n"
+                b"x-llm-guard-proxy-probe: local-recovery\r\n"
+                + f"Content-Length: {len(exact)}\r\n\r\n".encode()
+                + exact
+            ),
+        )
+        try:
+            for request in requests:
+                raw_fixture_request(server.server_port, request)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        attempts, errors = fixture.snapshot()
+        self.assertEqual(len(attempts), len(requests))
+        self.assertEqual(
+            [attempt["endpoint"] for attempt in attempts],
+            [
+                "embeddings",
+                "unknown",
+                "unknown",
+                "models",
+                "chat_completions",
+                "chat_completions",
+            ],
+        )
+        self.assertNotEqual(attempts[4]["role"], "recovery_probe")
+        self.assertEqual(attempts[5]["role"], "recovery_probe")
+        self.assertIn("fixture_request_parse_error", errors)
+
+        summary = passing_summary()
+        summary["attempts"].append(dict(attempts[3], number=5))
+        self.assertIn(
+            "unexpected_physical_business_attempt:5",
+            smoke.acceptance_errors(summary),
+        )
+
     def test_fixture_listener_requires_explicit_activation(self) -> None:
         fixture = smoke.Fixture(
             "reason", "private", "fresh", "positive", "fresh-output"
@@ -1599,7 +1898,7 @@ while True:
 """
         supervisor = None
         try:
-            supervisor = smoke.start_candidate_supervisor(
+            supervisor = start_test_candidate_supervisor(
                 [sys.executable, "-c", candidate, str(fake_port), str(guard_port)],
                 Path(self.fake_guard_tmp.name),
                 os.environ.copy(),
@@ -1617,6 +1916,87 @@ while True:
                 smoke.stop_candidate_supervisor(supervisor)
             smoke.stop_fixture_server(server, thread, fixture)
         self.assertEqual(fixture.snapshot()[0], [])
+
+    def test_runtime_pids_constraint_rejects_child_before_fixture_traffic(self) -> None:
+        candidate = r"""
+import errno, os, signal, socket, sys, time
+port, result = int(sys.argv[1]), sys.argv[2]
+signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+with socket.socket() as listener:
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", port))
+    listener.listen()
+    listener.accept()[0].close()
+    try:
+        child = os.fork()
+    except OSError as exc:
+        open(result, "w", encoding="ascii").write(str(exc.errno))
+    else:
+        if child == 0:
+            os._exit(0)
+        open(result, "w", encoding="ascii").write("forked")
+    while True:
+        time.sleep(1)
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            port = smoke.free_port()
+            result = root / "fork.result"
+            supervisor = start_test_candidate_supervisor(
+                [sys.executable, "-c", candidate, str(port), str(result)],
+                root,
+                os.environ.copy(),
+                root / "candidate.log",
+                binary=self.fake_guard,
+            )
+            try:
+                smoke.wait_port(port, supervisor, time.monotonic() + 2)
+                locked = smoke.lock_candidate_runtime(supervisor, port)
+                with socket.create_connection(("127.0.0.1", port), timeout=1):
+                    pass
+                deadline = time.monotonic() + 2
+                while not result.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(result.exists())
+                self.assertEqual(result.read_text(), str(errno.EAGAIN))
+                self.assertGreater(locked, 0)
+                smoke.require_candidate_runtime(supervisor, port)
+            finally:
+                smoke.stop_candidate_supervisor(supervisor)
+
+    def test_runtime_pids_lock_rejects_preexisting_wrong_child(self) -> None:
+        candidate = r"""
+import os, signal, socket, sys, time
+port = int(sys.argv[1])
+signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+if os.fork() == 0:
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+    while True:
+        time.sleep(1)
+with socket.socket() as listener:
+    listener.bind(("127.0.0.1", port))
+    listener.listen()
+    while True:
+        time.sleep(1)
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            port = smoke.free_port()
+            supervisor = start_test_candidate_supervisor(
+                [sys.executable, "-c", candidate, str(port)],
+                root,
+                os.environ.copy(),
+                root / "candidate.log",
+                binary=self.fake_guard,
+            )
+            try:
+                smoke.wait_port(port, supervisor, time.monotonic() + 2)
+                with self.assertRaisesRegex(
+                    RuntimeError, "^runtime_cgroup_not_exclusive$"
+                ):
+                    smoke.lock_candidate_runtime(supervisor, port)
+            finally:
+                smoke.stop_candidate_supervisor(supervisor)
 
     def test_final_snapshot_waits_for_handler_quiescence(self) -> None:
         fixture = smoke.Fixture("reason", "private", "fresh", "positive", "fresh-output")
@@ -1943,7 +2323,7 @@ while True:
                 ),
             ):
                 try:
-                    supervisor = smoke.start_candidate_supervisor(
+                    supervisor = start_test_candidate_supervisor(
                         [sys.executable, "-c", candidate, str(ready)],
                         root,
                         os.environ.copy(),
@@ -1980,8 +2360,25 @@ while True:
                         int(pid)
                         for pid in (scope_path / "cgroup.procs").read_text().split()
                     }
-                    self.assertIn(worker_pid, members)
-                    self.assertIn(candidate_pid, members)
+                    self.assertEqual(members, set())
+                    self.assertEqual(
+                        {
+                            int(pid)
+                            for pid in (
+                                scope_path / "supervisor" / "cgroup.procs"
+                            ).read_text().split()
+                        },
+                        {worker_pid},
+                    )
+                    self.assertEqual(
+                        {
+                            int(pid)
+                            for pid in (
+                                scope_path / "runtime" / "cgroup.procs"
+                            ).read_text().split()
+                        },
+                        {candidate_pid},
+                    )
                     deadline = time.monotonic() + 2
                     while not ready.exists() and time.monotonic() < deadline:
                         time.sleep(0.01)
@@ -2040,7 +2437,7 @@ with socket.socket() as listener:
             ):
                 try:
                     port = smoke.free_port()
-                    supervisor = smoke.start_candidate_supervisor(
+                    supervisor = start_test_candidate_supervisor(
                         [sys.executable, "-c", candidate, str(port)],
                         root,
                         os.environ.copy(),
@@ -2094,6 +2491,7 @@ with socket.socket() as listener:
             control,
             {},
             smoke.ScopeFence("test.scope", "/test.scope", -1, -1, worker_identity),
+            smoke.RuntimeCgroup("/test.scope/runtime", -1, -1, -1),
         )
         try:
             worker.kill()
@@ -2169,7 +2567,7 @@ with socket.socket() as listener:
                         patch.dict(os.environ, environment),
                         self.assertRaises(smoke.SupervisorStartError) as caught,
                     ):
-                        smoke.start_candidate_supervisor(
+                        start_test_candidate_supervisor(
                             [sys.executable, "-c", "raise SystemExit(99)"],
                             root,
                             os.environ.copy(),
@@ -2240,7 +2638,7 @@ while True:
             ready = root / "candidate.ready"
             unrelated_ready = root / "unrelated.ready"
             unrelated_term = root / "unrelated.term"
-            supervisor = smoke.start_candidate_supervisor(
+            supervisor = start_test_candidate_supervisor(
                 [sys.executable, "-c", candidate, str(ready)],
                 root,
                 os.environ.copy(),
@@ -2326,13 +2724,21 @@ while True:
                 "import importlib.util, json, pathlib, sys\n"
                 f"spec=importlib.util.spec_from_file_location('smoke', {str(ROOT / 'scripts' / 'llm_guard_proxy_loop_recovery_smoke.py')!r})\n"
                 "module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)\n"
+                "binary=pathlib.Path(sys.argv[1]); config=pathlib.Path(sys.argv[2]); root=pathlib.Path(sys.argv[3])\n"
                 "try:\n"
-                " module.authorize_candidate_supervisor(pathlib.Path(sys.argv[1]), sys.argv[1])\n"
+                " module.authorize_candidate_supervisor(binary, module.sha256(binary), [str(binary), str(config)], root, {'PATH':'/usr/bin:/bin'}, root/'candidate.log', config)\n"
                 "except module.SupervisorStartError as exc:\n"
                 " print(json.dumps(exc.cleanup, separators=(',', ':')))\n"
             )
             runner = subprocess.Popen(
-                [sys.executable, "-c", runner_code, str(binary)],
+                [
+                    sys.executable,
+                    "-c",
+                    runner_code,
+                    str(binary),
+                    str(TEST_CONFIG),
+                    str(root),
+                ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 text=True,
@@ -2390,7 +2796,7 @@ while True:
                 ready = root / "candidate.ready"
                 timeout = 0.5 if mode == "timeout" else smoke.SUPERVISOR_CONTROL_TIMEOUT
                 with patch.object(smoke, "SUPERVISOR_CONTROL_TIMEOUT", timeout):
-                    handle = smoke.start_candidate_supervisor(
+                    handle = start_test_candidate_supervisor(
                         [sys.executable, "-c", candidate, str(ready)],
                         root,
                         os.environ.copy(),
@@ -2545,7 +2951,7 @@ while True:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ready = root / "ready"
-            supervisor = smoke.start_candidate_supervisor(
+            supervisor = start_test_candidate_supervisor(
                 [sys.executable, "-c", child_ready, str(ready)],
                 root,
                 os.environ.copy(),
@@ -2607,6 +3013,8 @@ while True:
                         str(ROOT / "config" / "llm-guard-proxy" / "config.toml"),
                         "--binary",
                         str(binary),
+                        "--expected-binary-sha256",
+                        smoke.sha256(binary),
                         "--root",
                         str(base / "run"),
                     ],
@@ -2699,7 +3107,7 @@ while True:
                 unrelated_ready = root / "unrelated.ready"
                 unrelated_term = root / "unrelated.term"
                 baseline = smoke._capture_direct_children()
-                supervisor = smoke.start_candidate_supervisor(
+                supervisor = start_test_candidate_supervisor(
                     [
                         sys.executable,
                         "-c",
@@ -2824,6 +3232,8 @@ while True:
                         str(ROOT / "config" / "llm-guard-proxy" / "config.toml"),
                         "--binary",
                         str(binary),
+                        "--expected-binary-sha256",
+                        smoke.sha256(binary),
                         "--root",
                         str(root),
                     ]
