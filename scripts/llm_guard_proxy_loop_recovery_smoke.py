@@ -4143,6 +4143,8 @@ def acceptance_errors(summary: dict) -> list[str]:
         errors.append("proxy_not_exited")
     if not process_cleanup.get("graceful_stop") or process_cleanup.get("stop_error"):
         errors.append("proxy_not_gracefully_stopped")
+    if summary.get("service_quiesced_before_fixture_stop") is not True:
+        errors.append("service_not_quiesced_before_fixture_stop")
 
     fixture_cleanup = summary.get("fixture_cleanup", {})
     if fixture_cleanup.get("unexpected_exit"):
@@ -4535,6 +4537,7 @@ def _run_in_transient_service(args: argparse.Namespace) -> int:
             "service_main_pid": None,
             "service_control_group": None,
             "service_cleanup": None,
+            "service_quiesced_before_fixture_stop": False,
         }
         summary.update(hashes)
         command = _systemd_service_command(unit, executable, service_argv)
@@ -4719,9 +4722,6 @@ def _run_in_transient_service(args: argparse.Namespace) -> int:
         except Exception as exc:
             summary["execution_error"] = _stable_error(exc, "execution_failed")
         finally:
-            summary["fixture_cleanup"] = stop_fixture_server(
-                server, server_thread, fixture
-            )
             if fence is not None:
                 cleanup = _finish_service_fence(fence)
                 process_cleanup.update(_service_process_cleanup(fence, cleanup))
@@ -4757,6 +4757,14 @@ def _run_in_transient_service(args: argparse.Namespace) -> int:
                     "service_error": summary.get("execution_error"),
                 }
                 _collect_unit(cleanup, unit, None)
+            summary["service_quiesced_before_fixture_stop"] = bool(
+                cleanup.get("service_fence_established") is True
+                and cleanup.get("service_populated_final") == 0
+                and cleanup.get("service_quiesced") is True
+            )
+            summary["fixture_cleanup"] = stop_fixture_server(
+                server, server_thread, fixture
+            )
             try:
                 proc.communicate(timeout=SUPERVISOR_CLEANUP_TIMEOUT)
             except subprocess.TimeoutExpired:
@@ -4823,6 +4831,7 @@ def _run_in_transient_service(args: argparse.Namespace) -> int:
             and cleanup.get("service_fence_established")
             and cleanup.get("service_quiesced")
             and cleanup.get("service_collected")
+            and summary["service_quiesced_before_fixture_stop"]
         )
         if lifecycle_final:
             scan_stats: dict[str, int | float | bool] = {}
@@ -4901,6 +4910,7 @@ def main() -> int:
             json.dumps(
                 {
                     "execution_error": error,
+                    "service_quiesced_before_fixture_stop": False,
                     "acceptance_errors": [error["code"]],
                     "error_code": error["code"],
                     "result": "FAIL",

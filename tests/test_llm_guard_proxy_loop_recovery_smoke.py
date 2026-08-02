@@ -308,6 +308,7 @@ def passing_summary() -> dict:
         "execution_error": None,
         "subreaper_enabled": True,
         "exclusive_supervisor": True,
+        "service_quiesced_before_fixture_stop": True,
         "process_cleanup": {
             "exclusive_supervisor": True,
             "supervisor_exited": True,
@@ -3175,6 +3176,61 @@ class V5RootRepairRegressionTests(unittest.TestCase):
         self.assertTrue(cleanup["accept_barrier_completed"])
         self.assertTrue(cleanup["accept_barrier_empty"])
 
+
+class V6H2FinalizationOrderTests(unittest.TestCase):
+    def test_acceptance_requires_service_quiescence_before_fixture_stop(self) -> None:
+        summary = passing_summary()
+        summary["service_quiesced_before_fixture_stop"] = False
+        self.assertIn(
+            "service_not_quiesced_before_fixture_stop",
+            smoke.acceptance_errors(summary),
+        )
+
+    def test_service_quiescence_precedes_fixture_stop(self) -> None:
+        source = inspect.getsource(smoke._run_in_transient_service)
+        self.assertLess(
+            source.index("cleanup = _finish_service_fence(fence)"),
+            source.index('summary["fixture_cleanup"] = stop_fixture_server('),
+        )
+
+    def test_pre_quiescence_backlog_is_counted_before_final_snapshot(self) -> None:
+        fixture = smoke.Fixture(
+            "reason", "private", "fresh", "positive", "fresh-output"
+        )
+        server = smoke.FixtureHTTPServer(
+            ("127.0.0.1", 0), fixture.handler(), fixture
+        )
+        server.server_activate()
+        sent = threading.Event()
+
+        def delayed_service_request() -> None:
+            with socket.create_connection(server.server_address, timeout=2) as client:
+                client.sendall(
+                    b"GET /v1/models HTTP/1.1\r\n"
+                    b"Host: fixture\r\nConnection: close\r\n\r\n"
+                )
+            sent.set()
+
+        producer = threading.Thread(target=delayed_service_request, daemon=True)
+        producer.start()
+        self.assertTrue(sent.wait(timeout=2))
+        producer.join(timeout=2)
+        self.assertFalse(producer.is_alive())
+
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.01},
+            daemon=True,
+        )
+        server_thread.start()
+        cleanup = smoke.stop_fixture_server(server, server_thread, fixture)
+        attempts, errors = fixture.snapshot()
+
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(errors, [])
+        self.assertTrue(cleanup["accept_barrier_completed"])
+        self.assertTrue(cleanup["accept_barrier_empty"])
+        self.assertTrue(cleanup["handlers_quiesced"])
 
 
 if __name__ == "__main__":
