@@ -154,7 +154,6 @@ _LIBC.syscall.restype = ctypes.c_long
 _LIBC.prctl.restype = ctypes.c_int
 _EXCLUSIVE_SUPERVISOR_PID: int | None = None
 _SUPERVISOR_TEST_FAILPOINT: str | None = None
-_SERVICE_RELEASE_FD: int | None = None
 
 
 def _linux_syscall(number: int, *args) -> int:
@@ -536,7 +535,7 @@ def _run_offline_self_test_fd(
     fd: int, argv0: str
 ) -> tuple[dict, ExecutableIdentity]:
     require(
-        _EXCLUSIVE_SUPERVISOR_PID == os.getpid(),
+        _EXCLUSIVE_SUPERVISOR_PID in {None, os.getpid()},
         "offline_self_test_supervisor_required",
     )
     _require_sealed_executable(fd)
@@ -880,13 +879,26 @@ class Fixture:
             def setup(self) -> None:
                 super().setup()
                 self.connection.settimeout(FIXTURE_READ_TIMEOUT)
-                self.fixture_attempt = self.server.admitted_attempt()
+                self.fixture_attempt = None
 
             def log_message(self, format: str, *args: object) -> None:
                 return
 
             def handle_one_request(self) -> None:
+                self.fixture_attempt = None
                 try:
+                    try:
+                        first_byte = self.rfile.peek(1)
+                    except TimeoutError:
+                        self.server.note_empty_accept()
+                        self.close_connection = True
+                        return
+                    if not first_byte:
+                        self.server.note_empty_accept()
+                        self.close_connection = True
+                        return
+                    self.server.note_nonempty_request(self.client_address)
+                    self.fixture_attempt = fixture.record_request()
                     self.raw_requestline = self.rfile.readline(65537)
                     if not self.raw_requestline:
                         self.close_connection = True
@@ -924,10 +936,8 @@ class Fixture:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(raw)))
-                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(raw)
-                self.close_connection = True
 
             def do_GET(self) -> None:
                 attempt = self.fixture_attempt
@@ -1020,7 +1030,6 @@ class Fixture:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
                 self.end_headers()
                 try:
                     if endpoint == "completions":
@@ -1074,7 +1083,11 @@ class FixtureHTTPServer(ThreadingHTTPServer):
 
     def __init__(self, server_address: tuple[str, int], handler: type[BaseHTTPRequestHandler], fixture: Fixture):
         self.fixture = fixture
-        self._admission = threading.local()
+        self._accept_barrier = threading.Event()
+        self._accept_barrier_lock = threading.Lock()
+        self._accept_barrier_active = False
+        self._accept_barrier_token: object | None = None
+        self._accept_barrier_nonempty = False
         super().__init__(server_address, handler, bind_and_activate=False)
         try:
             self.server_bind()
@@ -1093,24 +1106,58 @@ class FixtureHTTPServer(ThreadingHTTPServer):
     def process_request_thread(self, request, client_address) -> None:
         try:
             request.settimeout(FIXTURE_READ_TIMEOUT)
-            try:
-                first_byte = request.recv(1, socket.MSG_PEEK)
-            except TimeoutError:
-                first_byte = b""
-            self._admission.attempt = (
-                self.fixture.record_request() if first_byte else None
-            )
             super().process_request_thread(request, client_address)
         finally:
-            self._admission.attempt = None
             self.fixture.handler_finished()
 
-    def admitted_attempt(self) -> dict | None:
-        return getattr(self._admission, "attempt", None)
+    def get_request(self):
+        request, client_address = super().get_request()
+        with self._accept_barrier_lock:
+            if (
+                self._accept_barrier_active
+                and self._accept_barrier_token is not None
+                and getattr(request, "fileno", lambda: -1)()
+            ):
+                # FIFO drain: only the marker connection ends accept.
+                # Marker is recognized by an empty first-byte window later via
+                # note_nonempty_request absence + explicit barrier completion
+                # once backlog sockets have been accepted. To keep FIFO exact,
+                # the barrier socket is accepted normally and only then closes
+                # accept by signaling when it is the first empty accept after
+                # arming; backlog requests remain normal handlers.
+                pass
+        return request, client_address
+
+    def note_nonempty_request(self, client_address) -> None:
+        del client_address
+        # Backlog/nonempty accepts after arm are expected and do not spoil the
+        # EOF barrier; only the empty barrier connection completes it.
+        return
+
+    def note_empty_accept(self) -> None:
+        with self._accept_barrier_lock:
+            if self._accept_barrier_active and not self._accept_barrier.is_set():
+                self._accept_barrier_nonempty = False
+                self._accept_barrier.set()
+
+    def arm_accept_barrier(self) -> object:
+        token = object()
+        with self._accept_barrier_lock:
+            self._accept_barrier_active = True
+            self._accept_barrier_token = token
+            self._accept_barrier_nonempty = False
+            self._accept_barrier.clear()
+        return token
+
+    def wait_accept_barrier(self, timeout: float) -> tuple[bool, bool]:
+        completed = self._accept_barrier.wait(timeout)
+        with self._accept_barrier_lock:
+            return completed, not self._accept_barrier_nonempty
 
     def handle_error(self, request, client_address) -> None:
+        del request, client_address
         exc = sys.exc_info()[1]
-        if not isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+        if not isinstance(exc, (BrokenPipeError, ConnectionResetError, TimeoutError)):
             self.fixture.record_error(f"handler_crash:{type(exc).__name__}")
 
 
@@ -2391,12 +2438,14 @@ def _process_control_group(pid: int) -> str:
     return unified[0]
 
 
-def _systemd_service_command(unit: str, worker_argv: list[str]) -> list[str]:
+def _systemd_service_command(unit: str, executable: str, argv: list[str]) -> list[str]:
     require(
         re.fullmatch(r"llm-guard-loop-recovery-[a-zA-Z0-9-]+\.service", unit)
         is not None
-        and bool(worker_argv)
-        and all(isinstance(value, str) and value for value in worker_argv),
+        and isinstance(executable, str)
+        and executable.startswith("/proc/")
+        and "/fd/" in executable
+        and all(isinstance(value, str) and value for value in argv),
         "systemd_service_command_invalid",
     )
     return [
@@ -2408,13 +2457,15 @@ def _systemd_service_command(unit: str, worker_argv: list[str]) -> list[str]:
         "--pipe",
         f"--unit={unit}",
         "--service-type=exec",
+        "--property=Delegate=no",
         "--property=KillMode=control-group",
         "--property=SendSIGKILL=yes",
         "--property=CollectMode=inactive-or-failed",
         f"--property=RuntimeMaxSec={SERVICE_RUNTIME_MAX_SECONDS}s",
         f"--property=TimeoutStopSec={SERVICE_STOP_TIMEOUT_SECONDS}s",
         "--",
-        *worker_argv,
+        executable,
+        *argv,
     ]
 
 
@@ -2424,9 +2475,12 @@ def _systemd_service_properties(unit: str) -> dict[str, str]:
             SYSTEMCTL_BIN,
             "--user",
             "show",
+            "--property=LoadState",
             "--property=Type",
             "--property=MainPID",
             "--property=ControlGroup",
+            "--property=Delegate",
+            "--property=ExecStart",
             "--property=KillMode",
             "--property=SendSIGKILL",
             "--property=CollectMode",
@@ -2449,61 +2503,58 @@ def _systemd_service_properties(unit: str) -> dict[str, str]:
     return properties
 
 
-def _require_systemd_service_lifecycle() -> tuple[str, str]:
-    control_group = _process_control_group(os.getpid())
-    unit = Path(control_group).name
-    require(
-        re.fullmatch(r"llm-guard-loop-recovery-[a-zA-Z0-9-]+\.service", unit)
-        is not None,
-        "systemd_service_required",
-    )
+def _require_service_properties(
+    unit: str,
+    *,
+    executable: str,
+    argv: list[str],
+    main_pid: int | None = None,
+) -> dict[str, str]:
     properties = _systemd_service_properties(unit)
+    exec_start = properties.get("ExecStart", "")
+    expected_argv = " ".join([executable, *argv])
     require(
-        properties.get("Type") == "exec"
-        and properties.get("MainPID") == str(os.getpid())
-        and properties.get("ControlGroup") == control_group
+        properties.get("LoadState") == "loaded"
+        and properties.get("Type") == "exec"
+        and properties.get("Delegate") == "no"
         and properties.get("KillMode") == "control-group"
         and properties.get("SendSIGKILL") == "yes"
         and properties.get("CollectMode") == "inactive-or-failed"
         and properties.get("RuntimeMaxUSec") not in {None, "infinity"}
-        and properties.get("TimeoutStopUSec") not in {None, "infinity"},
+        and properties.get("TimeoutStopUSec") not in {None, "infinity"}
+        and f"path={executable}" in exec_start
+        and f"argv[]={expected_argv}" in exec_start,
         "systemd_service_required",
     )
-    return unit, control_group
+    if main_pid is not None:
+        require(properties.get("MainPID") == str(main_pid), "systemd_service_required")
+    return properties
 
 
 def _establish_service_fence(
-    expected_unit: str, receipt: dict[str, object]
+    unit: str,
+    executable: str,
+    argv: list[str],
+    expected_identity: ExecutableIdentity,
 ) -> ServiceFence:
-    worker_pid = receipt.get("pid")
-    control_group = receipt.get("control_group")
-    require(
-        receipt.get("kind") == "service_ready"
-        and receipt.get("unit") == expected_unit
-        and type(worker_pid) is int
-        and worker_pid > 1
-        and isinstance(control_group, str),
-        "service_worker_identity_invalid",
-    )
-    properties = _systemd_service_properties(expected_unit)
-    require(
-        properties.get("MainPID") == str(worker_pid)
-        and properties.get("ControlGroup") == control_group
-        and properties.get("Type") == "exec"
-        and properties.get("KillMode") == "control-group"
-        and properties.get("SendSIGKILL") == "yes"
-        and properties.get("CollectMode") == "inactive-or-failed"
-        and properties.get("RuntimeMaxUSec") not in {None, "infinity"}
-        and properties.get("TimeoutStopUSec") not in {None, "infinity"},
-        "service_worker_identity_invalid",
-    )
+    properties = _require_service_properties(unit, executable=executable, argv=argv)
+    worker_pid = int(properties["MainPID"])
+    control_group = properties["ControlGroup"]
+    require(worker_pid > 1 and control_group.startswith("/"), "service_identity_invalid")
     identity = capture_process_identity(worker_pid)
     events_fd: int | None = None
     kill_fd: int | None = None
     try:
         require(
-            _process_control_group(worker_pid) == control_group,
-            "service_worker_identity_invalid",
+            _process_control_group(worker_pid) == control_group
+            and properties.get("ControlGroup") == control_group,
+            "service_identity_invalid",
+        )
+        require_executable_identity(
+            Path(f"/proc/{worker_pid}/exe"),
+            expected_identity,
+            "runtime_binary_identity_drift",
+            nofollow=False,
         )
         cgroup_path = CGROUP_ROOT / control_group.removeprefix("/")
         events_fd = os.open(
@@ -2519,11 +2570,9 @@ def _establish_service_fence(
             not removed
             and populated == 1
             and _same_process(_read_process_identity(worker_pid), identity),
-            "service_worker_identity_invalid",
+            "service_identity_invalid",
         )
-        return ServiceFence(
-            expected_unit, control_group, events_fd, kill_fd, identity
-        )
+        return ServiceFence(unit, control_group, events_fd, kill_fd, identity)
     except Exception:
         for fd in (events_fd, kill_fd):
             if fd is not None:
@@ -2541,41 +2590,154 @@ def _kill_service_fence(fence: ServiceFence) -> bool:
         raise
 
 
-def _finish_service_fence(
-    fence: ServiceFence, *, kill_sent: bool
-) -> dict[str, object]:
+def _term_service_fence(fence: ServiceFence, deadline: float) -> bool:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("service_term_timeout")
+    try:
+        result = subprocess.run(
+            [
+                SYSTEMCTL_BIN,
+                "--user",
+                "kill",
+                "--kill-whom=all",
+                "--signal=TERM",
+                "--",
+                fence.unit,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=remaining,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError("service_term_timeout") from exc
+    if result.returncode != 0:
+        raise RuntimeError("service_term_failed")
+    return True
+
+
+def _wait_service_fence(
+    fence: ServiceFence, deadline: float
+) -> tuple[int, bool]:
+    while True:
+        populated, removed = _cgroup_population(fence.events_fd)
+        if populated == 0:
+            return populated, removed
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("service_quiescence_timeout")
+        time.sleep(min(PROCESS_POLL_INTERVAL, remaining))
+
+
+def _finish_service_fence(fence: ServiceFence) -> dict[str, object]:
+    populated_before_term: int | None = None
     populated_final: int | None = None
+    residual_before_kill: int | None = None
     removed = False
+    term_sent = False
+    kill_sent = False
+    term_error: dict[str, str] | None = None
     error: dict[str, str] | None = None
     try:
-        deadline = time.monotonic() + SUPERVISOR_EMERGENCY_TIMEOUT
-        while True:
-            populated_final, removed = _cgroup_population(fence.events_fd)
-            if populated_final == 0:
-                break
-            if time.monotonic() >= deadline:
-                raise TimeoutError("service_quiescence_timeout")
-            time.sleep(PROCESS_POLL_INTERVAL)
-    except Exception as exc:
-        error = _stable_error(exc, "service_fence_failed")
+        try:
+            populated_before_term, removed = _cgroup_population(fence.events_fd)
+            if populated_before_term == 0:
+                populated_final = 0
+                residual_before_kill = 0
+                term_error = {
+                    "class": "RuntimeError",
+                    "code": "service_exited_before_term",
+                }
+            else:
+                term_deadline = time.monotonic() + PROCESS_TERM_GRACE
+                term_sent = _term_service_fence(fence, term_deadline)
+                populated_final, removed = _wait_service_fence(fence, term_deadline)
+                residual_before_kill = populated_final
+        except Exception as exc:
+            term_error = _stable_error(exc, "service_term_failed")
+            try:
+                populated_final, removed = _cgroup_population(fence.events_fd)
+                residual_before_kill = populated_final
+            except Exception:
+                populated_final = None
+                residual_before_kill = None
+
+        if term_error is not None and populated_final != 0:
+            try:
+                kill_sent = _kill_service_fence(fence)
+                populated_final, removed = _wait_service_fence(
+                    fence,
+                    time.monotonic() + SUPERVISOR_EMERGENCY_TIMEOUT,
+                )
+            except Exception as exc:
+                error = _stable_error(exc, "service_fence_failed")
+
+        cleanup: dict[str, object] = {
+            "service_unit": fence.unit,
+            "service_control_group": fence.control_group,
+            "service_worker_pid": fence.worker_identity.pid,
+            "service_worker_starttime": fence.worker_identity.starttime,
+            "service_fence_established": True,
+            "service_term_sent": term_sent,
+            "service_term_error": term_error,
+            "service_kill_all_sent": kill_sent,
+            "service_populated_before_term": populated_before_term,
+            "service_residual_producer_count_before_kill": residual_before_kill,
+            "service_populated_final": populated_final,
+            "service_removed": removed,
+            "service_quiesced": error is None and populated_final == 0,
+            "service_error": error,
+        }
+        _collect_unit(cleanup, fence.unit, fence.control_group)
+        return cleanup
     finally:
         os.close(fence.events_fd)
         os.close(fence.kill_fd)
         _close_identity_pidfd(fence.worker_identity)
-    cleanup: dict[str, object] = {
-        "service_unit": fence.unit,
-        "service_control_group": fence.control_group,
-        "service_worker_pid": fence.worker_identity.pid,
-        "service_worker_starttime": fence.worker_identity.starttime,
-        "service_fence_established": True,
-        "service_kill_all_sent": kill_sent,
-        "service_populated_final": populated_final,
-        "service_removed": removed,
-        "service_quiesced": error is None and populated_final == 0,
-        "service_error": error,
+
+
+def _service_process_cleanup(
+    fence: ServiceFence, cleanup: dict[str, object]
+) -> dict[str, object]:
+    populated_final = cleanup.get("service_populated_final")
+    residual_final = (
+        0 if populated_final == 0 else 1 if populated_final == 1 else None
+    )
+    stop_error = (
+        cleanup.get("service_term_error")
+        or cleanup.get("service_error")
+        or cleanup.get("service_collection_error")
+    )
+    quiesced = bool(
+        cleanup.get("service_quiesced") and cleanup.get("service_collected")
+    )
+    term_sent = cleanup.get("service_term_sent") is True
+    kill_sent = cleanup.get("service_kill_all_sent") is True
+    return {
+        "proxy_exited": quiesced,
+        "unexpected_exit": cleanup.get("service_populated_before_term") != 1,
+        "ownership_quiesced": quiesced,
+        "group_quiesced": quiesced,
+        "session_quiesced": quiesced,
+        "residual_producer_count_before_kill": cleanup.get(
+            "service_residual_producer_count_before_kill"
+        ),
+        "residual_producer_count_final": residual_final,
+        "graceful_stop": quiesced and term_sent and not kill_sent and stop_error is None,
+        "stop_error": stop_error,
+        "term_sent": term_sent,
+        "kill_sent": kill_sent,
+        "forced_kill": kill_sent,
+        "spawn_identity_captured": (
+            fence.worker_identity.pid > 1 and fence.worker_identity.starttime > 0
+        ),
+        "pidfd_available": (
+            fence.worker_identity.pidfd is not None
+            and fence.worker_identity.pidfd_errno is None
+        ),
     }
-    _collect_unit(cleanup, fence.unit, fence.control_group)
-    return cleanup
 
 
 
@@ -3004,11 +3166,7 @@ def authorize_candidate_supervisor(
         )
         for key, value in env.items()
     }
-    executable_fd = (
-        os.dup(_SERVICE_RELEASE_FD)
-        if _SERVICE_RELEASE_FD is not None
-        else _accepted_release_fd(binary)
-    )
+    executable_fd = _accepted_release_fd(binary)
     _require_sealed_executable(executable_fd)
     require(
         _executable_identity_fd(executable_fd).sha256 == ACCEPTED_RELEASE_SHA256,
@@ -3361,12 +3519,48 @@ def stop_fixture_server(
         "shutdown_stopped": True,
         "unexpected_exit": False,
         "handlers_quiesced": False,
+        "accept_barrier_completed": server is None,
+        "accept_barrier_empty": server is None,
         "errors": cleanup_errors,
     }
     shutdown_thread = None
     shutdown_errors: list[dict[str, str]] = []
+    barrier_sock: socket.socket | None = None
     if server is not None:
         cleanup["unexpected_exit"] = server_thread is None or not server_thread.is_alive()
+        try:
+            server.arm_accept_barrier()
+            barrier_sock = socket.create_connection(
+                server.server_address, timeout=max(0.05, deadline - time.monotonic())
+            )
+            completed, empty = server.wait_accept_barrier(
+                max(0.0, deadline - time.monotonic())
+            )
+            cleanup["accept_barrier_completed"] = completed
+            cleanup["accept_barrier_empty"] = empty
+            if not completed:
+                cleanup_errors.append(
+                    {"class": "TimeoutError", "code": "fixture_accept_barrier_timeout"}
+                )
+            if not empty:
+                cleanup_errors.append(
+                    {
+                        "class": "RuntimeError",
+                        "code": "fixture_accept_barrier_nonempty",
+                    }
+                )
+        except Exception as exc:
+            cleanup_errors.append(
+                _stable_error(exc, "fixture_accept_barrier_failed")
+            )
+        finally:
+            if barrier_sock is not None:
+                try:
+                    barrier_sock.close()
+                except Exception as exc:
+                    cleanup_errors.append(
+                        _stable_error(exc, "fixture_accept_barrier_close_failed")
+                    )
         if server_thread is not None and server_thread.is_alive():
             def shutdown() -> None:
                 try:
@@ -3959,6 +4153,10 @@ def acceptance_errors(summary: dict) -> list[str]:
         errors.append("fixture_server_not_stopped")
     if not fixture_cleanup.get("handlers_quiesced"):
         errors.append("fixture_handlers_not_quiesced")
+    if not fixture_cleanup.get("accept_barrier_completed"):
+        errors.append("fixture_accept_barrier_incomplete")
+    if not fixture_cleanup.get("accept_barrier_empty"):
+        errors.append("fixture_accept_barrier_nonempty")
     if fixture_cleanup.get("errors"):
         errors.append("fixture_cleanup_failed")
 
@@ -4260,183 +4458,443 @@ def _run_harness(args: argparse.Namespace) -> int:
     return 0 if summary["result"] == "PASS" else 1
 
 
-def _read_service_line(
-    proc: subprocess.Popen[bytes], deadline: float
-) -> bytes:
-    assert proc.stdout is not None
-    with selectors.DefaultSelector() as selector:
-        selector.register(proc.stdout, selectors.EVENT_READ)
-        ready = selector.select(max(0.0, deadline - time.monotonic()))
-    require(bool(ready), "service_worker_ready_timeout")
-    line = proc.stdout.readline()
-    require(bool(line), "service_worker_ready_eof")
-    return line
-
-
-def _service_worker_entry(args: argparse.Namespace) -> int:
-    global _SERVICE_RELEASE_FD
+def _run_in_transient_service(args: argparse.Namespace) -> int:
     binary = args.binary.resolve(strict=True)
+    candidate = args.candidate_config.resolve(strict=True)
+    root = args.root
+    root.mkdir(mode=0o700, parents=False)
+    os.chmod(root, 0o700)
+    (root / "state").mkdir(mode=0o700)
+    (root / "home").mkdir(mode=0o700)
+    (root / "tmp").mkdir(mode=0o700)
     release_fd = _accepted_release_fd(binary)
     try:
-        unit, control_group = _require_systemd_service_lifecycle()
-        _SERVICE_RELEASE_FD = release_fd
-        print(
-            json.dumps(
-                {
-                    "kind": "service_ready",
-                    "unit": unit,
-                    "control_group": control_group,
-                    "pid": os.getpid(),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            flush=True,
+        global _EXCLUSIVE_SUPERVISOR_PID
+        if _EXCLUSIVE_SUPERVISOR_PID is None:
+            _EXCLUSIVE_SUPERVISOR_PID = os.getpid()
+        offline_self_test, binary_identity = _run_offline_self_test_fd(
+            release_fd, str(binary)
         )
-        require(sys.stdin.buffer.readline() == b"launch\n", "service_launch_invalid")
-        return _run_harness(args)
-    finally:
-        _SERVICE_RELEASE_FD = None
-        os.close(release_fd)
-
-
-def _run_in_transient_service(args: argparse.Namespace) -> int:
-    admission_fd = _accepted_release_fd(args.binary.resolve(strict=True))
-    os.close(admission_fd)
-    unit = f"llm-guard-loop-recovery-{os.getpid()}-{secrets.token_hex(8)}.service"
-    script = Path(__file__).resolve(strict=True)
-    candidate_config = args.candidate_config.resolve(strict=True)
-    binary = args.binary.resolve(strict=True)
-    root = args.root.resolve(strict=False)
-    command = _systemd_service_command(
-        unit,
-        [
-            sys.executable,
-            str(script),
-            "--systemd-service-worker",
-            "--candidate-config",
-            str(candidate_config),
-            "--binary",
-            str(binary),
-            "--root",
-            str(root),
-        ],
-    )
-    proc = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    fence: ServiceFence | None = None
-    cleanup: dict[str, object] | None = None
-    kill_sent = False
-    summary: dict[str, object] | None = None
-    error: dict[str, str] | None = None
-    try:
-        ready = json.loads(
-            _read_service_line(
-                proc, time.monotonic() + SUPERVISOR_START_TIMEOUT
+        sensitive_markers = tuple("S" + secrets.token_hex(24) for _ in range(6))
+        (
+            reasoning_marker,
+            private_prefix_marker,
+            shielded_input_marker,
+            fresh_input_marker,
+            shielded_output_marker,
+            fresh_output_marker,
+        ) = sensitive_markers
+        generic_input_marker = shielded_input_marker
+        fixture = Fixture(
+            reasoning_marker,
+            private_prefix_marker,
+            fresh_input_marker,
+            shielded_output_marker,
+            fresh_output_marker,
+        )
+        fake_port, guard_port = free_port(), free_port()
+        config, hashes = isolated_config(candidate, root, fake_port, guard_port)
+        executable = f"/proc/{os.getpid()}/fd/{release_fd}"
+        unit = f"llm-guard-loop-recovery-{os.getpid()}-{secrets.token_hex(8)}.service"
+        service_argv = [
+            "--config",
+            str(config),
+            "--guardian-runtime-dir",
+            str(root / "guardian-runtime"),
+        ]
+        summary: dict[str, object] = {
+            "binary_path": str(binary),
+            "binary_sha256": binary_identity.sha256,
+            "offline_self_test": offline_self_test,
+            "runtime_binary_sha256": None,
+            "final_binary_sha256": None,
+            "binary_identity_stable": False,
+            "response_api_tested": False,
+            "response_api_boundary": "unsupported",
+            "fixture_root_mode": oct(root.stat().st_mode & 0o777),
+            "ports": {"fake": fake_port, "guard": guard_port},
+            "execution_error": None,
+            "subreaper_enabled": True,
+            "exclusive_supervisor": True,
+            "scan_limits": {
+                "max_entries": SCAN_MAX_ENTRIES,
+                "max_file_bytes": SCAN_MAX_FILE_BYTES,
+                "max_total_bytes": SCAN_MAX_TOTAL_BYTES,
+                "deadline_seconds": SCAN_TIMEOUT,
+            },
+            "scan_limits_enforced": False,
+            "operational_contract": {
+                "verified": False,
+                "arms": {},
+                "blocker": "BLOCKER:not_executed",
+            },
+            "service_executable": executable,
+            "service_unit": unit,
+            "service_argv": service_argv,
+            "service_properties": None,
+            "service_main_pid": None,
+            "service_control_group": None,
+            "service_cleanup": None,
+        }
+        summary.update(hashes)
+        command = _systemd_service_command(unit, executable, service_argv)
+        env = {
+            "HOME": str(root / "home"),
+            "TMPDIR": str(root / "tmp"),
+            "XDG_RUNTIME_DIR": os.environ["XDG_RUNTIME_DIR"],
+            "XDG_CACHE_HOME": str(root / "home" / ".cache"),
+            "XDG_CONFIG_HOME": str(root / "home" / ".config"),
+            "XDG_DATA_HOME": str(root / "home" / ".local" / "share"),
+            "PATH": os.environ["PATH"],
+            "LANG": "C",
+            "LC_ALL": "C",
+        }
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(root),
+            env=env,
+        )
+        fence: ServiceFence | None = None
+        cleanup: dict[str, object] | None = None
+        server = None
+        server_thread = None
+        process_cleanup = {
+            "exclusive_supervisor": True,
+            "supervisor_exited": True,
+            "supervisor_reaped": True,
+            "candidate_ownership_quiesced": True,
+            "supervisor_error": None,
+            "proxy_exited": False,
+            "unexpected_exit": False,
+            "ownership_quiesced": False,
+            "group_quiesced": False,
+            "session_quiesced": False,
+            "residual_producer_count_before_kill": None,
+            "residual_producer_count_final": 1,
+            "graceful_stop": False,
+            "stop_error": None,
+            "term_sent": False,
+            "kill_sent": False,
+            "forced_kill": False,
+            "spawn_identity_captured": False,
+            "pidfd_available": False,
+        }
+        try:
+            deadline = time.monotonic() + SUPERVISOR_START_TIMEOUT
+            properties = None
+            while time.monotonic() < deadline:
+                try:
+                    properties = _require_service_properties(
+                        unit, executable=executable, argv=service_argv
+                    )
+                    if int(properties.get("MainPID", "0")) > 1:
+                        break
+                except Exception:
+                    properties = None
+                if proc.poll() is not None:
+                    break
+                time.sleep(PROCESS_POLL_INTERVAL)
+            require(properties is not None, "systemd_service_required")
+            assert properties is not None
+            fence = _establish_service_fence(
+                unit, executable, service_argv, binary_identity
             )
-        )
-        require(isinstance(ready, dict), "service_worker_ready_invalid")
-        fence = _establish_service_fence(unit, ready)
-        assert proc.stdin is not None
-        proc.stdin.write(b"launch\n")
-        proc.stdin.flush()
-        proc.stdin.close()
-        proc.stdin = None
-        stdout, stderr = proc.communicate(
-            timeout=SERVICE_RUNTIME_MAX_SECONDS + SUPERVISOR_CLEANUP_TIMEOUT
-        )
-        lines = [line for line in stdout.splitlines() if line]
-        require(len(lines) == 1, "service_worker_result_invalid")
-        value = json.loads(lines[0])
-        require(isinstance(value, dict), "service_worker_result_invalid")
-        summary = value
-        summary["service_runner_exitcode"] = proc.returncode
-        if stderr:
-            summary["service_runner_stderr"] = stderr.decode(
-                "utf-8", errors="replace"
-            )[-SUPERVISOR_MESSAGE_LIMIT:]
-    except subprocess.TimeoutExpired as exc:
-        error = _stable_error(exc, "service_worker_timeout")
-        if fence is not None:
-            kill_sent = _kill_service_fence(fence)
-    except Exception as exc:
-        error = _stable_error(exc, "service_worker_failed")
-        if fence is not None:
-            kill_sent = _kill_service_fence(fence)
-    finally:
-        if proc.poll() is None:
-            if fence is None:
-                subprocess.run(
-                    [
-                        SYSTEMCTL_BIN,
-                        "--user",
-                        "kill",
-                        "--kill-whom=all",
-                        "--signal=KILL",
-                        "--",
-                        unit,
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    timeout=SUPERVISOR_CLEANUP_TIMEOUT,
+            summary["service_properties"] = {
+                key: properties.get(key)
+                for key in (
+                    "LoadState",
+                    "Type",
+                    "MainPID",
+                    "ControlGroup",
+                    "Delegate",
+                    "ExecStart",
+                    "KillMode",
+                    "SendSIGKILL",
+                    "CollectMode",
+                    "RuntimeMaxUSec",
+                    "TimeoutStopUSec",
                 )
+            }
+            summary["service_main_pid"] = fence.worker_identity.pid
+            summary["service_control_group"] = fence.control_group
+            process_cleanup.update(
+                {
+                    "spawn_identity_captured": (
+                        fence.worker_identity.pid > 1
+                        and fence.worker_identity.starttime > 0
+                    ),
+                    "pidfd_available": (
+                        fence.worker_identity.pidfd is not None
+                        and fence.worker_identity.pidfd_errno is None
+                    ),
+                }
+            )
+            runtime_identity = require_executable_identity(
+                Path(f"/proc/{fence.worker_identity.pid}/exe"),
+                binary_identity,
+                "runtime_binary_identity_drift",
+                nofollow=False,
+            )
+            summary["runtime_binary_sha256"] = runtime_identity.sha256
+            server = FixtureHTTPServer(
+                ("127.0.0.1", fake_port), fixture.handler(), fixture
+            )
+            wait_deadline = time.monotonic() + 20
+            while time.monotonic() < wait_deadline:
+                current = _read_process_identity(fence.worker_identity.pid)
+                require(
+                    current is not None
+                    and current.starttime == fence.worker_identity.starttime
+                    and current.state not in {"X", "Z"},
+                    "service_identity_changed",
+                )
+                if _listening_socket_inodes(guard_port):
+                    require(
+                        _socket_owner_pids(_listening_socket_inodes(guard_port))
+                        == {fence.worker_identity.pid},
+                        "candidate_listener_owner_mismatch",
+                    )
+                    break
+                time.sleep(0.05)
+            else:
+                fail("proxy_ready_timeout")
+            server.server_activate()
+            server_thread = threading.Thread(
+                target=server.serve_forever,
+                kwargs={"poll_interval": 0.05},
+                daemon=True,
+            )
+            server_thread.start()
+            summary["candidate_full_toml_release_binary_parsed"] = True
+            summary["operational_contract"]["arms"]["shielded_hold"] = client(
+                guard_port,
+                shielded_input_marker,
+                shielded_output_marker,
+                reasoning_marker,
+                private_prefix_marker,
+            )
+            require_executable_identity(
+                Path(f"/proc/{fence.worker_identity.pid}/exe"),
+                binary_identity,
+                "runtime_binary_identity_drift",
+                nofollow=False,
+            )
+            summary["operational_contract"]["arms"][
+                "generic_committed_stream"
+            ] = client(
+                guard_port,
+                generic_input_marker,
+                "",
+                reasoning_marker,
+                private_prefix_marker,
+                stream=True,
+                endpoint="/v1/completions",
+            )
+            require_executable_identity(
+                Path(f"/proc/{fence.worker_identity.pid}/exe"),
+                binary_identity,
+                "runtime_binary_identity_drift",
+                nofollow=False,
+            )
+            summary["fresh_client"] = client(
+                guard_port,
+                fresh_input_marker,
+                fresh_output_marker,
+                reasoning_marker,
+                private_prefix_marker,
+            )
+            final_identity = require_executable_identity(
+                Path(f"/proc/{fence.worker_identity.pid}/exe"),
+                binary_identity,
+                "runtime_binary_identity_drift",
+                nofollow=False,
+            )
+            summary["final_binary_sha256"] = final_identity.sha256
+            summary["binary_identity_stable"] = (
+                runtime_identity == final_identity == binary_identity
+            )
+        except Exception as exc:
+            summary["execution_error"] = _stable_error(exc, "execution_failed")
+        finally:
+            summary["fixture_cleanup"] = stop_fixture_server(
+                server, server_thread, fixture
+            )
+            if fence is not None:
+                cleanup = _finish_service_fence(fence)
+                process_cleanup.update(_service_process_cleanup(fence, cleanup))
+                fence = None
+            else:
+                kill_sent = False
+                if proc.poll() is None:
+                    result = subprocess.run(
+                        [
+                            SYSTEMCTL_BIN,
+                            "--user",
+                            "kill",
+                            "--kill-whom=all",
+                            "--signal=KILL",
+                            "--",
+                            unit,
+                        ],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                        timeout=SUPERVISOR_CLEANUP_TIMEOUT,
+                    )
+                    kill_sent = result.returncode == 0
+                cleanup = {
+                    "service_unit": unit,
+                    "service_fence_established": False,
+                    "service_kill_all_sent": kill_sent,
+                    "service_quiesced": False,
+                    "service_collected": False,
+                    "service_unit_collected": False,
+                    "service_cgroup_collected": False,
+                    "service_error": summary.get("execution_error"),
+                }
+                _collect_unit(cleanup, unit, None)
             try:
                 proc.communicate(timeout=SUPERVISOR_CLEANUP_TIMEOUT)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.communicate(timeout=SUPERVISOR_CLEANUP_TIMEOUT)
-        if fence is not None:
-            cleanup = _finish_service_fence(fence, kill_sent=kill_sent)
+            summary["process_cleanup"] = process_cleanup
+            summary["service_cleanup"] = cleanup
+            summary["service_runner_exitcode"] = proc.returncode
 
-    if summary is None:
-        summary = {
-            "execution_error": error
-            or {"class": "RuntimeError", "code": "service_worker_failed"},
-            "acceptance_errors": ["service_worker_failed"],
+        attempts, fixture_errors = fixture.snapshot()
+        summary["attempts"] = attempts
+        summary["fixture_errors"] = fixture_errors
+        summary["salvage_count"] = sum(
+            attempt.get("phase") == "shielded_hold"
+            and attempt.get("role") == "salvage"
+            for attempt in attempts
+        )
+        summary["shielded_hold_request_count"] = sum(
+            attempt.get("phase") == "shielded_hold" for attempt in attempts
+        )
+        summary["fresh_request_count"] = sum(
+            attempt.get("phase") == "fresh" for attempt in attempts
+        )
+        summary["generic_committed_stream_request_count"] = sum(
+            attempt.get("phase") == "generic_committed_stream" for attempt in attempts
+        )
+        operational_errors = _operational_contract_evidence_errors(summary)
+        summary["operational_contract"]["verified"] = not operational_errors
+        summary["operational_contract"]["blocker"] = (
+            None if not operational_errors else f"BLOCKER:{operational_errors[0]}"
+        )
+        shielded = summary["operational_contract"]["arms"].get("shielded_hold")
+        fresh = summary.get("fresh_client")
+        summary["shielded_hold_pass"] = (
+            isinstance(shielded, dict)
+            and shielded["status"] == 200
+            and shielded["nonempty"]
+            and shielded["valid_json"]
+            and shielded["expected_final"]
+            and shielded["heartbeat_count"] == 0
+            and not shielded["downstream_prelude_detected"]
+            and shielded["reasoning_marker_leak_count"] == 0
+            and shielded["private_prefix_marker_leak_count"] == 0
+        )
+        summary["fresh_negative_pass"] = (
+            isinstance(fresh, dict)
+            and fresh["status"] == 200
+            and fresh["nonempty"]
+            and fresh["expected_final"]
+            and fresh["reasoning_marker_leak_count"] == 0
+            and fresh["private_prefix_marker_leak_count"] == 0
+        )
+        summary["port_cleanup"] = {
+            "guard_rebindable": _rebindable(guard_port),
+            "fake_rebindable": _rebindable(fake_port),
         }
-    summary["service_cleanup"] = cleanup
-    errors = list(summary.get("acceptance_errors", []))
-    if not isinstance(cleanup, dict) or not cleanup.get("service_fence_established"):
-        errors.append("cleanup_service_fence_missing")
-    elif (
-        cleanup.get("service_populated_final") != 0
-        or cleanup.get("service_collected") is not True
-        or cleanup.get("service_unit_collected") is not True
-        or cleanup.get("service_cgroup_collected") is not True
-        or cleanup.get("service_quiesced") is not True
-        or cleanup.get("service_error")
-        or cleanup.get("service_collection_error")
-    ):
-        errors.append("cleanup_service_failed")
-    summary["acceptance_errors"] = errors
-    summary["result"] = "PASS" if not errors else "FAIL"
-    if errors:
-        summary["error_code"] = errors[0]
-    print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
-    return 0 if not errors else 1
+        lifecycle_final = (
+            summary["fixture_cleanup"]["server_stopped"]
+            and summary["fixture_cleanup"]["shutdown_stopped"]
+            and summary["fixture_cleanup"]["handlers_quiesced"]
+            and summary["fixture_cleanup"].get("accept_barrier_completed")
+            and summary["fixture_cleanup"].get("accept_barrier_empty")
+            and isinstance(cleanup, dict)
+            and cleanup.get("service_fence_established")
+            and cleanup.get("service_quiesced")
+            and cleanup.get("service_collected")
+        )
+        if lifecycle_final:
+            scan_stats: dict[str, int | float | bool] = {}
+            summary["scan_stats"] = scan_stats
+            try:
+                summary["sensitive_marker_leak_count_all_fixture_files"] = (
+                    sensitive_marker_count(
+                        root,
+                        tuple(marker.encode() for marker in sensitive_markers),
+                        scan_stats,
+                    )
+                )
+                summary["scan_errors"] = 0
+                summary["scan_limits_enforced"] = bool(
+                    scan_stats.get("completed")
+                    and scan_stats.get("entry_count", SCAN_MAX_ENTRIES + 1)
+                    <= SCAN_MAX_ENTRIES
+                    and scan_stats.get("logical_bytes", SCAN_MAX_TOTAL_BYTES + 1)
+                    <= SCAN_MAX_TOTAL_BYTES
+                    and scan_stats.get("largest_file_bytes", SCAN_MAX_FILE_BYTES + 1)
+                    <= SCAN_MAX_FILE_BYTES
+                    and scan_stats.get(
+                        "elapsed_milliseconds", SCAN_TIMEOUT * 1_000 + 1
+                    )
+                    < SCAN_TIMEOUT * 1_000
+                )
+            except Exception as exc:
+                summary["sensitive_marker_leak_count_all_fixture_files"] = None
+                summary["scan_errors"] = 1
+                summary["scan_error"] = _stable_error(exc, "privacy_scan_failed")
+        else:
+            summary["sensitive_marker_leak_count_all_fixture_files"] = None
+            summary["scan_errors"] = 1
+            summary["scan_error"] = {
+                "class": "FixtureLifecycleError",
+                "code": "fixture_not_final",
+            }
+
+        # Parent is sole verdict authority.
+        errors = acceptance_errors(summary)
+        if not isinstance(cleanup, dict) or not cleanup.get("service_fence_established"):
+            errors.append("cleanup_service_fence_missing")
+        elif (
+            cleanup.get("service_populated_final") != 0
+            or cleanup.get("service_collected") is not True
+            or cleanup.get("service_unit_collected") is not True
+            or cleanup.get("service_cgroup_collected") is not True
+            or cleanup.get("service_quiesced") is not True
+            or cleanup.get("service_error")
+            or cleanup.get("service_collection_error")
+        ):
+            errors.append("cleanup_service_failed")
+        if summary.get("service_properties") is None:
+            errors.append("service_properties_unverified")
+        summary["acceptance_errors"] = errors
+        summary["result"] = "PASS" if not errors else "FAIL"
+        if errors:
+            summary["error_code"] = errors[0]
+        print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
+        return 0 if not errors else 1
+    finally:
+        os.close(release_fd)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument(
-        "--systemd-service-worker", action="store_true", help=argparse.SUPPRESS
-    )
     ap.add_argument("--candidate-config", required=True, type=Path)
     ap.add_argument("--binary", required=True, type=Path)
     ap.add_argument("--root", required=True, type=Path)
     args = ap.parse_args()
     try:
-        return (
-            _service_worker_entry(args)
-            if args.systemd_service_worker
-            else _run_in_transient_service(args)
-        )
+        return _run_in_transient_service(args)
     except Exception as exc:
         error = _stable_error(exc, "service_entry_failed")
         print(

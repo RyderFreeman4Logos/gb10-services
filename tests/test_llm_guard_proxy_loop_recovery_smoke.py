@@ -330,6 +330,9 @@ def passing_summary() -> dict:
             "server_stopped": True,
             "shutdown_stopped": True,
             "handlers_quiesced": True,
+            "accept_barrier_completed": True,
+            "accept_barrier_empty": True,
+            "errors": [],
         },
         "port_cleanup": {"guard_rebindable": True, "fake_rebindable": True},
         "sensitive_marker_leak_count_all_fixture_files": 0,
@@ -534,39 +537,40 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 os.close(fd)
             self.assertFalse(marker.exists())
 
-    def test_direct_service_worker_requires_systemd_mainpid_lifecycle(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            binary = Path(tmp) / "accepted-fixture"
-            self.write_self_test(binary)
-            fd = os.open(binary, os.O_RDONLY | os.O_CLOEXEC)
-            args = smoke.argparse.Namespace(binary=binary)
-            with (
-                patch.object(smoke, "_accepted_release_fd", return_value=fd),
-                patch.object(smoke, "_run_harness") as run_harness,
-                self.assertRaisesRegex(RuntimeError, "systemd_service_required"),
-            ):
-                smoke._service_worker_entry(args)
-            run_harness.assert_not_called()
+    def test_hidden_worker_path_is_deleted(self) -> None:
+        source = Path(smoke.__file__).read_text(encoding="utf-8")
+        for obsolete in (
+            "--systemd-service-worker",
+            "_service_worker_entry",
+            '"kind": "service_ready"',
+            '"kind": "service_summary"',
+        ):
+            self.assertNotIn(obsolete, source)
 
     def test_transient_service_command_has_native_finite_cleanup_contract(self) -> None:
+        executable = f"/proc/{os.getpid()}/fd/3"
+        argv = ["--config", "/tmp/config.toml"]
         command = smoke._systemd_service_command(
             "llm-guard-loop-recovery-test.service",
-            [sys.executable, "worker.py"],
+            executable,
+            argv,
         )
         self.assertIn("--service-type=exec", command)
+        self.assertIn("--property=Delegate=no", command)
         self.assertIn("--property=KillMode=control-group", command)
         self.assertIn("--property=SendSIGKILL=yes", command)
         self.assertIn("--property=CollectMode=inactive-or-failed", command)
         self.assertTrue(any(item.startswith("--property=RuntimeMaxSec=") for item in command))
         self.assertTrue(any(item.startswith("--property=TimeoutStopSec=") for item in command))
         self.assertNotIn("--scope", command)
-        self.assertFalse(any("Delegate=" in item for item in command))
+        self.assertEqual(command[command.index("--") + 1 :], [executable, *argv])
+        self.assertNotIn(sys.executable, command[command.index("--") + 1 :])
 
     @unittest.skipUnless(
         Path(smoke.SYSTEMD_RUN_BIN).is_file() and Path(smoke.SYSTEMCTL_BIN).is_file(),
         "systemd tools unavailable",
     )
-    def test_killing_transient_service_worker_collects_double_fork_descendant(
+    def test_killing_transient_service_collects_double_fork_descendant(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -581,9 +585,14 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 "(root/'main.pid').write_text(str(os.getpid())), print('READY', flush=True), "
                 "signal.pause())"
             )
+            python = Path(sys.executable).resolve()
+            release_fd = smoke._sealed_executable_fd(python, smoke.sha256(python))
+            executable = f"/proc/{os.getpid()}/fd/{release_fd}"
             proc = subprocess.Popen(
                 smoke._systemd_service_command(
-                    unit, [sys.executable, "-c", worker, str(root)]
+                    unit,
+                    executable,
+                    ["-c", worker, str(root)],
                 ),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -631,6 +640,7 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 ).stdout.strip()
                 self.assertEqual(loaded, "not-found")
             finally:
+                os.close(release_fd)
                 if proc.poll() is None:
                     subprocess.run(
                         [smoke.SYSTEMCTL_BIN, "--user", "stop", "--", unit],
@@ -2863,6 +2873,308 @@ while True:
         summary["fixture_cleanup"] = receipt[0]
         summary["fixture_errors"] = errors
         self.assertTrue(smoke.acceptance_errors(summary))
+
+
+class V5RootRepairRegressionTests(unittest.TestCase):
+    def _fixture_server(self):
+        fixture = smoke.Fixture(
+            "reason", "private", "fresh", "positive", "fresh-output"
+        )
+        handler = fixture.handler()
+        server = smoke.FixtureHTTPServer(("127.0.0.1", 0), handler, fixture)
+        server.server_activate()
+        thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.01},
+            daemon=True,
+        )
+        thread.start()
+        return fixture, handler, server, thread
+
+    def test_v5_hidden_worker_path_is_deleted(self) -> None:
+        source = Path(smoke.__file__).read_text(encoding="utf-8")
+        for obsolete in (
+            "--systemd-service-worker",
+            "_service_worker_entry",
+            '"kind": "service_ready"',
+            '"kind": "service_summary"',
+        ):
+            self.assertNotIn(obsolete, source)
+
+    def test_v5_transient_command_executes_only_parent_held_capability(self) -> None:
+        executable = f"/proc/{os.getpid()}/fd/97"
+        argv = ["--config", f"/proc/{os.getpid()}/fd/98"]
+        command = smoke._systemd_service_command(
+            "llm-guard-loop-recovery-v5-command.service",
+            executable,
+            argv,
+        )
+        self.assertEqual(command[command.index("--") + 1 :], [executable, *argv])
+        self.assertIn("--property=Delegate=no", command)
+        self.assertNotIn(sys.executable, command[command.index("--") + 1 :])
+
+    def test_v5_transient_launch_preserves_user_runtime_dir(self) -> None:
+        source = inspect.getsource(smoke._run_in_transient_service)
+        self.assertIn('"XDG_RUNTIME_DIR": os.environ["XDG_RUNTIME_DIR"]', source)
+
+    @unittest.skipUnless(
+        Path(smoke.SYSTEMD_RUN_BIN).is_file() and Path(smoke.SYSTEMCTL_BIN).is_file(),
+        "systemd tools unavailable",
+    )
+    def test_v5_normal_term_cleanup_preserves_identity_without_forced_kill(self) -> None:
+        source = Path("/usr/bin/sleep")
+        if not source.is_file():
+            self.skipTest("native sleep unavailable")
+        release_fd = smoke._sealed_executable_fd(source, smoke.sha256(source))
+        unit = (
+            f"llm-guard-loop-recovery-v5-{os.getpid()}-"
+            f"{secrets.token_hex(4)}.service"
+        )
+        executable = f"/proc/{os.getpid()}/fd/{release_fd}"
+        argv = ["5"]
+        fence = None
+        proc = subprocess.Popen(
+            smoke._systemd_service_command(unit, executable, argv),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            properties = None
+            while time.monotonic() < deadline:
+                try:
+                    properties = smoke._require_service_properties(
+                        unit, executable=executable, argv=argv
+                    )
+                    if int(properties.get("MainPID", "0")) > 1:
+                        break
+                except Exception:
+                    properties = None
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.01)
+            self.assertIsNotNone(properties)
+            assert properties is not None
+            identity = smoke._executable_identity_fd(release_fd)
+            fence = smoke._establish_service_fence(unit, executable, argv, identity)
+            self.assertEqual(properties["LoadState"], "loaded")
+            self.assertEqual(properties["Type"], "exec")
+            self.assertEqual(properties["Delegate"], "no")
+            self.assertIn(f"path={executable}", properties["ExecStart"])
+            self.assertIn(f"argv[]={executable} 5", properties["ExecStart"])
+            cleanup = smoke._finish_service_fence(fence)
+            process_cleanup = smoke._service_process_cleanup(fence, cleanup)
+            fence = None
+            proc.communicate(timeout=3)
+            self.assertTrue(cleanup["service_quiesced"])
+            self.assertEqual(cleanup["service_populated_final"], 0)
+            self.assertTrue(cleanup["service_unit_collected"])
+            self.assertTrue(cleanup["service_cgroup_collected"])
+            self.assertTrue(process_cleanup["term_sent"])
+            self.assertFalse(process_cleanup["kill_sent"])
+            self.assertFalse(process_cleanup["forced_kill"])
+            self.assertTrue(process_cleanup["spawn_identity_captured"])
+            self.assertTrue(process_cleanup["pidfd_available"])
+            self.assertEqual(process_cleanup["residual_producer_count_before_kill"], 0)
+            self.assertEqual(process_cleanup["residual_producer_count_final"], 0)
+            summary = passing_summary()
+            summary["process_cleanup"].update(process_cleanup)
+            self.assertEqual(smoke.acceptance_errors(summary), [])
+        finally:
+            if fence is not None:
+                try:
+                    smoke._kill_service_fence(fence)
+                except Exception:
+                    pass
+                smoke._finish_service_fence(fence)
+            if proc.poll() is None:
+                subprocess.run(
+                    [smoke.SYSTEMCTL_BIN, "--user", "stop", "--", unit],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                proc.kill()
+                proc.communicate(timeout=2)
+            os.close(release_fd)
+
+    @unittest.skipUnless(
+        Path(smoke.SYSTEMD_RUN_BIN).is_file() and Path(smoke.SYSTEMCTL_BIN).is_file(),
+        "systemd tools unavailable",
+    )
+    def test_v5_uncooperative_descendant_requires_cgroup_kill_and_fails_closed(
+        self,
+    ) -> None:
+        python = Path(sys.executable).resolve()
+        release_fd = smoke._sealed_executable_fd(python, smoke.sha256(python))
+        unit = (
+            f"llm-guard-loop-recovery-v5-stubborn-{os.getpid()}-"
+            f"{secrets.token_hex(4)}.service"
+        )
+        executable = f"/proc/{os.getpid()}/fd/{release_fd}"
+        worker = (
+            "import os,pathlib,signal,sys,time; root=pathlib.Path(sys.argv[1]); "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); child=os.fork(); "
+            "(signal.signal(signal.SIGTERM, signal.SIG_IGN), "
+            "(root/'descendant.pid').write_text(str(os.getpid())), print('READY', flush=True), "
+            "time.sleep(30)) if child == 0 else time.sleep(30)"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            argv = ["-c", worker, str(root)]
+            fence = None
+            proc = subprocess.Popen(
+                smoke._systemd_service_command(unit, executable, argv),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert proc.stdout is not None
+                self.assertEqual(proc.stdout.readline().strip(), "READY")
+                identity = smoke._executable_identity_fd(release_fd)
+                fence = smoke._establish_service_fence(unit, executable, argv, identity)
+                with patch.object(smoke, "PROCESS_TERM_GRACE", 0.1):
+                    cleanup = smoke._finish_service_fence(fence)
+                process_cleanup = smoke._service_process_cleanup(fence, cleanup)
+                fence = None
+                proc.communicate(timeout=3)
+                self.assertTrue(process_cleanup["term_sent"])
+                self.assertTrue(process_cleanup["kill_sent"])
+                self.assertTrue(process_cleanup["forced_kill"])
+                self.assertEqual(
+                    process_cleanup["residual_producer_count_before_kill"], 1
+                )
+                self.assertEqual(process_cleanup["residual_producer_count_final"], 0)
+                self.assertTrue(cleanup["service_quiesced"])
+                self.assertTrue(cleanup["service_unit_collected"])
+                self.assertTrue(cleanup["service_cgroup_collected"])
+                descendant_pid = int((root / "descendant.pid").read_text())
+                self.assertFalse(smoke.process_identity_is_live(descendant_pid))
+                summary = passing_summary()
+                summary["process_cleanup"].update(process_cleanup)
+                errors = smoke.acceptance_errors(summary)
+                self.assertIn("proxy_forced_kill", errors)
+                self.assertIn("proxy_residual_producer_detected", errors)
+                self.assertNotIn("proxy_spawn_identity_missing", errors)
+                self.assertNotIn("proxy_pidfd_unavailable", errors)
+            finally:
+                if fence is not None:
+                    try:
+                        smoke._kill_service_fence(fence)
+                    except Exception:
+                        pass
+                    smoke._finish_service_fence(fence)
+                if proc.poll() is None:
+                    subprocess.run(
+                        [smoke.SYSTEMCTL_BIN, "--user", "stop", "--", unit],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    proc.kill()
+                    proc.communicate(timeout=2)
+                os.close(release_fd)
+
+    def test_v5_parent_recomputes_forged_empty_acceptance_errors(self) -> None:
+        summary = passing_summary()
+        summary["binary_identity_stable"] = False
+        summary["acceptance_errors"] = []
+        errors = smoke.acceptance_errors(summary)
+        self.assertTrue(errors)
+        self.assertNotEqual(errors, [])
+        # Parent recomputation ignores forged empty list.
+        self.assertIn("binary_identity_drift", errors)
+
+    def test_v5_two_pipelined_requests_are_admitted_twice(self) -> None:
+        fixture, _, server, thread = self._fixture_server()
+        request = (
+            b"GET /v1/models HTTP/1.1\r\nHost: fixture\r\n\r\n"
+            b"GET /v1/models HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n"
+        )
+        response = raw_fixture_request(server.server_port, request)
+        cleanup = smoke.stop_fixture_server(server, thread, fixture)
+        attempts, errors = fixture.snapshot()
+        self.assertEqual(response.count(b"HTTP/1.1 200 OK"), 2)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(errors, [])
+        self.assertTrue(cleanup["accept_barrier_empty"])
+
+    def test_v5_byte_after_old_peek_window_is_admitted(self) -> None:
+        fixture = smoke.Fixture(
+            "reason", "private", "fresh", "positive", "fresh-output"
+        )
+        server = smoke.FixtureHTTPServer(("127.0.0.1", 0), fixture.handler(), fixture)
+        server.server_activate()
+        thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.01},
+            daemon=True,
+        )
+        thread.start()
+        # Idle connection past the old connection-scoped peek window closes with
+        # zero attempts (no second unadmitted read window).
+        idle = socket.create_connection(server.server_address, timeout=2)
+        try:
+            time.sleep(smoke.FIXTURE_READ_TIMEOUT + 0.05)
+            try:
+                idle.sendall(
+                    b"GET /v1/models HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n"
+                )
+                idle.settimeout(0.2)
+                late = idle.recv(64)
+            except OSError:
+                late = b""
+        finally:
+            idle.close()
+        # A fresh connection that delivers its first byte is admitted once.
+        response = raw_fixture_request(
+            server.server_port,
+            b"GET /v1/models HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n",
+        )
+        cleanup = smoke.stop_fixture_server(server, thread, fixture)
+        attempts, errors = fixture.snapshot()
+        self.assertFalse(late.startswith(b"HTTP/1.1 200 OK"))
+        self.assertTrue(response.startswith(b"HTTP/1.1 200 OK"))
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(errors, [])
+        self.assertTrue(cleanup["accept_barrier_empty"])
+
+    def test_v5_pre_shutdown_queued_request_is_counted_before_snapshot(self) -> None:
+        fixture, _, server, thread = self._fixture_server()
+        # Queue a complete request, then shut down. FIFO accept + EOF barrier must
+        # count it before the final snapshot without sleep sampling.
+        sock = socket.create_connection(server.server_address, timeout=2)
+        sock.sendall(
+            b"GET /v1/models HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n"
+        )
+        cleanup = smoke.stop_fixture_server(server, thread, fixture)
+        try:
+            sock.settimeout(0.2)
+            sock.recv(64)
+        except OSError:
+            pass
+        sock.close()
+        attempts, errors = fixture.snapshot()
+        self.assertGreaterEqual(len(attempts), 1)
+        self.assertEqual(errors, [])
+        self.assertTrue(cleanup["accept_barrier_completed"])
+        self.assertTrue(cleanup["accept_barrier_empty"])
+        self.assertTrue(cleanup["handlers_quiesced"])
+
+    def test_v5_eof_barrier_itself_counts_zero(self) -> None:
+        fixture, _, server, thread = self._fixture_server()
+        before, _ = fixture.snapshot()
+        cleanup = smoke.stop_fixture_server(server, thread, fixture)
+        after, errors = fixture.snapshot()
+        self.assertEqual(len(before), 0)
+        self.assertEqual(len(after), 0)
+        self.assertEqual(errors, [])
+        self.assertTrue(cleanup["accept_barrier_completed"])
+        self.assertTrue(cleanup["accept_barrier_empty"])
+
 
 
 if __name__ == "__main__":
