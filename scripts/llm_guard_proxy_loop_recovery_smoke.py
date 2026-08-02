@@ -6,6 +6,7 @@ import argparse
 import array
 import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -61,6 +62,18 @@ CGROUP_ROOT = Path("/sys/fs/cgroup")
 OFFLINE_SELF_TEST_TIMEOUT = 10.0
 OFFLINE_SELF_TEST_OUTPUT_LIMIT = 16 * 1024
 OFFLINE_SELF_TEST_ARGV = ("self-test", "post-await-no-replay")
+EXECUTABLE_SEALS = (
+    fcntl.F_SEAL_SEAL
+    | fcntl.F_SEAL_SHRINK
+    | fcntl.F_SEAL_GROW
+    | fcntl.F_SEAL_WRITE
+)
+READINESS_PROBE_BODY = {
+    "model": "aeon-ultimate",
+    "messages": [{"role": "user", "content": "1+1=?"}],
+    "chat_template_kwargs": {"enable_thinking": False},
+    "max_tokens": 1,
+}
 
 
 class ProcessIdentity(NamedTuple):
@@ -218,6 +231,49 @@ def _executable_identity_fd(fd: int) -> ExecutableIdentity:
     after = os.fstat(fd)
     _require_stable_stat(before, after, "binary_identity_drift")
     return ExecutableIdentity(*_stat_fingerprint(after), digest.hexdigest())
+
+
+def _require_sealed_executable(fd: int) -> None:
+    require(
+        fcntl.fcntl(fd, fcntl.F_GET_SEALS) == EXECUTABLE_SEALS,
+        "binary_not_write_sealed",
+    )
+
+
+def _sealed_executable_fd(path: Path) -> int:
+    source_fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    sealed_fd = os.memfd_create(
+        "llm-guard-loop-recovery",
+        os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+    )
+    try:
+        before = os.fstat(source_fd)
+        require(
+            stat.S_ISREG(before.st_mode) and before.st_mode & 0o111 != 0,
+            "binary_not_executable",
+        )
+        digest = hashlib.sha256()
+        while block := os.read(source_fd, 1024 * 1024):
+            digest.update(block)
+            view = memoryview(block)
+            while view:
+                written = os.write(sealed_fd, view)
+                require(written > 0, "binary_copy_truncated")
+                view = view[written:]
+        _require_stable_stat(before, os.fstat(source_fd), "binary_identity_drift")
+        os.fchmod(sealed_fd, stat.S_IMODE(before.st_mode))
+        fcntl.fcntl(sealed_fd, fcntl.F_ADD_SEALS, EXECUTABLE_SEALS)
+        _require_sealed_executable(sealed_fd)
+        require(
+            _executable_identity_fd(sealed_fd).sha256 == digest.hexdigest(),
+            "binary_copy_drift",
+        )
+        return sealed_fd
+    except Exception:
+        os.close(sealed_fd)
+        raise
+    finally:
+        os.close(source_fd)
 
 
 def executable_identity(path: Path, *, nofollow: bool = True) -> ExecutableIdentity:
@@ -433,6 +489,7 @@ def _run_offline_self_test_fd(
         _EXCLUSIVE_SUPERVISOR_PID == os.getpid(),
         "offline_self_test_scope_required",
     )
+    _require_sealed_executable(fd)
     proc: subprocess.Popen[bytes] | None = None
     process_identity: ProcessIdentity | None = None
     selector = selectors.DefaultSelector()
@@ -482,6 +539,12 @@ def _run_offline_self_test_fd(
                     len(output) <= OFFLINE_SELF_TEST_OUTPUT_LIMIT,
                     "offline_self_test_output_limit",
                 )
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, "offline_self_test_timeout")
+        assert process_identity.pidfd is not None
+        selector.register(process_identity.pidfd, selectors.EVENT_READ)
+        require(bool(selector.select(remaining)), "offline_self_test_timeout")
+        selector.unregister(process_identity.pidfd)
         require(_child_exited(proc.pid), "offline_self_test_not_exited")
         stdout, stderr = (bytes(buffers[stream.fileno()]) for stream in streams)
         require(stderr == b"", "offline_self_test_stderr")
@@ -530,7 +593,7 @@ def _run_offline_self_test_fd(
 
 
 def run_offline_self_test(binary: Path) -> tuple[dict, ExecutableIdentity]:
-    fd = os.open(binary, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    fd = _sealed_executable_fd(binary)
     try:
         return _run_offline_self_test_fd(fd, str(binary))
     finally:
@@ -602,13 +665,53 @@ class Fixture:
         with self.lock:
             self.attempts[number - 1][field] = time.monotonic_ns()
 
+    def record_request(self, path: str) -> dict:
+        endpoint = (
+            "chat_completions"
+            if path.endswith("/chat/completions")
+            else "completions"
+            if path.endswith("/completions")
+            else "embeddings"
+            if path.endswith("/embeddings")
+            else "models"
+            if path.endswith("/models")
+            else "unknown"
+        )
+        with self.lock:
+            attempt = {
+                "number": len(self.attempts) + 1,
+                "endpoint": endpoint,
+                "phase": "unknown",
+                "role": "unknown",
+                "admitted_monotonic_ns": time.monotonic_ns(),
+                "thinking_budget": None,
+                "thinking_budget_canonical": None,
+                "thinking_budget_native": None,
+                "max_tokens": None,
+                "stream": False,
+                "stream_usage": False,
+                "salvage_material_present": False,
+                "private_prefix_present": False,
+                "loop_tail_present": False,
+                "variant": "unknown",
+            }
+            self.attempts.append(attempt)
+            return attempt
+
     def inspect_request(
         self,
         endpoint: str,
         body: dict,
         *,
         recovery_probe: bool = False,
+        attempt: dict | None = None,
     ) -> dict:
+        if attempt is None:
+            attempt = self.record_request(
+                "/v1/chat/completions"
+                if endpoint == "chat_completions"
+                else f"/v1/{endpoint}"
+            )
         text = json.dumps(body, sort_keys=True, separators=(",", ":"))
         messages = body.get("messages")
         message_contents = {
@@ -622,13 +725,15 @@ class Fixture:
             "generic_committed_stream"
             if endpoint == "completions"
             else "shielded_hold"
+            if endpoint == "chat_completions"
+            else "unknown"
         )
         if endpoint == "chat_completions" and self.fresh_input_marker in message_contents:
             phase = "fresh"
         private_prefix_present = self.private_prefix_marker in text
         salvage_material = private_prefix_present and "Private bounded pre-loop reasoning notes" in text
         with self.lock:
-            n = len(self.attempts) + 1
+            n = attempt["number"]
             phase_has_primary = any(
                 item["phase"] == phase and item["role"] == "primary"
                 for item in self.attempts
@@ -637,9 +742,14 @@ class Fixture:
                 item["phase"] == phase and item["role"] == "salvage"
                 for item in self.attempts
             )
+            exact_recovery_probe = (
+                recovery_probe
+                and endpoint == "chat_completions"
+                and body == READINESS_PROBE_BODY
+            )
             role = (
                 "recovery_probe"
-                if recovery_probe
+                if exact_recovery_probe
                 else "primary"
                 if endpoint == "completions"
                 else "salvage"
@@ -649,12 +759,10 @@ class Fixture:
                 else "primary"
             )
             budget = effective_budget(body)
-            attempt = {
-                "number": n,
+            attempt.update({
                 "endpoint": endpoint,
                 "phase": phase,
                 "role": role,
-                "admitted_monotonic_ns": time.monotonic_ns(),
                 "thinking_budget": budget,
                 "thinking_budget_canonical": budgets(body)[0],
                 "thinking_budget_native": budgets(body)[1],
@@ -674,8 +782,7 @@ class Fixture:
                     if budget == THINKING_BUDGET
                     else "bounded-thinking"
                 ),
-            }
-            self.attempts.append(attempt)
+            })
             if endpoint == "chat_completions" and role == "primary":
                 if effective_budget(body) != THINKING_BUDGET:
                     self.errors.append(f"primary_thinking_budget:{phase}")
@@ -718,12 +825,17 @@ class Fixture:
                 self.close_connection = True
 
             def do_GET(self) -> None:
+                attempt = fixture.record_request(self.path)
                 if self.path.endswith("/models"):
+                    with fixture.lock:
+                        attempt.update(phase="startup", role="metadata")
                     self.send_json(200, {"object": "list", "data": [{"id": "aeon-ultimate", "object": "model"}]})
                 else:
+                    fixture.record_error("unexpected_upstream_route")
                     self.send_json(404, {"error": {"message": "fixture route"}})
 
             def do_POST(self) -> None:
+                attempt = fixture.record_request(self.path)
                 raw_length = self.headers.get("Content-Length")
                 if raw_length is None or re.fullmatch(r"[0-9]+", raw_length) is None:
                     fixture.record_error("fixture_invalid_content_length")
@@ -754,7 +866,20 @@ class Fixture:
                     fixture.record_error("malformed_upstream_request")
                     self.close_connection = True
                     return
+                probe = (
+                    self.path == "/v1/chat/completions"
+                    and self.headers.get("x-llm-guard-proxy-probe")
+                    == "local-recovery"
+                    and self.headers.get("Content-Type") == "application/json"
+                )
+                if not isinstance(body, dict):
+                    fixture.record_error("unexpected_upstream_route")
+                    self.send_json(404, {"error": {"message": "route"}})
+                    return
                 if self.path.endswith("/embeddings"):
+                    fixture.inspect_request(
+                        "embeddings", body, recovery_probe=probe, attempt=attempt
+                    )
                     values = body.get("input")
                     count = len(values) if isinstance(values, list) else 1
                     self.send_json(200, {"object": "list", "data": [{"object": "embedding", "index": i, "embedding": [1.0] + [0.0] * 255} for i in range(count)], "model": "fixture", "usage": {"prompt_tokens": 1, "total_tokens": 1}})
@@ -766,15 +891,16 @@ class Fixture:
                     if self.path.endswith("/completions")
                     else None
                 )
-                if endpoint is None or not isinstance(body, dict):
+                if endpoint is None:
+                    fixture.inspect_request("unknown", body, attempt=attempt)
                     fixture.record_error("unexpected_upstream_route")
                     self.send_json(404, {"error": {"message": "route"}})
                     return
                 attempt = fixture.inspect_request(
                     endpoint,
                     body,
-                    recovery_probe=self.headers.get("x-llm-guard-proxy-probe")
-                    == "local-recovery",
+                    recovery_probe=probe,
+                    attempt=attempt,
                 )
                 if attempt["role"] == "recovery_probe":
                     self.send_json(
@@ -843,7 +969,12 @@ class FixtureHTTPServer(ThreadingHTTPServer):
 
     def __init__(self, server_address: tuple[str, int], handler: type[BaseHTTPRequestHandler], fixture: Fixture):
         self.fixture = fixture
-        super().__init__(server_address, handler)
+        super().__init__(server_address, handler, bind_and_activate=False)
+        try:
+            self.server_bind()
+        except Exception:
+            self.server_close()
+            raise
 
     def process_request(self, request, client_address) -> None:
         self.fixture.handler_started()
@@ -2176,10 +2307,12 @@ def _establish_scope_fence(
 ) -> ScopeFence:
     receipt = _recv_supervisor_receipt(control, deadline)
     worker_pid = receipt.get("pid")
+    worker_control_group = receipt.get("control_group")
     if (
         receipt.get("kind") != "scope_ready"
         or type(worker_pid) is not int
         or worker_pid <= 1
+        or not isinstance(worker_control_group, str)
     ):
         raise OSError(errno.ESTALE, "scope_worker_identity_invalid")
     worker_identity = capture_process_identity(worker_pid)
@@ -2187,6 +2320,8 @@ def _establish_scope_fence(
     kill_fd: int | None = None
     try:
         control_group = _process_control_group(worker_pid)
+        if control_group != worker_control_group:
+            raise OSError(errno.ESTALE, "scope_identity_invalid")
         parts = Path(control_group).parts
         if ".." in parts or not parts or parts[-1] != unit:
             raise OSError(errno.ESTALE, "scope_identity_invalid")
@@ -2228,6 +2363,21 @@ def _establish_scope_fence(
                     pass
         _close_identity_pidfd(worker_identity)
         raise
+
+
+def _require_scope_fence_live(scope: ScopeFence) -> None:
+    populated, removed = _scope_population(scope.events_fd)
+    current = _read_process_identity(scope.worker_identity.pid)
+    require(
+        not removed
+        and populated == 1
+        and stat.S_ISREG(os.fstat(scope.kill_fd).st_mode)
+        and _same_process(current, scope.worker_identity)
+        and current is not None
+        and current.state not in {"X", "Z"}
+        and _process_control_group(current.pid) == scope.control_group,
+        "scope_fence_authority_invalid",
+    )
 
 
 def _fence_supervisor_scope(
@@ -2508,7 +2658,9 @@ def _emergency_supervisor_cleanup(
     return _finalize_supervisor_cleanup(cleanup, status, error)
 
 
-def _exclusive_supervisor_worker(control_fd: int) -> int:
+def _exclusive_supervisor_worker(
+    control_fd: int, expected_scope_unit: str | None
+) -> int:
     executable_fd: int | None = None
     try:
         control = socket.socket(fileno=control_fd)
@@ -2516,9 +2668,36 @@ def _exclusive_supervisor_worker(control_fd: int) -> int:
     except OSError:
         return 2
     try:
+        control_group = _process_control_group(os.getpid())
+        parts = Path(control_group).parts
+        require(
+            expected_scope_unit is not None
+            and re.fullmatch(
+                r"llm-guard-loop-recovery-[1-9][0-9]*-[0-9a-f]{16}\.scope",
+                expected_scope_unit,
+            )
+            is not None
+            and bool(parts)
+            and parts[-1] == expected_scope_unit,
+            "exclusive_supervisor_scope_required",
+        )
+        cgroup_path = CGROUP_ROOT / control_group.removeprefix("/")
+        require(
+            stat.S_ISDIR(cgroup_path.lstat().st_mode)
+            and os.getpid()
+            in {
+                int(member)
+                for member in (cgroup_path / "cgroup.procs").read_text().split()
+            },
+            "exclusive_supervisor_scope_required",
+        )
         _send_supervisor_packet(
             control,
-            {"kind": "scope_ready", "pid": os.getpid()},
+            {
+                "kind": "scope_ready",
+                "pid": os.getpid(),
+                "control_group": control_group,
+            },
             time.monotonic() + SUPERVISOR_START_TIMEOUT,
         )
         authorization, executable_fd = _recv_supervisor_launch(
@@ -2815,6 +2994,7 @@ def authorize_candidate_supervisor(
                     str(script),
                     "--exclusive-supervisor-fd",
                     "0",
+                    unit,
                 ],
             )
         except Exception:
@@ -2828,9 +3008,7 @@ def authorize_candidate_supervisor(
     try:
         scope = _establish_scope_fence(parent_control, unit, pid, deadline)
         wrapper_identity = capture_process_identity(pid)
-        executable_fd = os.open(
-            binary, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
-        )
+        executable_fd = _sealed_executable_fd(binary)
         _send_supervisor_packet(
             parent_control,
             {
@@ -2941,6 +3119,7 @@ def launch_candidate_supervisor(
     authorization.consumed = True
     deadline = time.monotonic() + SUPERVISOR_START_TIMEOUT
     try:
+        _require_scope_fence_live(authorization.scope)
         _send_supervisor_packet(
             authorization.control,
             {
@@ -3588,6 +3767,62 @@ def _operational_contract_evidence_errors(summary: dict) -> list[str]:
         )
     ):
         errors.append("generic_committed_stream_marker_leak")
+
+    fresh = summary.get("fresh_client", {})
+    fresh_attempts = [
+        attempt
+        for attempt in attempts
+        if attempt.get("phase") == "fresh"
+        and attempt.get("role") != "recovery_probe"
+    ]
+    if len(fresh_attempts) != 1:
+        errors.append("fresh_business_attempt_count")
+    if any(
+        attempt.get("phase") == "fresh"
+        and attempt.get("role") == "recovery_probe"
+        for attempt in attempts
+    ):
+        errors.append("fresh_recovery_probe")
+    fresh_first = (
+        fresh.get("first_downstream_nonempty_monotonic_ns")
+        if isinstance(fresh, dict)
+        else None
+    )
+    if not isinstance(fresh_first, int):
+        errors.append("fresh_first_byte_missing")
+    else:
+        for attempt in fresh_attempts:
+            admitted = attempt.get("admitted_monotonic_ns")
+            if not isinstance(admitted, int) or admitted >= fresh_first:
+                errors.append(
+                    f"fresh_post_commit_attempt:{attempt.get('number', 0)}"
+                )
+
+    committed_times = [
+        value
+        for value in (shielded_first, generic_first, fresh_first)
+        if isinstance(value, int)
+    ]
+    for attempt in attempts:
+        if attempt.get("phase") == "startup":
+            admitted = attempt.get("admitted_monotonic_ns")
+            if (
+                not isinstance(admitted, int)
+                or not committed_times
+                or admitted >= min(committed_times)
+            ):
+                errors.append(
+                    f"startup_post_commit_attempt:{attempt.get('number', 0)}"
+                )
+            continue
+        if (
+            attempt.get("phase")
+            not in {"shielded_hold", "generic_committed_stream", "fresh"}
+            and attempt.get("role") != "recovery_probe"
+        ):
+            errors.append(
+                f"unexpected_physical_business_attempt:{attempt.get('number', 0)}"
+            )
     return errors
 
 
@@ -3617,26 +3852,26 @@ def acceptance_errors(summary: dict) -> list[str]:
     fresh_attempts = [
         attempt
         for attempt in attempts
-        if attempt["phase"] == "fresh"
+        if attempt.get("phase") == "fresh"
         and attempt.get("role") == "primary"
-        and not attempt["salvage_material_present"]
+        and not attempt.get("salvage_material_present")
     ]
     if len(salvages) != 1:
         errors.append("salvage_count")
     if not fresh_attempts:
         errors.append("fresh_request_missing")
     for attempt in attempts:
-        number = attempt["number"]
+        number = attempt.get("number", 0)
         if attempt.get("role") == "salvage":
-            if attempt["phase"] != "shielded_hold":
+            if attempt.get("phase") != "shielded_hold":
                 errors.append(f"salvage_phase:{number}")
-            if not attempt["salvage_material_present"]:
+            if not attempt.get("salvage_material_present"):
                 errors.append(f"salvage_material_missing:{number}")
-            if attempt["thinking_budget"] != 0:
+            if attempt.get("thinking_budget") != 0:
                 errors.append(f"salvage_thinking_budget:{number}")
             if not attempt["private_prefix_present"]:
                 errors.append(f"salvage_private_prefix:{number}")
-            if attempt["loop_tail_present"]:
+            if attempt.get("loop_tail_present"):
                 errors.append(f"salvage_loop_tail:{number}")
             continue
         if any(
@@ -3649,14 +3884,14 @@ def acceptance_errors(summary: dict) -> list[str]:
         ):
             prefix = (
                 "fresh_request_replayed_private_material"
-                if attempt["phase"] == "fresh"
+                if attempt.get("phase") == "fresh"
                 else "non_salvage_replayed_private_material"
             )
             errors.append(f"{prefix}:{number}")
         if (
-            attempt["phase"] == "fresh"
+            attempt.get("phase") == "fresh"
             and attempt.get("role") == "primary"
-            and attempt["thinking_budget"] != THINKING_BUDGET
+            and attempt.get("thinking_budget") != THINKING_BUDGET
         ):
             errors.append(f"fresh_thinking_budget:{number}")
 
@@ -3853,15 +4088,16 @@ def main() -> int:
         )
         runtime_identity = require_candidate_runtime(supervisor)
         summary["runtime_binary_sha256"] = runtime_identity.sha256
+        wait_port(guard_port, supervisor, time.monotonic() + 20)
+        require_candidate_runtime(supervisor, guard_port)
+        server.server_activate()
         server_thread = threading.Thread(
             target=server.serve_forever,
             kwargs={"poll_interval": 0.05},
             daemon=True,
         )
         server_thread.start()
-        wait_port(guard_port, supervisor, time.monotonic() + 20)
         summary["candidate_full_toml_release_binary_parsed"] = True
-        require_candidate_runtime(supervisor, guard_port)
         summary["operational_contract"]["arms"]["shielded_hold"] = client(
             guard_port,
             shielded_input_marker,
@@ -4044,6 +4280,10 @@ def _rebindable(port: int) -> bool:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "--exclusive-supervisor-fd":
-        raise SystemExit(_exclusive_supervisor_worker(int(sys.argv[2])))
+    if len(sys.argv) in {3, 4} and sys.argv[1] == "--exclusive-supervisor-fd":
+        raise SystemExit(
+            _exclusive_supervisor_worker(
+                int(sys.argv[2]), sys.argv[3] if len(sys.argv) == 4 else None
+            )
+        )
     raise SystemExit(main())
