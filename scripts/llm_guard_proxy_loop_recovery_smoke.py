@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import selectors
 import shutil
 import signal
 import socket
@@ -56,6 +57,9 @@ SYSTEMD_RUN_BIN = "/usr/bin/systemd-run"
 SYSTEMCTL_BIN = "/usr/bin/systemctl"
 SCOPE_COLLECT_TIMEOUT = 2.0
 CGROUP_ROOT = Path("/sys/fs/cgroup")
+OFFLINE_SELF_TEST_TIMEOUT = 10.0
+OFFLINE_SELF_TEST_OUTPUT_LIMIT = 16 * 1024
+OFFLINE_SELF_TEST_ARGV = ("self-test", "post-await-no-replay")
 
 
 class ProcessIdentity(NamedTuple):
@@ -67,6 +71,16 @@ class ProcessIdentity(NamedTuple):
     starttime: int
     pidfd: int | None = None
     pidfd_errno: int | None = None
+
+
+class ExecutableIdentity(NamedTuple):
+    device: int
+    inode: int
+    mode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    sha256: str
 
 
 class ScopeFence(NamedTuple):
@@ -171,6 +185,299 @@ def sha256(path: Path) -> str:
         for block in iter(lambda: f.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _executable_identity_fd(fd: int) -> ExecutableIdentity:
+    before = os.fstat(fd)
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    for block in iter(lambda: os.read(fd, 1024 * 1024), b""):
+        digest.update(block)
+    after = os.fstat(fd)
+    _require_stable_stat(before, after, "binary_identity_drift")
+    return ExecutableIdentity(*_stat_fingerprint(after), digest.hexdigest())
+
+
+def executable_identity(path: Path, *, nofollow: bool = True) -> ExecutableIdentity:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if nofollow:
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        return _executable_identity_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def require_executable_identity(
+    path: Path,
+    expected: ExecutableIdentity,
+    code: str,
+    *,
+    nofollow: bool = True,
+) -> ExecutableIdentity:
+    try:
+        current = executable_identity(path, nofollow=nofollow)
+    except Exception:
+        fail(code)
+    require(current == expected, code)
+    return current
+
+
+_OFFLINE_PHASE_FIELDS = frozenset(
+    {
+        "pre_await_gate_ns",
+        "recovery_await_entered_ns",
+        "body_emitted_ns",
+        "client_ack_ns",
+        "recovery_await_completed_ns",
+        "control_replay_authorized_ns",
+        "post_await_committed_ns",
+    }
+)
+_OFFLINE_ARM_FIELDS = frozenset(
+    {
+        "ordered_roles",
+        "product_roles",
+        "attempt_count",
+        "fixture_rejected_count",
+        "request_claims",
+        "rejected_request_claims",
+        "recovery_replay_claims",
+        "rejected_recovery_replay_claims",
+        "rejected_physical_attempts",
+        "rejected_readiness_probes",
+        "business_count",
+        "probe_count",
+        "same_payload",
+        "first_chunk_stall",
+        "first_byte_wait_ms",
+        "client_observed_heartbeat",
+        "done_observed",
+        "terminal_error_observed",
+        "eof_observed",
+        "post_await_committed",
+        "phases",
+        "loopback_only",
+        "cleanup_complete",
+    }
+)
+
+
+def _exact_fields(value: object, fields: frozenset[str], code: str) -> dict:
+    require(type(value) is dict and value.keys() == fields, code)
+    assert isinstance(value, dict)
+    return value
+
+
+def _validate_offline_arm(arm: object, *, committed: bool) -> None:
+    arm = _exact_fields(arm, _OFFLINE_ARM_FIELDS, "offline_self_test_arm_schema")
+    phases = _exact_fields(
+        arm["phases"], _OFFLINE_PHASE_FIELDS, "offline_self_test_phase_schema"
+    )
+    int_fields = _OFFLINE_PHASE_FIELDS | {
+        "attempt_count",
+        "fixture_rejected_count",
+        "request_claims",
+        "rejected_request_claims",
+        "recovery_replay_claims",
+        "rejected_recovery_replay_claims",
+        "rejected_physical_attempts",
+        "rejected_readiness_probes",
+        "business_count",
+        "probe_count",
+        "first_byte_wait_ms",
+    }
+    require(
+        all(
+            type((phases if field in phases else arm)[field]) is int
+            for field in int_fields
+        ),
+        "offline_self_test_integer_type",
+    )
+    require(
+        all(
+            type(arm[field]) is bool
+            for field in (
+                "same_payload",
+                "first_chunk_stall",
+                "client_observed_heartbeat",
+                "done_observed",
+                "terminal_error_observed",
+                "eof_observed",
+                "post_await_committed",
+                "loopback_only",
+                "cleanup_complete",
+            )
+        ),
+        "offline_self_test_boolean_type",
+    )
+    require(type(arm["ordered_roles"]) is list, "offline_self_test_role_type")
+    require(type(arm["product_roles"]) is list, "offline_self_test_role_type")
+    zero_counters = (
+        "fixture_rejected_count",
+        "rejected_request_claims",
+        "rejected_recovery_replay_claims",
+        "rejected_physical_attempts",
+        "rejected_readiness_probes",
+    )
+    require(
+        all(arm[field] == 0 for field in zero_counters),
+        "offline_self_test_rejection_counter",
+    )
+    require(
+        arm["request_claims"] == 1
+        and arm["same_payload"] is True
+        and arm["first_chunk_stall"] is True
+        and arm["first_byte_wait_ms"] > 0
+        and arm["eof_observed"] is True
+        and arm["loopback_only"] is True
+        and arm["cleanup_complete"] is True,
+        "offline_self_test_common_invariant",
+    )
+    pre = phases["pre_await_gate_ns"]
+    entered = phases["recovery_await_entered_ns"]
+    completed = phases["recovery_await_completed_ns"]
+    if not committed:
+        require(
+            arm["ordered_roles"] == ["business", "recovery_probe", "business"]
+            and arm["product_roles"]
+            == ["business", "readiness_probe", "recovery_replay"]
+            and arm["attempt_count"] == 3
+            and arm["business_count"] == 2
+            and arm["probe_count"] == 1
+            and arm["recovery_replay_claims"] == 1
+            and arm["client_observed_heartbeat"] is False
+            and arm["done_observed"] is True
+            and arm["terminal_error_observed"] is False
+            and arm["post_await_committed"] is False
+            and phases["body_emitted_ns"] == 0
+            and phases["client_ack_ns"] == 0
+            and 0 < pre < entered < completed
+            < phases["control_replay_authorized_ns"]
+            and phases["post_await_committed_ns"] == 0,
+            "offline_self_test_control_invariant",
+        )
+        return
+    require(
+        arm["ordered_roles"] == ["business"]
+        and arm["product_roles"] == ["business"]
+        and arm["attempt_count"] == 1
+        and arm["business_count"] == 1
+        and arm["probe_count"] == 0
+        and arm["recovery_replay_claims"] == 0
+        and arm["client_observed_heartbeat"] is True
+        and arm["done_observed"] is False
+        and arm["terminal_error_observed"] is True
+        and arm["post_await_committed"] is True
+        and 0 < pre < entered < phases["body_emitted_ns"]
+        < phases["client_ack_ns"] < completed
+        < phases["post_await_committed_ns"]
+        and phases["control_replay_authorized_ns"] == 0,
+        "offline_self_test_committed_invariant",
+    )
+
+
+def validate_offline_self_test_receipt(receipt: object) -> None:
+    receipt = _exact_fields(
+        receipt,
+        frozenset(
+            {"self_test", "status", "control", "committed", "same_payload_across_arms"}
+        ),
+        "offline_self_test_receipt_schema",
+    )
+    require(
+        receipt["self_test"] == "post-await-no-replay"
+        and receipt["status"] == "passed"
+        and receipt["same_payload_across_arms"] is True,
+        "offline_self_test_receipt_status",
+    )
+    _validate_offline_arm(receipt["control"], committed=False)
+    _validate_offline_arm(receipt["committed"], committed=True)
+
+
+def _kill_and_reap(proc: subprocess.Popen[bytes]) -> None:
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            proc.kill()
+    try:
+        proc.wait(timeout=PROCESS_STOP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=PROCESS_STOP_TIMEOUT)
+
+
+def run_offline_self_test(binary: Path) -> tuple[dict, ExecutableIdentity]:
+    fd = os.open(binary, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    proc: subprocess.Popen[bytes] | None = None
+    selector = selectors.DefaultSelector()
+    streams: tuple[object, ...] = ()
+    try:
+        identity = _executable_identity_fd(fd)
+        proc = subprocess.Popen(
+            [str(binary), *OFFLINE_SELF_TEST_ARGV],
+            executable=f"/proc/self/fd/{fd}",
+            pass_fds=(fd,),
+            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        assert proc.stdout is not None and proc.stderr is not None
+        streams = (proc.stdout, proc.stderr)
+        buffers = {proc.stdout.fileno(): bytearray(), proc.stderr.fileno(): bytearray()}
+        for stream in streams:
+            selector.register(stream, selectors.EVENT_READ)
+        deadline = time.monotonic() + OFFLINE_SELF_TEST_TIMEOUT
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, "offline_self_test_timeout")
+            events = selector.select(remaining)
+            require(bool(events), "offline_self_test_timeout")
+            for key, _ in events:
+                output = buffers[key.fd]
+                chunk = os.read(
+                    key.fd,
+                    min(4096, OFFLINE_SELF_TEST_OUTPUT_LIMIT + 1 - len(output)),
+                )
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                output.extend(chunk)
+                require(
+                    len(output) <= OFFLINE_SELF_TEST_OUTPUT_LIMIT,
+                    "offline_self_test_output_limit",
+                )
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, "offline_self_test_timeout")
+        returncode = proc.wait(timeout=remaining)
+        require(returncode >= 0, "offline_self_test_signal")
+        require(returncode == 0, "offline_self_test_nonzero")
+        stdout, stderr = (bytes(buffers[stream.fileno()]) for stream in streams)
+        require(stderr == b"", "offline_self_test_stderr")
+        require(
+            stdout.endswith(b"\n") and stdout.count(b"\n") == 1,
+            "offline_self_test_stdout_contract",
+        )
+        try:
+            receipt = json.loads(stdout[:-1])
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            fail("offline_self_test_json")
+        validate_offline_self_test_receipt(receipt)
+        assert isinstance(receipt, dict)
+        return receipt, identity
+    finally:
+        os.close(fd)
+        selector.close()
+        if proc is not None:
+            _kill_and_reap(proc)
+        for stream in streams:
+            stream.close()
 
 
 def budgets(body: dict) -> tuple[int | None, int | None]:
@@ -2900,6 +3207,12 @@ def _operational_contract_evidence_errors(summary: dict) -> list[str]:
 
 def acceptance_errors(summary: dict) -> list[str]:
     errors: list[str] = []
+    try:
+        validate_offline_self_test_receipt(summary.get("offline_self_test"))
+    except RuntimeError:
+        errors.append("offline_self_test_failed")
+    if not summary.get("binary_identity_stable"):
+        errors.append("binary_identity_drift")
     if summary.get("execution_error") is not None:
         errors.append("execution_failed")
     if not summary.get("subreaper_enabled"):
@@ -3053,6 +3366,8 @@ def main() -> int:
     candidate = args.candidate_config.resolve(strict=True)
     binary = args.binary.resolve(strict=True)
     require(binary.is_file() and os.access(binary, os.X_OK), "binary_not_executable")
+    offline_self_test, binary_identity = run_offline_self_test(binary)
+    require_executable_identity(binary, binary_identity, "binary_identity_drift")
     root = args.root
     root.mkdir(mode=0o700, parents=False)
     os.chmod(root, 0o700)
@@ -3072,7 +3387,11 @@ def main() -> int:
     fake_port, guard_port = free_port(), free_port()
     summary: dict = {
         "binary_path": str(binary),
-        "binary_sha256": sha256(binary),
+        "binary_sha256": binary_identity.sha256,
+        "offline_self_test": offline_self_test,
+        "runtime_binary_sha256": None,
+        "final_binary_sha256": None,
+        "binary_identity_stable": False,
         "response_api_tested": False,
         "response_api_boundary": "unsupported",
         "fixture_root_mode": oct(root.stat().st_mode & 0o777),
@@ -3121,6 +3440,14 @@ def main() -> int:
         summary["exclusive_supervisor"] = bool(
             supervisor.started_receipt["exclusive_supervisor"]
         )
+        candidate_identity = supervisor.started_receipt["candidate_identity"]
+        runtime_identity = require_executable_identity(
+            Path(f"/proc/{candidate_identity['pid']}/exe"),
+            binary_identity,
+            "runtime_binary_identity_drift",
+            nofollow=False,
+        )
+        summary["runtime_binary_sha256"] = runtime_identity.sha256
         server_thread = threading.Thread(
             target=server.serve_forever,
             kwargs={"poll_interval": 0.05},
@@ -3178,6 +3505,19 @@ def main() -> int:
             )
     summary["process_cleanup"] = process_cleanup
     summary["fixture_cleanup"] = stop_fixture_server(server, server_thread, fixture)
+    try:
+        final_identity = require_executable_identity(
+            binary, binary_identity, "final_binary_identity_drift"
+        )
+        summary["final_binary_sha256"] = final_identity.sha256
+        summary["binary_identity_stable"] = (
+            summary["runtime_binary_sha256"] == binary_identity.sha256
+        )
+    except RuntimeError as exc:
+        if summary["execution_error"] is None:
+            summary["execution_error"] = _stable_error(
+                exc, "final_binary_identity_drift"
+            )
     attempts, fixture_errors = fixture.snapshot()
     summary["attempts"] = attempts
     summary["fixture_errors"] = fixture_errors

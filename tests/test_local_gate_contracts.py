@@ -56,6 +56,7 @@ class LocalGateContractTests(unittest.TestCase):
         justfile = JUSTFILE.read_text()
         self.assertTrue(LOOP_RECOVERY_SMOKE.is_file())
         self.assertIn("guard-loop-recovery-smoke:", justfile)
+        self.assertIn("guard-loop-recovery-unit", justfile)
         self.assertIn("LLM_GUARD_PROXY_BINARY", justfile)
         self.assertIn(str(LOOP_RECOVERY_SMOKE.relative_to(ROOT)), justfile)
 
@@ -79,6 +80,21 @@ class LocalGateContractTests(unittest.TestCase):
             2,
         )
         self.assertNotIn('"private_prefix_marker":', smoke)
+
+    def test_guard_offline_self_test_precedes_f1_network_and_binds_runtime(self) -> None:
+        smoke = LOOP_RECOVERY_SMOKE.read_text()
+        prerequisite = smoke.index(
+            "offline_self_test, binary_identity = run_offline_self_test(binary)"
+        )
+        for later in (
+            "free_port(), free_port()",
+            "FixtureHTTPServer(",
+            "isolated_config(candidate, root, fake_port, guard_port)",
+            "start_candidate_supervisor(",
+        ):
+            self.assertLess(prerequisite, smoke.index(later, prerequisite))
+        self.assertIn('Path(f"/proc/{candidate_identity[\'pid\']}/exe")', smoke)
+        self.assertIn('binary, binary_identity, "final_binary_identity_drift"', smoke)
 
     def test_active_guard_docs_match_private_metadata_only_policy(self) -> None:
         raw_flags = (

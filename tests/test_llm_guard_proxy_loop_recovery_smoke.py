@@ -222,6 +222,8 @@ def attempt(
 def passing_summary() -> dict:
     tick_ns = smoke.PROBE_HEARTBEAT_INTERVAL_SECS * 1_000_000_000
     return {
+        "offline_self_test": offline_receipt(),
+        "binary_identity_stable": True,
         "attempts": [
             attempt(
                 1,
@@ -334,6 +336,225 @@ def passing_summary() -> dict:
         "scan_errors": 0,
         "scan_limits_enforced": True,
     }
+
+
+def offline_receipt() -> dict:
+    return {
+        "self_test": "post-await-no-replay",
+        "status": "passed",
+        "control": {
+            "ordered_roles": ["business", "recovery_probe", "business"],
+            "product_roles": ["business", "readiness_probe", "recovery_replay"],
+            "attempt_count": 3,
+            "fixture_rejected_count": 0,
+            "request_claims": 1,
+            "rejected_request_claims": 0,
+            "recovery_replay_claims": 1,
+            "rejected_recovery_replay_claims": 0,
+            "rejected_physical_attempts": 0,
+            "rejected_readiness_probes": 0,
+            "business_count": 2,
+            "probe_count": 1,
+            "same_payload": True,
+            "first_chunk_stall": True,
+            "first_byte_wait_ms": 50,
+            "client_observed_heartbeat": False,
+            "done_observed": True,
+            "terminal_error_observed": False,
+            "eof_observed": True,
+            "post_await_committed": False,
+            "phases": {
+                "pre_await_gate_ns": 1,
+                "recovery_await_entered_ns": 2,
+                "body_emitted_ns": 0,
+                "client_ack_ns": 0,
+                "recovery_await_completed_ns": 3,
+                "control_replay_authorized_ns": 4,
+                "post_await_committed_ns": 0,
+            },
+            "loopback_only": True,
+            "cleanup_complete": True,
+        },
+        "committed": {
+            "ordered_roles": ["business"],
+            "product_roles": ["business"],
+            "attempt_count": 1,
+            "fixture_rejected_count": 0,
+            "request_claims": 1,
+            "rejected_request_claims": 0,
+            "recovery_replay_claims": 0,
+            "rejected_recovery_replay_claims": 0,
+            "rejected_physical_attempts": 0,
+            "rejected_readiness_probes": 0,
+            "business_count": 1,
+            "probe_count": 0,
+            "same_payload": True,
+            "first_chunk_stall": True,
+            "first_byte_wait_ms": 50,
+            "client_observed_heartbeat": True,
+            "done_observed": False,
+            "terminal_error_observed": True,
+            "eof_observed": True,
+            "post_await_committed": True,
+            "phases": {
+                "pre_await_gate_ns": 1,
+                "recovery_await_entered_ns": 2,
+                "body_emitted_ns": 3,
+                "client_ack_ns": 4,
+                "recovery_await_completed_ns": 5,
+                "control_replay_authorized_ns": 0,
+                "post_await_committed_ns": 6,
+            },
+            "loopback_only": True,
+            "cleanup_complete": True,
+        },
+        "same_payload_across_arms": True,
+    }
+
+
+class GuardOfflineSelfTestTests(unittest.TestCase):
+    def write_self_test(
+        self,
+        path: Path,
+        *,
+        receipt: dict | None = None,
+        body: str | None = None,
+    ) -> None:
+        if body is None:
+            body = f"print({json.dumps(receipt or offline_receipt())!r})\n"
+        path.write_text("#!/usr/bin/python3\n" + body, encoding="utf-8")
+        path.chmod(0o700)
+
+    def test_valid_receipt_runs_exact_command_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "guard"
+            body = (
+                "import os, sys\n"
+                f"assert sys.argv[1:] == {list(smoke.OFFLINE_SELF_TEST_ARGV)!r}\n"
+                "assert os.environ == {'LANG': 'C', 'LC_ALL': 'C', "
+                "'PATH': '/usr/bin:/bin'}\n"
+                f"print({json.dumps(offline_receipt())!r})\n"
+            )
+            self.write_self_test(binary, body=body)
+            receipt, identity = smoke.run_offline_self_test(binary)
+            digest = smoke.sha256(binary)
+        self.assertEqual(receipt, offline_receipt())
+        self.assertEqual(identity.sha256, digest)
+
+    def test_process_failures_stop_before_network(self) -> None:
+        cases = {
+            "nonzero": "raise SystemExit(7)\n",
+            "signal": "import os, signal\nos.kill(os.getpid(), signal.SIGTERM)\n",
+            "timeout": "import time\ntime.sleep(10)\n",
+            "multiline": "print('{}')\nprint('{}')\n",
+            "non_json": "print('not-json')\n",
+            "stderr": "import sys\nprint('diagnostic', file=sys.stderr)\n",
+            "output_limit": f"print('x' * {smoke.OFFLINE_SELF_TEST_OUTPUT_LIMIT})\n",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, body in cases.items():
+                binary = root / name
+                self.write_self_test(binary, body=body)
+                timeout = 0.05 if name == "timeout" else smoke.OFFLINE_SELF_TEST_TIMEOUT
+                with (
+                    self.subTest(name=name),
+                    patch.object(smoke, "OFFLINE_SELF_TEST_TIMEOUT", timeout),
+                    patch.object(smoke, "free_port", side_effect=AssertionError("network")),
+                    self.assertRaises(RuntimeError) as caught,
+                ):
+                    smoke.run_offline_self_test(binary)
+                self.assertNotIn("network", str(caught.exception))
+
+            binary = root / "main-invalid"
+            self.write_self_test(binary, body="print('not-json')\n")
+            argv = [
+                "smoke",
+                "--candidate-config",
+                str(ROOT / "config" / "llm-guard-proxy" / "config.toml"),
+                "--binary",
+                str(binary),
+                "--root",
+                str(root / "run"),
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(smoke, "free_port") as free_port,
+                self.assertRaises(RuntimeError),
+            ):
+                smoke.main()
+            free_port.assert_not_called()
+
+    def test_receipt_schema_and_f1_invariants_fail_closed(self) -> None:
+        mutations = (
+            ("unknown", lambda value: value.update(extra=True)),
+            ("missing", lambda value: value.pop("status")),
+            ("wrong_type", lambda value: value["control"].update(business_count=True)),
+            ("control_b2", lambda value: value["control"].update(business_count=1)),
+            ("control_probe", lambda value: value["control"].update(probe_count=0)),
+            ("control_roles", lambda value: value["control"].update(product_roles=["business"])),
+            ("committed_b2", lambda value: value["committed"].update(business_count=2)),
+            ("committed_probe", lambda value: value["committed"].update(probe_count=1)),
+            ("committed_replay", lambda value: value["committed"].update(recovery_replay_claims=1)),
+            ("committed_salvage", lambda value: value["committed"].update(ordered_roles=["business", "salvage"])),
+            ("committed_shadow", lambda value: value["committed"].update(product_roles=["business", "shadow"])),
+            ("committed_failover", lambda value: value["committed"].update(ordered_roles=["business", "failover"])),
+            ("committed_done", lambda value: value["committed"].update(done_observed=True)),
+            ("committed_success", lambda value: value["committed"].update(terminal_error_observed=False)),
+        )
+        for name, mutate in mutations:
+            receipt = offline_receipt()
+            mutate(receipt)
+            with self.subTest(name=name), self.assertRaises(RuntimeError):
+                smoke.validate_offline_self_test_receipt(receipt)
+
+    def test_private_field_is_rejected_without_echo(self) -> None:
+        receipt = offline_receipt()
+        marker = "private-marker-must-not-echo"
+        receipt["raw_prompt"] = marker
+        with self.assertRaises(RuntimeError) as caught:
+            smoke.validate_offline_self_test_receipt(receipt)
+        self.assertNotIn(marker, str(caught.exception))
+
+    def test_executable_replacement_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "guard"
+            replacement = root / "replacement"
+            self.write_self_test(binary)
+            _, identity = smoke.run_offline_self_test(binary)
+            self.write_self_test(replacement, body="print('replacement')\n")
+            os.replace(replacement, binary)
+            with self.assertRaises(RuntimeError):
+                smoke.require_executable_identity(binary, identity, "binary_identity_drift")
+        summary = passing_summary()
+        summary["binary_identity_stable"] = False
+        self.assertIn("binary_identity_drift", smoke.acceptance_errors(summary))
+
+    def test_failure_paths_reap_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, tail, timeout in (
+                ("timeout", "import time\ntime.sleep(10)\n", 0.05),
+                ("error", "print('not-json')\n", smoke.OFFLINE_SELF_TEST_TIMEOUT),
+            ):
+                pid_file = root / f"{name}.pid"
+                binary = root / name
+                body = (
+                    "import os\n"
+                    f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+                    + tail
+                )
+                self.write_self_test(binary, body=body)
+                with (
+                    self.subTest(name=name),
+                    patch.object(smoke, "OFFLINE_SELF_TEST_TIMEOUT", timeout),
+                    self.assertRaises(RuntimeError),
+                ):
+                    smoke.run_offline_self_test(binary)
+                pid = int(pid_file.read_text())
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(pid, os.WNOHANG)
 
 
 class LoopRecoveryFinalizationTests(unittest.TestCase):
@@ -1680,8 +1901,12 @@ while True:
             marker = base / "spawned"
             binary = base / "candidate"
             binary.write_text(
-                "#!/usr/bin/env python3\n"
+                "#!/usr/bin/python3\n"
+                "import json, sys\n"
                 "from pathlib import Path\n"
+                f"if sys.argv[1:] == {list(smoke.OFFLINE_SELF_TEST_ARGV)!r}:\n"
+                f"    print({json.dumps(offline_receipt())!r})\n"
+                "    raise SystemExit(0)\n"
                 f"Path({str(marker)!r}).write_text('spawned')\n"
             )
             binary.chmod(0o700)
@@ -1894,8 +2119,11 @@ while True:
             base = Path(tmp)
             binary = base / "candidate"
             binary.write_text(
-                "#!/usr/bin/env python3\n"
-                "import time\n"
+                "#!/usr/bin/python3\n"
+                "import json, sys, time\n"
+                f"if sys.argv[1:] == {list(smoke.OFFLINE_SELF_TEST_ARGV)!r}:\n"
+                f"    print({json.dumps(offline_receipt())!r})\n"
+                "    raise SystemExit(0)\n"
                 "time.sleep(60)\n"
             )
             binary.chmod(0o700)
