@@ -890,14 +890,16 @@ class Fixture:
                     try:
                         first_byte = self.rfile.peek(1)
                     except TimeoutError:
-                        self.server.note_empty_accept()
+                        self.server.note_empty_accept(self.client_address)
                         self.close_connection = True
                         return
                     if not first_byte:
-                        self.server.note_empty_accept()
+                        self.server.note_empty_accept(self.client_address)
                         self.close_connection = True
                         return
-                    self.server.note_nonempty_request(self.client_address)
+                    if self.server.note_nonempty_request(self.client_address):
+                        self.close_connection = True
+                        return
                     self.fixture_attempt = fixture.record_request()
                     self.raw_requestline = self.rfile.readline(65537)
                     if not self.raw_requestline:
@@ -1087,6 +1089,7 @@ class FixtureHTTPServer(ThreadingHTTPServer):
         self._accept_barrier_lock = threading.Lock()
         self._accept_barrier_active = False
         self._accept_barrier_token: object | None = None
+        self._accept_barrier_expected_peer: tuple[str, int] | None = None
         self._accept_barrier_nonempty = False
         super().__init__(server_address, handler, bind_and_activate=False)
         try:
@@ -1110,49 +1113,53 @@ class FixtureHTTPServer(ThreadingHTTPServer):
         finally:
             self.fixture.handler_finished()
 
-    def get_request(self):
-        request, client_address = super().get_request()
+    def note_nonempty_request(self, client_address) -> bool:
         with self._accept_barrier_lock:
             if (
                 self._accept_barrier_active
                 and self._accept_barrier_token is not None
-                and getattr(request, "fileno", lambda: -1)()
+                and client_address == self._accept_barrier_expected_peer
             ):
-                # FIFO drain: only the marker connection ends accept.
-                # Marker is recognized by an empty first-byte window later via
-                # note_nonempty_request absence + explicit barrier completion
-                # once backlog sockets have been accepted. To keep FIFO exact,
-                # the barrier socket is accepted normally and only then closes
-                # accept by signaling when it is the first empty accept after
-                # arming; backlog requests remain normal handlers.
-                pass
-        return request, client_address
+                self._accept_barrier_nonempty = True
+                self._accept_barrier.set()
+                return True
+        return False
 
-    def note_nonempty_request(self, client_address) -> None:
-        del client_address
-        # Backlog/nonempty accepts after arm are expected and do not spoil the
-        # EOF barrier; only the empty barrier connection completes it.
-        return
-
-    def note_empty_accept(self) -> None:
+    def note_empty_accept(self, client_address) -> None:
         with self._accept_barrier_lock:
-            if self._accept_barrier_active and not self._accept_barrier.is_set():
+            if (
+                self._accept_barrier_active
+                and self._accept_barrier_token is not None
+                and client_address == self._accept_barrier_expected_peer
+            ):
                 self._accept_barrier_nonempty = False
                 self._accept_barrier.set()
 
-    def arm_accept_barrier(self) -> object:
+    def arm_accept_barrier(self, expected_peer: tuple[str, int]) -> object:
         token = object()
         with self._accept_barrier_lock:
             self._accept_barrier_active = True
             self._accept_barrier_token = token
+            self._accept_barrier_expected_peer = expected_peer
             self._accept_barrier_nonempty = False
             self._accept_barrier.clear()
         return token
 
-    def wait_accept_barrier(self, timeout: float) -> tuple[bool, bool]:
+    def wait_accept_barrier(
+        self, token: object, timeout: float
+    ) -> tuple[bool, bool]:
+        with self._accept_barrier_lock:
+            if self._accept_barrier_token is not token:
+                return False, False
         completed = self._accept_barrier.wait(timeout)
         with self._accept_barrier_lock:
-            return completed, not self._accept_barrier_nonempty
+            if self._accept_barrier_token is not token:
+                return False, False
+            empty = not self._accept_barrier_nonempty
+            self._accept_barrier_active = False
+            self._accept_barrier_expected_peer = None
+            self._accept_barrier_token = None
+            return completed, empty
 
     def handle_error(self, request, client_address) -> None:
         del request, client_address
@@ -3529,12 +3536,15 @@ def stop_fixture_server(
     if server is not None:
         cleanup["unexpected_exit"] = server_thread is None or not server_thread.is_alive()
         try:
-            server.arm_accept_barrier()
-            barrier_sock = socket.create_connection(
-                server.server_address, timeout=max(0.05, deadline - time.monotonic())
-            )
+            barrier_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            barrier_sock.settimeout(max(0.05, deadline - time.monotonic()))
+            barrier_sock.bind(("127.0.0.1", 0))
+            barrier_peer = barrier_sock.getsockname()
+            barrier_token = server.arm_accept_barrier(barrier_peer)
+            barrier_sock.connect(server.server_address)
+            barrier_sock.shutdown(socket.SHUT_WR)
             completed, empty = server.wait_accept_barrier(
-                max(0.0, deadline - time.monotonic())
+                barrier_token, max(0.0, deadline - time.monotonic())
             )
             cleanup["accept_barrier_completed"] = completed
             cleanup["accept_barrier_empty"] = empty

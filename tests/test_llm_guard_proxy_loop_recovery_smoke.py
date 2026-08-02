@@ -3233,5 +3233,181 @@ class V6H2FinalizationOrderTests(unittest.TestCase):
         self.assertTrue(cleanup["handlers_quiesced"])
 
 
+class V7FixtureMarkerIdentityTests(unittest.TestCase):
+    def test_old_empty_accept_cannot_beat_bound_marker_and_backlog(self) -> None:
+        fixture = smoke.Fixture(
+            "reason", "private", "fresh", "positive", "fresh-output"
+        )
+        server = smoke.FixtureHTTPServer(
+            ("127.0.0.1", 0), fixture.handler(), fixture
+        )
+        server.server_activate()
+        a = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        b = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        a.bind(("127.0.0.1", 0))
+        b.bind(("127.0.0.1", 0))
+        a_peer = a.getsockname()
+        b_peer = b.getsockname()
+        a_accepted = threading.Event()
+        release_accepts = threading.Event()
+        barrier_armed = threading.Event()
+        a_reported = threading.Event()
+        accepted_peers: list[tuple[str, int]] = []
+        empty_reports: list[tuple[str, int]] = []
+        marker_peer: list[tuple[str, int]] = []
+        cleanup: list[dict[str, object]] = []
+        real_process_request = server.process_request
+        real_note_empty_accept = server.note_empty_accept
+        real_arm_accept_barrier = server.arm_accept_barrier
+
+        def process_request(request, client_address) -> None:
+            accepted_peers.append(client_address)
+            real_process_request(request, client_address)
+            if client_address == a_peer:
+                a_accepted.set()
+                if not release_accepts.wait(timeout=2):
+                    raise TimeoutError("test_accept_gate_timeout")
+
+        def note_empty_accept(client_address) -> None:
+            real_note_empty_accept(client_address)
+            empty_reports.append(client_address)
+            if client_address == a_peer:
+                a_reported.set()
+
+        def arm_accept_barrier(expected_peer):
+            token = real_arm_accept_barrier(expected_peer)
+            marker_peer.append(expected_peer)
+            barrier_armed.set()
+            return token
+
+        server.process_request = process_request
+        server.note_empty_accept = note_empty_accept
+        server.arm_accept_barrier = arm_accept_barrier
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        stop_thread: threading.Thread | None = None
+        server_thread.start()
+        try:
+            a.connect(server.server_address)
+            self.assertTrue(a_accepted.wait(timeout=2))
+
+            b.connect(server.server_address)
+            b.sendall(
+                b"GET /v1/models HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            b.shutdown(socket.SHUT_WR)
+
+            stop_thread = threading.Thread(
+                target=lambda: cleanup.append(
+                    smoke.stop_fixture_server(server, server_thread, fixture)
+                ),
+                daemon=True,
+            )
+            stop_thread.start()
+            self.assertTrue(barrier_armed.wait(timeout=2))
+
+            a.shutdown(socket.SHUT_WR)
+            self.assertTrue(a_reported.wait(timeout=2))
+            self.assertFalse(server._accept_barrier.is_set())
+
+            release_accepts.set()
+            stop_thread.join(timeout=3)
+            self.assertFalse(stop_thread.is_alive())
+            self.assertEqual(len(cleanup), 1)
+            self.assertTrue(cleanup[0]["accept_barrier_completed"])
+            self.assertTrue(cleanup[0]["accept_barrier_empty"])
+            self.assertTrue(cleanup[0]["handlers_quiesced"])
+            self.assertEqual(cleanup[0]["errors"], [])
+            self.assertEqual(
+                accepted_peers[:3],
+                [a_peer, b_peer, marker_peer[0]],
+            )
+            self.assertEqual(empty_reports, [a_peer, marker_peer[0]])
+            attempts, errors = fixture.snapshot()
+            self.assertEqual(errors, [])
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(attempts[0]["endpoint"], "models")
+        finally:
+            release_accepts.set()
+            for client in (a, b):
+                try:
+                    client.close()
+                except OSError:
+                    pass
+            if stop_thread is not None:
+                stop_thread.join(timeout=3)
+            if server_thread.is_alive():
+                server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+    def test_exact_marker_nonempty_fails_closed_without_business_attempt(self) -> None:
+        fixture = smoke.Fixture(
+            "reason", "private", "fresh", "positive", "fresh-output"
+        )
+        server = smoke.FixtureHTTPServer(
+            ("127.0.0.1", 0), fixture.handler(), fixture
+        )
+        server.server_activate()
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        marker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        marker.bind(("127.0.0.1", 0))
+        marker_peer = marker.getsockname()
+        server_thread.start()
+        try:
+            token = server.arm_accept_barrier(marker_peer)
+            marker.connect(server.server_address)
+            marker.sendall(b"X")
+            marker.shutdown(socket.SHUT_WR)
+            self.assertEqual(
+                server.wait_accept_barrier(token, timeout=2),
+                (True, False),
+            )
+            self.assertEqual(fixture.snapshot(), ([], []))
+            self.assertIsNone(server._accept_barrier_expected_peer)
+            self.assertIsNone(server._accept_barrier_token)
+        finally:
+            marker.close()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+            self.assertFalse(server_thread.is_alive())
+            self.assertTrue(fixture.wait_for_handlers(timeout=2))
+
+    def test_stale_barrier_generation_cannot_complete_or_clear_current(self) -> None:
+        fixture = smoke.Fixture(
+            "reason", "private", "fresh", "positive", "fresh-output"
+        )
+        server = smoke.FixtureHTTPServer(
+            ("127.0.0.1", 0), fixture.handler(), fixture
+        )
+        old_peer = ("127.0.0.1", 31001)
+        current_peer = ("127.0.0.1", 31002)
+        try:
+            old_token = server.arm_accept_barrier(old_peer)
+            current_token = server.arm_accept_barrier(current_peer)
+
+            server.note_empty_accept(old_peer)
+            self.assertFalse(server._accept_barrier.is_set())
+            self.assertEqual(
+                server.wait_accept_barrier(old_token, timeout=0),
+                (False, False),
+            )
+            self.assertEqual(server._accept_barrier_expected_peer, current_peer)
+            self.assertIs(server._accept_barrier_token, current_token)
+
+            server.note_empty_accept(current_peer)
+            self.assertEqual(
+                server.wait_accept_barrier(current_token, timeout=0),
+                (True, True),
+            )
+            self.assertIsNone(server._accept_barrier_expected_peer)
+            self.assertIsNone(server._accept_barrier_token)
+        finally:
+            server.server_close()
+            self.assertEqual(fixture.snapshot(), ([], []))
+
+
 if __name__ == "__main__":
     unittest.main()
