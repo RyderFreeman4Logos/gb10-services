@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import secrets
+import shlex
 import signal
 import socket
 import subprocess
@@ -39,6 +40,66 @@ def enable_test_subreaper() -> None:
 
 def fd_count() -> int:
     return len(os.listdir("/proc/self/fd"))
+
+
+def start_direct_supervisor_worker() -> tuple[subprocess.Popen[bytes], socket.socket]:
+    parent, child = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
+    )
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "llm_guard_proxy_loop_recovery_smoke.py"),
+            "--exclusive-supervisor-fd",
+            str(child.fileno()),
+        ],
+        pass_fds=(child.fileno(),),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    child.close()
+    ready = smoke._recv_supervisor_receipt(parent, time.monotonic() + 2)
+    if ready.get("kind") != "scope_ready":
+        parent.close()
+        proc.kill()
+        proc.wait(timeout=2)
+        raise RuntimeError("direct_supervisor_not_ready")
+    return proc, parent
+
+
+def send_direct_launch(
+    control: socket.socket,
+    packet: dict[str, object],
+    executable_fd: int | None = None,
+) -> None:
+    payload = json.dumps(packet, sort_keys=True, separators=(",", ":")).encode()
+    ancillary = (
+        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, bytes(ctypes.c_int(executable_fd)))]
+        if executable_fd is not None
+        else []
+    )
+    sent = control.sendmsg([payload], ancillary)
+    if sent != len(payload):
+        raise RuntimeError("direct_supervisor_launch_truncated")
+
+
+def finish_direct_supervisor(
+    proc: subprocess.Popen[bytes], control: socket.socket, started: bool
+) -> None:
+    try:
+        if started and proc.poll() is None:
+            smoke._send_supervisor_packet(
+                control, b"stop", time.monotonic() + 2
+            )
+            smoke._recv_supervisor_receipt(control, time.monotonic() + 4)
+    finally:
+        control.close()
+        try:
+            proc.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
 
 
 def run_client_fixture(
@@ -413,6 +474,14 @@ def offline_receipt() -> dict:
 
 
 class GuardOfflineSelfTestTests(unittest.TestCase):
+    def setUp(self) -> None:
+        enable_test_subreaper()
+        self.exclusive_supervisor_pid = smoke._EXCLUSIVE_SUPERVISOR_PID
+        smoke._EXCLUSIVE_SUPERVISOR_PID = os.getpid()
+
+    def tearDown(self) -> None:
+        smoke._EXCLUSIVE_SUPERVISOR_PID = self.exclusive_supervisor_pid
+
     def write_self_test(
         self,
         path: Path,
@@ -440,6 +509,194 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
             digest = smoke.sha256(binary)
         self.assertEqual(receipt, offline_receipt())
         self.assertEqual(identity.sha256, digest)
+
+    def test_direct_supervisor_packet_without_executable_capability_cannot_launch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "launched"
+            binary = root / "candidate"
+            self.write_self_test(
+                binary,
+                body=(
+                    "import pathlib, time\n"
+                    f"pathlib.Path({str(marker)!r}).write_text('launched')\n"
+                    "time.sleep(30)\n"
+                ),
+            )
+            proc, control = start_direct_supervisor_worker()
+            started = False
+            try:
+                send_direct_launch(
+                    control,
+                    {
+                        "kind": "launch",
+                        "argv": [str(binary)],
+                        "cwd": str(root),
+                        "env": {"PATH": "/usr/bin:/bin"},
+                        "log_path": str(root / "candidate.log"),
+                        "test_failpoint": None,
+                        "control_timeout": 5,
+                    },
+                )
+                receipt = smoke._recv_supervisor_receipt(
+                    control, time.monotonic() + 2
+                )
+                started = receipt.get("kind") == "started"
+            finally:
+                finish_direct_supervisor(proc, control, started)
+            self.assertFalse(started)
+            self.assertFalse(marker.exists())
+
+    def test_runtime_launch_uses_verified_fd_after_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "candidate"
+            replacement = root / "replacement"
+            legitimate = root / "legitimate"
+            hostile = root / "hostile"
+            source = root / "candidate.c"
+            receipt_literal = json.dumps(
+                json.dumps(offline_receipt(), separators=(",", ":"))
+            )
+            source.write_text(
+                "#include <fcntl.h>\n"
+                "#include <signal.h>\n"
+                "#include <string.h>\n"
+                "#include <unistd.h>\n"
+                "static void stop(int signal_number) { _exit(0); }\n"
+                "int main(int argc, char **argv) {\n"
+                "  if (argc == 3 && !strcmp(argv[1], \"self-test\") && "
+                "!strcmp(argv[2], \"post-await-no-replay\")) {\n"
+                f"    static const char receipt[] = {receipt_literal};\n"
+                "    write(1, receipt, sizeof(receipt) - 1);\n"
+                "    write(1, \"\\n\", 1);\n"
+                "    return 0;\n"
+                "  }\n"
+                "  int fd = open(argv[1], O_WRONLY | O_CREAT | O_TRUNC, 0600);\n"
+                "  write(fd, \"ran\", 3);\n"
+                "  close(fd);\n"
+                "  signal(SIGTERM, stop);\n"
+                "  for (;;) pause();\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["/usr/bin/cc", "-O2", "-o", str(binary), str(source)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.write_self_test(
+                replacement,
+                body=(
+                    "import pathlib, signal, time\n"
+                    f"pathlib.Path({str(hostile)!r}).write_text('ran')\n"
+                    "signal.signal(signal.SIGTERM, lambda *_: exit(0))\n"
+                    "while True: time.sleep(0.05)\n"
+                ),
+            )
+            executable_fd = os.open(
+                binary, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            )
+            os.replace(replacement, binary)
+            proc, control = start_direct_supervisor_worker()
+            started = False
+            try:
+                send_direct_launch(
+                    control,
+                    {
+                        "kind": "authorize",
+                        "argv0": str(binary),
+                        "test_failpoint": None,
+                        "control_timeout": 5,
+                    },
+                    executable_fd,
+                )
+                authorization = smoke._recv_supervisor_receipt(
+                    control, time.monotonic() + 2
+                )
+                self.assertEqual(authorization.get("kind"), "authorized")
+                smoke._send_supervisor_packet(
+                    control,
+                    {
+                        "kind": "launch",
+                        "argv": [str(binary), str(legitimate)],
+                        "cwd": str(root),
+                        "env": {"PATH": "/usr/bin:/bin"},
+                        "log_path": str(root / "candidate.log"),
+                    },
+                    time.monotonic() + 2,
+                )
+                receipt = smoke._recv_supervisor_receipt(
+                    control, time.monotonic() + 2
+                )
+                started = receipt.get("kind") == "started"
+                deadline = time.monotonic() + 1
+                while (
+                    started
+                    and not legitimate.exists()
+                    and not hostile.exists()
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+            finally:
+                os.close(executable_fd)
+                finish_direct_supervisor(proc, control, started)
+            self.assertTrue(started)
+            self.assertTrue(legitimate.exists())
+            self.assertFalse(hostile.exists())
+
+    def test_readiness_rejects_different_executable_listener_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            port = smoke.free_port()
+            listener = root / "listener.py"
+            listener.write_text(
+                "import socket, sys, time\n"
+                "with socket.socket() as sock:\n"
+                "    sock.bind(('127.0.0.1', int(sys.argv[1])))\n"
+                "    sock.listen()\n"
+                "    time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            candidate = root / "candidate"
+            candidate.write_text(
+                "#!/bin/sh\n"
+                f"/usr/bin/python3 {listener} {port} &\n"
+                "wait\n",
+                encoding="utf-8",
+            )
+            candidate.chmod(0o700)
+            proc = subprocess.Popen([str(candidate)], start_new_session=True)
+            parent, child = socket.socketpair()
+            identity = smoke.capture_spawn_identity(proc.pid)
+            expected = smoke.executable_identity(
+                Path(f"/proc/{proc.pid}/exe"), nofollow=False
+            )
+            handle = smoke.SupervisorHandle(
+                proc.pid,
+                identity,
+                parent,
+                {
+                    "candidate_identity": smoke._identity_receipt(identity),
+                    "binary_identity": expected._asdict(),
+                },
+                smoke.ScopeFence("test.scope", "/test.scope", -1, -1, identity),
+            )
+            try:
+                with self.assertRaises(RuntimeError):
+                    smoke.wait_port(port, handle, time.monotonic() + 2)
+            finally:
+                child.close()
+                parent.close()
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=2)
+                smoke._close_identity_pidfd(identity)
 
     def test_process_failures_stop_before_network(self) -> None:
         cases = {
@@ -480,9 +737,10 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
             with (
                 patch.object(sys, "argv", argv),
                 patch.object(smoke, "free_port") as free_port,
-                self.assertRaises(RuntimeError),
+                redirect_stdout(io.StringIO()),
             ):
-                smoke.main()
+                result = smoke.main()
+            self.assertEqual(result, 1)
             free_port.assert_not_called()
 
     def test_receipt_schema_and_f1_invariants_fail_closed(self) -> None:
@@ -515,6 +773,27 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as caught:
             smoke.validate_offline_self_test_receipt(receipt)
         self.assertNotIn(marker, str(caught.exception))
+
+    def test_duplicate_json_members_are_rejected_recursively(self) -> None:
+        raw = json.dumps(offline_receipt(), separators=(",", ":"))
+        cases = {
+            "top_level": raw.replace(
+                '"status":"passed"',
+                '"status":"failed","status":"passed"',
+                1,
+            ),
+            "nested": raw.replace(
+                '"business_count":2',
+                '"business_count":1,"business_count":2',
+                1,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, payload in cases.items():
+                binary = Path(tmp) / name
+                self.write_self_test(binary, body=f"print({payload!r})\n")
+                with self.subTest(name=name), self.assertRaises(RuntimeError):
+                    smoke.run_offline_self_test(binary)
 
     def test_executable_replacement_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -556,18 +835,91 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 with self.assertRaises(ChildProcessError):
                     os.waitpid(pid, os.WNOHANG)
 
+    def test_offline_self_test_fences_setsid_pipe_holder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "guard"
+            child_pid = root / "child.pid"
+            body = (
+                "import os, signal, time\n"
+                "if os.fork() == 0:\n"
+                "    os.setsid()\n"
+                "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                f"    open({str(child_pid)!r}, 'w').write(str(os.getpid()))\n"
+                "    time.sleep(30)\n"
+                f"print({json.dumps(offline_receipt())!r})\n"
+            )
+            self.write_self_test(binary, body=body)
+            with (
+                patch.object(smoke, "OFFLINE_SELF_TEST_TIMEOUT", 0.2),
+                self.assertRaises(RuntimeError),
+            ):
+                smoke.run_offline_self_test(binary)
+            pid = int(child_pid.read_text())
+            survived = smoke.process_identity_is_live(pid)
+            try:
+                self.assertFalse(survived, "escaped offline descendant survived")
+            finally:
+                if survived:
+                    os.kill(pid, signal.SIGKILL)
+
 
 class LoopRecoveryFinalizationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.fake_guard_tmp = tempfile.TemporaryDirectory()
+        root = Path(cls.fake_guard_tmp.name)
+        source = root / "fake_guard.c"
+        cls.fake_guard = root / "fake_guard"
+        receipt_literal = json.dumps(
+            json.dumps(offline_receipt(), separators=(",", ":"))
+        )
+        source.write_text(
+            "#include <Python.h>\n"
+            "#include <string.h>\n"
+            "#include <unistd.h>\n"
+            "int main(int argc, char **argv) {\n"
+            "  if (argc == 3 && !strcmp(argv[1], \"self-test\") && "
+            "!strcmp(argv[2], \"post-await-no-replay\")) {\n"
+            f"    static const char receipt[] = {receipt_literal};\n"
+            "    write(1, receipt, sizeof(receipt) - 1);\n"
+            "    write(1, \"\\n\", 1);\n"
+            "    return 0;\n"
+            "  }\n"
+            "  return Py_BytesMain(argc, argv);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        flags = shlex.split(
+            subprocess.check_output(
+                ["/usr/bin/python3-config", "--embed", "--cflags", "--ldflags"],
+                text=True,
+            )
+        )
+        subprocess.run(
+            ["/usr/bin/cc", str(source), "-o", str(cls.fake_guard), *flags],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.fake_guard_tmp.cleanup()
+
     def test_final_acceptance_checks_every_attempt_privacy_and_budget(self) -> None:
         self.assertFalse(smoke.acceptance_errors(passing_summary()))
 
         for budget in (1024, smoke.THINKING_BUDGET):
-            legal_shadow = passing_summary()
-            legal_shadow["attempts"].append(
+            extra_shadow = passing_summary()
+            extra_shadow["attempts"].append(
                 attempt(5, "shielded_hold", budget=budget, role="shadow")
             )
-            with self.subTest(legal_shadow_budget=budget):
-                self.assertFalse(smoke.acceptance_errors(legal_shadow))
+            with self.subTest(extra_shadow_budget=budget):
+                self.assertIn(
+                    "shielded_hold_business_attempt_count",
+                    smoke.acceptance_errors(extra_shadow),
+                )
 
         for field in (
             "salvage_material_present",
@@ -731,6 +1083,23 @@ class LoopRecoveryFinalizationTests(unittest.TestCase):
             "shielded_hold_salvage_after_first_byte",
             smoke.acceptance_errors(late_salvage),
         )
+
+        for role in ("shadow", "unknown-future-role"):
+            late_relabel = passing_summary()
+            late_relabel["attempts"].append(
+                attempt(
+                    5,
+                    "shielded_hold",
+                    budget=smoke.THINKING_BUDGET,
+                    role=role,
+                    admitted=shielded_first + 1,
+                )
+            )
+            with self.subTest(role=role):
+                self.assertIn(
+                    "shielded_hold_post_commit_attempt:5",
+                    smoke.acceptance_errors(late_relabel),
+                )
 
         generic_retry = passing_summary()
         generic_first = generic_retry["operational_contract"]["arms"][
@@ -1336,6 +1705,7 @@ while True:
                         root,
                         os.environ.copy(),
                         root / "candidate.log",
+                        binary=self.fake_guard,
                     )
                     candidate_pid = supervisor.started_receipt["candidate_identity"][
                         "pid"
@@ -1432,6 +1802,7 @@ with socket.socket() as listener:
                         root,
                         os.environ.copy(),
                         root / "candidate.log",
+                        binary=self.fake_guard,
                     )
                     wrapper = smoke._read_process_identity(supervisor.pid)
                     self.assertIsNotNone(wrapper)
@@ -1560,6 +1931,7 @@ with socket.socket() as listener:
                             root,
                             os.environ.copy(),
                             root / "candidate.log",
+                            binary=self.fake_guard,
                         )
                     self.assertEqual(caught.exception.error["code"], "ESTALE")
                     self.assertIsInstance(caught.exception.__cause__, OSError)
@@ -1630,6 +2002,7 @@ while True:
                 root,
                 os.environ.copy(),
                 root / "candidate.log",
+                binary=self.fake_guard,
             )
             unrelated = subprocess.Popen(
                 [
@@ -1711,6 +2084,7 @@ while True:
                         root,
                         os.environ.copy(),
                         root / "candidate.log",
+                        binary=self.fake_guard,
                     )
                     deadline = time.monotonic() + 2
                     while not ready.exists() and time.monotonic() < deadline:
@@ -1865,6 +2239,7 @@ while True:
                 root,
                 os.environ.copy(),
                 root / "candidate.log",
+                binary=self.fake_guard,
             )
             try:
                 deadline = time.monotonic() + 2
@@ -2027,6 +2402,7 @@ while True:
                     root,
                     os.environ.copy(),
                     root / "candidate.log",
+                    binary=self.fake_guard,
                 )
                 unrelated = subprocess.Popen(
                     [

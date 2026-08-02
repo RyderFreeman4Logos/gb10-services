@@ -84,17 +84,18 @@ class LocalGateContractTests(unittest.TestCase):
     def test_guard_offline_self_test_precedes_f1_network_and_binds_runtime(self) -> None:
         smoke = LOOP_RECOVERY_SMOKE.read_text()
         prerequisite = smoke.index(
-            "offline_self_test, binary_identity = run_offline_self_test(binary)"
+            "authorization = authorize_candidate_supervisor(binary, str(binary))"
         )
         for later in (
             "free_port(), free_port()",
             "FixtureHTTPServer(",
             "isolated_config(candidate, root, fake_port, guard_port)",
-            "start_candidate_supervisor(",
+            "launch_candidate_supervisor(",
         ):
             self.assertLess(prerequisite, smoke.index(later, prerequisite))
-        self.assertIn('Path(f"/proc/{candidate_identity[\'pid\']}/exe")', smoke)
-        self.assertIn('binary, binary_identity, "final_binary_identity_drift"', smoke)
+        self.assertIn("authorization, executable_fd = _recv_supervisor_launch", smoke)
+        self.assertIn('executable=f"/proc/self/fd/{executable_fd}"', smoke)
+        self.assertIn("require_candidate_runtime(supervisor, guard_port)", smoke)
 
     def test_active_guard_docs_match_private_metadata_only_policy(self) -> None:
         raw_flags = (
