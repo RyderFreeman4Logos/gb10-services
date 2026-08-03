@@ -784,8 +784,21 @@ class QueritDeployerContractTests(unittest.TestCase):
             "NO_SWAP_HELPER=/home/obj/.local/bin/gb10_verify_vllm_no_swap.sh",
             'verify_no_swap "$RERANK_UNIT" "$RERANK_CONTAINER"',
             'verify_no_swap "$EMBEDDING_UNIT" "$EMBEDDING_CONTAINER"',
+            'bind_runtime_swap_max "$AEON_UNIT" "$AEON_CONTAINER"',
+            'bind_runtime_swap_max "$EMBEDDING_UNIT" "$EMBEDDING_CONTAINER"',
         ):
             self.assertIn(contract, self.source)
+        reload_index = self.source.index("run_systemctl daemon-reload")
+        self.assertLess(
+            self.source.index('bind_runtime_swap_max "$AEON_UNIT" "$AEON_CONTAINER"'),
+            reload_index,
+        )
+        self.assertLess(
+            self.source.index(
+                'bind_runtime_swap_max "$EMBEDDING_UNIT" "$EMBEDDING_CONTAINER"'
+            ),
+            reload_index,
+        )
 
     def test_enables_querit_only_after_readiness_and_smoke(self) -> None:
         ready = self.source.index("RERANK_READY")

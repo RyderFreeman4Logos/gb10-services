@@ -112,6 +112,15 @@ class CgroupEvidence:
     swap_current: int
 
 
+@dataclasses.dataclass(frozen=True)
+class GenerationEvidence:
+    snapshot: ContainerSnapshot
+    proc_starttime: int
+    proc_scope: str
+    systemd_scope: str
+    cgroup: CgroupEvidence
+
+
 def run_command(
     arguments: Sequence[str],
     *,
@@ -695,6 +704,58 @@ def systemd_scope(identifier: str) -> str:
     return rows[0]
 
 
+def systemd_memory_swap_max(identifier: str) -> None:
+    result = run_command(
+        [
+            SYSTEMCTL_BIN,
+            "--user",
+            "show",
+            "-p",
+            "MemorySwapMax",
+            "--value",
+            f"docker-{identifier}.scope",
+        ]
+    )
+    if result.stdout not in {b"0", b"0\n"}:
+        reject("systemd Docker MemorySwapMax read-back is not exactly zero")
+
+
+def private_cidfile(contract: UnitContract) -> tuple[str, tuple[int, ...]]:
+    raw = contract.cidfile
+    if raw.startswith("%t/"):
+        runtime = canonical_absolute(
+            os.environ.get("XDG_RUNTIME_DIR", ""), "XDG runtime directory"
+        )
+        raw = f"{runtime}/{raw.removeprefix('%t/')}"
+    path = canonical_absolute(raw, "unit cidfile path")
+    parent = require_directory_chain(path.parent, "unit cidfile parent")
+    if parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) & 0o077:
+        reject("unit cidfile parent is not owner-only")
+    try:
+        lexical = os.lstat(path)
+    except OSError as error:
+        reject(f"unit cidfile is unavailable: {error}")
+    if (
+        not stat.S_ISREG(lexical.st_mode)
+        or lexical.st_uid != os.geteuid()
+        or lexical.st_nlink != 1
+        or stat.S_IMODE(lexical.st_mode) & 0o077
+    ):
+        reject("unit cidfile is not one owner-only regular file")
+    payload, opened = read_regular(path, 128, "unit cidfile")
+    current = os.lstat(path)
+    if not (
+        metadata_identity(lexical)
+        == metadata_identity(opened)
+        == metadata_identity(current)
+    ):
+        reject("unit cidfile changed while reading")
+    text = decode_text(payload, "unit cidfile")
+    if re.fullmatch(r"[0-9a-f]{64}\n?", text) is None:
+        reject("unit cidfile does not contain exactly one full container ID")
+    return text.rstrip("\n"), metadata_identity(current)
+
+
 def read_uint(path: Path, label: str) -> int:
     payload, _metadata = read_regular(path, 128, label)
     if re.fullmatch(rb"(?:0|[1-9][0-9]*)\n?", payload) is None:
@@ -745,7 +806,7 @@ def cgroup_evidence(path: str, expected_memory: int) -> CgroupEvidence:
     )
 
 
-def verify_generation(contract: UnitContract) -> None:
+def verify_generation(contract: UnitContract) -> GenerationEvidence:
     first = wait_snapshot(contract)
     first_starttime = proc_starttime(first.pid)
     first_proc_scope = canonical_proc_scope(first.pid, first.identifier)
@@ -776,6 +837,51 @@ def verify_generation(contract: UnitContract) -> None:
         reject("systemd Docker ControlGroup changed during verification")
     if first_cgroup != second_cgroup:
         reject("cgroup directory identity or authoritative files changed during verification")
+    return GenerationEvidence(
+        second,
+        second_starttime,
+        second_proc_scope,
+        second_systemd_scope,
+        second_cgroup,
+    )
+
+
+def bind_runtime_swap_max(contract: UnitContract) -> None:
+    cid_before = private_cidfile(contract)
+    before = verify_generation(contract)
+    if cid_before[0] != before.snapshot.identifier:
+        reject("unit cidfile and exact live Docker generation disagree")
+    by_id_payload = inspect_payload(cid_before[0], allow_absent=False)
+    assert by_id_payload is not None
+    try:
+        by_id = parse_snapshot(by_id_payload, contract)
+    except NotReady as error:
+        reject(f"cidfile Docker generation is not running: {error}")
+    if by_id != before.snapshot or private_cidfile(contract) != cid_before:
+        reject("cidfile full-ID and container-name authorities disagree or changed")
+
+    scope_unit = f"docker-{before.snapshot.identifier}.scope"
+    run_command(
+        [
+            SYSTEMCTL_BIN,
+            "--user",
+            "set-property",
+            "--runtime",
+            scope_unit,
+            "MemorySwapMax=0",
+        ]
+    )
+    systemd_memory_swap_max(before.snapshot.identifier)
+
+    after = verify_generation(contract)
+    by_id_payload = inspect_payload(cid_before[0], allow_absent=False)
+    assert by_id_payload is not None
+    try:
+        by_id = parse_snapshot(by_id_payload, contract)
+    except NotReady as error:
+        reject(f"cidfile Docker generation stopped after runtime binding: {error}")
+    if after != before or by_id != before.snapshot or private_cidfile(contract) != cid_before:
+        reject("generation evidence or private cidfile changed while runtime swap policy was bound")
 
 
 def docker_cgroup_v2_preflight() -> None:
@@ -900,8 +1006,11 @@ def profile_authority_mode(arguments: Sequence[str]) -> bool:
     return True
 
 
-def parse_cli(arguments: Sequence[str]) -> tuple[bool, list[str], list[str], str | None]:
+def parse_cli(
+    arguments: Sequence[str],
+) -> tuple[bool, bool, list[str], list[str], str | None]:
     cleanup_mode = False
+    bind_mode = False
     units: list[str] = []
     containers: list[str] = []
     cidfile: str | None = None
@@ -912,6 +1021,12 @@ def parse_cli(arguments: Sequence[str]) -> tuple[bool, list[str], list[str], str
             if cleanup_mode:
                 reject("--cleanup may appear only once")
             cleanup_mode = True
+            index += 1
+            continue
+        if token == "--bind-runtime-swap-max":
+            if bind_mode:
+                reject("--bind-runtime-swap-max may appear only once")
+            bind_mode = True
             index += 1
             continue
         if token in {"--unit", "--container", "--cidfile"}:
@@ -930,10 +1045,13 @@ def parse_cli(arguments: Sequence[str]) -> tuple[bool, list[str], list[str], str
             continue
         if token in {"-h", "--help"}:
             reject(
-                "usage: [--unit ABSOLUTE_PATH]... [--container NAME]... or "
-                "--cleanup [--container NAME]... --cidfile ABSOLUTE_PATH"
+                "usage: [--bind-runtime-swap-max] --unit ABSOLUTE_PATH "
+                "[--container NAME] or --cleanup [--container NAME]... "
+                "--cidfile ABSOLUTE_PATH"
             )
         reject(f"unknown CLI argument: {token}")
+    if cleanup_mode and bind_mode:
+        reject("cleanup and runtime swap binding are mutually exclusive")
     if cleanup_mode:
         if units or not containers or cidfile is None:
             reject("cleanup requires at least one --container and one --cidfile")
@@ -944,7 +1062,9 @@ def parse_cli(arguments: Sequence[str]) -> tuple[bool, list[str], list[str], str
             reject("verification requires at least one --unit")
         if len(set(units)) != len(units) or len(set(containers)) != len(containers):
             reject("verification arguments contain duplicates")
-    return cleanup_mode, units, containers, cidfile
+        if bind_mode and (len(units) != 1 or len(containers) != 1):
+            reject("runtime swap binding requires one unit and its one container")
+    return cleanup_mode, bind_mode, units, containers, cidfile
 
 
 def main() -> None:
@@ -953,7 +1073,7 @@ def main() -> None:
 
     if profile_authority_mode(ARGUMENTS):
         return
-    cleanup_mode, unit_paths, containers, cidfile = parse_cli(ARGUMENTS)
+    cleanup_mode, bind_mode, unit_paths, containers, cidfile = parse_cli(ARGUMENTS)
     if cleanup_mode:
         assert cidfile is not None
         cleanup(containers, cidfile)
@@ -973,9 +1093,13 @@ def main() -> None:
         contract = by_container.get(container)
         if contract is None:
             reject(f"container lacks one matching --unit authority: {container}")
-        verify_generation(contract)
+        if bind_mode:
+            bind_runtime_swap_max(contract)
+        else:
+            verify_generation(contract)
+    action = "bound" if bind_mode else "verified"
     print(
-        "gb10_vllm_no_swap: verified "
+        f"gb10_vllm_no_swap: {action} "
         f"units={len(contracts)} containers={len(containers)} cgroup_version=2"
     )
 

@@ -185,6 +185,7 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
         result = self._run()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         log = self.command_log.read_text()
+        self.assertNotIn("set-property", log)
         self.assertIn("docker info --format {{.CgroupVersion}}", log)
         self.assertIn("docker inspect --type container vllm-test", log)
         self.assertIn(
@@ -192,6 +193,137 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
             log,
         )
         self.assertGreaterEqual(log.count("docker inspect --type container vllm-test"), 2)
+
+    def test_runtime_swap_binding_survives_reload_and_rejects_stale_cid(self) -> None:
+        environment = {
+            **self._test_environment(),
+            "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
+        }
+        scope_path = self.cgroup_root / self.scopes["vllm-test"].removeprefix("/")
+        scope_unit = f"docker-{self.identifiers['vllm-test']}.scope"
+
+        reloaded = subprocess.run(
+            [self.systemctl, "--user", "daemon-reload"],
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(reloaded.returncode, 0, reloaded.stdout + reloaded.stderr)
+        self.assertEqual((scope_path / "memory.swap.max").read_text(), "max\n")
+        rejected = self.assert_rejected()
+        self.assertIn("memory.swap.max", rejected.stderr)
+
+        self._write_generation("vllm-test")
+        self._write_generation("vllm-second")
+        self.inspect_state.unlink(missing_ok=True)
+        bound = self._run(bind_runtime_swap_max=True)
+        self.assertEqual(bound.returncode, 0, bound.stdout + bound.stderr)
+        exact_set = f"systemctl set-property --runtime {scope_unit} MemorySwapMax=0"
+        self.assertEqual(self.command_log.read_text().splitlines().count(exact_set), 1)
+
+        reloaded = subprocess.run(
+            [self.systemctl, "--user", "daemon-reload"],
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(reloaded.returncode, 0, reloaded.stdout + reloaded.stderr)
+        self.assertEqual((scope_path / "memory.swap.max").read_text(), "0\n")
+        unrelated_scope = self.cgroup_root / self.scopes["vllm-second"].removeprefix("/")
+        self.assertEqual(
+            (unrelated_scope / "memory.swap.max").read_text(),
+            "max\n",
+            "runtime binding must not install a prefix/global Docker scope policy",
+        )
+        verified = self._run()
+        self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+
+        self.cidfiles["vllm-test"].write_text(self.identifiers["vllm-second"] + "\n")
+        self.inspect_state.unlink(missing_ok=True)
+        stale = self.assert_rejected(bind_runtime_swap_max=True)
+        self.assertIn("cidfile", stale.stderr)
+        self.assertEqual(self.command_log.read_text().splitlines().count(exact_set), 1)
+
+    def test_binder_compares_complete_generation_evidence_across_set_property(self) -> None:
+        scope = self.cgroup_root / self.scopes["vllm-test"].removeprefix("/")
+        stat_path = self.proc_root / str(self.pids["vllm-test"]) / "stat"
+        replacement_files = {
+            "cgroup.events": "populated 1\nfrozen 0\n",
+            "memory.max": f"{self.memory}\n",
+            "memory.swap.max": "0\n",
+            "memory.swap.current": "0\n",
+        }
+        cases = (
+            [{"op": "write", "path": str(stat_path), "data": _proc_stat(4242, 999_999)}],
+            [
+                {
+                    "op": "write",
+                    "path": str(scope / "cgroup.events"),
+                    "data": "populated 1\nfrozen 1\n",
+                }
+            ],
+            [{"op": "replace_dir", "path": str(scope), "files": replacement_files}],
+        )
+        for actions in cases:
+            with self.subTest(actions=actions):
+                self._write_generation("vllm-test")
+                self.inspect_state.unlink(missing_ok=True)
+                rejected = self.assert_rejected(
+                    bind_runtime_swap_max=True,
+                    set_property_actions=actions,
+                )
+                self.assertIn("changed while runtime swap policy was bound", rejected.stderr)
+                if scope.exists():
+                    shutil.rmtree(scope)
+                old = scope.with_name(scope.name + ".old")
+                if old.exists():
+                    old.rename(scope)
+
+    def test_binder_rejects_invalid_preconditions_without_repair(self) -> None:
+        scope = self.cgroup_root / self.scopes["vllm-test"].removeprefix("/")
+        cidfile = self.cidfiles["vllm-test"]
+        for path, payload in (
+            (scope / "memory.swap.max", "max\n"),
+            (scope / "memory.swap.current", "1\n"),
+        ):
+            with self.subTest(path=path.name, payload=payload):
+                self._write_generation("vllm-test")
+                self.command_log.unlink(missing_ok=True)
+                path.write_text(payload)
+                self.assert_rejected(bind_runtime_swap_max=True)
+                self.assertNotIn("set-property", self.command_log.read_text())
+
+        for payload in ("not-a-cid\n", self.identifiers["vllm-second"] + "\n"):
+            with self.subTest(cidfile=payload):
+                self._write_generation("vllm-test")
+                self.command_log.unlink(missing_ok=True)
+                cidfile.write_text(payload)
+                self.assert_rejected(bind_runtime_swap_max=True)
+                self.assertNotIn("set-property", self.command_log.read_text())
+
+        self._write_generation("vllm-test")
+        self.command_log.unlink(missing_ok=True)
+        cidfile.unlink()
+        cidfile.symlink_to(self.cidfiles["vllm-second"])
+        self.assert_rejected(bind_runtime_swap_max=True)
+        self.assertNotIn("set-property", self.command_log.read_text())
+
+    def test_binder_rejects_set_failure_or_nonzero_manager_readback(self) -> None:
+        exact_set = (
+            f"systemctl set-property --runtime docker-{self.identifiers['vllm-test']}.scope "
+            "MemorySwapMax=0"
+        )
+        for kwargs in ({"set_property_fail": True}, {"memory_swap_readback": "infinity"}):
+            with self.subTest(kwargs=kwargs):
+                self._write_generation("vllm-test")
+                self.inspect_state.unlink(missing_ok=True)
+                self.command_log.unlink(missing_ok=True)
+                self.assert_rejected(bind_runtime_swap_max=True, **kwargs)
+                self.assertEqual(self.command_log.read_text().splitlines().count(exact_set), 1)
 
     def test_resolves_only_the_canonical_dflash_profile_variable(self) -> None:
         profile = "/home/obj/.config/gb10/aeon-dflash-profiles/active.env"
@@ -677,8 +809,6 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
                 self.inspect_state.unlink(missing_ok=True)
                 self.assert_rejected(second_inspect_actions=actions)
                 if scope.exists():
-                    import shutil
-
                     shutil.rmtree(scope)
                 old = scope.with_name(scope.name + ".old")
                 if old.exists():

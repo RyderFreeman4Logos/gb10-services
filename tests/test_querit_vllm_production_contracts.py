@@ -171,7 +171,14 @@ class QueritVllmProductionContractTests(unittest.TestCase):
         self.assertEqual(
             _logical_argv(unit, "ExecStartPost"),
             [
-                ["/home/obj/.local/bin/gb10_service_ready.sh", "rerank", "http://100.105.4.92:18013", "Querit/Querit-4B", "--deadline", "1800"],
+                NO_SWAP_PREFIX
+                + [
+                    "--bind-runtime-swap-max",
+                    "--unit",
+                    expected_unit,
+                    "--container",
+                    "querit-4b-vllm",
+                ],
                 NO_SWAP_PREFIX
                 + [
                     "--unit",
@@ -179,6 +186,7 @@ class QueritVllmProductionContractTests(unittest.TestCase):
                     "--container",
                     "querit-4b-vllm",
                 ],
+                ["/home/obj/.local/bin/gb10_service_ready.sh", "rerank", "http://100.105.4.92:18013", "Querit/Querit-4B", "--deadline", "1800"],
             ],
         )
         self.assertIn("[Install]", unit)

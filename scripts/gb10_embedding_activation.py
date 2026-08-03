@@ -18,8 +18,8 @@ __all__ = ["ActivationInterrupted", "activate", "main"]
 EXPECTED_IMPORT_AUTHORITY: dict[str, str] = {
     "gb10_embedding_activation_checks.py": "7e6d00538e8d952c137e5b5114fc16919f6e1bab59d6260602f989a2103f44a4",
     "gb10_embedding_activation_config.py": "8cfe41e37a31adc2c060cd68700c304775231b62d9e8f03170f0bc371ced5de7",
-    "gb10_embedding_activation_storage.py": "6c3e2a73b9a657e57e357d452b56bbf57eab9eff3d7136ba615f1d0b3f61cb5d",
-    "gb10_embedding_profile_contract.py": "ef1b5d7b6191136171a1df0c7d9596e88b40ec061bb5e9f5a09c4625bc20a868",
+    "gb10_embedding_activation_storage.py": "f0f09c6b66e45169835b56b65560be7f7b4e1de51227069f3e2a31454706ce1a",
+    "gb10_embedding_profile_contract.py": "a5e2427c172c4cf00c8296d110dbc5ef7c76b58736aeb48d1ebd5d1caec27050",
     "gb10_embedding_verifier_runtime.py": "599af1c802e1a0d3e942fb0b16cdfd3a66f9e928ab64eabf3fb455ec007df629",
     "gb10_verify_embedding_profile.py": "5ddbea42ec11ab6cf8fd8a0df14d40edd6b3920d33851510274c24a5092732f4",
 }
@@ -109,6 +109,13 @@ from gb10_embedding_verifier_runtime import (  # noqa: E402
 )
 from gb10_verify_embedding_profile import verify_production  # noqa: E402
 
+RELOAD_STABLE_NEIGHBORS = {
+    "vllm-aeon-27b-dflash.service": "vllm-aeon-27b-dflash",
+    "vllm-querit-4b-reranker.service": "querit-4b-vllm",
+    "vllm-qwen3-reranker-8b.service": "vllm-qwen3-reranker-8b",
+}
+
+
 class ActivationInterrupted(RuntimeError):
     """Signal converted to a recoverable pre-commit failure."""
 
@@ -135,6 +142,8 @@ def _verify_live_no_swap(
     unit_path: Path,
     *,
     helper_path: Path,
+    container: str = "vllm-embedding",
+    bind_runtime_swap_max: bool = False,
     expected_artifact_sha256: dict[str, str] | None = None,
 ) -> None:
     """Attest one unit and its exact live Docker generation with an owned bundle."""
@@ -174,15 +183,61 @@ def _verify_live_no_swap(
             "--norc",
             str(helper_path),
         ]
+    if bind_runtime_swap_max:
+        arguments.append("--bind-runtime-swap-max")
     arguments.extend(
         [
             "--unit",
             str(unit_path),
             "--container",
-            "vllm-embedding",
+            container,
         ]
     )
     command(arguments, timeout=config.command_seconds, deadline=deadline)
+
+
+def _bind_reload_stable_scopes(
+    config: RuntimeConfig,
+    deadline: float,
+    embedding_unit_path: Path | None,
+    neighbors: dict[str, dict[str, str]],
+    *,
+    helper_path: Path,
+    expected_artifact_sha256: dict[str, str] | None = None,
+) -> None:
+    before = _query_generation(config, deadline)
+    if before.running != (embedding_unit_path is not None):
+        raise TransactionError("embedding runtime state changed before no-swap binding")
+    if embedding_unit_path is not None:
+        _verify_live_no_swap(
+            config,
+            deadline,
+            embedding_unit_path,
+            helper_path=helper_path,
+            bind_runtime_swap_max=True,
+            expected_artifact_sha256=expected_artifact_sha256,
+        )
+    for unit, container in RELOAD_STABLE_NEIGHBORS.items():
+        fields = neighbors.get(unit)
+        if fields is None:
+            raise TransactionError(f"missing neighbor no-swap authority: {unit}")
+        if fields["MainPID"] != "0":
+            _verify_live_no_swap(
+                config,
+                deadline,
+                config.unit_dir / unit,
+                helper_path=helper_path,
+                container=container,
+                bind_runtime_swap_max=True,
+                expected_artifact_sha256=expected_artifact_sha256,
+            )
+        elif fields["ActiveState"] not in {"inactive", "failed"}:
+            raise TransactionError(f"neighbor lacks a bindable stable generation: {unit}")
+    if _neighbors(config, deadline) != neighbors:
+        raise TransactionError("neighbor generation changed during no-swap binding")
+    after = _query_generation(config, deadline)
+    if after.stable != before.stable:
+        raise TransactionError("embedding generation changed during no-swap binding")
 
 
 
@@ -398,10 +453,33 @@ def _rollback_uninterrupted(config: RuntimeConfig, deadline: float) -> bool:
             failed_generation = _query_generation(config, deadline)
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
             failed_generation = _manifest_generation(manifest["before"])
-        _restore_prior_unit(config, manifest)
-        _install_transaction_no_swap_bundle(config, manifest)
-        _run_systemctl(config, deadline, "daemon-reload")
         prior_generation = _manifest_generation(manifest["before"])
+        no_swap_authority = {
+            key: manifest["no_swap_artifacts"][key]["source_sha256"]
+            for key in NO_SWAP_KEYS
+        }
+        _install_transaction_no_swap_bundle(config, manifest)
+        rollback_neighbors = _neighbors(config, deadline)
+        if rollback_neighbors != manifest["neighbors"]:
+            raise TransactionError("neighbor generation changed before rollback reload")
+        active_unit = None
+        if failed_generation.running:
+            active_unit = (
+                config.transaction / "unit.before"
+                if manifest["prior"]["present"]
+                and failed_generation.stable == prior_generation.stable
+                else config.transaction / "unit.source"
+            )
+        _bind_reload_stable_scopes(
+            config,
+            deadline,
+            active_unit,
+            rollback_neighbors,
+            helper_path=config.installed_no_swap_helper,
+            expected_artifact_sha256=no_swap_authority,
+        )
+        _restore_prior_unit(config, manifest)
+        _run_systemctl(config, deadline, "daemon-reload")
         if not prior_generation.running:
             raise TransactionError("transaction prior generation was not active/running")
         _run_systemctl(config, deadline, "restart", UNIT)
@@ -409,19 +487,25 @@ def _rollback_uninterrupted(config: RuntimeConfig, deadline: float) -> bool:
             config, failed_generation, deadline
         )
         try:
+            restored_unit = (
+                config.installed_unit
+                if manifest["prior"]["present"]
+                else config.source_unit
+            )
             _verify_live_no_swap(
                 config,
                 deadline,
-                (
-                    config.installed_unit
-                    if manifest["prior"]["present"]
-                    else config.source_unit
-                ),
+                restored_unit,
                 helper_path=config.installed_no_swap_helper,
-                expected_artifact_sha256={
-                    key: manifest["no_swap_artifacts"][key]["source_sha256"]
-                    for key in NO_SWAP_KEYS
-                },
+                bind_runtime_swap_max=True,
+                expected_artifact_sha256=no_swap_authority,
+            )
+            _verify_live_no_swap(
+                config,
+                deadline,
+                restored_unit,
+                helper_path=config.installed_no_swap_helper,
+                expected_artifact_sha256=no_swap_authority,
             )
         except BaseException:
             _run_systemctl(config, deadline, "stop", UNIT)
@@ -535,10 +619,31 @@ def activate(config: RuntimeConfig) -> int:
         )
         _test_boundary(config, "after_install", deadline)
         _set_phase(config, "installed")
+        before = _manifest_generation(manifest["before"])
+        current_before_reload = _query_generation(config, deadline)
+        if current_before_reload.stable != before.stable:
+            raise TransactionError("embedding generation changed before daemon reload")
+        neighbors_before_reload = _neighbors(config, deadline)
+        if neighbors_before_reload != manifest["neighbors"]:
+            raise TransactionError("neighbor generation changed before daemon reload")
+        _bind_reload_stable_scopes(
+            config,
+            deadline,
+            (
+                config.transaction / "unit.before"
+                if manifest["prior"]["present"]
+                else config.source_unit
+            ),
+            neighbors_before_reload,
+            helper_path=config.installed_no_swap_helper,
+            expected_artifact_sha256={
+                key: manifest["no_swap_artifacts"][key]["source_sha256"]
+                for key in NO_SWAP_KEYS
+            },
+        )
         _run_systemctl(config, deadline, "daemon-reload")
         _set_phase(config, "reloaded")
         _verify_installed_no_swap_helper(config)
-        before = _manifest_generation(manifest["before"])
         _run_systemctl(config, deadline, "restart", UNIT)
         current = _wait_new_generation(config, before, deadline)
         _verify_live_no_swap(

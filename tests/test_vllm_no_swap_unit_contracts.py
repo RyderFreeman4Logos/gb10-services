@@ -187,10 +187,20 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                     "--container",
                     container,
                 ]
+                runtime_binder = verification_prefix + [
+                    "--bind-runtime-swap-max",
+                    "--unit",
+                    unit_path,
+                    "--container",
+                    container,
+                ]
+                self.assertEqual(posts[:2], [runtime_binder, generation_verifier])
                 if name == "vllm-querit-4b-reranker.service":
                     self.assertEqual(
                         posts,
                         [
+                            runtime_binder,
+                            generation_verifier,
                             [
                                 "/home/obj/.local/bin/gb10_service_ready.sh",
                                 "rerank",
@@ -199,11 +209,8 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                                 "--deadline",
                                 "1800",
                             ],
-                            generation_verifier,
                         ],
                     )
-                else:
-                    self.assertEqual(posts[0], generation_verifier)
                 cleanup = PRODUCTION_PREFIX + ["--cleanup"]
                 cleanup_containers = (
                     DFLASH_CLEANUP_CONTAINERS
@@ -281,7 +288,8 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
         source = VERIFIER_CORE.read_text()
         self.assertNotIn('SYSTEMCTL_BIN, "--user", "is-active"', source)
         self.assertNotIn('SYSTEMCTL_BIN, "is-active"', source)
-        self.assertEqual(source.count("SYSTEMCTL_BIN,"), 2)
+        self.assertIn('"set-property",', source)
+        self.assertIn('"MemorySwapMax=0",', source)
         self.assertIn('f"docker-{identifier}.scope",', source)
 
     def test_production_entry_is_ambient_environment_independent(self) -> None:
@@ -341,7 +349,7 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
         self.assertIn('"no_swap_artifacts": artifacts', activation)
         self.assertIn('"schema": 2', activation)
 
-    def test_embedding_profile_contract_orders_clean_verifier_before_readiness(self) -> None:
+    def test_embedding_profile_contract_orders_binder_and_verifier_before_readiness(self) -> None:
         import sys
 
         sys.path.insert(0, str(ROOT / "scripts"))
@@ -351,6 +359,17 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
             profile.EXPECTED_EXEC_START_POST[0],
             PRODUCTION_PREFIX
             + [
+                "--bind-runtime-swap-max",
+                "--unit",
+                f"{UNIT_ROOT}/vllm-embedding.service",
+                "--container",
+                "vllm-embedding",
+            ],
+        )
+        self.assertEqual(
+            profile.EXPECTED_EXEC_START_POST[1],
+            PRODUCTION_PREFIX
+            + [
                 "--unit",
                 f"{UNIT_ROOT}/vllm-embedding.service",
                 "--container",
@@ -358,5 +377,5 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
             ],
         )
         self.assertTrue(
-            profile.EXPECTED_EXEC_START_POST[1][0].endswith("gb10_service_ready.sh")
+            profile.EXPECTED_EXEC_START_POST[2][0].endswith("gb10_service_ready.sh")
         )

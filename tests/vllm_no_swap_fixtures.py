@@ -46,6 +46,7 @@ class VllmNoSwapFixture(unittest.TestCase):
         self.command_log = self.root / "commands.log"
         self.inspect_state = self.root / "inspect-state.json"
         self.cleanup_state = self.root / "cleanup-state.json"
+        self.systemd_state = self.root / "systemd-state.json"
         self.docker = self.root / "docker"
         self.systemctl = self.root / "systemctl"
         self._write_docker()
@@ -65,11 +66,20 @@ class VllmNoSwapFixture(unittest.TestCase):
             )
             for name, identifier in self.identifiers.items()
         }
-        self._write_unit(self.unit, "vllm-test", "/run/user/1001/gb10-vllm-cids/test.cid")
+        self.cidfiles = {
+            "vllm-test": self.root / "cids/test.cid",
+            "vllm-second": self.root / "cids/second.cid",
+        }
+        for name, cidfile in self.cidfiles.items():
+            cidfile.parent.mkdir(exist_ok=True)
+            cidfile.parent.chmod(0o700)
+            cidfile.write_text(self.identifiers[name] + "\n")
+            cidfile.chmod(0o600)
+        self._write_unit(self.unit, "vllm-test", str(self.cidfiles["vllm-test"]))
         self._write_unit(
             self.second_unit,
             "vllm-second",
-            "/run/user/1001/gb10-vllm-cids/second.cid",
+            str(self.cidfiles["vllm-second"]),
         )
         for name in self.identifiers:
             self._write_generation(name)
@@ -231,7 +241,8 @@ class VllmNoSwapFixture(unittest.TestCase):
     def _write_systemctl(self) -> None:
         self.systemctl.write_text(
             "#!/usr/bin/python3\n"
-            "import json, os, sys\n"
+            "import json, os, shutil, sys\n"
+            "from pathlib import Path\n"
             "args = [arg for arg in sys.argv[1:] if arg != '--user']\n"
             "expected_runtime = f'/run/user/{os.getuid()}'\n"
             "if os.environ.get('XDG_RUNTIME_DIR') != expected_runtime:\n"
@@ -239,15 +250,41 @@ class VllmNoSwapFixture(unittest.TestCase):
             "    raise SystemExit(90)\n"
             "with open(os.environ['GB10_FAKE_COMMAND_LOG'], 'a') as sink:\n"
             "    sink.write('systemctl ' + ' '.join(args) + '\\n')\n"
-            "if len(args) != 5 or args[:4] != ['show', '-p', 'ControlGroup', '--value']:\n"
-            "    raise SystemExit(87)\n"
-            "unit = args[-1]\n"
-            "if not unit.startswith('docker-') or not unit.endswith('.scope'):\n"
-            "    raise SystemExit(88)\n"
-            "identifier = unit.removeprefix('docker-').removesuffix('.scope')\n"
             "scopes = json.loads(os.environ['GB10_FAKE_SCOPES'])\n"
-            "if identifier not in scopes: raise SystemExit(89)\n"
-            "sys.stdout.write(scopes[identifier] + '\\n')\n"
+            "state_path = Path(os.environ['GB10_FAKE_SYSTEMD_STATE'])\n"
+            "state = json.loads(state_path.read_text()) if state_path.exists() else {}\n"
+            "def scope_id(unit):\n"
+            "    if not unit.startswith('docker-') or not unit.endswith('.scope'): raise SystemExit(88)\n"
+            "    identifier = unit.removeprefix('docker-').removesuffix('.scope')\n"
+            "    if identifier not in scopes: raise SystemExit(89)\n"
+            "    return identifier\n"
+            "def swap_path(identifier):\n"
+            "    return Path(os.environ['GB10_VLLM_NO_SWAP_CGROUP_ROOT']) / scopes[identifier].removeprefix('/') / 'memory.swap.max'\n"
+            "if len(args) == 5 and args[:2] == ['show', '-p'] and args[3] == '--value':\n"
+            "    unit = args[-1]; identifier = scope_id(unit)\n"
+            "    if args[2] == 'ControlGroup': sys.stdout.write(scopes[identifier] + '\\n'); raise SystemExit(0)\n"
+            "    if args[2] == 'MemorySwapMax': sys.stdout.write(os.environ.get('GB10_FAKE_MEMORY_SWAP_READBACK', state.get(unit, 'infinity')) + '\\n'); raise SystemExit(0)\n"
+            "    raise SystemExit(87)\n"
+            "if len(args) == 4 and args[:2] == ['set-property', '--runtime'] and args[3] == 'MemorySwapMax=0':\n"
+            "    unit = args[2]; identifier = scope_id(unit)\n"
+            "    if os.environ.get('GB10_FAKE_SET_PROPERTY_FAIL') == '1': raise SystemExit(73)\n"
+            "    state[unit] = '0'; state_path.write_text(json.dumps(state, sort_keys=True)); swap_path(identifier).write_text('0\\n')\n"
+            "    for action in json.loads(os.environ.get('GB10_FAKE_SET_PROPERTY_ACTIONS', '[]')):\n"
+            "        path = Path(action['path'])\n"
+            "        if action['op'] == 'write': path.write_text(action['data'])\n"
+            "        elif action['op'] == 'replace_dir':\n"
+            "            backup = path.with_name(path.name + '.old')\n"
+            "            if backup.exists(): shutil.rmtree(backup)\n"
+            "            path.rename(backup); path.mkdir()\n"
+            "            for filename, data in action['files'].items(): (path / filename).write_text(data)\n"
+            "        else: raise SystemExit(95)\n"
+            "    raise SystemExit(0)\n"
+            "if args == ['daemon-reload']:\n"
+            "    for identifier in scopes:\n"
+            "        unit = f'docker-{identifier}.scope'\n"
+            "        swap_path(identifier).write_text(('0' if state.get(unit) == '0' else 'max') + '\\n')\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(87)\n"
         )
         self.systemctl.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
 
@@ -258,9 +295,12 @@ class VllmNoSwapFixture(unittest.TestCase):
         info_fail: bool = False,
         inspect_sequences: dict[str, list[dict[str, object] | None]] | None = None,
         second_inspect_actions: list[dict[str, object]] | None = None,
+        set_property_actions: list[dict[str, object]] | None = None,
+        set_property_fail: bool = False,
+        memory_swap_readback: str | None = None,
         docker_mode: str = "verify",
     ) -> dict[str, str]:
-        return {
+        environment = {
             "DOCKER_HOST": f"unix:///run/user/{os.getuid()}/docker.sock",
             "GB10_FAKE_CGROUP_VERSION": cgroup_version,
             "GB10_FAKE_COMMAND_LOG": str(self.command_log),
@@ -270,7 +310,11 @@ class VllmNoSwapFixture(unittest.TestCase):
             "GB10_FAKE_INSPECT_SEQUENCES": json.dumps(
                 inspect_sequences
                 if inspect_sequences is not None
-                else {name: [self.containers[name]] for name in self.containers}
+                else {
+                    reference: [self.containers[name]]
+                    for name in self.containers
+                    for reference in (name, self.identifiers[name])
+                }
             ),
             "GB10_FAKE_INSPECT_STATE": str(self.inspect_state),
             "GB10_FAKE_SCOPES": json.dumps(
@@ -279,9 +323,12 @@ class VllmNoSwapFixture(unittest.TestCase):
                     for name, scope in self.scopes.items()
                 }
             ),
+            "GB10_FAKE_SYSTEMD_STATE": str(self.systemd_state),
             "GB10_FAKE_SECOND_INSPECT_ACTIONS": json.dumps(
                 second_inspect_actions or []
             ),
+            "GB10_FAKE_SET_PROPERTY_ACTIONS": json.dumps(set_property_actions or []),
+            "GB10_FAKE_SET_PROPERTY_FAIL": "1" if set_property_fail else "0",
             "GB10_VLLM_NO_SWAP_CGROUP_ROOT": str(self.cgroup_root),
             "GB10_VLLM_NO_SWAP_DOCKER_BIN": str(self.docker),
             "GB10_VLLM_NO_SWAP_PROC_ROOT": str(self.proc_root),
@@ -290,6 +337,9 @@ class VllmNoSwapFixture(unittest.TestCase):
             "GB10_VLLM_NO_SWAP_COMMAND_TIMEOUT_SECONDS": "2",
             "GB10_VLLM_NO_SWAP_AEON_PROFILE_PATH": str(self.profile_path),
         }
+        if memory_swap_readback is not None:
+            environment["GB10_FAKE_MEMORY_SWAP_READBACK"] = memory_swap_readback
+        return environment
 
     def select_profile(self, target: str) -> None:
         replacement = self.profile_dir / "active.env.next"
@@ -308,14 +358,21 @@ class VllmNoSwapFixture(unittest.TestCase):
         info_fail: bool = False,
         inspect_sequences: dict[str, list[dict[str, object] | None]] | None = None,
         second_inspect_actions: list[dict[str, object]] | None = None,
+        set_property_actions: list[dict[str, object]] | None = None,
+        set_property_fail: bool = False,
+        memory_swap_readback: str | None = None,
         profile_value: str | None = None,
         profile_path: Path | None = None,
+        bind_runtime_swap_max: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         environment = self._test_environment(
             cgroup_version=cgroup_version,
             info_fail=info_fail,
             inspect_sequences=inspect_sequences,
             second_inspect_actions=second_inspect_actions,
+            set_property_actions=set_property_actions,
+            set_property_fail=set_property_fail,
+            memory_swap_readback=memory_swap_readback,
         )
         if profile_value is not None:
             environment["AEON_GPU_MEMORY_UTILIZATION"] = profile_value
@@ -331,6 +388,8 @@ class VllmNoSwapFixture(unittest.TestCase):
             str(wrapper),
             "--test-only",
         ]
+        if bind_runtime_swap_max:
+            argv.append("--bind-runtime-swap-max")
         selected_units = units if units is not None else (self.unit,)
         for unit in selected_units:
             argv.extend(["--unit", str(unit)])

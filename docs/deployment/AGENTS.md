@@ -27,7 +27,7 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 * `vllm-embedding.service` tracked source contract: BF16 Qwen3-Embedding-8B with 4,096-dimensional output, `max-model-len=32768`, `max-num-batched-tokens=8192`, `max-num-seqs=64`, and `kv-cache-memory-bytes=4800M`. It requests equal 128 GiB Docker memory/swap caps without imposing the obsolete 20 GiB service budget. Its post-start verifier binds full Docker ID/PID/`StartedAt`, `/proc` starttime and canonical Docker scope, scope dev/inode, and authoritative `cgroup.events`, then re-reads the unchanged identity and proves exact `memory.max`, zero `memory.swap.max`, and zero activation-time `memory.swap.current`. The validated 5,820 MiB baseline yielded 41,376 KV tokens; 4,800 MiB projects about 34,124 tokens (4.14% above 32,768) but is not production-verified until an authorized live restart prints at least 32,768 tokens.
 * `vllm-aeon-27b-dflash.service` is the sole AEON text runtime owner: DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-seqs=16`, and `max-num-batched-tokens=4096`. It reads `/home/obj/.config/gb10/aeon-dflash-profiles/active.env`; tracked `baseline.env` selects `gpu-memory-utilization=0.355` and `hikv.env` selects `0.45`. `active.env` currently links to HiKV. Historical clean-start baseline capacity was 286,962 KV tokens; record a v0.26.0 live receipt before making a capacity claim. Common unit bounds are `TimeoutStartSec=3000` and readiness deadline 2800. The HiKV-named unit is only a compatibility symlink to this canonical unit, never a profile selector. Guard `readiness_deadline_ms` remains `1500000` (25 minutes) and `restart_queue` timeouts remain 600 — cold start can take 15–20 minutes. See the unit header comment for deployment constraints.
 * The v0.26.0 AEON text units rotate compiled artifacts into `/home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473` (mounted as `/var/cache/vllm/aeon-qwen36-v0260`); do not reuse the v0.25.1 `c15e2c` namespace.
-* `vllm-querit-4b-reranker.service`: single canonical BF16 pooling production owner on `18013`, with a 32,768-token context, 4,800 MiB KV cache, equal 18 GiB Docker memory/swap caps, and the live-proven AEON scheduler profile `--max-num-batched-tokens 16384`, `--max-num-seqs 32`, `--max-num-partial-prefills 1`, and `--max-long-partial-prefills 1`. Every startup completes the bounded rerank-readiness probe before its unit-owned generation verifier runs; that verifier binds the exact Docker generation without querying the still-starting `Type=simple` service's active state.
+* `vllm-querit-4b-reranker.service`: single canonical BF16 pooling production owner on `18013`, with a 32,768-token context, 4,800 MiB KV cache, equal 18 GiB Docker memory/swap caps, and the live-proven AEON scheduler profile `--max-num-batched-tokens 16384`, `--max-num-seqs 32`, `--max-num-partial-prefills 1`, and `--max-long-partial-prefills 1`. Every startup first binds the exact Docker generation, then runs the unit-owned strict no-swap verifier, and finally completes the bounded rerank-readiness probe; the verifier does not query the still-starting `Type=simple` service's active state.
 * `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
 * `llm-guard-proxy` routes by request `model` to AEON chat (`aeon-ultimate`, `qwen3.6-27b-decensor-by-aeon`, `qwen3.6-27b-decensored`), embedding (`qwen3-embedding-8b`, `Qwen/Qwen3-Embedding-8B`), or reranker (`qwen3-reranker-8b`, `Qwen/Qwen3-Reranker-8B`).
 * `llm-guard-proxy` default chat (`:18009`) is force_disable with a single no-thinking rung. Opt-in legacy bounded chat (`:18014`) keeps its multi-rung ladder and `bounded_answer_from_cot`; guarded max-thinking (`:18011`) uses `truncate_cot_then_answer` for one retry-local no-thinking synthesis. The legacy 18002/18003 ports are guard-owned downstream listeners, not raw vLLM publishes.
@@ -284,8 +284,18 @@ requires the exact expected `HostConfig.Memory`, `MemorySwap == Memory`, exact
 unit/container process argv identity, `memory.max`, `memory.swap.max == 0`, and
 activation-time `memory.swap.current == 0`, and rejects any identity change on
 re-read.
-`systemctl --user show ... ControlGroup` is only a cross-check; neither it nor a
-parent-service `MemorySwapMax=0` substitutes for Docker-generation attribution.
+Before that strict verification and before readiness, each tracked vLLM unit
+invokes the same authority with `--bind-runtime-swap-max`. This mode first proves
+the already-zero kernel state, then binds the owner-only private cidfile's exact
+full ID and container name to the live PID, `/proc` path, and Docker scope. Only
+then does it run `systemctl --user set-property --runtime
+docker-<full-id>.scope MemorySwapMax=0` and require both manager-property and
+kernel read-back against the unchanged generation. It never repairs an already
+nonzero or unlimited kernel state. The runtime property makes a later
+`daemon-reload` replay zero instead of Docker's transient scope reverting to
+`infinity`. `systemctl --user show ... ControlGroup` remains only a cross-check;
+neither it, the runtime property, nor a parent-service `MemorySwapMax=0`
+substitutes for Docker-generation attribution and the following strict verifier.
 
 Verifier and cleanup calls in production units run through fixed absolute tools
 under `env -i` with the fixed rootless socket. The explicit `--test-only` seam is

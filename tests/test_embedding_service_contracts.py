@@ -287,21 +287,29 @@ def _embedding_contract(unit: str) -> dict[str, int]:
             if lowered == forbidden or lowered.startswith(f"{forbidden}="):
                 raise AssertionError(f"forbidden embedding option: {token}")
 
-    if len(exec_start_posts) != 2:
+    if len(exec_start_posts) != 3:
         raise AssertionError(
-            f"expected verifier and readiness ExecStartPost commands, found {len(exec_start_posts)}"
+            f"expected binder, verifier, and readiness ExecStartPost commands, found {len(exec_start_posts)}"
         )
-    verifier, readiness = exec_start_posts
+    binder, verifier, readiness = exec_start_posts
     expected_unit = "/home/obj/.config/systemd/user/vllm-embedding.service"
     if exec_conditions != [NO_SWAP_PREFIX + ["--unit", expected_unit]]:
         raise AssertionError("ExecCondition must fail closed on unit and cgroup-v2 evidence")
+    if binder != NO_SWAP_PREFIX + [
+        "--bind-runtime-swap-max",
+        "--unit",
+        expected_unit,
+        "--container",
+        "vllm-embedding",
+    ]:
+        raise AssertionError("ExecStartPost must bind the exact embedding scope first")
     if verifier != NO_SWAP_PREFIX + [
         "--unit",
         expected_unit,
         "--container",
         "vllm-embedding",
     ]:
-        raise AssertionError("ExecStartPost must verify the exact embedding cgroup first")
+        raise AssertionError("ExecStartPost must strictly verify the bound embedding cgroup")
     if not readiness or not readiness[0].endswith("gb10_service_ready.sh"):
         raise AssertionError(
             "ExecStartPost must use gb10_service_ready.sh"
