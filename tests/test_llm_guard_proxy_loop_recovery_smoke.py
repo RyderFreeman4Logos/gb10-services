@@ -46,6 +46,10 @@ def fd_count() -> int:
     return len(os.listdir("/proc/self/fd"))
 
 
+def sealed_system_python() -> tuple[int, str]:
+    python = Path("/usr/bin/python3").resolve(strict=True)
+    release_fd = smoke._sealed_executable_fd(python, smoke.sha256(python))
+    return release_fd, f"/proc/{os.getpid()}/fd/{release_fd}"
 
 
 def post_fixture(
@@ -548,6 +552,19 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
         ):
             self.assertNotIn(obsolete, source)
 
+    def test_linux_memfd_seal_constants_match_the_kernel_abi(self) -> None:
+        self.assertEqual(
+            (
+                smoke.F_ADD_SEALS,
+                smoke.F_GET_SEALS,
+                smoke.F_SEAL_SEAL,
+                smoke.F_SEAL_SHRINK,
+                smoke.F_SEAL_GROW,
+                smoke.F_SEAL_WRITE,
+            ),
+            (1033, 1034, 0x0001, 0x0002, 0x0004, 0x0008),
+        )
+
     def test_transient_service_command_has_native_finite_cleanup_contract(self) -> None:
         executable = f"/proc/{os.getpid()}/fd/3"
         argv = ["--config", "/tmp/config.toml"]
@@ -586,9 +603,7 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 "(root/'main.pid').write_text(str(os.getpid())), print('READY', flush=True), "
                 "signal.pause())"
             )
-            python = Path(sys.executable).resolve()
-            release_fd = smoke._sealed_executable_fd(python, smoke.sha256(python))
-            executable = f"/proc/{os.getpid()}/fd/{release_fd}"
+            release_fd, executable = sealed_system_python()
             proc = subprocess.Popen(
                 smoke._systemd_service_command(
                     unit,
@@ -3007,13 +3022,11 @@ class V5RootRepairRegressionTests(unittest.TestCase):
     def test_v5_uncooperative_descendant_requires_cgroup_kill_and_fails_closed(
         self,
     ) -> None:
-        python = Path(sys.executable).resolve()
-        release_fd = smoke._sealed_executable_fd(python, smoke.sha256(python))
+        release_fd, executable = sealed_system_python()
         unit = (
             f"llm-guard-loop-recovery-v5-stubborn-{os.getpid()}-"
             f"{secrets.token_hex(4)}.service"
         )
-        executable = f"/proc/{os.getpid()}/fd/{release_fd}"
         worker = (
             "import os,pathlib,signal,sys,time; root=pathlib.Path(sys.argv[1]); "
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); child=os.fork(); "

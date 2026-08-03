@@ -69,12 +69,14 @@ SERVICE_STOP_TIMEOUT_SECONDS = 4
 OFFLINE_SELF_TEST_TIMEOUT = 10.0
 OFFLINE_SELF_TEST_OUTPUT_LIMIT = 16 * 1024
 OFFLINE_SELF_TEST_ARGV = ("self-test", "post-await-no-replay")
-EXECUTABLE_SEALS = (
-    fcntl.F_SEAL_SEAL
-    | fcntl.F_SEAL_SHRINK
-    | fcntl.F_SEAL_GROW
-    | fcntl.F_SEAL_WRITE
-)
+F_LINUX_SPECIFIC_BASE = 1024
+F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", F_LINUX_SPECIFIC_BASE + 9)
+F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", F_LINUX_SPECIFIC_BASE + 10)
+F_SEAL_SEAL = getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+F_SEAL_SHRINK = getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+F_SEAL_GROW = getattr(fcntl, "F_SEAL_GROW", 0x0004)
+F_SEAL_WRITE = getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+EXECUTABLE_SEALS = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE
 READINESS_PROBE_BODY = {
     "model": "aeon-ultimate",
     "messages": [{"role": "user", "content": "1+1=?"}],
@@ -239,7 +241,7 @@ def _executable_identity_fd(fd: int) -> ExecutableIdentity:
 
 def _require_sealed_executable(fd: int) -> None:
     require(
-        fcntl.fcntl(fd, fcntl.F_GET_SEALS) == EXECUTABLE_SEALS,
+        fcntl.fcntl(fd, F_GET_SEALS) == EXECUTABLE_SEALS,
         "binary_not_write_sealed",
     )
 
@@ -274,7 +276,7 @@ def _sealed_file_fd(
                 view = view[written:]
         _require_stable_stat(before, os.fstat(source_fd), "binary_identity_drift")
         os.fchmod(sealed_fd, stat.S_IMODE(before.st_mode))
-        fcntl.fcntl(sealed_fd, fcntl.F_ADD_SEALS, EXECUTABLE_SEALS)
+        fcntl.fcntl(sealed_fd, F_ADD_SEALS, EXECUTABLE_SEALS)
         _require_sealed_executable(sealed_fd)
         os.lseek(sealed_fd, 0, os.SEEK_SET)
         copied = hashlib.sha256()
