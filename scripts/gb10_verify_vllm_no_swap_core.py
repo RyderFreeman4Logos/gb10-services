@@ -645,9 +645,10 @@ def minimal_identity(payload: dict[str, object], reference: str) -> tuple[str, s
     return identifier, name.removeprefix("/")
 
 
-def cleanup(container: str, cidfile_raw: str) -> None:
-    if NAME.fullmatch(container) is None:
-        reject("cleanup container name is unsafe")
+def cleanup(containers: Sequence[str], cidfile_raw: str) -> None:
+    for container in containers:
+        if NAME.fullmatch(container) is None:
+            reject("cleanup container name is unsafe")
     cidfile = canonical_absolute(cidfile_raw, "cleanup cidfile")
     require_directory_chain(cidfile.parent, "cleanup cidfile parent")
     try:
@@ -657,8 +658,10 @@ def cleanup(container: str, cidfile_raw: str) -> None:
     except OSError as error:
         reject(f"cannot inspect cleanup cidfile: {error}")
     if lexical is None:
-        by_name = inspect_payload(container, allow_absent=True)
-        if by_name is not None:
+        if any(
+            inspect_payload(container, allow_absent=True) is not None
+            for container in containers
+        ):
             reject("container exists without its private cidfile authority")
         return
     if stat.S_ISLNK(lexical.st_mode) or not stat.S_ISREG(lexical.st_mode):
@@ -672,16 +675,21 @@ def cleanup(container: str, cidfile_raw: str) -> None:
     if re.fullmatch(r"[0-9a-f]{64}\n?", text) is None:
         reject("cleanup cidfile does not contain exactly one full container ID")
     identifier = text.rstrip("\n")
-    by_name = inspect_payload(container, allow_absent=True)
+    by_names: list[tuple[str, dict[str, object]]] = []
+    for container in containers:
+        by_name = inspect_payload(container, allow_absent=True)
+        if by_name is not None:
+            by_names.append((container, by_name))
     by_identifier = inspect_payload(identifier, allow_absent=True)
-    if by_name is None and by_identifier is None:
+    if not by_names and by_identifier is None:
         current = os.lstat(cidfile)
         if (current.st_dev, current.st_ino) != (lexical.st_dev, lexical.st_ino):
             reject("cleanup cidfile changed before idempotent removal")
         os.unlink(cidfile)
         return
-    if by_name is None or by_identifier is None:
+    if len(by_names) != 1 or by_identifier is None:
         reject("cleanup name and full-ID authority disagree")
+    container, by_name = by_names[0]
     name_id, name_value = minimal_identity(by_name, container)
     id_id, id_name = minimal_identity(by_identifier, identifier)
     if (
@@ -706,7 +714,10 @@ def cleanup(container: str, cidfile_raw: str) -> None:
     )
     if removed.returncode != 0 and not known_absence(removed):
         reject("generation-bound Docker remove failed")
-    if inspect_payload(container, allow_absent=True) is not None:
+    if any(
+        inspect_payload(container, allow_absent=True) is not None
+        for container in containers
+    ):
         reject("container name still resolves after cleanup")
     if inspect_payload(identifier, allow_absent=True) is not None:
         reject("full container ID still resolves after cleanup")
@@ -747,12 +758,14 @@ def parse_cli(arguments: Sequence[str]) -> tuple[bool, list[str], list[str], str
         if token in {"-h", "--help"}:
             reject(
                 "usage: [--unit ABSOLUTE_PATH]... [--container NAME]... or "
-                "--cleanup --container NAME --cidfile ABSOLUTE_PATH"
+                "--cleanup [--container NAME]... --cidfile ABSOLUTE_PATH"
             )
         reject(f"unknown CLI argument: {token}")
     if cleanup_mode:
-        if units or len(containers) != 1 or cidfile is None:
-            reject("cleanup requires exactly one --container and one --cidfile")
+        if units or not containers or cidfile is None:
+            reject("cleanup requires at least one --container and one --cidfile")
+        if len(set(containers)) != len(containers):
+            reject("cleanup arguments contain duplicates")
     else:
         if cidfile is not None or not units:
             reject("verification requires at least one --unit")
@@ -768,7 +781,7 @@ def main() -> None:
     cleanup_mode, unit_paths, containers, cidfile = parse_cli(ARGUMENTS)
     if cleanup_mode:
         assert cidfile is not None
-        cleanup(containers[0], cidfile)
+        cleanup(containers, cidfile)
         print("gb10_vllm_no_swap: cleanup verified")
         return
 

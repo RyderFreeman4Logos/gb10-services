@@ -42,6 +42,13 @@ SERVICE_CONTRACTS = {
         "%t/gb10-vllm-cids/vllm-qwen3-reranker-8b.cid",
     ),
 }
+DFLASH_CLEANUP_CONTAINERS = (
+    "vllm-aeon-27b-dflash-n12",
+    "vllm-aeon-27b-dflash-hikv",
+    "vllm-aeon-27b-dflash",
+)
+
+
 def _logical_argv(unit: str, directive: str) -> list[list[str]]:
     commands: list[list[str]] = []
     pending: list[str] = []
@@ -164,16 +171,28 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                     )
                 else:
                     self.assertEqual(posts[0], generation_verifier)
-                cleanup = PRODUCTION_PREFIX + [
-                    "--cleanup",
-                    "--container",
-                    container,
-                    "--cidfile",
-                    cidfile,
+                cleanup = PRODUCTION_PREFIX + ["--cleanup"]
+                cleanup_containers = (
+                    DFLASH_CLEANUP_CONTAINERS
+                    if name == "vllm-aeon-27b-dflash.service"
+                    else (container,)
+                )
+                for cleanup_container in cleanup_containers:
+                    cleanup.extend(["--container", cleanup_container])
+                cleanup.extend(["--cidfile", cidfile])
+                start_pre_cleanups = [
+                    argv
+                    for argv in _logical_argv(unit, "ExecStartPre")
+                    if "--cleanup" in argv
                 ]
-                self.assertIn(cleanup, _logical_argv(unit, "ExecStartPre"))
+                self.assertEqual(start_pre_cleanups, [cleanup])
                 self.assertEqual(_logical_argv(unit, "ExecStop"), [cleanup])
-                self.assertIn(cleanup, _logical_argv(unit, "ExecStopPost"))
+                stop_post_cleanups = [
+                    argv
+                    for argv in _logical_argv(unit, "ExecStopPost")
+                    if "--cleanup" in argv
+                ]
+                self.assertEqual(stop_post_cleanups, [cleanup])
                 for directive in ("ExecStartPre", "ExecStop", "ExecStopPost"):
                     commands = _logical_argv(unit, directive)
                     self.assertFalse(
