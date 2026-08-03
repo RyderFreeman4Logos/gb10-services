@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import shlex
 import subprocess
@@ -12,7 +13,11 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from test_embedding_service_contracts import _logical_directive_argv, _option_values
+from test_embedding_service_contracts import (
+    _logical_directive_argv,
+    _option_values,
+    _split_docker_run_argv,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,9 +30,8 @@ def _canonical_aeon_docker_profile() -> tuple[list[str], int, int]:
     exec_starts = _logical_directive_argv(AEON_UNIT.read_text(), "ExecStart")
     if len(exec_starts) != 1:
         raise AssertionError(f"expected one AEON ExecStart, found {len(exec_starts)}")
-    argv = exec_starts[0]
-    if argv[:2] != ["/usr/bin/docker", "run"]:
-        raise AssertionError("AEON unit must use the canonical docker run command")
+    utilization = (ROOT / "config" / "aeon-dflash-profiles" / "active.env").read_text().split("=", 1)[1].strip()
+    argv = [token.replace("${AEON_GPU_MEMORY_UTILIZATION}", utilization) for token in exec_starts[0]]
     try:
         image_index = next(
             index
@@ -36,8 +40,7 @@ def _canonical_aeon_docker_profile() -> tuple[list[str], int, int]:
         )
     except StopIteration as error:
         raise AssertionError("AEON unit has no immutable AEON image") from error
-    host_argv = argv[2:image_index]
-    command = argv[image_index + 1 :]
+    host_argv, command = _split_docker_run_argv(argv, argv[image_index])
     memory = _option_values(host_argv, "--memory")[0]
     memory_swap = _option_values(host_argv, "--memory-swap")[0]
     if not memory.endswith("g") or not memory_swap.endswith("g"):
@@ -68,9 +71,20 @@ class QueritDeployerContractTests(unittest.TestCase):
         canary_stop_effective: bool = True,
         canary_stop_fails: bool = False,
         canary_disable_effective: bool = True,
+        switch_profile_after_snapshot: bool = False,
     ) -> tuple[dict[str, str], Path, Path, Path]:
         fake_bin = tmp / "bin"
         fake_bin.mkdir()
+        profile_dir = tmp / "aeon-dflash-profiles"
+        profile_dir.mkdir()
+        (profile_dir / "baseline.env").write_text(
+            "AEON_GPU_MEMORY_UTILIZATION=0.355\n"
+        )
+        (profile_dir / "hikv.env").write_text(
+            "AEON_GPU_MEMORY_UTILIZATION=0.45\n"
+        )
+        profile_path = profile_dir / "active.env"
+        profile_path.symlink_to("hikv.env")
         calls = tmp / "calls"
         rerank_active = tmp / "rerank-active"
         fallback_active = tmp / "fallback-active"
@@ -253,16 +267,40 @@ class QueritDeployerContractTests(unittest.TestCase):
         python.chmod(0o755)
 
         no_swap = fake_bin / "gb10_verify_vllm_no_swap.sh"
+        profile_authority = fake_bin / "profile-authority.sh"
+        shutil.copy2(ROOT / "scripts" / "gb10_verify_vllm_no_swap.sh", profile_authority)
+        shutil.copy2(
+            ROOT / "scripts" / "gb10_verify_vllm_no_swap_core.py",
+            fake_bin / "gb10_verify_vllm_no_swap_core.py",
+        )
+        profile_authority.chmod(0o755)
         no_swap_count = tmp / "no-swap-count"
         no_swap.write_text(
             "#!/usr/bin/env bash\n"
+            'if [[ "${2-}" == --profile-snapshot || "${2-}" == --profile-attest ]]; then\n'
+            f'  printf \'profile-%s\\n\' "${{2#--profile-}}" >> {calls}\n'
+            f'  output="$(/usr/bin/bash {profile_authority} "$@")" || exit $?\n'
+            '  [[ -z "$output" ]] || printf \'%s\\n\' "$output"\n'
+            '  if [[ "${2-}" == --profile-snapshot '
+            '&& "${FAKE_SWITCH_PROFILE_AFTER_SNAPSHOT:-0}" == 1 ]]; then\n'
+            f'    ln -s baseline.env {profile_dir}/active.env.next\n'
+            f'    mv -Tf {profile_dir}/active.env.next {profile_path}\n'
+            '  fi\n'
+            '  exit 0\n'
+            'fi\n'
             f"count=$(cat {no_swap_count} 2>/dev/null || printf 0)\n"
             "count=$((count + 1))\n"
             f"printf '%s\\n' \"$count\" > {no_swap_count}\n"
             f"printf 'no-swap %s\\n' \"$*\" >> {calls}\n"
+            f"printf 'no-swap-env %s %s\\n' \"${{AEON_GPU_MEMORY_UTILIZATION-}}\" \"$*\" >> {calls}\n"
             'if (( count == ${FAKE_NO_SWAP_FAIL_AT:-0} )); then exit 85; fi\n'
         )
         no_swap.chmod(0o755)
+
+        proc_root = tmp / "proc"
+        cgroup_root = tmp / "cgroup"
+        proc_root.mkdir()
+        cgroup_root.mkdir()
 
         meminfo = tmp / "meminfo"
         meminfo.write_text("MemAvailable: 8388608 kB\n")
@@ -280,6 +318,9 @@ class QueritDeployerContractTests(unittest.TestCase):
             "FAKE_DOCKER_MODE": docker_mode,
             "FAKE_CGROUP_VERSION": cgroup_version,
             "FAKE_NO_SWAP_FAIL_AT": str(no_swap_fail_at),
+            "FAKE_SWITCH_PROFILE_AFTER_SNAPSHOT": (
+                "1" if switch_profile_after_snapshot else "0"
+            ),
             "FAKE_CANARY_STOP_EFFECTIVE": "1" if canary_stop_effective else "0",
             "FAKE_CANARY_STOP_FAILS": "1" if canary_stop_fails else "0",
             "FAKE_CANARY_DISABLE_EFFECTIVE": (
@@ -287,6 +328,14 @@ class QueritDeployerContractTests(unittest.TestCase):
             ),
             "GB10_NO_SWAP_HELPER_TEST_PATH": str(no_swap),
             "GB10_QUERIT_PROFILE_TEST_ONLY": "1",
+            "GB10_AEON_PROFILE_PATH": str(profile_path),
+            "DOCKER_HOST": f"unix:///run/user/{os.getuid()}/docker.sock",
+            "GB10_VLLM_NO_SWAP_DOCKER_BIN": str(docker),
+            "GB10_VLLM_NO_SWAP_SYSTEMCTL_BIN": str(systemctl),
+            "GB10_VLLM_NO_SWAP_PROC_ROOT": str(proc_root),
+            "GB10_VLLM_NO_SWAP_CGROUP_ROOT": str(cgroup_root),
+            "GB10_VLLM_NO_SWAP_WAIT_SECONDS": "1",
+            "GB10_VLLM_NO_SWAP_COMMAND_TIMEOUT_SECONDS": "1",
         }
         return env, calls, signal_marker, docker_marker
 
@@ -309,9 +358,126 @@ class QueritDeployerContractTests(unittest.TestCase):
             aeon_no_swap = (
                 "no-swap --test-only --unit "
                 "/home/obj/.config/systemd/user/vllm-aeon-27b-dflash.service "
-                "--container vllm-aeon-27b-dflash-n12"
+                "--container vllm-aeon-27b-dflash"
             )
             self.assertGreaterEqual(recorded.count(aeon_no_swap), 2, recorded)
+            aeon_environment = (
+                "no-swap-env 0.45 --test-only --unit "
+                "/home/obj/.config/systemd/user/vllm-aeon-27b-dflash.service "
+                "--container vllm-aeon-27b-dflash"
+            )
+            self.assertGreaterEqual(recorded.count(aeon_environment), 2, recorded)
+            self.assertEqual(recorded[0], "profile-snapshot", recorded)
+            guarded_prefixes = ("systemctl ", "docker ", "curl ", "no-swap --test-only --unit ")
+            for index, line in enumerate(recorded):
+                if line.startswith(guarded_prefixes):
+                    self.assertGreater(index, 0, recorded)
+                    self.assertEqual(recorded[index - 1], "profile-attest", recorded)
+            self.assertEqual(recorded[-1], "profile-attest", recorded)
+
+    def test_accepts_the_baseline_profile_without_inheriting_the_scalar(self) -> None:
+        command, _, _ = _canonical_aeon_docker_profile()
+        utilization = command.index("--gpu-memory-utilization")
+        baseline_command = [*command]
+        baseline_command[utilization + 1] = "0.355"
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            env, _, _, _ = self._make_fake_stack(
+                Path(raw_tmp), guard_mode="ok", aeon_command=baseline_command
+            )
+            active = Path(env["GB10_AEON_PROFILE_PATH"])
+            replacement = active.with_name("active.env.next")
+            replacement.symlink_to("baseline.env")
+            replacement.replace(active)
+            env["AEON_GPU_MEMORY_UTILIZATION"] = "0.45"
+            result = subprocess.run(
+                ["bash", str(DEPLOYER)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("DEPLOY_SUCCESS", result.stdout)
+
+    def test_rejects_non_data_profiles_without_executing_shell_or_inheriting_value(self) -> None:
+        hostile = {
+            "missing": b"",
+            "duplicate": (
+                b"AEON_GPU_MEMORY_UTILIZATION=0.355\n"
+                b"AEON_GPU_MEMORY_UTILIZATION=0.45\n"
+            ),
+            "Docker selector": (
+                b"AEON_GPU_MEMORY_UTILIZATION=0.45\n"
+                b"DOCKER_HOST=unix:///tmp/redirected.sock\n"
+            ),
+            "publisher selector": (
+                b"AEON_GPU_MEMORY_UTILIZATION=0.45\n"
+                b"GB10_SYSTEMCTL_BIN=/tmp/redirected\n"
+            ),
+        }
+        for label, payload in hostile.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw_tmp:
+                env, calls, _, _ = self._make_fake_stack(Path(raw_tmp), guard_mode="ok")
+                Path(env["GB10_AEON_PROFILE_PATH"]).resolve().write_bytes(payload)
+                env["AEON_GPU_MEMORY_UTILIZATION"] = "0.45"
+                result = subprocess.run(
+                    ["bash", str(DEPLOYER)],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                recorded = calls.read_text().splitlines()
+                self.assertEqual(recorded, ["profile-snapshot"], recorded)
+                self.assertNotIn("DEPLOY_SUCCESS", result.stdout)
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            env, calls, _, _ = self._make_fake_stack(tmp, guard_mode="ok")
+            marker = tmp / "shell-payload-executed"
+            Path(env["GB10_AEON_PROFILE_PATH"]).resolve().write_text(
+                "AEON_GPU_MEMORY_UTILIZATION="
+                f"$(/usr/bin/touch {shlex.quote(str(marker))}; printf 0.45)\n"
+            )
+            result = subprocess.run(
+                ["bash", str(DEPLOYER)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(marker.exists())
+            self.assertEqual(calls.read_text().splitlines(), ["profile-snapshot"])
+
+    def test_profile_switch_after_snapshot_fails_before_any_runtime_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            env, calls, _, _ = self._make_fake_stack(
+                Path(raw_tmp),
+                guard_mode="ok",
+                switch_profile_after_snapshot=True,
+            )
+            result = subprocess.run(
+                ["bash", str(DEPLOYER)],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            recorded = calls.read_text().splitlines()
+            self.assertEqual(recorded[0], "profile-snapshot", recorded)
+            self.assertGreaterEqual(recorded.count("profile-attest"), 1, recorded)
+            self.assertTrue(
+                all(line in {"profile-snapshot", "profile-attest"} for line in recorded),
+                recorded,
+            )
+            self.assertNotIn("DEPLOY_SUCCESS", result.stdout)
 
     def test_rejects_stale_or_noncanonical_aeon_profiles_before_mutation(self) -> None:
         command, memory_bytes, memory_swap_bytes = _canonical_aeon_docker_profile()
@@ -729,6 +895,17 @@ class QueritDeployerContractTests(unittest.TestCase):
             )
             self.assertGreaterEqual(
                 sum(line.startswith("no-swap ") for line in recorded), 7
+            )
+            self.assertGreaterEqual(
+                sum(
+                    line.startswith(
+                        "no-swap-env 0.45 --test-only --unit "
+                        "/home/obj/.config/systemd/user/"
+                        "vllm-aeon-27b-dflash.service"
+                    )
+                    for line in recorded
+                ),
+                2,
             )
 
     def test_sigterm_after_switch_rolls_back_once(self) -> None:

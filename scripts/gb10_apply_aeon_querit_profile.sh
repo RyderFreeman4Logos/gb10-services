@@ -11,12 +11,13 @@ RETIRED_CANARY_ADAPTER_UNIT=vllm-querit-4b-canary.service
 RETIRED_CANARY_BACKEND_UNIT=vllm-querit-4b-canary-backend.service
 GUARD_UNIT=llm-guard-proxy.service
 EMBEDDING_UNIT=vllm-embedding.service
-AEON_CONTAINER=vllm-aeon-27b-dflash-n12
+AEON_CONTAINER=vllm-aeon-27b-dflash
 EMBEDDING_CONTAINER=vllm-embedding
 RERANK_CONTAINER=querit-4b-vllm
 FALLBACK_CONTAINER=vllm-qwen3-reranker-8b
 NO_SWAP_HELPER=/home/obj/.local/bin/gb10_verify_vllm_no_swap.sh
 NO_SWAP_TEST_ARGS=()
+PROFILE_TEST_ENVIRONMENT=()
 if [[ "${GB10_QUERIT_PROFILE_TEST_ONLY:-0}" == 1 ]]; then
     NO_SWAP_HELPER="${GB10_NO_SWAP_HELPER_TEST_PATH:?test helper path required}"
     [[ "$NO_SWAP_HELPER" == /* && -x "$NO_SWAP_HELPER" ]] || {
@@ -24,16 +25,57 @@ if [[ "${GB10_QUERIT_PROFILE_TEST_ONLY:-0}" == 1 ]]; then
         exit 2
     }
     NO_SWAP_TEST_ARGS=(--test-only)
-elif [[ -n "${GB10_NO_SWAP_HELPER_TEST_PATH:-}" ]]; then
-    echo "test no-swap helper selector requires explicit test-only mode" >&2
+    AEON_PROFILE_PATH="${GB10_AEON_PROFILE_PATH:?test AEON profile path required}"
+    [[ "$AEON_PROFILE_PATH" == /* ]] || {
+        echo "test AEON profile path must be absolute" >&2
+        exit 2
+    }
+    PROFILE_TEST_ENVIRONMENT=(
+        "GB10_VLLM_NO_SWAP_AEON_PROFILE_PATH=$AEON_PROFILE_PATH"
+    )
+elif [[ -n "${GB10_NO_SWAP_HELPER_TEST_PATH:-}" || -v GB10_AEON_PROFILE_PATH ]]; then
+    echo "test profile selectors require explicit test-only mode" >&2
     exit 2
+else
+    AEON_PROFILE_PATH=/home/obj/.config/gb10/aeon-dflash-profiles/active.env
 fi
 AEON_URL="${GB10_AEON_URL:-http://100.105.4.92:18010}"
 RERANK_URL="${GB10_RERANK_URL:-http://100.105.4.92:18013}"
 GUARD_SCORE_URL="${GB10_GUARD_SCORE_URL:-http://100.105.4.92:18003/v1/score}"
+
+run_profile_helper() {
+    if (( ${#NO_SWAP_TEST_ARGS[@]} == 1 )); then
+        /usr/bin/env -u AEON_GPU_MEMORY_UTILIZATION \
+            "${PROFILE_TEST_ENVIRONMENT[@]}" \
+            "$NO_SWAP_HELPER" "${NO_SWAP_TEST_ARGS[@]}" "$@"
+    else
+        /usr/bin/env -i \
+            HOME=/home/obj \
+            PATH=/usr/bin:/bin \
+            LC_ALL=C \
+            DOCKER_HOST=unix:///run/user/1001/docker.sock \
+            /usr/bin/bash --noprofile --norc \
+            "$NO_SWAP_HELPER" "$@"
+    fi
+}
+
+unset AEON_GPU_MEMORY_UTILIZATION
+profile_snapshot="$(run_profile_helper --profile-snapshot)"
+if [[ "$profile_snapshot" =~ ^(0\.355|0\.45)\ ([0-9a-f]{64})$ ]]; then
+    EXPECTED_AEON_GPU_MEMORY_UTILIZATION="${BASH_REMATCH[1]}"
+    AEON_PROFILE_SNAPSHOT="${BASH_REMATCH[2]}"
+else
+    echo "AEON profile helper returned a malformed authority snapshot" >&2
+    exit 2
+fi
+readonly EXPECTED_AEON_GPU_MEMORY_UTILIZATION AEON_PROFILE_SNAPSHOT
+
+attest_aeon_profile() {
+    run_profile_helper --profile-attest "$AEON_PROFILE_SNAPSHOT"
+}
+
 # Keep this owner aligned with the committed AEON unit: AUTO KV sizing must
 # remain enabled so the patched UMA headroom guard can size the pool.
-EXPECTED_AEON_GPU_MEMORY_UTILIZATION=0.355
 EXPECTED_AEON_MEMORY_BYTES=$((128 * 1024 * 1024 * 1024))
 MIN_AVAILABLE_GIB=${GB10_MIN_AVAILABLE_GIB:-4}
 AEON_READY_ATTEMPTS=${GB10_AEON_READY_ATTEMPTS:-120}
@@ -60,37 +102,52 @@ if [[ $# -ne 0 ]]; then
 fi
 
 run_systemctl() {
+    attest_aeon_profile || return 1
     /usr/bin/timeout --signal=TERM --kill-after=5 "$SYSTEMCTL_TIMEOUT_SECONDS" \
         systemctl --user "$@"
 }
 
 run_systemctl_start() {
+    attest_aeon_profile || return 1
     /usr/bin/timeout --signal=TERM --kill-after=5 \
         "$SYSTEMCTL_START_TIMEOUT_SECONDS" systemctl --user "$@"
 }
 
 run_docker() {
+    attest_aeon_profile || return 1
     /usr/bin/timeout --signal=TERM --kill-after=5 "$DOCKER_TIMEOUT_SECONDS" \
         docker "$@"
 }
 
 verify_no_swap() {
     local unit="$1" container="${2:-}"
+    attest_aeon_profile || return 1
     local -a arguments=(
         "${NO_SWAP_TEST_ARGS[@]}"
         --unit "/home/obj/.config/systemd/user/$unit"
     )
+    local -a profile_environment=()
+    if [[ "$unit" == "$AEON_UNIT" ]]; then
+        profile_environment=(
+            "AEON_GPU_MEMORY_UTILIZATION=$EXPECTED_AEON_GPU_MEMORY_UTILIZATION"
+        )
+    fi
+    if (( ${#NO_SWAP_TEST_ARGS[@]} == 1 )); then
+        profile_environment+=("${PROFILE_TEST_ENVIRONMENT[@]}")
+    fi
     if [[ -n "$container" ]]; then
         arguments+=(--container "$container")
     fi
     if (( ${#NO_SWAP_TEST_ARGS[@]} == 1 )); then
-        "$NO_SWAP_HELPER" "${arguments[@]}"
+        /usr/bin/env "${profile_environment[@]}" \
+            "$NO_SWAP_HELPER" "${arguments[@]}"
     else
         /usr/bin/env -i \
             HOME=/home/obj \
             PATH=/usr/bin:/bin \
             LC_ALL=C \
             DOCKER_HOST=unix:///run/user/1001/docker.sock \
+            "${profile_environment[@]}" \
             /usr/bin/bash --noprofile --norc \
             "$NO_SWAP_HELPER" "${arguments[@]}"
     fi
@@ -209,6 +266,7 @@ DEPLOY_SUCCESS=0
 CLEANUP_STARTED=0
 
 rollback_runtime_state() {
+    attest_aeon_profile || return 1
     if ! require_cgroup_v2; then
         printf 'Rollback refused service mutation without Docker cgroup v2\n' >&2
         return 1
@@ -230,6 +288,7 @@ rollback_runtime_state() {
     elif [[ "$PREV_RERANK_ACTIVE" == "active" ]]; then
         verify_no_swap "$RERANK_UNIT" "$RERANK_CONTAINER" || rollback_failed=1
     fi
+    attest_aeon_profile || rollback_failed=1
     return "$rollback_failed"
 }
 
@@ -308,6 +367,7 @@ read_mem_available_kib() {
 
 require_memory_headroom() {
     local available_kib
+    attest_aeon_profile || return 1
     available_kib="$(read_mem_available_kib)"
     if (( available_kib < MIN_AVAILABLE_GIB * 1024 * 1024 )); then
         echo "INSUFFICIENT_MEMORY available_kib=$available_kib minimum_gib=$MIN_AVAILABLE_GIB" >&2
@@ -317,8 +377,10 @@ require_memory_headroom() {
 
 wait_for_url() {
     local url="$1" attempts="$2" label="$3" attempt
+    attest_aeon_profile || return 1
     for ((attempt = 1; attempt <= attempts; attempt++)); do
         if curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
+            attest_aeon_profile || return 1
             return 0
         fi
         sleep 5
@@ -406,6 +468,7 @@ PY
         echo "AEON_MEMORY_SWAP_MISMATCH actual=$memory_swap_limit expected=$EXPECTED_AEON_MEMORY_BYTES" >&2
         return 44
     fi
+    attest_aeon_profile || return 1
 }
 
 run_systemctl is-active --quiet "$GUARD_UNIT"
@@ -437,15 +500,20 @@ run_systemctl is-active --quiet "$RERANK_UNIT"
 require_memory_headroom
 echo "RERANK_READY"
 
+attest_aeon_profile
 RAW="$(curl -fsS --max-time 30 -H 'content-type: application/json' \
     -d '{"model":"qwen3-reranker-8b","query":"capital of France","documents":["Paris is the capital of France.","Bananas are yellow."],"top_n":2}' \
     "$RERANK_URL/v1/rerank")"
+attest_aeon_profile
 python3 -c 'import json,math,sys; d=json.loads(sys.argv[1]); r=d["results"]; assert r[0]["index"] == 0; assert all(math.isfinite(float(x["relevance_score"])) for x in r); print("RAW_RERANK_OK", r)' "$RAW"
+attest_aeon_profile
 
 GUARD="$(curl -fsS --max-time 30 -H 'content-type: application/json' \
     -d '{"model":"qwen3-reranker-8b","text_1":"capital of France","text_2":"Paris is the capital of France."}' \
     "$GUARD_SCORE_URL")"
+attest_aeon_profile
 python3 -c 'import json,math,sys; d=json.loads(sys.argv[1]); s=float(d["data"][0]["score"]); assert math.isfinite(s); print("GUARD_SCORE_OK", s)' "$GUARD"
+attest_aeon_profile
 
 run_systemctl enable "$RERANK_UNIT"
 run_systemctl is-enabled --quiet "$RERANK_UNIT"
@@ -456,6 +524,7 @@ fi
 run_systemctl is-active --quiet \
     vllm-embedding.service "$AEON_UNIT" "$RERANK_UNIT" "$GUARD_UNIT"
 
+attest_aeon_profile
 DEPLOY_SUCCESS=1
 MIGRATION_STARTED=0
 trap - ERR INT TERM EXIT

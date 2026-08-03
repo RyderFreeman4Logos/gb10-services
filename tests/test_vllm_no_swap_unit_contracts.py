@@ -24,13 +24,27 @@ PRODUCTION_PREFIX = [
     "--norc",
     HELPER,
 ]
+AEON_PROFILE_ASSIGNMENT = (
+    "AEON_GPU_MEMORY_UTILIZATION=${AEON_GPU_MEMORY_UTILIZATION}"
+)
+AEON_PRODUCTION_PREFIX = [
+    *PRODUCTION_PREFIX[:6],
+    AEON_PROFILE_ASSIGNMENT,
+    *PRODUCTION_PREFIX[6:],
+]
+AEON_DOCKER_PREFIX = [
+    "/usr/bin/env",
+    "-i",
+    "HOME=/home/obj",
+    "PATH=/usr/bin:/bin",
+    "LC_ALL=C",
+    f"DOCKER_HOST={ROOTLESS_SOCKET}",
+    "/usr/bin/docker",
+    "run",
+]
 SERVICE_CONTRACTS = {
     "vllm-aeon-27b-dflash.service": (
-        "vllm-aeon-27b-dflash-n12",
-        "%t/gb10-memory-guardian/aeon-text.cid",
-    ),
-    "vllm-aeon-27b-dflash-hikv.service": (
-        "vllm-aeon-27b-dflash-hikv",
+        "vllm-aeon-27b-dflash",
         "%t/gb10-memory-guardian/aeon-text.cid",
     ),
     "vllm-embedding.service": (
@@ -46,6 +60,13 @@ SERVICE_CONTRACTS = {
         "%t/gb10-vllm-cids/vllm-qwen3-reranker-8b.cid",
     ),
 }
+DFLASH_CLEANUP_CONTAINERS = (
+    "vllm-aeon-27b-dflash-n12",
+    "vllm-aeon-27b-dflash-hikv",
+    "vllm-aeon-27b-dflash",
+)
+
+
 def _logical_argv(unit: str, directive: str) -> list[list[str]]:
     commands: list[list[str]] = []
     pending: list[str] = []
@@ -86,6 +107,8 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
     def test_inventory_discovers_every_and_only_tracked_vllm_backend(self) -> None:
         discovered: set[str] = set()
         for path in (ROOT / "systemd").glob("*.service"):
+            if path.is_symlink():
+                continue
             starts = _logical_argv(path.read_text(), "ExecStart")
             if any(
                 any(
@@ -105,7 +128,17 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                 start = _logical_argv(unit, "ExecStart")
                 self.assertEqual(len(start), 1)
                 argv = start[0]
-                self.assertEqual(argv[:2], ["/usr/bin/docker", "run"])
+                if name == "vllm-aeon-27b-dflash.service":
+                    self.assertEqual(
+                        argv[: len(AEON_DOCKER_PREFIX)], AEON_DOCKER_PREFIX
+                    )
+                    argv = [
+                        "/usr/bin/docker",
+                        "run",
+                        *argv[len(AEON_DOCKER_PREFIX) :],
+                    ]
+                else:
+                    self.assertEqual(argv[:2], ["/usr/bin/docker", "run"])
                 image_at = next(
                     index
                     for index, token in enumerate(argv)
@@ -140,10 +173,15 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                     expected_memory_swap_max,
                 )
                 unit_path = f"{UNIT_ROOT}/{name}"
-                condition = PRODUCTION_PREFIX + ["--unit", unit_path]
+                verification_prefix = (
+                    AEON_PRODUCTION_PREFIX
+                    if name == "vllm-aeon-27b-dflash.service"
+                    else PRODUCTION_PREFIX
+                )
+                condition = verification_prefix + ["--unit", unit_path]
                 self.assertEqual(_logical_argv(unit, "ExecCondition")[0], condition)
                 posts = _logical_argv(unit, "ExecStartPost")
-                generation_verifier = PRODUCTION_PREFIX + [
+                generation_verifier = verification_prefix + [
                     "--unit",
                     unit_path,
                     "--container",
@@ -166,16 +204,28 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                     )
                 else:
                     self.assertEqual(posts[0], generation_verifier)
-                cleanup = PRODUCTION_PREFIX + [
-                    "--cleanup",
-                    "--container",
-                    container,
-                    "--cidfile",
-                    cidfile,
+                cleanup = PRODUCTION_PREFIX + ["--cleanup"]
+                cleanup_containers = (
+                    DFLASH_CLEANUP_CONTAINERS
+                    if name == "vllm-aeon-27b-dflash.service"
+                    else (container,)
+                )
+                for cleanup_container in cleanup_containers:
+                    cleanup.extend(["--container", cleanup_container])
+                cleanup.extend(["--cidfile", cidfile])
+                start_pre_cleanups = [
+                    argv
+                    for argv in _logical_argv(unit, "ExecStartPre")
+                    if "--cleanup" in argv
                 ]
-                self.assertIn(cleanup, _logical_argv(unit, "ExecStartPre"))
+                self.assertEqual(start_pre_cleanups, [cleanup])
                 self.assertEqual(_logical_argv(unit, "ExecStop"), [cleanup])
-                self.assertIn(cleanup, _logical_argv(unit, "ExecStopPost"))
+                stop_post_cleanups = [
+                    argv
+                    for argv in _logical_argv(unit, "ExecStopPost")
+                    if "--cleanup" in argv
+                ]
+                self.assertEqual(stop_post_cleanups, [cleanup])
                 for directive in ("ExecStartPre", "ExecStop", "ExecStopPost"):
                     commands = _logical_argv(unit, directive)
                     self.assertFalse(
@@ -190,6 +240,42 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                             for argv in commands
                         )
                     )
+
+    def test_dflash_docker_and_direct_post_start_helpers_have_clean_environments(self) -> None:
+        unit = (ROOT / "systemd" / "vllm-aeon-27b-dflash.service").read_text()
+        start = _logical_argv(unit, "ExecStart")
+        self.assertEqual(start[0][: len(AEON_DOCKER_PREFIX)], AEON_DOCKER_PREFIX)
+        posts = _logical_argv(unit, "ExecStartPost")
+        clean = [
+            "/usr/bin/env",
+            "-i",
+            "HOME=/home/obj",
+            "PATH=/usr/bin:/bin",
+            "LC_ALL=C",
+        ]
+        publisher = next(
+            argv
+            for argv in posts
+            if any(
+                token.endswith("/llm_guard_proxy_publish_cgroup_registration.sh")
+                for token in argv
+            )
+        )
+        self.assertEqual(publisher[: len(clean)], clean)
+        self.assertIn(
+            "GB10_CONTAINER_CIDFILE=%t/gb10-memory-guardian/aeon-text.cid",
+            publisher,
+        )
+        self.assertIn(
+            "GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1",
+            publisher,
+        )
+        readiness = next(
+            argv
+            for argv in posts
+            if any(token.endswith("/gb10_service_ready.sh") for token in argv)
+        )
+        self.assertEqual(readiness[: len(clean)], clean)
 
     def test_generation_verifier_does_not_query_type_simple_service_state(self) -> None:
         source = VERIFIER_CORE.read_text()
@@ -212,7 +298,13 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                 helper_commands = [argv for argv in commands if HELPER in argv]
                 self.assertGreaterEqual(len(helper_commands), 4)
                 for argv in helper_commands:
-                    self.assertEqual(argv[: len(PRODUCTION_PREFIX)], PRODUCTION_PREFIX)
+                    expected_prefix = (
+                        AEON_PRODUCTION_PREFIX
+                        if name == "vllm-aeon-27b-dflash.service"
+                        and "--cleanup" not in argv
+                        else PRODUCTION_PREFIX
+                    )
+                    self.assertEqual(argv[: len(expected_prefix)], expected_prefix)
                     self.assertNotIn("--test-only", argv)
 
     def test_deployment_agents_names_current_guardian_and_cleanup_authority(self) -> None:

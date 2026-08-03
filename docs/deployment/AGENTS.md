@@ -25,8 +25,7 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 * Rollback/superseded image retained on GB10: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-14-v0.25.0` (`sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55`).
 * The prior v0.25.1 AEON build's MRv2/torchcodec/TP>1 notes are historical release evidence, not v0.26.0 feature claims. The v0.26.0 OCI description inherits a stale v0.25.1 string; use the dated tag plus immutable digest above as authority and do not infer unverified feature parity or multi-Spark hardware validation.
 * `vllm-embedding.service` tracked source contract: BF16 Qwen3-Embedding-8B with 4,096-dimensional output, `max-model-len=32768`, `max-num-batched-tokens=8192`, `max-num-seqs=64`, and `kv-cache-memory-bytes=4800M`. It requests equal 128 GiB Docker memory/swap caps without imposing the obsolete 20 GiB service budget. Its post-start verifier binds full Docker ID/PID/`StartedAt`, `/proc` starttime and canonical Docker scope, scope dev/inode, and authoritative `cgroup.events`, then re-reads the unchanged identity and proves exact `memory.max`, zero `memory.swap.max`, and zero activation-time `memory.swap.current`. The validated 5,820 MiB baseline yielded 41,376 KV tokens; 4,800 MiB projects about 34,124 tokens (4.14% above 32,768) but is not production-verified until an authorized live restart prints at least 32,768 tokens.
-* `vllm-aeon-27b-dflash.service`: tracked v0.26.0 source profile (not a live-production activation claim): DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-seqs=16`, `max-num-batched-tokens=4096`, AUTO KV sizing via `gpu-memory-utilization=0.355` with no explicit `kv-cache-memory-bytes`; historical clean-start capacity evidence is 286,962 KV tokens. This is the co-resident baseline — safe with embedding+reranker, but only supports ~1.1x concurrent 262K-token contexts pending v0.26.0 validation.
-* `vllm-aeon-27b-dflash-hikv.service`: **deployment-choice v0.26.0 variant** of the AEON text service. It keeps the model/DFlash/seqs/batch profile and uses `gpu-memory-utilization=0.45` for a larger AUTO-KV pool. Prior `0.50` capacity/headroom estimates are retired; record a v0.26.0 live receipt before presenting a capacity claim. The two units conflict; deployers choose one. When using hikv, keep Guard `readiness_deadline_ms` at `1500000` (25 minutes) and `restart_queue` timeouts at 600 — cold start can take 15–20 minutes. See the unit header comment for deployment constraints.
+* `vllm-aeon-27b-dflash.service` is the sole AEON text runtime owner: DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-seqs=16`, and `max-num-batched-tokens=4096`. It reads `/home/obj/.config/gb10/aeon-dflash-profiles/active.env`; tracked `baseline.env` selects `gpu-memory-utilization=0.355` and `hikv.env` selects `0.45`. `active.env` currently links to HiKV. Historical clean-start baseline capacity was 286,962 KV tokens; record a v0.26.0 live receipt before making a capacity claim. Common unit bounds are `TimeoutStartSec=3000` and readiness deadline 2800. The HiKV-named unit is only a compatibility symlink to this canonical unit, never a profile selector. Guard `readiness_deadline_ms` remains `1500000` (25 minutes) and `restart_queue` timeouts remain 600 — cold start can take 15–20 minutes. See the unit header comment for deployment constraints.
 * The v0.26.0 AEON text units rotate compiled artifacts into `/home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473` (mounted as `/var/cache/vllm/aeon-qwen36-v0260`); do not reuse the v0.25.1 `c15e2c` namespace.
 * `vllm-querit-4b-reranker.service`: single canonical BF16 pooling production owner on `18013`, with a 32,768-token context, 4,800 MiB KV cache, equal 18 GiB Docker memory/swap caps, and the live-proven AEON scheduler profile `--max-num-batched-tokens 16384`, `--max-num-seqs 32`, `--max-num-partial-prefills 1`, and `--max-long-partial-prefills 1`. Every startup completes the bounded rerank-readiness probe before its unit-owned generation verifier runs; that verifier binds the exact Docker generation without querying the still-starting `Type=simple` service's active state.
 * `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
@@ -168,10 +167,18 @@ mkdir -p /home/obj/.config/systemd/user/
 # Install tracked services.
 install -m 0644 systemd/llm-guard-proxy.service \
   systemd/vllm-querit-4b-reranker.service systemd/sysmon.service \
-  systemd/vllm-aeon-27b-dflash.service systemd/vllm-aeon-27b-dflash-hikv.service \
+  systemd/vllm-aeon-27b-dflash.service \
   systemd/vllm-embedding.service \
   systemd/vllm-qwen3-reranker-8b.service \
   /home/obj/.config/systemd/user/
+
+# Install the profile data and the source-tracked HiKV selection.
+install -d -m 0755 /home/obj/.config/gb10/aeon-dflash-profiles
+install -m 0644 config/aeon-dflash-profiles/baseline.env config/aeon-dflash-profiles/hikv.env \
+  /home/obj/.config/gb10/aeon-dflash-profiles/
+ln -sfn hikv.env /home/obj/.config/gb10/aeon-dflash-profiles/active.env.new
+mv -Tf /home/obj/.config/gb10/aeon-dflash-profiles/active.env.new /home/obj/.config/gb10/aeon-dflash-profiles/active.env
+ln -sfn vllm-aeon-27b-dflash.service /home/obj/.config/systemd/user/vllm-aeon-27b-dflash-hikv.service
 
 # Reload systemd daemon
 systemctl --user daemon-reload
@@ -184,21 +191,8 @@ systemctl --user enable --now sysmon.service
 # Start model services and the proxy independently.
 systemctl --user enable --now vllm-embedding.service
 systemctl --user enable --now vllm-aeon-27b-dflash.service
-# Optional HIGH-KV switch (mutually exclusive with baseline):
-#   systemctl --user enable vllm-aeon-27b-dflash-hikv.service
-#   /home/obj/.local/bin/gb10_lifecycle.sh stop \
-#     --unit vllm-aeon-27b-dflash.service --actor deployment-operator --reason hikv-switch
-#   systemctl --user disable vllm-aeon-27b-dflash.service
-#   state_dir=/home/obj/.local/state/gb10-lifecycle
-#   marker="$state_dir/selected-text-unit"
-#   install -d -m 0700 "$state_dir"
-#   tmp="$(mktemp "$state_dir/.selected-text-unit.XXXXXXXXXX")"
-#   printf 'vllm-aeon-27b-dflash-hikv.service\n' > "$tmp" && mv -f -- "$tmp" "$marker"
-#   /home/obj/.local/bin/gb10_lifecycle.sh start \
-#     --unit vllm-aeon-27b-dflash-hikv.service --actor deployment-operator --reason hikv-switch
-# Recovery helpers prefer that selected-text-unit file (or GB10_TEXT_UNIT)
-# over a still-enabled baseline so a failed HIGH-KV start cannot silently
-# recycle the co-resident baseline profile.
+# To select baseline for a future authorized stop/start, atomically repoint
+# active.env to baseline.env; keep the canonical systemd unit enabled.
 systemctl --user disable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now vllm-querit-4b-reranker.service
 systemctl --user enable --now llm-guard-proxy.service

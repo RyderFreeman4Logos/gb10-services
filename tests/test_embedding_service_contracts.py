@@ -91,6 +91,16 @@ _DOCKER_HOST_OPTION_ARITY = {
 def _split_docker_run_argv(
     argv: list[str], expected_image: str
 ) -> tuple[list[str], list[str]]:
+    clean_prefix = [
+        "/usr/bin/env",
+        "-i",
+        "HOME=/home/obj",
+        "PATH=/usr/bin:/bin",
+        "LC_ALL=C",
+        "DOCKER_HOST=unix:///run/user/1001/docker.sock",
+    ]
+    if argv[: len(clean_prefix)] == clean_prefix:
+        argv = argv[len(clean_prefix) :]
     if argv[:2] != ["/usr/bin/docker", "run"]:
         raise AssertionError("ExecStart must be the canonical docker run command")
     host: list[str] = []
@@ -497,7 +507,6 @@ class EmbeddingDeploymentContractTests(unittest.TestCase):
         "vllm-querit-4b-reranker.service",
         "sysmon.service",
         "vllm-aeon-27b-dflash.service",
-        "vllm-aeon-27b-dflash-hikv.service",
         "vllm-embedding.service",
         "vllm-qwen3-reranker-8b.service",
     }

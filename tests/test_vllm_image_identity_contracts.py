@@ -119,13 +119,12 @@ class VllmImageIdentityContractTests(unittest.TestCase):
     def test_every_aeon_unit_binds_version_label_and_digest_to_one_release(self) -> None:
         units = sorted((ROOT / "systemd").glob("*.service"))
         aeon_units = [
-            path for path in units if "aeon-vllm-ultimate" in path.read_text()
+            path for path in units if not path.is_symlink() and "aeon-vllm-ultimate" in path.read_text()
         ]
         self.assertEqual(
             {path.name for path in aeon_units},
             {
                 "vllm-aeon-27b-dflash.service",
-                "vllm-aeon-27b-dflash-hikv.service",
                 "vllm-embedding.service",
                 "vllm-qwen3-reranker-8b.service",
                 "vllm-querit-4b-reranker.service",
@@ -155,10 +154,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
     def test_aeon_compile_cache_namespace_rotates_with_the_release(self) -> None:
         host_cache = "/home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473"
         container_cache = "/var/cache/vllm/aeon-qwen36-v0260"
-        for unit_name in (
-            "vllm-aeon-27b-dflash.service",
-            "vllm-aeon-27b-dflash-hikv.service",
-        ):
+        for unit_name in ("vllm-aeon-27b-dflash.service",):
             text = (ROOT / "systemd" / unit_name).read_text()
             with self.subTest(unit=unit_name):
                 self.assertIn(f"ExecStartPre=/usr/bin/install -d -m 0700 {host_cache}", text)
@@ -192,14 +188,15 @@ class VllmImageIdentityContractTests(unittest.TestCase):
             guide,
         )
 
-    def test_current_deployment_docs_install_both_selectable_aeon_units(self) -> None:
+    def test_current_deployment_docs_install_the_canonical_aeon_unit_and_alias(self) -> None:
         documents = (
             (ROOT / "README.md").read_text(),
             (ROOT / "docs" / "deployment" / "AGENTS.md").read_text(),
         )
         for document in documents:
             self.assertIn("systemd/vllm-aeon-27b-dflash.service", document)
-            self.assertIn("systemd/vllm-aeon-27b-dflash-hikv.service", document)
+            self.assertIn("vllm-aeon-27b-dflash-hikv.service", document)
+            self.assertIn("active.env", document)
 
     def test_aeon_tracked_runtime_profile_matches_deployment_reference(self) -> None:
         unit = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
@@ -230,7 +227,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         self.assertEqual(option_value("--max-model-len"), "262144")
         self.assertEqual(option_value("--max-num-seqs"), "16")
         self.assertEqual(option_value("--max-num-batched-tokens"), "4096")
-        self.assertEqual(option_value("--gpu-memory-utilization"), "0.355")
+        self.assertEqual(option_value("--gpu-memory-utilization"), "${AEON_GPU_MEMORY_UTILIZATION}")
         self.assertEqual(option_value("--kv-cache-dtype"), "fp8_e4m3")
         self.assertEqual(option_value("--attention-backend"), "TRITON_ATTN")
         served_name_index = runtime_argv.index("--served-model-name")
@@ -256,18 +253,18 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         self.assertEqual(len(reference_rows), 1)
         reference_row = reference_rows[0]
         for expected in (
-            "tracked v0.26.0 source profile",
+            "sole AEON text runtime owner",
             "DFlash n=10",
             "kv-cache-dtype=fp8_e4m3",
             "attention-backend=TRITON_ATTN",
             "max-model-len=262144",
             "max-num-seqs=16",
             "max-num-batched-tokens=4096",
-            "AUTO KV",
+            "baseline.env",
             "gpu-memory-utilization=0.355",
-            "no explicit `kv-cache-memory-bytes`",
+            "hikv.env",
             "286,962 KV tokens",
-            "not a live-production activation claim",
+            "record a v0.26.0 live receipt",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, reference_row)

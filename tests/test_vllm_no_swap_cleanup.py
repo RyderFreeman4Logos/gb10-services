@@ -7,13 +7,22 @@ from pathlib import Path
 from vllm_no_swap_fixtures import VERIFIER, VllmNoSwapFixture
 
 
+DFLASH_CONTAINERS = (
+    "vllm-aeon-27b-dflash-n12",
+    "vllm-aeon-27b-dflash-hikv",
+    "vllm-aeon-27b-dflash",
+)
+
+
 class VllmNoSwapCleanupTests(VllmNoSwapFixture):
     def _seed_cleanup(self, *, cid: str, name: str = "vllm-test") -> Path:
         cidfile = self.root / "runtime" / "vllm-test.cid"
-        cidfile.parent.mkdir(mode=0o700)
+        cidfile.parent.mkdir(mode=0o700, exist_ok=True)
         cidfile.write_text(f"{cid}\n")
         cidfile.chmod(0o600)
-        payload = self._inspect(name, identifier=cid)
+        fixture_name = name if name in self.identifiers else "vllm-test"
+        payload = self._inspect(fixture_name, identifier=cid)
+        payload["Name"] = f"/{name}"
         self.cleanup_state.write_text(
             json.dumps(
                 {
@@ -28,7 +37,7 @@ class VllmNoSwapCleanupTests(VllmNoSwapFixture):
         return cidfile
 
     def _run_cleanup(
-        self, cidfile: Path, *, name: str = "vllm-test"
+        self, cidfile: Path, *, names: tuple[str, ...] = ("vllm-test",)
     ) -> subprocess.CompletedProcess[str]:
         environment = self._test_environment(docker_mode="cleanup")
         argv = [
@@ -41,11 +50,10 @@ class VllmNoSwapCleanupTests(VllmNoSwapFixture):
             str(VERIFIER),
             "--test-only",
             "--cleanup",
-            "--container",
-            name,
-            "--cidfile",
-            str(cidfile),
         ]
+        for name in names:
+            argv.extend(["--container", name])
+        argv.extend(["--cidfile", str(cidfile)])
         return subprocess.run(
             argv,
             check=False,
@@ -68,6 +76,45 @@ class VllmNoSwapCleanupTests(VllmNoSwapFixture):
         self.assertIn(f"docker rm -f {identifier}", log)
         second = self._run_cleanup(cidfile)
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+
+    def test_cleanup_accepts_each_approved_dflash_generation_from_one_allowlist(self) -> None:
+        identifier = self.identifiers["vllm-test"]
+        for name in DFLASH_CONTAINERS:
+            with self.subTest(name=name):
+                self.command_log.unlink(missing_ok=True)
+                cidfile = self._seed_cleanup(cid=identifier, name=name)
+                result = self._run_cleanup(cidfile, names=DFLASH_CONTAINERS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                state = json.loads(self.cleanup_state.read_text())
+                self.assertEqual(state["stopped"], [identifier])
+                self.assertEqual(state["removed"], [identifier])
+                self.assertFalse(cidfile.exists())
+
+    def test_cleanup_allowlist_rejects_an_unapproved_generation(self) -> None:
+        identifier = self.identifiers["vllm-test"]
+        cidfile = self._seed_cleanup(cid=identifier, name="vllm-unapproved")
+        result = self._run_cleanup(cidfile, names=DFLASH_CONTAINERS)
+        self.assertNotEqual(result.returncode, 0)
+        log = self.command_log.read_text() if self.command_log.exists() else ""
+        self.assertNotIn("docker stop", log)
+        self.assertNotIn("docker rm", log)
+
+    def test_cleanup_allowlist_rejects_multiple_approved_generations(self) -> None:
+        identifier = self.identifiers["vllm-test"]
+        cidfile = self._seed_cleanup(cid=identifier, name=DFLASH_CONTAINERS[0])
+        state = json.loads(self.cleanup_state.read_text())
+        second_identifier = self.identifiers["vllm-second"]
+        second = self._inspect("vllm-second", identifier=second_identifier)
+        second["Name"] = f"/{DFLASH_CONTAINERS[1]}"
+        state["names"][DFLASH_CONTAINERS[1]] = second_identifier
+        state["objects"][second_identifier] = second
+        self.cleanup_state.write_text(json.dumps(state, sort_keys=True))
+
+        result = self._run_cleanup(cidfile, names=DFLASH_CONTAINERS)
+        self.assertNotEqual(result.returncode, 0)
+        log = self.command_log.read_text()
+        self.assertNotIn("docker stop", log)
+        self.assertNotIn("docker rm", log)
 
     def test_cleanup_fails_closed_on_malformed_stale_or_replacement_authority(self) -> None:
         identifier = self.identifiers["vllm-test"]

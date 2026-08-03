@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import posixpath
@@ -45,6 +46,22 @@ FULL_ID = re.compile(r"[0-9a-f]{64}")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 STARTED_AT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z")
 COMPONENT = re.compile(r"[A-Za-z0-9_.@:-]+")
+AEON_PROFILE_KEY = "AEON_GPU_MEMORY_UTILIZATION"
+AEON_PROFILE_PLACEHOLDER = "${AEON_GPU_MEMORY_UTILIZATION}"
+AEON_PROFILE_FILE = "/home/obj/.config/gb10/aeon-dflash-profiles/active.env"
+AEON_PROFILE_TEST_SELECTOR = "GB10_VLLM_NO_SWAP_AEON_PROFILE_PATH"
+AEON_PROFILE_TARGET_VALUES = {"baseline.env": "0.355", "hikv.env": "0.45"}
+AEON_PROFILE_VALUES = set(AEON_PROFILE_TARGET_VALUES.values())
+AEON_DOCKER_PREFIX = [
+    "/usr/bin/env",
+    "-i",
+    "HOME=/home/obj",
+    "PATH=/usr/bin:/bin",
+    "LC_ALL=C",
+    "DOCKER_HOST=unix:///run/user/1001/docker.sock",
+    "/usr/bin/docker",
+    "run",
+]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -63,6 +80,12 @@ class UnitContract:
     image: str
     entrypoint: tuple[str, ...]
     command: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class AeonProfileAuthority:
+    value: str
+    seal: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -207,6 +230,94 @@ def decode_text(payload: bytes, label: str) -> str:
         reject(f"{label} is not strict UTF-8: {error}")
 
 
+def metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def read_aeon_profile_authority() -> AeonProfileAuthority:
+    selected = os.environ.get(AEON_PROFILE_TEST_SELECTOR)
+    if selected is not None and not TEST_ONLY:
+        reject("AEON profile path override is test-only")
+    raw_path = selected if TEST_ONLY and selected is not None else AEON_PROFILE_FILE
+    path = canonical_absolute(raw_path, "AEON profile path")
+    if path.name != "active.env" or (not TEST_ONLY and raw_path != AEON_PROFILE_FILE):
+        reject("AEON profile path is not the fixed canonical active.env")
+    parent = require_directory_chain(path.parent, "AEON profile parent")
+    if parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) & 0o022:
+        reject("AEON profile parent owner or mode is unsafe")
+
+    try:
+        link_before = os.lstat(path)
+    except OSError as error:
+        reject(f"AEON profile selector is unavailable: {error}")
+    if (
+        not stat.S_ISLNK(link_before.st_mode)
+        or link_before.st_uid != os.geteuid()
+        or link_before.st_nlink != 1
+    ):
+        reject("AEON profile selector is not one owner-bound symlink")
+    target = os.readlink(path)
+    expected_value = AEON_PROFILE_TARGET_VALUES.get(target)
+    if expected_value is None:
+        reject("AEON profile selector target is not an approved relative profile")
+
+    target_path = path.parent / target
+    try:
+        target_before = os.lstat(target_path)
+    except OSError as error:
+        reject(f"AEON profile target is unavailable: {error}")
+    payload, opened = read_regular(target_path, 128, "AEON profile target")
+    try:
+        link_after = os.lstat(path)
+        target_after = os.lstat(target_path)
+    except OSError as error:
+        reject(f"AEON profile authority changed while reading: {error}")
+    if (
+        metadata_identity(link_before) != metadata_identity(link_after)
+        or os.readlink(path) != target
+        or metadata_identity(target_before) != metadata_identity(opened)
+        or metadata_identity(opened) != metadata_identity(target_after)
+    ):
+        reject("AEON profile authority changed while reading")
+    if (
+        opened.st_uid != os.geteuid()
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) not in (0o600, 0o644)
+    ):
+        reject("AEON profile target owner, mode, or link count is unsafe")
+
+    text = decode_text(payload, "AEON profile target")
+    matched = re.fullmatch(r"AEON_GPU_MEMORY_UTILIZATION=(0\.355|0\.45)\n?", text)
+    if matched is None:
+        reject("AEON profile target must contain exactly one canonical assignment")
+    value = matched.group(1)
+    if value != expected_value:
+        reject("AEON profile target does not authorize its named value")
+    seal_payload = json.dumps(
+        [
+            str(path),
+            target,
+            *metadata_identity(link_after),
+            *metadata_identity(target_after),
+            hashlib.sha256(payload).hexdigest(),
+            value,
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return AeonProfileAuthority(value, hashlib.sha256(seal_payload).hexdigest())
+
+
 def logical_exec_start(text: str) -> list[str]:
     commands: list[list[str]] = []
     pending: list[str] = []
@@ -278,7 +389,15 @@ def parse_unit(path_raw: str) -> UnitContract:
     payload, metadata = read_regular(path, 256_000, "unit file")
     if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
         reject("unit file owner or mode is unsafe")
-    argv = logical_exec_start(decode_text(payload, "unit file"))
+    text = decode_text(payload, "unit file")
+    argv = logical_exec_start(text)
+    clean_profile_start = argv[: len(AEON_DOCKER_PREFIX)] == AEON_DOCKER_PREFIX
+    if clean_profile_start:
+        argv = [
+            "/usr/bin/docker",
+            "run",
+            *argv[len(AEON_DOCKER_PREFIX) :],
+        ]
     if len(argv) < 4 or argv[:2] != ["/usr/bin/docker", "run"]:
         reject("unit ExecStart is not one direct absolute Docker run")
 
@@ -358,6 +477,43 @@ def parse_unit(path_raw: str) -> UnitContract:
         reject("container command is not a direct tracked vLLM launcher")
     if any(token in {"/bin/sh", "/bin/bash", "sh", "bash", "-c"} for token in command[:3]):
         reject("shell-wrapped vLLM command is forbidden")
+
+    profile_value = os.environ.get(AEON_PROFILE_KEY)
+    variable_tokens = [token for token in argv if "$" in token]
+    if variable_tokens:
+        if not clean_profile_start:
+            reject("AEON profile Docker run lacks its exact clean environment")
+        section = ""
+        profile_declarations: list[tuple[str, str]] = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.startswith("[") and line.endswith("]"):
+                section = line
+            elif line.startswith("EnvironmentFile="):
+                profile_declarations.append((section, line))
+        if variable_tokens != [AEON_PROFILE_PLACEHOLDER]:
+            reject("unit ExecStart contains an unapproved variable")
+        if profile_declarations != [
+            ("[Service]", f"EnvironmentFile={AEON_PROFILE_FILE}")
+        ]:
+            reject("unit does not declare one exact canonical AEON profile")
+        if (
+            command.count("--gpu-memory-utilization") != 1
+            or command.count(AEON_PROFILE_PLACEHOLDER) != 1
+            or command.index(AEON_PROFILE_PLACEHOLDER)
+            != command.index("--gpu-memory-utilization") + 1
+        ):
+            reject("approved AEON profile variable is not the exact option value")
+        authority = read_aeon_profile_authority()
+        if profile_value not in AEON_PROFILE_VALUES:
+            reject("AEON profile value is missing or unapproved")
+        if profile_value != authority.value:
+            reject("manager-expanded AEON profile value is not authorized")
+        command[command.index(AEON_PROFILE_PLACEHOLDER)] = profile_value
+    elif clean_profile_start:
+        reject("clean AEON profile Docker environment lacks its profile placeholder")
+    elif profile_value is not None:
+        reject("AEON profile value was supplied for a unit without its placeholder")
     return UnitContract(
         path,
         container,
@@ -645,9 +801,10 @@ def minimal_identity(payload: dict[str, object], reference: str) -> tuple[str, s
     return identifier, name.removeprefix("/")
 
 
-def cleanup(container: str, cidfile_raw: str) -> None:
-    if NAME.fullmatch(container) is None:
-        reject("cleanup container name is unsafe")
+def cleanup(containers: Sequence[str], cidfile_raw: str) -> None:
+    for container in containers:
+        if NAME.fullmatch(container) is None:
+            reject("cleanup container name is unsafe")
     cidfile = canonical_absolute(cidfile_raw, "cleanup cidfile")
     require_directory_chain(cidfile.parent, "cleanup cidfile parent")
     try:
@@ -657,8 +814,10 @@ def cleanup(container: str, cidfile_raw: str) -> None:
     except OSError as error:
         reject(f"cannot inspect cleanup cidfile: {error}")
     if lexical is None:
-        by_name = inspect_payload(container, allow_absent=True)
-        if by_name is not None:
+        if any(
+            inspect_payload(container, allow_absent=True) is not None
+            for container in containers
+        ):
             reject("container exists without its private cidfile authority")
         return
     if stat.S_ISLNK(lexical.st_mode) or not stat.S_ISREG(lexical.st_mode):
@@ -672,16 +831,21 @@ def cleanup(container: str, cidfile_raw: str) -> None:
     if re.fullmatch(r"[0-9a-f]{64}\n?", text) is None:
         reject("cleanup cidfile does not contain exactly one full container ID")
     identifier = text.rstrip("\n")
-    by_name = inspect_payload(container, allow_absent=True)
+    by_names: list[tuple[str, dict[str, object]]] = []
+    for container in containers:
+        by_name = inspect_payload(container, allow_absent=True)
+        if by_name is not None:
+            by_names.append((container, by_name))
     by_identifier = inspect_payload(identifier, allow_absent=True)
-    if by_name is None and by_identifier is None:
+    if not by_names and by_identifier is None:
         current = os.lstat(cidfile)
         if (current.st_dev, current.st_ino) != (lexical.st_dev, lexical.st_ino):
             reject("cleanup cidfile changed before idempotent removal")
         os.unlink(cidfile)
         return
-    if by_name is None or by_identifier is None:
+    if len(by_names) != 1 or by_identifier is None:
         reject("cleanup name and full-ID authority disagree")
+    container, by_name = by_names[0]
     name_id, name_value = minimal_identity(by_name, container)
     id_id, id_name = minimal_identity(by_identifier, identifier)
     if (
@@ -706,7 +870,10 @@ def cleanup(container: str, cidfile_raw: str) -> None:
     )
     if removed.returncode != 0 and not known_absence(removed):
         reject("generation-bound Docker remove failed")
-    if inspect_payload(container, allow_absent=True) is not None:
+    if any(
+        inspect_payload(container, allow_absent=True) is not None
+        for container in containers
+    ):
         reject("container name still resolves after cleanup")
     if inspect_payload(identifier, allow_absent=True) is not None:
         reject("full container ID still resolves after cleanup")
@@ -714,6 +881,23 @@ def cleanup(container: str, cidfile_raw: str) -> None:
     if (current.st_dev, current.st_ino) != (lexical.st_dev, lexical.st_ino):
         reject("cleanup cidfile changed before final removal")
     os.unlink(cidfile)
+
+
+def profile_authority_mode(arguments: Sequence[str]) -> bool:
+    if not arguments or arguments[0] not in {"--profile-snapshot", "--profile-attest"}:
+        return False
+    if arguments[0] == "--profile-snapshot":
+        if len(arguments) != 1:
+            reject("--profile-snapshot accepts no values")
+        authority = read_aeon_profile_authority()
+        print(f"{authority.value} {authority.seal}")
+        return True
+    if len(arguments) != 2 or FULL_ID.fullmatch(arguments[1]) is None:
+        reject("--profile-attest requires one authority seal")
+    authority = read_aeon_profile_authority()
+    if authority.seal != arguments[1]:
+        reject("AEON profile authority changed after its bound snapshot")
+    return True
 
 
 def parse_cli(arguments: Sequence[str]) -> tuple[bool, list[str], list[str], str | None]:
@@ -747,12 +931,14 @@ def parse_cli(arguments: Sequence[str]) -> tuple[bool, list[str], list[str], str
         if token in {"-h", "--help"}:
             reject(
                 "usage: [--unit ABSOLUTE_PATH]... [--container NAME]... or "
-                "--cleanup --container NAME --cidfile ABSOLUTE_PATH"
+                "--cleanup [--container NAME]... --cidfile ABSOLUTE_PATH"
             )
         reject(f"unknown CLI argument: {token}")
     if cleanup_mode:
-        if units or len(containers) != 1 or cidfile is None:
-            reject("cleanup requires exactly one --container and one --cidfile")
+        if units or not containers or cidfile is None:
+            reject("cleanup requires at least one --container and one --cidfile")
+        if len(set(containers)) != len(containers):
+            reject("cleanup arguments contain duplicates")
     else:
         if cidfile is not None or not units:
             reject("verification requires at least one --unit")
@@ -765,15 +951,17 @@ def main() -> None:
     if "XDG_RUNTIME_DIR" not in os.environ:
         os.environ["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
 
+    if profile_authority_mode(ARGUMENTS):
+        return
     cleanup_mode, unit_paths, containers, cidfile = parse_cli(ARGUMENTS)
     if cleanup_mode:
         assert cidfile is not None
-        cleanup(containers[0], cidfile)
+        cleanup(containers, cidfile)
         print("gb10_vllm_no_swap: cleanup verified")
         return
 
-    docker_cgroup_v2_preflight()
     contracts = [parse_unit(path) for path in unit_paths]
+    docker_cgroup_v2_preflight()
     by_container: dict[str, UnitContract] = {}
     for contract in contracts:
         if contract.container in by_container:

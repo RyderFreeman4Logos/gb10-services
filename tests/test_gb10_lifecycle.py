@@ -4,7 +4,6 @@ import os
 import stat
 import subprocess
 import tempfile
-import threading
 import time
 import unittest
 from pathlib import Path
@@ -795,377 +794,149 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             )
             self.assertNotIn("event=reset-failed", audit)
 
-    def test_guard_helper_calls_lifecycle_without_an_outer_timeout(self) -> None:
+    def run_guard_helper(
+        self,
+        *,
+        active_state: str,
+        requested_unit: str | None = UNIT,
+        selected_value: str | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], list[str], str | None]:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            events = root / "events.log"
+            lifecycle = root / "lifecycle"
+            systemctl = root / "systemctl"
+            sleep = root / "sleep"
+            selected = root / "selected-text-unit"
+            if selected_value is not None:
+                selected.write_text(selected_value)
+            self.make_executable(
+                lifecycle,
+                "#!/bin/sh\n"
+                'printf "lifecycle %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n',
+            )
+            self.make_executable(
+                systemctl,
+                "#!/bin/sh\n"
+                'printf "systemctl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
+                'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then\n'
+                '    printf "%s\\n" "$GB10_HELPER_ACTIVE_STATE"\n'
+                "    exit 0\n"
+                "fi\n"
+                "exit 1\n",
+            )
+            self.make_executable(sleep, "#!/bin/sh\nexit 0\n")
+            helper = root / "aeon_text_stop_start.sh"
+            helper.write_text(
+                GUARD_HELPER.read_text()
+                .replace("/usr/bin/systemctl", str(systemctl))
+                .replace("/usr/bin/sleep", str(sleep))
+            )
+            environment = os.environ.copy()
+            environment.pop("GB10_TEXT_UNIT", None)
+            environment.update(
+                {
+                    "GB10_HELPER_ACTIVE_STATE": active_state,
+                    "GB10_HELPER_EVENT_LOG": str(events),
+                    "GB10_LIFECYCLE_BIN": str(lifecycle),
+                    "GB10_SELECTED_TEXT_UNIT_FILE": str(selected),
+                }
+            )
+            if requested_unit is not None:
+                environment["GB10_TEXT_UNIT"] = requested_unit
+            result = subprocess.run(
+                ["/usr/bin/bash", str(helper)],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            return (
+                result,
+                events.read_text().splitlines(),
+                selected.read_text() if selected.exists() else None,
+            )
+
+    def test_guard_helper_calls_canonical_lifecycle_without_an_outer_timeout(self) -> None:
         source = GUARD_HELPER.read_text()
         self.assertNotIn("/usr/bin/timeout", source)
         self.assertNotIn("STOP_TIMEOUT_SECS", source)
         self.assertNotIn("START_TIMEOUT_SECS", source)
 
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            events = root / "events.log"
-            lifecycle = root / "lifecycle"
-            systemctl = root / "systemctl"
-            sleep = root / "sleep"
-            self.make_executable(
-                lifecycle,
-                "#!/bin/sh\n"
-                'printf "lifecycle %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n',
-            )
-            self.make_executable(
-                systemctl,
-                "#!/bin/sh\n"
-                'printf "systemctl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
-                'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then\n'
-                '    printf "active\\n"\n'
-                "    exit 0\n"
-                "fi\n"
-                "exit 0\n",
-            )
-            self.make_executable(sleep, "#!/bin/sh\nexit 0\n")
-            helper = root / "aeon_text_stop_start.sh"
-            helper.write_text(
-                source.replace("/usr/bin/systemctl", str(systemctl)).replace(
-                    "/usr/bin/sleep",
-                    str(sleep),
-                )
-            )
-            selected = root / "selected-text-unit"
-            environment = os.environ.copy()
-            environment.update(
-                {
-                    "GB10_HELPER_EVENT_LOG": str(events),
-                    "GB10_LIFECYCLE_BIN": str(lifecycle),
-                    "GB10_TEXT_UNIT": UNIT,
-                    "GB10_SELECTED_TEXT_UNIT_FILE": str(selected),
-                }
-            )
+        result, events, selected = self.run_guard_helper(active_state="active")
 
-            result = subprocess.run(
-                ["/usr/bin/bash", str(helper)],
-                cwd=ROOT,
-                env=environment,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=10,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(selected.read_text().strip(), UNIT)
-            event_lines = events.read_text().splitlines()
-            self.assertEqual(len(event_lines), 3)
-            self.assertTrue(event_lines[0].startswith("lifecycle stop "))
-            self.assertTrue(event_lines[1].startswith("lifecycle start "))
-            self.assertEqual(
-                event_lines[2],
-                "systemctl --user show --property=ActiveState --value "
-                "vllm-aeon-27b-dflash.service",
-            )
-
-    def test_guard_helper_selects_an_activating_hikv_unit(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            events = root / "events.log"
-            lifecycle = root / "lifecycle"
-            systemctl = root / "systemctl"
-            sleep = root / "sleep"
-            self.make_executable(
-                lifecycle,
-                "#!/bin/sh\n"
-                'printf "lifecycle %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n',
-            )
-            self.make_executable(
-                systemctl,
-                "#!/bin/sh\n"
-                'printf "systemctl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
-                'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then\n'
-                '    case "${5:-}" in\n'
-                f'        {UNIT}) printf "inactive\\n" ;;\n'
-                f'        {HIKV_UNIT}) printf "activating\\n" ;;\n'
-                "    esac\n"
-                "    exit 0\n"
-                "fi\n"
-                # is-active must stay nonzero for activating Type=simple units.
-                "exit 1\n",
-            )
-            self.make_executable(sleep, "#!/bin/sh\nexit 0\n")
-            helper = root / "aeon_text_stop_start.sh"
-            helper.write_text(
-                GUARD_HELPER.read_text()
-                .replace("/usr/bin/systemctl", str(systemctl))
-                .replace("/usr/bin/sleep", str(sleep))
-            )
-            selected = root / "selected-text-unit"
-            environment = os.environ.copy()
-            environment.pop("GB10_TEXT_UNIT", None)
-            environment.update(
-                {
-                    "GB10_HELPER_EVENT_LOG": str(events),
-                    "GB10_LIFECYCLE_BIN": str(lifecycle),
-                    "GB10_SELECTED_TEXT_UNIT_FILE": str(selected),
-                }
-            )
-
-            result = subprocess.run(
-                ["/usr/bin/bash", str(helper)],
-                cwd=ROOT,
-                env=environment,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=10,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(selected.read_text().strip(), HIKV_UNIT)
-            self.assertEqual(
-                events.read_text().splitlines(),
-                [
-                    "systemctl --user show --property=ActiveState --value " + UNIT,
-                    "systemctl --user show --property=ActiveState --value " + HIKV_UNIT,
-                    "lifecycle stop --unit "
-                    + HIKV_UNIT
-                    + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
-                    "lifecycle start --unit "
-                    + HIKV_UNIT
-                    + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
-                    "systemctl --user show --property=ActiveState --value " + HIKV_UNIT,
-                ],
-            )
-
-    def test_guard_helper_accepts_activating_without_is_active_success(self) -> None:
-        """Type=simple HIGH-KV units remain activating while ExecStartPost runs."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            events = root / "events.log"
-            lifecycle = root / "lifecycle"
-            systemctl = root / "systemctl"
-            sleep = root / "sleep"
-            selected = root / "selected-text-unit"
-            self.make_executable(
-                lifecycle,
-                "#!/bin/sh\n"
-                'printf "lifecycle %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n',
-            )
-            self.make_executable(
-                systemctl,
-                "#!/bin/sh\n"
-                'printf "systemctl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
-                'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then\n'
-                f'    printf "activating\\n"\n'
-                "    exit 0\n"
-                "fi\n"
-                "exit 1\n",
-            )
-            self.make_executable(sleep, "#!/bin/sh\nexit 0\n")
-            helper = root / "aeon_text_stop_start.sh"
-            helper.write_text(
-                GUARD_HELPER.read_text()
-                .replace("/usr/bin/systemctl", str(systemctl))
-                .replace("/usr/bin/sleep", str(sleep))
-            )
-            environment = os.environ.copy()
-            environment.update(
-                {
-                    "GB10_HELPER_EVENT_LOG": str(events),
-                    "GB10_LIFECYCLE_BIN": str(lifecycle),
-                    "GB10_TEXT_UNIT": HIKV_UNIT,
-                    "GB10_SELECTED_TEXT_UNIT_FILE": str(selected),
-                }
-            )
-            result = subprocess.run(
-                ["/usr/bin/bash", str(helper)],
-                cwd=ROOT,
-                env=environment,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=10,
-            )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(selected.read_text().strip(), HIKV_UNIT)
-            self.assertIn(
-                "systemctl --user show --property=ActiveState --value " + HIKV_UNIT,
-                events.read_text(),
-            )
-            self.assertNotIn("is-active", events.read_text())
-
-    def test_guard_helper_prefers_persisted_hikv_over_enabled_baseline(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            events = root / "events.log"
-            lifecycle = root / "lifecycle"
-            systemctl = root / "systemctl"
-            sleep = root / "sleep"
-            selected = root / "selected-text-unit"
-            selected.write_text(HIKV_UNIT + "\n")
-            self.make_executable(
-                lifecycle,
-                "#!/bin/sh\n"
-                'printf "lifecycle %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n',
-            )
-            self.make_executable(
-                systemctl,
-                "#!/bin/sh\n"
-                'printf "systemctl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
-                'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then\n'
-                # Both inactive initially; after start, hikv becomes activating.
-                '    if [ "${5:-}" = "' + HIKV_UNIT + '" ]; then\n'
-                '        if grep -q "lifecycle start" "$GB10_HELPER_EVENT_LOG" 2>/dev/null; then\n'
-                '            printf "activating\\n"\n'
-                "        else\n"
-                '            printf "failed\\n"\n'
-                "        fi\n"
-                "        exit 0\n"
-                "    fi\n"
-                '    printf "inactive\\n"\n'
-                "    exit 0\n"
-                "fi\n"
-                'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "is-enabled" ]; then\n'
-                f'    if [ "${{3:-}}" = "{UNIT}" ]; then\n'
-                '        printf "enabled\\n"\n'
-                "        exit 0\n"
-                "    fi\n"
-                '    printf "disabled\\n"\n'
-                "    exit 1\n"
-                "fi\n"
-                "exit 1\n",
-            )
-            self.make_executable(sleep, "#!/bin/sh\nexit 0\n")
-            helper = root / "aeon_text_stop_start.sh"
-            helper.write_text(
-                GUARD_HELPER.read_text()
-                .replace("/usr/bin/systemctl", str(systemctl))
-                .replace("/usr/bin/sleep", str(sleep))
-            )
-            environment = os.environ.copy()
-            environment.pop("GB10_TEXT_UNIT", None)
-            environment.update(
-                {
-                    "GB10_HELPER_EVENT_LOG": str(events),
-                    "GB10_LIFECYCLE_BIN": str(lifecycle),
-                    "GB10_SELECTED_TEXT_UNIT_FILE": str(selected),
-                }
-            )
-            result = subprocess.run(
-                ["/usr/bin/bash", str(helper)],
-                cwd=ROOT,
-                env=environment,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=10,
-            )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            lines = events.read_text().splitlines()
-            self.assertIn(
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIsNone(selected)
+        self.assertEqual(
+            events,
+            [
                 "lifecycle stop --unit "
-                + HIKV_UNIT
+                + UNIT
                 + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
-                lines,
-            )
-            self.assertIn(
                 "lifecycle start --unit "
-                + HIKV_UNIT
+                + UNIT
                 + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
-                lines,
-            )
-            self.assertNotIn("lifecycle stop --unit " + UNIT, "\n".join(lines))
-            self.assertEqual(selected.read_text().strip(), HIKV_UNIT)
+                "systemctl --user show --property=ActiveState --value " + UNIT,
+            ],
+        )
 
-    def test_selected_text_unit_publish_is_atomic_for_concurrent_readers(self) -> None:
-        """A reader must observe a complete old or new marker during publishes."""
-        for source in (GUARD_HELPER, RESTART_HELPER):
-            with self.subTest(helper=source.name), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                selected = root / "selected-text-unit"
-                selected.write_text(UNIT + "\n")
-                source_text = source.read_text()
-                self.assertIn("mktemp", source_text)
-                self.assertTrue(
-                    '"$MV" -f -- "$tmp" "$SELECTED_TEXT_UNIT_FILE"' in source_text
-                    or 'mv -f -- "$tmp" "$SELECTED_TEXT_UNIT_FILE"' in source_text
-                )
-                self.assertNotIn('cp -- "$tmp" "$SELECTED_TEXT_UNIT_FILE"', source_text)
+    def test_guard_helper_accepts_activating_canonical_unit_by_default(self) -> None:
+        result, events, selected = self.run_guard_helper(
+            active_state="activating",
+            requested_unit=None,
+        )
 
-                lifecycle = root / "lifecycle"
-                systemctl = root / "systemctl"
-                sleep = root / "sleep"
-                self.make_executable(lifecycle, "#!/bin/sh\nexit 0\n")
-                self.make_executable(
-                    systemctl,
-                    "#!/bin/sh\n"
-                    'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then\n'
-                    '    printf "active\\n"\n'
-                    "fi\n"
-                    "exit 0\n",
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIsNone(selected)
+        self.assertEqual(events[-1], "systemctl --user show --property=ActiveState --value " + UNIT)
+        self.assertNotIn(HIKV_UNIT, "\n".join(events))
+
+    def test_guard_helper_canonicalizes_hikv_alias_without_is_active(self) -> None:
+        result, events, selected = self.run_guard_helper(
+            active_state="activating",
+            requested_unit=HIKV_UNIT,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIsNone(selected)
+        self.assertEqual(events[-1], "systemctl --user show --property=ActiveState --value " + UNIT)
+        self.assertNotIn(HIKV_UNIT, "\n".join(events))
+        self.assertNotIn("is-active", "\n".join(events))
+
+    def test_guard_helper_ignores_obsolete_persisted_unit_selection(self) -> None:
+        marker = HIKV_UNIT + "\n"
+        result, events, selected = self.run_guard_helper(
+            active_state="active",
+            requested_unit=None,
+            selected_value=marker,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(selected, marker)
+        self.assertNotIn(HIKV_UNIT, "\n".join(events))
+        self.assertNotIn("is-enabled", "\n".join(events))
+        self.assertTrue(all(UNIT in event for event in events))
+
+    def test_active_profile_publish_uses_atomic_rename(self) -> None:
+        for source in (README, RUNBOOK):
+            with self.subTest(source=source):
+                lines = source.read_text().splitlines()
+                link_index = next(
+                    index
+                    for index, line in enumerate(lines)
+                    if "ln -sfn hikv.env " in line and line.endswith("/active.env.new")
                 )
-                self.make_executable(sleep, "#!/bin/sh\nexit 0\n")
-                self.make_executable(root / "curl", "#!/bin/sh\nexit 0\n")
-                self.make_executable(root / "pkill", "#!/bin/sh\nexit 0\n")
-                helper = root / source.name
-                helper.write_text(
-                    source_text.replace("/usr/bin/systemctl", str(systemctl)).replace(
-                        "/usr/bin/sleep", str(sleep)
+                self.assertIn("mv -Tf ", lines[link_index + 1])
+                self.assertIn("/active.env.new ", lines[link_index + 1])
+                self.assertTrue(lines[link_index + 1].endswith("/active.env"))
+                self.assertFalse(
+                    any(
+                        "ln -sfn hikv.env " in line and line.endswith("/active.env")
+                        for line in lines
                     )
                 )
-                helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
-                valid = {UNIT + "\n", HIKV_UNIT + "\n"}
-                observed: list[str] = []
-                done = threading.Event()
-
-                def reader() -> None:
-                    while not done.is_set():
-                        observed.append(selected.read_text())
-
-                thread = threading.Thread(target=reader)
-                thread.start()
-                processes: list[subprocess.Popen[str]] = []
-                try:
-                    for index in range(40):
-                        text_unit = UNIT if index % 2 else HIKV_UNIT
-                        if source == RESTART_HELPER:
-                            text_unit = text_unit.removesuffix(".service")
-                        environment = os.environ.copy()
-                        environment.update(
-                            {
-                                "GB10_LIFECYCLE_BIN": str(lifecycle),
-                                "GB10_SELECTED_TEXT_UNIT_FILE": str(selected),
-                                "GB10_TEXT_UNIT": text_unit,
-                                "PATH": f"{root}:/usr/bin:/bin",
-                            }
-                        )
-                        processes.append(
-                            subprocess.Popen(
-                                ["/usr/bin/bash", str(helper)],
-                                cwd=ROOT,
-                                env=environment,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True,
-                            )
-                        )
-                    for process in processes:
-                        stdout, stderr = process.communicate(timeout=10)
-                        self.assertEqual(process.returncode, 0, stdout + stderr)
-                finally:
-                    done.set()
-                    thread.join(timeout=10)
-                    for process in processes:
-                        if process.poll() is None:
-                            process.terminate()
-                    for process in processes:
-                        try:
-                            process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait(timeout=5)
-
-                self.assertFalse(thread.is_alive())
-                self.assertGreater(len(observed), 0)
-                self.assertTrue(all(value in valid for value in observed), observed[:10])
-
 
 
 if __name__ == "__main__":
