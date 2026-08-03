@@ -38,19 +38,21 @@ graph TD
    `429`/`Retry-After`, model metadata enrichment, AEON chat hot-restart probes,
    stall detection, request parameter overrides for the AEON service-unit
    sampling defaults (`temperature=0.6`, `top_p=0.95`, `top_k=20`,
-   `max_tokens=50000`), metrics, debug summaries, SQLite observability, full
-   quality-debug evidence logging, SSE heartbeats, and Cloudflare-friendly
-   streaming. Default multi-model chat on `:18009` is **force_disable** (no
-   thinking, single-rung ladder, loop_guard off) after the 2026-07 three-arm
-   quality benchmark; embedding/reranker models still route on the same port by
-   `model`. Opt-in legacy **bounded** chat is on forced listener `:18014`
-   (bounded 32768 + loop_guard CoT salvage + multi-rung ladder). Experimental
-   max-thinking arms remain on `:18011` (guarded) and `:18015` (raw).
+   `max_tokens=50000`), metrics, debug summaries, SQLite observability,
+   metadata-only/redacted evidence logging, SSE heartbeats, and
+   Cloudflare-friendly streaming. Default multi-model chat on `:18009` is
+   **force_disable** (no thinking, single-rung ladder, loop_guard off) after the
+   2026-07 three-arm quality benchmark; embedding/reranker models still route on
+   the same port by `model`. Opt-in legacy **bounded** chat on `:18014` keeps
+   `bounded_answer_from_cot`, a 32768 budget, and its multi-rung ladder. Guarded
+   max-thinking on `:18011` uses `truncate_cot_then_answer` for exactly one
+   no-thinking synthesis from retry-local truncated CoT; `:18015` remains raw.
 
-   Evidence is intentionally configured for loop-detector improvement rather
-   than privacy-minimal production: redacted raw payloads, selected request
-   headers, raw reasoning, loop shadow continuations, and 100% paired
-   max/bounded/no-thinking comparisons are recorded within bounded retention.
+   Captured private CoT stays retry-local and is never persisted. Evidence keeps
+   metadata-only/redacted summaries and selected request headers. Every raw
+   capture flag is false: `capture_raw_payloads = false`,
+   `include_raw_payloads = false`, `include_raw_input = false`,
+   `include_raw_output = false`, and `include_raw_reasoning = false`.
 
    Embedding and reranker profiles explicitly disable chat-only hot-restart
    probes, thinking rewrites, and parameter overrides.
