@@ -234,10 +234,12 @@ if bind:
     args.remove("--bind-runtime-swap-max")
 if args.count("--unit") != 1 or args.count("--container") != 1:
     raise SystemExit(82)
-unit = Path(args[args.index("--unit") + 1]).name
+unit_path = Path(args[args.index("--unit") + 1])
+unit = unit_path.name
 container = args[args.index("--container") + 1]
 containers = {
     "unit.before": "vllm-embedding",
+    "unit.source": "vllm-embedding",
     "vllm-embedding.service": "vllm-embedding",
     "vllm-aeon-27b-dflash.service": "vllm-aeon-27b-dflash",
     "vllm-querit-4b-reranker.service": "querit-4b-vllm",
@@ -245,6 +247,8 @@ containers = {
 }
 if containers.get(unit) != container:
     raise SystemExit(83)
+if container == "vllm-embedding" and unit_path.read_bytes().count(b"ExecStart=") != 1:
+    raise SystemExit(88)
 count = int(state.get("no_swap_count", 0)) + 1
 state["no_swap_count"] = count
 if container not in set(state.get("swap_zero", [])):

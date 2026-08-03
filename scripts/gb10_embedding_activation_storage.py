@@ -326,6 +326,17 @@ def _load_manifest(config: RuntimeConfig) -> dict[str, Any]:
         or not _valid_digest(manifest["source_sha256"])
     ):
         raise TransactionError("transaction source authority is invalid")
+    unit_source_path = config.transaction / "unit.source"
+    _secure_regular(unit_source_path, 0o600)
+    unit_source = read_nofollow(
+        unit_source_path, 1024 * 1024, owner_only=True
+    )
+    if _sha256(unit_source) != manifest["source_sha256"]:
+        raise TransactionError("transaction unit source copy is corrupt")
+    try:
+        validate_unit_text(unit_source.decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise TransactionError("transaction unit source copy is not UTF-8") from error
     verifier_authority = manifest["verifier_authority"]
     if not isinstance(verifier_authority, dict) or set(verifier_authority) != {
         str(path) for path in config.verifier_authority
@@ -402,6 +413,9 @@ def _persist_transaction(
         raise TransactionError("transaction temporary path already exists")
     os.mkdir(temporary, 0o700)
     try:
+        _atomic_write(
+            temporary / "unit.source", unit_source.data, 0o600, replace=False
+        )
         if prior_unit is not None:
             _atomic_write(temporary / "unit.before", prior_unit.data, 0o600, replace=False)
         for key in NO_SWAP_KEYS:

@@ -132,6 +132,17 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 transaction = fixture.transaction()
                 manifest = json.loads((transaction / "manifest.json").read_text())
                 self.assertEqual(set(manifest["no_swap_artifacts"]), {"core", "wrapper"})
+                unit_source = transaction / "unit.source"
+                unit_source_metadata = unit_source.lstat()
+                self.assertFalse(unit_source.is_symlink())
+                self.assertEqual(unit_source_metadata.st_uid, os.geteuid())
+                self.assertEqual(unit_source_metadata.st_nlink, 1)
+                self.assertEqual(unit_source_metadata.st_mode & 0o777, 0o600)
+                self.assertEqual(unit_source.read_bytes(), CANONICAL_UNIT.read_bytes())
+                self.assertEqual(
+                    hashlib.sha256(unit_source.read_bytes()).hexdigest(),
+                    manifest["source_sha256"],
+                )
                 self.assertEqual((transaction / "phase").read_text(), "committed\n")
                 receipt_path = transaction / "activation.receipt.json"
                 receipt = json.loads(receipt_path.read_text())
@@ -447,6 +458,53 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                     os.killpg(process.pid, signal.SIGKILL)
                     process.communicate(timeout=5)
 
+    def test_source_mutation_after_restart_uses_sealed_candidate_for_rollback(self) -> None:
+        with ActivationFixture() as fixture:
+            fixture.hooks["pause_at"] = "after_restart"
+            process = fixture.spawn()
+            try:
+                fixture.wait_for_marker()
+                fixture.source_unit.write_bytes(b"hostile source unit drift\n")
+                fixture.source_unit.chmod(0o644)
+                fixture.release.write_text("release\n")
+                stdout, stderr = process.communicate(timeout=15)
+                self.assertNotEqual(process.returncode, 0, stdout + stderr)
+                self.assertNotIn("embedding rollback failed", stderr)
+                self.assert_restored(fixture)
+                state = json.loads(fixture.state_path.read_text())
+                self.assertEqual(state["daemon_reload_unbound"], [[], []])
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.communicate(timeout=5)
+
+    def test_stale_restarted_transaction_uses_sealed_candidate_for_rollback(self) -> None:
+        with ActivationFixture() as fixture:
+            fixture.hooks["pause_at"] = "after_restart"
+            process = fixture.spawn()
+            try:
+                fixture.wait_for_marker()
+                fixture.source_unit.write_bytes(b"hostile source unit drift\n")
+                fixture.source_unit.chmod(0o644)
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=5)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.communicate(timeout=5)
+            self.assertEqual((fixture.transaction() / "phase").read_text(), "restarted\n")
+            fixture.state = json.loads(fixture.state_path.read_text())
+            fixture.hooks["pause_at"] = ""
+            recovered = fixture.run()
+            self.assertNotEqual(
+                recovered.returncode, 0, recovered.stdout + recovered.stderr
+            )
+            self.assertIn("rerun activation", recovered.stderr)
+            self.assertNotIn("embedding rollback failed", recovered.stderr)
+            self.assert_restored(fixture)
+            state = json.loads(fixture.state_path.read_text())
+            self.assertEqual(state["daemon_reload_unbound"], [[], []])
+
     def test_no_swap_bundle_first_install_and_installed_drift_are_owned(self) -> None:
         for prior_helper_present, prior_core_present in (
             (False, False),
@@ -530,6 +588,57 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 self.assertEqual(
                     fixture.installed_helper.read_bytes(), before_wrapper
                 )
+
+    def test_sealed_candidate_unit_rejects_hostile_path_bytes_mode_and_digest(self) -> None:
+        for case in ("hostile", "symlink", "bytes", "mode", "digest"):
+            with self.subTest(case=case), ActivationFixture() as fixture:
+                initial = fixture.run()
+                self.assertEqual(
+                    initial.returncode, 0, initial.stdout + initial.stderr
+                )
+                transaction = fixture.transaction()
+                unit_source = transaction / "unit.source"
+                manifest_path = transaction / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                if case == "hostile":
+                    hostile = b"hostile transaction unit\n"
+                    unit_source.write_bytes(hostile)
+                    unit_source.chmod(0o600)
+                    manifest["source_sha256"] = hashlib.sha256(hostile).hexdigest()
+                elif case == "symlink":
+                    unit_source.unlink()
+                    unit_source.symlink_to(fixture.source_unit)
+                elif case == "bytes":
+                    unit_source.write_bytes(unit_source.read_bytes() + b"# drift\n")
+                    unit_source.chmod(0o600)
+                elif case == "mode":
+                    unit_source.chmod(0o644)
+                else:
+                    manifest["source_sha256"] = "0" * 64
+                if case in {"hostile", "digest"}:
+                    raw = json.dumps(
+                        manifest, sort_keys=True, separators=(",", ":")
+                    ).encode() + b"\n"
+                    manifest_path.write_bytes(raw)
+                    manifest_path.chmod(0o600)
+                    complete = transaction / "complete"
+                    complete.write_text(
+                        f"manifest_sha256={hashlib.sha256(raw).hexdigest()}\n"
+                    )
+                    complete.chmod(0o600)
+                before_log = fixture.log()
+                before_unit = fixture.installed_unit.read_bytes()
+                rejected = fixture.run()
+                self.assertNotEqual(
+                    rejected.returncode, 0, rejected.stdout + rejected.stderr
+                )
+                after_log = fixture.log()
+                for command in ("daemon-reload", "restart ", "stop "):
+                    self.assertEqual(
+                        after_log.count(command), before_log.count(command)
+                    )
+                self.assertEqual(fixture.installed_unit.read_bytes(), before_unit)
+                self.assertEqual((transaction / "phase").read_text(), "committed\n")
 
     def test_core_source_and_installed_drift_fail_closed_and_restore_pair(self) -> None:
         for target, pause in (("source", "prepared"), ("installed", "after_restart")):
