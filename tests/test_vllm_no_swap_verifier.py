@@ -193,6 +193,61 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
         )
         self.assertGreaterEqual(log.count("docker inspect --type container vllm-test"), 2)
 
+    def test_resolves_only_the_canonical_dflash_profile_variable(self) -> None:
+        profile = "/home/obj/.config/gb10/aeon-dflash-profiles/active.env"
+        literal = [
+            "/usr/local/bin/vllm",
+            "serve",
+            "model",
+            "--gpu-memory-utilization",
+            "${AEON_GPU_MEMORY_UTILIZATION}",
+        ]
+        for value in ("0.355", "0.45"):
+            with self.subTest(value=value):
+                self.inspect_state.unlink(missing_ok=True)
+                self._write_unit(
+                    self.unit,
+                    "vllm-test",
+                    "/run/user/1001/gb10-vllm-cids/test.cid",
+                    application=literal,
+                    environment_files=(profile,),
+                )
+                rendered = [value if token == literal[-1] else token for token in literal]
+                payload = self._inspect("vllm-test", command=rendered)
+                result = self._run(
+                    inspect_sequences={"vllm-test": [payload]},
+                    profile_value=value,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        for label, environment_files, command, profile_value in (
+            ("missing value", (profile,), literal, None),
+            ("unapproved value", (profile,), literal, "0.451"),
+            ("ambiguous profile", (profile, profile), literal, "0.355"),
+            (
+                "unapproved variable",
+                (profile,),
+                [*literal[:-1], "${UNAPPROVED}"],
+                "0.355",
+            ),
+        ):
+            with self.subTest(label=label):
+                self._write_unit(
+                    self.unit,
+                    "vllm-test",
+                    "/run/user/1001/gb10-vllm-cids/test.cid",
+                    application=command,
+                    environment_files=environment_files,
+                )
+                self.assert_rejected(containers=(), profile_value=profile_value)
+
+        self._write_unit(
+            self.unit,
+            "vllm-test",
+            "/run/user/1001/gb10-vllm-cids/test.cid",
+        )
+        self.assert_rejected(containers=(), profile_value="0.355")
+
     def test_timed_out_command_does_not_wait_for_setsid_pipe_holder(self) -> None:
         escaped_pid = self.root / "escaped.pid"
         self.docker.write_text(

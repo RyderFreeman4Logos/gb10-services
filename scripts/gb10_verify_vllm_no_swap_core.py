@@ -45,6 +45,10 @@ FULL_ID = re.compile(r"[0-9a-f]{64}")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 STARTED_AT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z")
 COMPONENT = re.compile(r"[A-Za-z0-9_.@:-]+")
+AEON_PROFILE_KEY = "AEON_GPU_MEMORY_UTILIZATION"
+AEON_PROFILE_PLACEHOLDER = "${AEON_GPU_MEMORY_UTILIZATION}"
+AEON_PROFILE_FILE = "/home/obj/.config/gb10/aeon-dflash-profiles/active.env"
+AEON_PROFILE_VALUES = {"0.355", "0.45"}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -278,7 +282,8 @@ def parse_unit(path_raw: str) -> UnitContract:
     payload, metadata = read_regular(path, 256_000, "unit file")
     if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
         reject("unit file owner or mode is unsafe")
-    argv = logical_exec_start(decode_text(payload, "unit file"))
+    text = decode_text(payload, "unit file")
+    argv = logical_exec_start(text)
     if len(argv) < 4 or argv[:2] != ["/usr/bin/docker", "run"]:
         reject("unit ExecStart is not one direct absolute Docker run")
 
@@ -358,6 +363,36 @@ def parse_unit(path_raw: str) -> UnitContract:
         reject("container command is not a direct tracked vLLM launcher")
     if any(token in {"/bin/sh", "/bin/bash", "sh", "bash", "-c"} for token in command[:3]):
         reject("shell-wrapped vLLM command is forbidden")
+
+    profile_value = os.environ.get(AEON_PROFILE_KEY)
+    variable_tokens = [token for token in argv if "$" in token]
+    if variable_tokens:
+        section = ""
+        profile_declarations: list[tuple[str, str]] = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.startswith("[") and line.endswith("]"):
+                section = line
+            elif line.startswith("EnvironmentFile="):
+                profile_declarations.append((section, line))
+        if variable_tokens != [AEON_PROFILE_PLACEHOLDER]:
+            reject("unit ExecStart contains an unapproved variable")
+        if profile_declarations != [
+            ("[Service]", f"EnvironmentFile={AEON_PROFILE_FILE}")
+        ]:
+            reject("unit does not declare one exact canonical AEON profile")
+        if (
+            command.count("--gpu-memory-utilization") != 1
+            or command.count(AEON_PROFILE_PLACEHOLDER) != 1
+            or command.index(AEON_PROFILE_PLACEHOLDER)
+            != command.index("--gpu-memory-utilization") + 1
+        ):
+            reject("approved AEON profile variable is not the exact option value")
+        if profile_value not in AEON_PROFILE_VALUES:
+            reject("AEON profile value is missing or unapproved")
+        command[command.index(AEON_PROFILE_PLACEHOLDER)] = profile_value
+    elif profile_value is not None:
+        reject("AEON profile value was supplied for a unit without its placeholder")
     return UnitContract(
         path,
         container,

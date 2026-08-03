@@ -77,6 +77,7 @@ class VllmNoSwapFixture(unittest.TestCase):
         cidfile: str,
         *,
         application: list[str] | None = None,
+        environment_files: tuple[str, ...] = (),
     ) -> None:
         command = application or [
             "/usr/local/bin/vllm",
@@ -85,7 +86,8 @@ class VllmNoSwapFixture(unittest.TestCase):
         ]
         path.write_text(
             "[Service]\n"
-            "ExecStart=/usr/bin/docker run --rm "
+            + "".join(f"EnvironmentFile={value}\n" for value in environment_files)
+            + "ExecStart=/usr/bin/docker run --rm "
             f"--cidfile={cidfile} --name {name} "
             "--memory 18g --memory-swap 18g --memory-swappiness 0 --entrypoint python3 "
             f"{self.image} "
@@ -283,6 +285,7 @@ class VllmNoSwapFixture(unittest.TestCase):
         info_fail: bool = False,
         inspect_sequences: dict[str, list[dict[str, object] | None]] | None = None,
         second_inspect_actions: list[dict[str, object]] | None = None,
+        profile_value: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         environment = self._test_environment(
             cgroup_version=cgroup_version,
@@ -290,6 +293,8 @@ class VllmNoSwapFixture(unittest.TestCase):
             inspect_sequences=inspect_sequences,
             second_inspect_actions=second_inspect_actions,
         )
+        if profile_value is not None:
+            environment["AEON_GPU_MEMORY_UTILIZATION"] = profile_value
         argv = [
             "/usr/bin/env",
             "-i",

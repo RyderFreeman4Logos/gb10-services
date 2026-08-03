@@ -24,6 +24,14 @@ PRODUCTION_PREFIX = [
     "--norc",
     HELPER,
 ]
+AEON_PROFILE_ASSIGNMENT = (
+    "AEON_GPU_MEMORY_UTILIZATION=${AEON_GPU_MEMORY_UTILIZATION}"
+)
+AEON_PRODUCTION_PREFIX = [
+    *PRODUCTION_PREFIX[:6],
+    AEON_PROFILE_ASSIGNMENT,
+    *PRODUCTION_PREFIX[6:],
+]
 SERVICE_CONTRACTS = {
     "vllm-aeon-27b-dflash.service": (
         "vllm-aeon-27b-dflash",
@@ -145,10 +153,15 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                     expected_memory_swap_max,
                 )
                 unit_path = f"{UNIT_ROOT}/{name}"
-                condition = PRODUCTION_PREFIX + ["--unit", unit_path]
+                verification_prefix = (
+                    AEON_PRODUCTION_PREFIX
+                    if name == "vllm-aeon-27b-dflash.service"
+                    else PRODUCTION_PREFIX
+                )
+                condition = verification_prefix + ["--unit", unit_path]
                 self.assertEqual(_logical_argv(unit, "ExecCondition")[0], condition)
                 posts = _logical_argv(unit, "ExecStartPost")
-                generation_verifier = PRODUCTION_PREFIX + [
+                generation_verifier = verification_prefix + [
                     "--unit",
                     unit_path,
                     "--container",
@@ -229,7 +242,13 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                 helper_commands = [argv for argv in commands if HELPER in argv]
                 self.assertGreaterEqual(len(helper_commands), 4)
                 for argv in helper_commands:
-                    self.assertEqual(argv[: len(PRODUCTION_PREFIX)], PRODUCTION_PREFIX)
+                    expected_prefix = (
+                        AEON_PRODUCTION_PREFIX
+                        if name == "vllm-aeon-27b-dflash.service"
+                        and "--cleanup" not in argv
+                        else PRODUCTION_PREFIX
+                    )
+                    self.assertEqual(argv[: len(expected_prefix)], expected_prefix)
                     self.assertNotIn("--test-only", argv)
 
     def test_deployment_agents_names_current_guardian_and_cleanup_authority(self) -> None:

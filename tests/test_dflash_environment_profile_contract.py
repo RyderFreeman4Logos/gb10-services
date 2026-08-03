@@ -68,6 +68,11 @@ class DflashEnvironmentProfileContractTests(unittest.TestCase):
         self.assertIn(f"EnvironmentFile={INSTALLED_ACTIVE_PROFILE}", text)
         self.assertIn("TimeoutStartSec=3000", text)
         self.assertIn("--deadline 2800", text)
+        profile_assignment = (
+            "AEON_GPU_MEMORY_UTILIZATION=${AEON_GPU_MEMORY_UTILIZATION}"
+        )
+        self.assertIn(profile_assignment, _directive_argv(text, "ExecCondition"))
+        self.assertIn(profile_assignment, _directive_argv(text, "ExecStartPost"))
         argv = _directive_argv(text, "ExecStart")
         utilization = argv.index("--gpu-memory-utilization")
         self.assertEqual(argv[utilization + 1], "${AEON_GPU_MEMORY_UTILIZATION}")

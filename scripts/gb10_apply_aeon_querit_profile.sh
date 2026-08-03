@@ -95,17 +95,25 @@ verify_no_swap() {
         "${NO_SWAP_TEST_ARGS[@]}"
         --unit "/home/obj/.config/systemd/user/$unit"
     )
+    local -a profile_environment=()
+    if [[ "$unit" == "$AEON_UNIT" ]]; then
+        profile_environment=(
+            "AEON_GPU_MEMORY_UTILIZATION=$EXPECTED_AEON_GPU_MEMORY_UTILIZATION"
+        )
+    fi
     if [[ -n "$container" ]]; then
         arguments+=(--container "$container")
     fi
     if (( ${#NO_SWAP_TEST_ARGS[@]} == 1 )); then
-        "$NO_SWAP_HELPER" "${arguments[@]}"
+        /usr/bin/env "${profile_environment[@]}" \
+            "$NO_SWAP_HELPER" "${arguments[@]}"
     else
         /usr/bin/env -i \
             HOME=/home/obj \
             PATH=/usr/bin:/bin \
             LC_ALL=C \
             DOCKER_HOST=unix:///run/user/1001/docker.sock \
+            "${profile_environment[@]}" \
             /usr/bin/bash --noprofile --norc \
             "$NO_SWAP_HELPER" "${arguments[@]}"
     fi

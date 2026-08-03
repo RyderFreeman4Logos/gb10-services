@@ -261,6 +261,7 @@ class QueritDeployerContractTests(unittest.TestCase):
             "count=$((count + 1))\n"
             f"printf '%s\\n' \"$count\" > {no_swap_count}\n"
             f"printf 'no-swap %s\\n' \"$*\" >> {calls}\n"
+            f"printf 'no-swap-env %s %s\\n' \"${{AEON_GPU_MEMORY_UTILIZATION-}}\" \"$*\" >> {calls}\n"
             'if (( count == ${FAKE_NO_SWAP_FAIL_AT:-0} )); then exit 85; fi\n'
         )
         no_swap.chmod(0o755)
@@ -316,6 +317,12 @@ class QueritDeployerContractTests(unittest.TestCase):
                 "--container vllm-aeon-27b-dflash"
             )
             self.assertGreaterEqual(recorded.count(aeon_no_swap), 2, recorded)
+            aeon_environment = (
+                "no-swap-env 0.45 --test-only --unit "
+                "/home/obj/.config/systemd/user/vllm-aeon-27b-dflash.service "
+                "--container vllm-aeon-27b-dflash"
+            )
+            self.assertGreaterEqual(recorded.count(aeon_environment), 2, recorded)
 
     def test_rejects_stale_or_noncanonical_aeon_profiles_before_mutation(self) -> None:
         command, memory_bytes, memory_swap_bytes = _canonical_aeon_docker_profile()
@@ -733,6 +740,17 @@ class QueritDeployerContractTests(unittest.TestCase):
             )
             self.assertGreaterEqual(
                 sum(line.startswith("no-swap ") for line in recorded), 7
+            )
+            self.assertGreaterEqual(
+                sum(
+                    line.startswith(
+                        "no-swap-env 0.45 --test-only --unit "
+                        "/home/obj/.config/systemd/user/"
+                        "vllm-aeon-27b-dflash.service"
+                    )
+                    for line in recorded
+                ),
+                2,
             )
 
     def test_sigterm_after_switch_rolls_back_once(self) -> None:
