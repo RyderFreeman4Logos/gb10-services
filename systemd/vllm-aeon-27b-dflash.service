@@ -36,7 +36,7 @@ ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-memory-guardian
 ExecStartPre=/usr/bin/install -d -m 0700 /home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473
 ExecStartPre=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-aeon-27b-dflash-n12 --container vllm-aeon-27b-dflash-hikv --container vllm-aeon-27b-dflash --cidfile %t/gb10-memory-guardian/aeon-text.cid
 ExecStartPre=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1
-ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.cid --name vllm-aeon-27b-dflash \
+ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.cid --name vllm-aeon-27b-dflash \
   --cgroup-parent app.slice \
   --gpus all --ipc host \
   -p 100.105.4.92:18010:8000 \
@@ -88,9 +88,9 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.c
 # Verify the immutable vLLM command and this Docker generation's exact user scope first.
 ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock AEON_GPU_MEMORY_UTILIZATION=${AEON_GPU_MEMORY_UTILIZATION} /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-aeon-27b-dflash.service --container vllm-aeon-27b-dflash
 # Publish the exact Docker cgroup for llm-guard-proxy's integrated guardian.
-ExecStartPost=/home/obj/.local/bin/llm_guard_proxy_publish_cgroup_registration.sh
+ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C XDG_RUNTIME_DIR=%t GB10_CONTAINER_CIDFILE=%t/gb10-memory-guardian/aeon-text.cid GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1 /usr/bin/bash --noprofile --norc /home/obj/.local/bin/llm_guard_proxy_publish_cgroup_registration.sh
 # Raw :18010 readiness (defaults target Guard :18009).
-ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh chat http://100.105.4.92:18010 aeon-ultimate --deadline 2800
+ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_service_ready.sh chat http://100.105.4.92:18010 aeon-ultimate --deadline 2800
 ExecStop=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-aeon-27b-dflash-n12 --container vllm-aeon-27b-dflash-hikv --container vllm-aeon-27b-dflash --cidfile %t/gb10-memory-guardian/aeon-text.cid
 ExecStopPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-aeon-27b-dflash-n12 --container vllm-aeon-27b-dflash-hikv --container vllm-aeon-27b-dflash --cidfile %t/gb10-memory-guardian/aeon-text.cid
 ExecStopPost=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1

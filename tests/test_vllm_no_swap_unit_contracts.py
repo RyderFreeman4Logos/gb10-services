@@ -32,6 +32,16 @@ AEON_PRODUCTION_PREFIX = [
     AEON_PROFILE_ASSIGNMENT,
     *PRODUCTION_PREFIX[6:],
 ]
+AEON_DOCKER_PREFIX = [
+    "/usr/bin/env",
+    "-i",
+    "HOME=/home/obj",
+    "PATH=/usr/bin:/bin",
+    "LC_ALL=C",
+    f"DOCKER_HOST={ROOTLESS_SOCKET}",
+    "/usr/bin/docker",
+    "run",
+]
 SERVICE_CONTRACTS = {
     "vllm-aeon-27b-dflash.service": (
         "vllm-aeon-27b-dflash",
@@ -118,7 +128,17 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                 start = _logical_argv(unit, "ExecStart")
                 self.assertEqual(len(start), 1)
                 argv = start[0]
-                self.assertEqual(argv[:2], ["/usr/bin/docker", "run"])
+                if name == "vllm-aeon-27b-dflash.service":
+                    self.assertEqual(
+                        argv[: len(AEON_DOCKER_PREFIX)], AEON_DOCKER_PREFIX
+                    )
+                    argv = [
+                        "/usr/bin/docker",
+                        "run",
+                        *argv[len(AEON_DOCKER_PREFIX) :],
+                    ]
+                else:
+                    self.assertEqual(argv[:2], ["/usr/bin/docker", "run"])
                 image_at = next(
                     index
                     for index, token in enumerate(argv)
@@ -220,6 +240,42 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                             for argv in commands
                         )
                     )
+
+    def test_dflash_docker_and_direct_post_start_helpers_have_clean_environments(self) -> None:
+        unit = (ROOT / "systemd" / "vllm-aeon-27b-dflash.service").read_text()
+        start = _logical_argv(unit, "ExecStart")
+        self.assertEqual(start[0][: len(AEON_DOCKER_PREFIX)], AEON_DOCKER_PREFIX)
+        posts = _logical_argv(unit, "ExecStartPost")
+        clean = [
+            "/usr/bin/env",
+            "-i",
+            "HOME=/home/obj",
+            "PATH=/usr/bin:/bin",
+            "LC_ALL=C",
+        ]
+        publisher = next(
+            argv
+            for argv in posts
+            if any(
+                token.endswith("/llm_guard_proxy_publish_cgroup_registration.sh")
+                for token in argv
+            )
+        )
+        self.assertEqual(publisher[: len(clean)], clean)
+        self.assertIn(
+            "GB10_CONTAINER_CIDFILE=%t/gb10-memory-guardian/aeon-text.cid",
+            publisher,
+        )
+        self.assertIn(
+            "GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1",
+            publisher,
+        )
+        readiness = next(
+            argv
+            for argv in posts
+            if any(token.endswith("/gb10_service_ready.sh") for token in argv)
+        )
+        self.assertEqual(readiness[: len(clean)], clean)
 
     def test_generation_verifier_does_not_query_type_simple_service_state(self) -> None:
         source = VERIFIER_CORE.read_text()

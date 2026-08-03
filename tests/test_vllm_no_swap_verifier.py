@@ -202,9 +202,10 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
             "--gpu-memory-utilization",
             "${AEON_GPU_MEMORY_UTILIZATION}",
         ]
-        for value in ("0.355", "0.45"):
-            with self.subTest(value=value):
+        for target, value in (("baseline.env", "0.355"), ("hikv.env", "0.45")):
+            with self.subTest(target=target, value=value):
                 self.inspect_state.unlink(missing_ok=True)
+                self.select_profile(target)
                 self._write_unit(
                     self.unit,
                     "vllm-test",
@@ -247,6 +248,103 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
             "/run/user/1001/gb10-vllm-cids/test.cid",
         )
         self.assert_rejected(containers=(), profile_value="0.355")
+
+    def test_profile_artifact_is_strict_data_and_bound_to_its_canonical_target(self) -> None:
+        profile = "/home/obj/.config/gb10/aeon-dflash-profiles/active.env"
+        literal = [
+            "/usr/local/bin/vllm",
+            "serve",
+            "model",
+            "--gpu-memory-utilization",
+            "${AEON_GPU_MEMORY_UTILIZATION}",
+        ]
+        self._write_unit(
+            self.unit,
+            "vllm-test",
+            "/run/user/1001/gb10-vllm-cids/test.cid",
+            application=literal,
+            environment_files=(profile,),
+        )
+        marker = self.root / "shell-payload-executed"
+        canonical = {
+            "baseline.env": b"AEON_GPU_MEMORY_UTILIZATION=0.355\n",
+            "hikv.env": b"AEON_GPU_MEMORY_UTILIZATION=0.45\n",
+        }
+        hostile = {
+            "missing assignment with inherited approved value": (
+                "hikv.env",
+                b"",
+                "0.45",
+            ),
+            "duplicate assignment": (
+                "hikv.env",
+                b"AEON_GPU_MEMORY_UTILIZATION=0.355\n"
+                b"AEON_GPU_MEMORY_UTILIZATION=0.45\n",
+                "0.45",
+            ),
+            "extra Docker selector": (
+                "hikv.env",
+                b"AEON_GPU_MEMORY_UTILIZATION=0.45\n"
+                b"DOCKER_HOST=unix:///tmp/redirected.sock\n",
+                "0.45",
+            ),
+            "extra publisher selector": (
+                "hikv.env",
+                b"AEON_GPU_MEMORY_UTILIZATION=0.45\nGB10_SYSTEMCTL_BIN=/tmp/fake\n",
+                "0.45",
+            ),
+            "shell payload": (
+                "hikv.env",
+                (
+                    "AEON_GPU_MEMORY_UTILIZATION="
+                    f"$(/usr/bin/touch {shlex.quote(str(marker))}; printf 0.45)\n"
+                ).encode(),
+                "0.45",
+            ),
+            "unapproved value": (
+                "hikv.env",
+                b"AEON_GPU_MEMORY_UTILIZATION=0.451\n",
+                "0.451",
+            ),
+            "malformed bytes": (
+                "hikv.env",
+                b"AEON_GPU_MEMORY_UTILIZATION=0.45\xff\n",
+                "0.45",
+            ),
+            "target value mismatch": (
+                "baseline.env",
+                b"AEON_GPU_MEMORY_UTILIZATION=0.45\n",
+                "0.45",
+            ),
+        }
+        for label, (target, payload, inherited) in hostile.items():
+            with self.subTest(label=label):
+                for name, value in canonical.items():
+                    (self.profile_dir / name).write_bytes(value)
+                (self.profile_dir / target).write_bytes(payload)
+                self.select_profile(target)
+                self.command_log.unlink(missing_ok=True)
+                self.assert_rejected(containers=(), profile_value=inherited)
+                self.assertFalse(marker.exists())
+                self.assertFalse(self.command_log.exists(), "invalid profile reached Docker")
+
+        other = self.profile_dir / "other.env"
+        other.write_bytes(canonical["hikv.env"])
+        self.select_profile("other.env")
+        self.assert_rejected(containers=(), profile_value="0.45")
+
+        self.select_profile(str(self.profile_dir / "hikv.env"))
+        self.assert_rejected(containers=(), profile_value="0.45")
+
+        selected = self.profile_dir / "selected.env"
+        selected.symlink_to("hikv.env")
+        self.assert_rejected(
+            containers=(), profile_value="0.45", profile_path=selected
+        )
+
+        self.profile_path.unlink()
+        self.profile_path.write_bytes(canonical["hikv.env"])
+        self.assert_rejected(containers=(), profile_value="0.45")
 
     def test_timed_out_command_does_not_wait_for_setsid_pipe_holder(self) -> None:
         escaped_pid = self.root / "escaped.pid"
@@ -339,7 +437,7 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
             "1",
             "1",
             "--unit",
-            "/tmp/not-read-before-docker-preflight.service",
+            str(self.unit),
         ]
         try:
             with mock.patch.object(sys, "argv", argv), mock.patch(
@@ -649,5 +747,27 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
         self.assertIn("test-only selector", result.stderr)
         self.assertFalse(self.command_log.exists())
         self.assertTrue(marker.exists(), "direct bash proves why production units must use env -i")
+
+        override = subprocess.run(
+            [
+                "/usr/bin/env",
+                "-i",
+                f"DOCKER_HOST=unix:///run/user/{os.getuid()}/docker.sock",
+                f"GB10_VLLM_NO_SWAP_AEON_PROFILE_PATH={self.profile_path}",
+                "/usr/bin/bash",
+                "--noprofile",
+                "--norc",
+                str(VERIFIER),
+                "--unit",
+                str(self.unit),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertNotEqual(override.returncode, 0)
+        self.assertIn("test-only selector", override.stderr)
+        self.assertFalse(self.command_log.exists())
         source = VERIFIER.read_text()
         self.assertIn("/usr/bin/python3 -I", source)

@@ -33,6 +33,16 @@ class VllmNoSwapFixture(unittest.TestCase):
         self.cgroup_root.mkdir()
         self.unit = self.root / "vllm-test.service"
         self.second_unit = self.root / "vllm-second.service"
+        self.profile_dir = self.root / "aeon-dflash-profiles"
+        self.profile_dir.mkdir()
+        self.profile_path = self.profile_dir / "active.env"
+        (self.profile_dir / "baseline.env").write_text(
+            "AEON_GPU_MEMORY_UTILIZATION=0.355\n"
+        )
+        (self.profile_dir / "hikv.env").write_text(
+            "AEON_GPU_MEMORY_UTILIZATION=0.45\n"
+        )
+        self.profile_path.symlink_to("hikv.env")
         self.command_log = self.root / "commands.log"
         self.inspect_state = self.root / "inspect-state.json"
         self.cleanup_state = self.root / "cleanup-state.json"
@@ -84,10 +94,16 @@ class VllmNoSwapFixture(unittest.TestCase):
             "serve",
             "model",
         ]
+        launcher = (
+            "/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C "
+            "DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/docker run"
+            if environment_files
+            else "/usr/bin/docker run"
+        )
         path.write_text(
             "[Service]\n"
             + "".join(f"EnvironmentFile={value}\n" for value in environment_files)
-            + "ExecStart=/usr/bin/docker run --rm "
+            + f"ExecStart={launcher} --rm "
             f"--cidfile={cidfile} --name {name} "
             "--memory 18g --memory-swap 18g --memory-swappiness 0 --entrypoint python3 "
             f"{self.image} "
@@ -272,7 +288,14 @@ class VllmNoSwapFixture(unittest.TestCase):
             "GB10_VLLM_NO_SWAP_SYSTEMCTL_BIN": str(self.systemctl),
             "GB10_VLLM_NO_SWAP_WAIT_SECONDS": "1",
             "GB10_VLLM_NO_SWAP_COMMAND_TIMEOUT_SECONDS": "2",
+            "GB10_VLLM_NO_SWAP_AEON_PROFILE_PATH": str(self.profile_path),
         }
+
+    def select_profile(self, target: str) -> None:
+        replacement = self.profile_dir / "active.env.next"
+        replacement.unlink(missing_ok=True)
+        replacement.symlink_to(target)
+        replacement.replace(self.profile_path)
 
     def _run(
         self,
@@ -286,6 +309,7 @@ class VllmNoSwapFixture(unittest.TestCase):
         inspect_sequences: dict[str, list[dict[str, object] | None]] | None = None,
         second_inspect_actions: list[dict[str, object]] | None = None,
         profile_value: str | None = None,
+        profile_path: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         environment = self._test_environment(
             cgroup_version=cgroup_version,
@@ -295,6 +319,8 @@ class VllmNoSwapFixture(unittest.TestCase):
         )
         if profile_value is not None:
             environment["AEON_GPU_MEMORY_UTILIZATION"] = profile_value
+        if profile_path is not None:
+            environment["GB10_VLLM_NO_SWAP_AEON_PROFILE_PATH"] = str(profile_path)
         argv = [
             "/usr/bin/env",
             "-i",
