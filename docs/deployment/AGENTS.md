@@ -284,8 +284,18 @@ requires the exact expected `HostConfig.Memory`, `MemorySwap == Memory`, exact
 unit/container process argv identity, `memory.max`, `memory.swap.max == 0`, and
 activation-time `memory.swap.current == 0`, and rejects any identity change on
 re-read.
-`systemctl --user show ... ControlGroup` is only a cross-check; neither it nor a
-parent-service `MemorySwapMax=0` substitutes for Docker-generation attribution.
+Before that strict verification and before readiness, each tracked vLLM unit
+invokes the same authority with `--bind-runtime-swap-max`. This mode first proves
+the already-zero kernel state, then binds the owner-only private cidfile's exact
+full ID and container name to the live PID, `/proc` path, and Docker scope. Only
+then does it run `systemctl --user set-property --runtime
+docker-<full-id>.scope MemorySwapMax=0` and require both manager-property and
+kernel read-back against the unchanged generation. It never repairs an already
+nonzero or unlimited kernel state. The runtime property makes a later
+`daemon-reload` replay zero instead of Docker's transient scope reverting to
+`infinity`. `systemctl --user show ... ControlGroup` remains only a cross-check;
+neither it, the runtime property, nor a parent-service `MemorySwapMax=0`
+substitutes for Docker-generation attribution and the following strict verifier.
 
 Verifier and cleanup calls in production units run through fixed absolute tools
 under `env -i` with the fixed rootless socket. The explicit `--test-only` seam is

@@ -37,7 +37,7 @@ __all__ = [
 
 EXPECTED_VERIFIER_AUTHORITY: dict[str, str] = {
     "gb10_verify_embedding_profile.py": "5ddbea42ec11ab6cf8fd8a0df14d40edd6b3920d33851510274c24a5092732f4",
-    "gb10_embedding_profile_contract.py": "ef1b5d7b6191136171a1df0c7d9596e88b40ec061bb5e9f5a09c4625bc20a868",
+    "gb10_embedding_profile_contract.py": "a5e2427c172c4cf00c8296d110dbc5ef7c76b58736aeb48d1ebd5d1caec27050",
     "gb10_embedding_verifier_runtime.py": "599af1c802e1a0d3e942fb0b16cdfd3a66f9e928ab64eabf3fb455ec007df629",
 }
 NO_SWAP_KEYS = ("core", "wrapper")
@@ -47,8 +47,8 @@ NO_SWAP_PRIVATE_FILES = {
 }
 NO_SWAP_PRIOR_FILES = {"core": "no_swap_core.before", "wrapper": "no_swap_wrapper.before"}
 EXPECTED_NO_SWAP_SHA256 = {
-    "core": "b191090b040322a50a9e16389c55f51a59f7878e3e42749098dcf64497c89178",
-    "wrapper": "d4e12fee613abb1c6ea847907aed9671ec15fe7b9b4ec0c2cb45439e9c1389e0",
+    "core": "df2f373d21ab2223eaa5c2598cca1e8347c8f7666a2520ee7fc441f0a8c78fbb",
+    "wrapper": "ecdc085021c6a7b53454844150bb3ecadfba0af3ccf77ad92f80a29b2b32d484",
 }
 
 class ActivationStorageError(RuntimeError):

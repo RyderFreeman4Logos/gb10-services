@@ -155,6 +155,20 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 )
                 self.assertIn("--container vllm-embedding", log)
                 self.assertEqual(log.count(f"restart {UNIT}"), 1)
+                state = json.loads(fixture.state_path.read_text())
+                self.assertEqual(state["daemon_reload_unbound"], [[]])
+                self.assertEqual(
+                    set(state["runtime_bound"]),
+                    {
+                        "vllm-embedding",
+                        "vllm-aeon-27b-dflash",
+                        "vllm-qwen3-reranker-8b",
+                    },
+                )
+                replay = fixture.daemon_reload()
+                self.assertEqual(replay.returncode, 0, replay.stdout + replay.stderr)
+                replay_state = json.loads(fixture.state_path.read_text())
+                self.assertEqual(replay_state["daemon_reload_unbound"][-1], [])
                 for neighbor in (
                     "vllm-aeon-27b-dflash.service",
                     "vllm-querit-4b-reranker.service",
@@ -219,6 +233,20 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             self.assertEqual(
                 rollback_snapshot["inode"], fixture.installed_unit.stat().st_ino
             )
+            self.assertEqual(state["daemon_reload_unbound"], [[], []])
+            self.assertNotIn(b"--bind-runtime-swap-max", fixture.prior_bytes)
+            self.assertEqual(
+                set(state["runtime_bound"]),
+                {
+                    "vllm-embedding",
+                    "vllm-aeon-27b-dflash",
+                    "vllm-qwen3-reranker-8b",
+                },
+            )
+            replay = fixture.daemon_reload()
+            self.assertEqual(replay.returncode, 0, replay.stdout + replay.stderr)
+            replay_state = json.loads(fixture.state_path.read_text())
+            self.assertEqual(replay_state["daemon_reload_unbound"][-1], [])
 
     def test_hup_int_and_term_after_install_restore_exact_prior_unit(self) -> None:
         for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
@@ -571,7 +599,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
 
     def test_no_swap_helper_prior_absence_is_restored_after_post_start_failure(self) -> None:
         with ActivationFixture(prior_helper_present=False) as fixture:
-            fixture.state["fail_no_swap_at"] = 2
+            fixture.state["fail_no_swap_at"] = 5
             result = fixture.run()
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assert_restored(fixture, helper_present=False)

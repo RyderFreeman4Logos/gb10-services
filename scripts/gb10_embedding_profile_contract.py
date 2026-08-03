@@ -27,7 +27,7 @@ EXPECTED_IMAGE = (
 EXPECTED_CONTAINER = "vllm-embedding"
 EXPECTED_MODELS = ("qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B")
 EXPECTED_PROFILE = "qwen3-embedding-8b-32k-4800M-128GiB"
-EXPECTED_UNIT_SHA256 = "ecd1994bf8033558dfe2d3d2ee5827f1f8fa8ac4aab9e0ad20f9232b37693787"
+EXPECTED_UNIT_SHA256 = "9113883d880d09997fc30170d49f9f04f3c85e62181b86cb6e4961f4c33beda0"
 EXPECTED_NO_SWAP_PREFIX = [
     "/usr/bin/env",
     "-i",
@@ -114,6 +114,14 @@ EXPECTED_EXEC_START_PRE = (
     EXPECTED_CLEANUP,
 )
 EXPECTED_EXEC_START_POST = (
+    [
+        *EXPECTED_NO_SWAP_PREFIX,
+        "--bind-runtime-swap-max",
+        "--unit",
+        "/home/obj/.config/systemd/user/vllm-embedding.service",
+        "--container",
+        EXPECTED_CONTAINER,
+    ],
     [
         *EXPECTED_NO_SWAP_PREFIX,
         "--unit",

@@ -120,12 +120,16 @@ run_docker() {
 }
 
 verify_no_swap() {
-    local unit="$1" container="${2:-}"
+    local unit="$1" container="${2:-}" mode="${3:-}"
     attest_aeon_profile || return 1
-    local -a arguments=(
-        "${NO_SWAP_TEST_ARGS[@]}"
-        --unit "/home/obj/.config/systemd/user/$unit"
-    )
+    local -a arguments=("${NO_SWAP_TEST_ARGS[@]}")
+    if [[ "$mode" == bind ]]; then
+        arguments+=(--bind-runtime-swap-max)
+    elif [[ -n "$mode" ]]; then
+        echo "unsupported no-swap helper mode: $mode" >&2
+        return 2
+    fi
+    arguments+=(--unit "/home/obj/.config/systemd/user/$unit")
     local -a profile_environment=()
     if [[ "$unit" == "$AEON_UNIT" ]]; then
         profile_environment=(
@@ -151,6 +155,10 @@ verify_no_swap() {
             /usr/bin/bash --noprofile --norc \
             "$NO_SWAP_HELPER" "${arguments[@]}"
     fi
+}
+
+bind_runtime_swap_max() {
+    verify_no_swap "$1" "$2" bind
 }
 
 require_cgroup_v2() {
@@ -489,6 +497,8 @@ run_systemctl disable "$FALLBACK_UNIT"
 run_systemctl stop "$RERANK_UNIT"
 run_systemctl reset-failed "$FALLBACK_UNIT" || true
 run_systemctl reset-failed "$RERANK_UNIT" || true
+bind_runtime_swap_max "$AEON_UNIT" "$AEON_CONTAINER"
+bind_runtime_swap_max "$EMBEDDING_UNIT" "$EMBEDDING_CONTAINER"
 run_systemctl daemon-reload
 run_systemctl_start start "$RERANK_UNIT"
 verify_no_swap "$RERANK_UNIT" "$RERANK_CONTAINER"

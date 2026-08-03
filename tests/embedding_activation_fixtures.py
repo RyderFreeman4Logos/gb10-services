@@ -80,11 +80,30 @@ if args and args[0] in {"show", "daemon-reload", "restart", "stop"}:
         else:
             snapshot = {"inode": None, "mode": None, "payload": None}
         state.setdefault("daemon_reload_units", []).append(snapshot)
+        active = {"vllm-embedding"} if state.get("active", True) else set()
+        containers = {
+            "vllm-aeon-27b-dflash.service": "vllm-aeon-27b-dflash",
+            "vllm-querit-4b-reranker.service": "querit-4b-vllm",
+            "vllm-qwen3-reranker-8b.service": "vllm-qwen3-reranker-8b",
+        }
+        active.update(
+            containers[unit]
+            for unit, fields in state["neighbors"].items()
+            if fields["MainPID"] != "0"
+        )
+        bound = set(state.get("runtime_bound", []))
+        unbound = sorted(active - bound)
+        state.setdefault("daemon_reload_unbound", []).append(unbound)
+        state["swap_zero"] = sorted(set(state.get("swap_zero", [])) - set(unbound))
         save()
         raise SystemExit(0)
     if action == "restart":
         if len(args) != 2 or args[1] != "vllm-embedding.service":
             raise SystemExit(91)
+        bound = set(state.get("runtime_bound", []))
+        bound.discard("vllm-embedding")
+        zero = set(state.get("swap_zero", []))
+        zero.add("vllm-embedding")
         count = int(state.get("restart_count", 0))
         state["restart_count"] = count + 1
         if state.get("fail_rollback_restart") and count >= 1:
@@ -96,6 +115,11 @@ if args and args[0] in {"show", "daemon-reload", "restart", "stop"}:
         if not state.get("same_generation"):
             state["generation"] = int(state.get("generation", 0)) + 1
         state["active"] = True
+        installed = Path(state["installed_unit"])
+        if installed.exists() and b"--bind-runtime-swap-max" in installed.read_bytes():
+            bound.add("vllm-embedding")
+        state["runtime_bound"] = sorted(bound)
+        state["swap_zero"] = sorted(zero)
         if state.get("mutate_neighbor"):
             state["neighbors"]["vllm-aeon-27b-dflash.service"]["NRestarts"] = "8"
         save()
@@ -105,6 +129,12 @@ if args and args[0] in {"show", "daemon-reload", "restart", "stop"}:
             raise SystemExit(92)
         state["active"] = False
         state["generation"] = int(state.get("generation", 0)) + 1
+        state["runtime_bound"] = sorted(
+            set(state.get("runtime_bound", [])) - {"vllm-embedding"}
+        )
+        state["swap_zero"] = sorted(
+            set(state.get("swap_zero", [])) - {"vllm-embedding"}
+        )
         save()
         raise SystemExit(0)
     unit = args[1]
@@ -197,12 +227,33 @@ with log_path.open("a") as sink:
 if not args or args[0] != "--test-only":
     raise SystemExit(81)
 args = args[1:]
+bind = "--bind-runtime-swap-max" in args
+if args.count("--bind-runtime-swap-max") > 1:
+    raise SystemExit(82)
+if bind:
+    args.remove("--bind-runtime-swap-max")
 if args.count("--unit") != 1 or args.count("--container") != 1:
     raise SystemExit(82)
-if args[args.index("--container") + 1] != "vllm-embedding":
+unit = Path(args[args.index("--unit") + 1]).name
+container = args[args.index("--container") + 1]
+containers = {
+    "unit.before": "vllm-embedding",
+    "vllm-embedding.service": "vllm-embedding",
+    "vllm-aeon-27b-dflash.service": "vllm-aeon-27b-dflash",
+    "vllm-querit-4b-reranker.service": "querit-4b-vllm",
+    "vllm-qwen3-reranker-8b.service": "vllm-qwen3-reranker-8b",
+}
+if containers.get(unit) != container:
     raise SystemExit(83)
 count = int(state.get("no_swap_count", 0)) + 1
 state["no_swap_count"] = count
+if container not in set(state.get("swap_zero", [])):
+    state_path.write_text(json.dumps(state, sort_keys=True))
+    raise SystemExit(85)
+if bind:
+    state["runtime_bound"] = sorted(
+        set(state.get("runtime_bound", [])) | {container}
+    )
 state_path.write_text(json.dumps(state, sort_keys=True))
 if int(state.get("fail_no_swap_at", 0)) == count:
     raise SystemExit(84)
@@ -298,7 +349,10 @@ class ActivationFixture:
         if prior_core_present:
             self.installed_core.write_bytes(self.prior_core_bytes)
             self.installed_core.chmod(self.prior_core_mode)
-        self.prior_bytes = CANONICAL_UNIT.read_bytes() + b"\n# prior fixture generation\n"
+        canonical_lines = CANONICAL_UNIT.read_bytes().splitlines(keepends=True)
+        self.prior_bytes = b"".join(
+            line for line in canonical_lines if b"--bind-runtime-swap-max" not in line
+        ) + b"\n# prior fixture generation\n"
         self.prior_mode = 0o640
         if prior_present:
             self.installed_unit.write_bytes(self.prior_bytes)
@@ -330,6 +384,7 @@ class ActivationFixture:
             "active": True,
             "child_pid_path": str(self.child_pid_path),
             "daemon_reload_units": [],
+            "daemon_reload_unbound": [],
             "cgroup_version": "2",
             "docker_info_fail": False,
             "drift_after_models": False,
@@ -362,6 +417,12 @@ class ActivationFixture:
             "neighbors": neighbor_states,
             "ready_timeout": False,
             "restart_count": 0,
+            "runtime_bound": [],
+            "swap_zero": [
+                "vllm-embedding",
+                "vllm-aeon-27b-dflash",
+                "vllm-qwen3-reranker-8b",
+            ],
             "rollback_same_generation": False,
             "same_generation": False,
             "verify_status": 0,
@@ -456,6 +517,16 @@ class ActivationFixture:
 
     def transaction(self) -> Path:
         return self.state_root / "transaction.v1"
+
+    def daemon_reload(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(self.tool), "--user", "daemon-reload"],
+            env=self.env(),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
 
     def log(self) -> str:
         return self.command_log.read_text() if self.command_log.exists() else ""
