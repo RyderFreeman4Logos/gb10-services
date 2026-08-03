@@ -11,7 +11,7 @@ RETIRED_CANARY_ADAPTER_UNIT=vllm-querit-4b-canary.service
 RETIRED_CANARY_BACKEND_UNIT=vllm-querit-4b-canary-backend.service
 GUARD_UNIT=llm-guard-proxy.service
 EMBEDDING_UNIT=vllm-embedding.service
-AEON_CONTAINER=vllm-aeon-27b-dflash-n12
+AEON_CONTAINER=vllm-aeon-27b-dflash
 EMBEDDING_CONTAINER=vllm-embedding
 RERANK_CONTAINER=querit-4b-vllm
 FALLBACK_CONTAINER=vllm-qwen3-reranker-8b
@@ -33,7 +33,22 @@ RERANK_URL="${GB10_RERANK_URL:-http://100.105.4.92:18013}"
 GUARD_SCORE_URL="${GB10_GUARD_SCORE_URL:-http://100.105.4.92:18003/v1/score}"
 # Keep this owner aligned with the committed AEON unit: AUTO KV sizing must
 # remain enabled so the patched UMA headroom guard can size the pool.
-EXPECTED_AEON_GPU_MEMORY_UTILIZATION=0.355
+AEON_PROFILE_PATH="${GB10_AEON_PROFILE_PATH:-/home/obj/.config/gb10/aeon-dflash-profiles/active.env}"
+[[ -r "$AEON_PROFILE_PATH" ]] || {
+    echo "AEON profile is missing or unreadable: $AEON_PROFILE_PATH" >&2
+    exit 2
+}
+# The installed profile is source-controlled and contains only the calibrated knob.
+# shellcheck disable=SC1090
+source "$AEON_PROFILE_PATH"
+EXPECTED_AEON_GPU_MEMORY_UTILIZATION="${AEON_GPU_MEMORY_UTILIZATION:?AEON_GPU_MEMORY_UTILIZATION is required}"
+case "$EXPECTED_AEON_GPU_MEMORY_UTILIZATION" in
+    0.355|0.45) ;;
+    *)
+        echo "AEON_GPU_MEMORY_UTILIZATION is not an approved profile value" >&2
+        exit 2
+        ;;
+esac
 EXPECTED_AEON_MEMORY_BYTES=$((128 * 1024 * 1024 * 1024))
 MIN_AVAILABLE_GIB=${GB10_MIN_AVAILABLE_GIB:-4}
 AEON_READY_ATTEMPTS=${GB10_AEON_READY_ATTEMPTS:-120}

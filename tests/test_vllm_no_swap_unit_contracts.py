@@ -26,11 +26,7 @@ PRODUCTION_PREFIX = [
 ]
 SERVICE_CONTRACTS = {
     "vllm-aeon-27b-dflash.service": (
-        "vllm-aeon-27b-dflash-n12",
-        "%t/gb10-memory-guardian/aeon-text.cid",
-    ),
-    "vllm-aeon-27b-dflash-hikv.service": (
-        "vllm-aeon-27b-dflash-hikv",
+        "vllm-aeon-27b-dflash",
         "%t/gb10-memory-guardian/aeon-text.cid",
     ),
     "vllm-embedding.service": (
@@ -86,6 +82,8 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
     def test_inventory_discovers_every_and_only_tracked_vllm_backend(self) -> None:
         discovered: set[str] = set()
         for path in (ROOT / "systemd").glob("*.service"):
+            if path.is_symlink():
+                continue
             starts = _logical_argv(path.read_text(), "ExecStart")
             if any(
                 any(

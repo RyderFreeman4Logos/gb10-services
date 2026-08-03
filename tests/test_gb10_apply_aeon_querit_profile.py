@@ -25,7 +25,8 @@ def _canonical_aeon_docker_profile() -> tuple[list[str], int, int]:
     exec_starts = _logical_directive_argv(AEON_UNIT.read_text(), "ExecStart")
     if len(exec_starts) != 1:
         raise AssertionError(f"expected one AEON ExecStart, found {len(exec_starts)}")
-    argv = exec_starts[0]
+    utilization = (ROOT / "config" / "aeon-dflash-profiles" / "active.env").read_text().split("=", 1)[1].strip()
+    argv = [token.replace("${AEON_GPU_MEMORY_UTILIZATION}", utilization) for token in exec_starts[0]]
     if argv[:2] != ["/usr/bin/docker", "run"]:
         raise AssertionError("AEON unit must use the canonical docker run command")
     try:
@@ -287,6 +288,9 @@ class QueritDeployerContractTests(unittest.TestCase):
             ),
             "GB10_NO_SWAP_HELPER_TEST_PATH": str(no_swap),
             "GB10_QUERIT_PROFILE_TEST_ONLY": "1",
+            "GB10_AEON_PROFILE_PATH": str(
+                ROOT / "config" / "aeon-dflash-profiles" / "active.env"
+            ),
         }
         return env, calls, signal_marker, docker_marker
 
@@ -309,7 +313,7 @@ class QueritDeployerContractTests(unittest.TestCase):
             aeon_no_swap = (
                 "no-swap --test-only --unit "
                 "/home/obj/.config/systemd/user/vllm-aeon-27b-dflash.service "
-                "--container vllm-aeon-27b-dflash-n12"
+                "--container vllm-aeon-27b-dflash"
             )
             self.assertGreaterEqual(recorded.count(aeon_no_swap), 2, recorded)
 

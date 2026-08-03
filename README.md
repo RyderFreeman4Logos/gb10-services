@@ -121,6 +121,7 @@ gb10-services/
 ├── LICENSE
 ├── README.md               # User guide (human-facing)
 ├── config/
+│   ├── aeon-dflash-profiles/ # baseline.env, hikv.env, active.env -> hikv.env
 │   └── llm-guard-proxy/
 │       └── config.toml     # Proxy routing, shielding, and guardian policy
 ├── docs/
@@ -140,7 +141,7 @@ gb10-services/
     ├── llm-guard-proxy.service
     ├── sysmon.service
     ├── vllm-aeon-27b-dflash.service
-    ├── vllm-aeon-27b-dflash-hikv.service # Alternative HIGH-KV AEON text unit
+    ├── vllm-aeon-27b-dflash-hikv.service # Compatibility symlink to canonical unit
     ├── vllm-embedding.service
     └── vllm-qwen3-reranker-8b.service # disabled fallback only
 ```
@@ -228,10 +229,17 @@ cp config/llm-guard-proxy/config.toml ~/.config/llm-guard-proxy/config.toml
 mkdir -p ~/.config/systemd/user/
 install -m 0644 systemd/llm-guard-proxy.service \
   systemd/vllm-querit-4b-reranker.service systemd/sysmon.service \
-  systemd/vllm-aeon-27b-dflash.service systemd/vllm-aeon-27b-dflash-hikv.service \
+  systemd/vllm-aeon-27b-dflash.service \
   systemd/vllm-embedding.service \
   systemd/vllm-qwen3-reranker-8b.service \
   ~/.config/systemd/user/
+
+install -d -m 0755 ~/.config/gb10/aeon-dflash-profiles
+install -m 0644 config/aeon-dflash-profiles/baseline.env config/aeon-dflash-profiles/hikv.env \
+  ~/.config/gb10/aeon-dflash-profiles/
+ln -sfn hikv.env ~/.config/gb10/aeon-dflash-profiles/active.env.new
+mv -Tf ~/.config/gb10/aeon-dflash-profiles/active.env.new ~/.config/gb10/aeon-dflash-profiles/active.env
+ln -sfn vllm-aeon-27b-dflash.service ~/.config/systemd/user/vllm-aeon-27b-dflash-hikv.service
 ```
 
 ### Step 3: Enable and Start the Stack

@@ -19,6 +19,7 @@ from test_embedding_service_contracts import (
 ROOT = Path(__file__).resolve().parents[1]
 QUERIT_UNIT = ROOT / "systemd" / "vllm-querit-4b-reranker.service"
 AEON_UNIT = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
+AEON_PROFILE = ROOT / "config" / "aeon-dflash-profiles" / "active.env"
 GUARD_UNIT = ROOT / "systemd" / "llm-guard-proxy.service"
 LEGACY_UNIT = ROOT / "systemd" / "vllm-qwen3-reranker-8b.service"
 MEMORY_GATE = ROOT / "scripts" / "gb10_check_mem_available.sh"
@@ -95,7 +96,14 @@ def _aeon_contract(unit: str) -> dict[str, int | float]:
         raise AssertionError(
             "text unit must not pin --kv-cache-memory-bytes (bypasses UMA guard)"
         )
-    util = float(_option_values(container_argv, "--gpu-memory-utilization")[0])
+    util_token = _option_values(container_argv, "--gpu-memory-utilization")[0]
+    if util_token == "${AEON_GPU_MEMORY_UTILIZATION}":
+        util_token = next(
+            line.split("=", 1)[1]
+            for line in AEON_PROFILE.read_text().splitlines()
+            if line.startswith("AEON_GPU_MEMORY_UTILIZATION=")
+        )
+    util = float(util_token)
     return {
         "model_len": int(model_len),
         "util": util,
@@ -157,7 +165,8 @@ class AeonLiveReceiptTests(unittest.TestCase):
         self.assertAlmostEqual(margin_percent, 2.8400421142578125)
         end_gib = run["end_mem_available_bytes"] / 1024**3
         text_gib = run["end_text_nvml_allocation_bytes"] / 1024**3
-        self.assertIn(f"~{end_gib:.1f}GiB MemAvailable", AEON_UNIT.read_text())
+        guide = (ROOT / "docs" / "deployment" / "AGENTS.md").read_text()
+        self.assertIn("Historical clean-start baseline capacity was 286,962 KV tokens", guide)
         note = (ROOT / receipt["documentation"]["research_note_path"]).read_text()
         self.assertIn(f"**{end_gib:.3f} GiB**", note)
         self.assertIn(f"**{text_gib:.3f} GiB** NVML", note)
@@ -257,7 +266,8 @@ class QueritServiceContractTests(unittest.TestCase):
             "OOMScoreAdjust=800",
             "--max-num-seqs 16",
             "--max-num-batched-tokens 4096",
-            "--gpu-memory-utilization 0.355",
+            "--gpu-memory-utilization ${AEON_GPU_MEMORY_UTILIZATION}",
+            "EnvironmentFile=/home/obj/.config/gb10/aeon-dflash-profiles/active.env",
             "FULL_DECODE_ONLY",
         ):
             self.assertIn(contract, unit)
@@ -269,26 +279,18 @@ class QueritServiceContractTests(unittest.TestCase):
     def test_aeon_text_uma_safe_profile(self) -> None:
         contract = _aeon_contract(AEON_UNIT.read_text())
         self.assertEqual(contract["model_len"], AEON_CONTEXT_TOKENS)
-        self.assertAlmostEqual(contract["util"], 0.355)
+        self.assertAlmostEqual(contract["util"], 0.45)
         _assert_aeon_headroom_evidence(contract)
 
-    def test_aeon_unit_documents_current_headroom_evidence(self) -> None:
-        unit = AEON_UNIT.read_text()
-        description = next(
-            line for line in unit.splitlines() if line.startswith("Description=")
-        )
-        self.assertIn("util=0.355", description)
-        self.assertIn("AUTO KV", description)
-        self.assertIn("KV capacity: 286962 tokens", unit)
-        self.assertIn("MemAvail after all 3: 39.75G", unit)
-        self.assertNotIn("KV capacity: 318295 tokens", unit)
-        self.assertIn("bypasses UMA", unit)
-        self.assertIn("~31.6GiB MemAvailable", unit)
-        self.assertNotIn("36GiB KV keeps ~2.47", unit)
+    def test_aeon_deployment_docs_preserve_headroom_evidence(self) -> None:
+        guide = (ROOT / "docs" / "deployment" / "AGENTS.md").read_text()
+        self.assertIn("Historical clean-start baseline capacity was 286,962 KV tokens", guide)
+        self.assertIn("`active.env` currently links to HiKV", guide)
+        self.assertIn("TimeoutStartSec=3000", guide)
 
     def test_aeon_headroom_contract_rejects_excessive_utilization(self) -> None:
         unit = AEON_UNIT.read_text().replace(
-            "--gpu-memory-utilization 0.355",
+            "--gpu-memory-utilization ${AEON_GPU_MEMORY_UTILIZATION}",
             "--gpu-memory-utilization 0.80",
             1,
         )

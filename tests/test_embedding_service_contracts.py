@@ -497,7 +497,6 @@ class EmbeddingDeploymentContractTests(unittest.TestCase):
         "vllm-querit-4b-reranker.service",
         "sysmon.service",
         "vllm-aeon-27b-dflash.service",
-        "vllm-aeon-27b-dflash-hikv.service",
         "vllm-embedding.service",
         "vllm-qwen3-reranker-8b.service",
     }

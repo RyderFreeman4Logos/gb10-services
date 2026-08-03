@@ -54,6 +54,8 @@ def main() -> int:
         targets = {"basic.target", "default.target"}
 
         for source in units:
+            if source.is_symlink():
+                continue
             text = source.read_text()
             targets.update(TARGET_PATTERN.findall(text))
             rewritten: list[str] = []
@@ -65,6 +67,10 @@ def main() -> int:
                     line = _rewrite_exec(line, stub)
                 rewritten.append(line)
             (unit_dir / source.name).write_text("\n".join(rewritten) + "\n")
+
+        for source in units:
+            if source.is_symlink():
+                (unit_dir / source.name).symlink_to(source.readlink())
 
         for target in targets:
             (unit_dir / target).write_text("[Unit]\n")
