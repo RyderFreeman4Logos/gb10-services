@@ -329,11 +329,12 @@ class QueritServiceContractTests(unittest.TestCase):
         # isolation from the default :18009 path.
         self.assertEqual(profiles["aeon-guard-max"]["max_in_flight_requests"], 8)
         self.assertEqual(profiles["aeon-guard-max"]["max_queued_generation_requests"], 0)
-        self.assertEqual(profiles["qwen3-embedding-8b"]["max_in_flight_requests"], 8)
+        # 2026-08-04 freeze mitigation: :18009-facing model paths share in-flight=4.
+        self.assertEqual(profiles["qwen3-embedding-8b"]["max_in_flight_requests"], 4)
         self.assertEqual(
             profiles["qwen3-embedding-8b"]["max_queued_generation_requests"], 64
         )
-        self.assertEqual(profiles["qwen3-reranker-8b"]["max_in_flight_requests"], 8)
+        self.assertEqual(profiles["qwen3-reranker-8b"]["max_in_flight_requests"], 4)
         self.assertEqual(
             profiles["qwen3-reranker-8b"]["max_queued_generation_requests"], 64
         )

@@ -515,7 +515,8 @@ name = "qwen3-embedding-8b"
 base_url = "http://100.105.4.92:18012/v1"
 match_models = ["qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B"]
 request_timeout_ms = 1800000
-max_in_flight_requests = 8
+# 2026-08-04 freeze mitigation trial: lower :18009 model concurrency to 4.
+max_in_flight_requests = 4
 max_queued_generation_requests = 64
 
 [upstreams.metadata]
@@ -541,7 +542,8 @@ base_url = "http://100.105.4.92:18013/v1"
 # Legacy Qwen aliases remain for codeseek hybrid search and older clients.
 match_models = ["Querit/Querit-4B", "qwen3-reranker-8b", "Qwen/Qwen3-Reranker-8B"]
 request_timeout_ms = 1800000
-max_in_flight_requests = 8
+# 2026-08-04 freeze mitigation trial: lower :18009 model concurrency to 4.
+max_in_flight_requests = 4
 max_queued_generation_requests = 64
 
 [upstreams.metadata]
