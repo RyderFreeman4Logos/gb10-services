@@ -337,6 +337,15 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertEqual(
             profiles["qwen3-reranker-8b"]["max_queued_generation_requests"], 64
         )
+        # ADK/shared arm-2 wire identity is Querit/Querit-4B; legacy Qwen aliases remain.
+        self.assertEqual(
+            profiles["qwen3-reranker-8b"]["match_models"],
+            [
+                "Querit/Querit-4B",
+                "qwen3-reranker-8b",
+                "Qwen/Qwen3-Reranker-8B",
+            ],
+        )
 
     def test_hikv_guard_recovery_budget_covers_the_cold_start_window(self) -> None:
         config = tomllib.loads(CONFIG.read_text())
