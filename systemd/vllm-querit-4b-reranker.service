@@ -1,3 +1,5 @@
+# Live memory (2026-08-06, PID 23710/5429): GPU 14.7G, RSS 1.3G.
+# Docker cap: --memory 18g (leaves ~3.3G headroom for KV cache growth).
 # Canonical Querit-4B vLLM pooling reranker (AEON v0.26.0, raw Tailnet :18013).
 # The llm-guard-proxy adapter on :18009/:18003 forwards rerank requests to
 # this backend; clients (CodeSeek, mempal, verbatim) see a DeepInfra-compatible
