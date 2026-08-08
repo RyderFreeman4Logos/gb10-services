@@ -2,36 +2,30 @@
 # Hash-pin the reviewed rebuild engine; production starts from an empty environment.
 set -euo pipefail
 umask 077
-
 if (( $# > 1 )) || (( $# == 1 )) && [[ "$1" != "--test-only" ]]; then
   printf 'usage: llm_guard_proxy_cached_rebuild.sh [--test-only]\n' >&2
   exit 64
 fi
-script_dir="$(cd -P -- "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-engine="$script_dir/llm_guard_proxy_cached_rebuild.py"
-expected_engine_sha256="c31aa8e0e50e2114858b82e34560388cb17e83dd7c16cb7e78b6b6cd8fd9deb2"
+script_dir="$(cd -P -- "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"; engine="$script_dir/llm_guard_proxy_cached_rebuild.py"
+expected_engine_sha256="beb4d91d18d3f8bc86debd4f21bfe4d63175440d60f8de55fb0ea363241145f5"
 if [[ -L "$engine" || ! -f "$engine" ]]; then
   printf 'Guard rebuild engine authority is unsafe\n' >&2
   exit 1
 fi
-exec {engine_fd}<"$engine"
-read -r owner mode links size device inode < <(
+exec {engine_fd}<"$engine"; read -r owner mode links size device inode < <(
   /usr/bin/stat -Lc '%u %a %h %s %d %i' -- "/proc/$$/fd/$engine_fd"
 )
-path_identity="$(/usr/bin/stat -Lc '%d %i %s' -- "$engine")"
-if [[ "$owner" != "$EUID" || "$mode" != 644 || "$links" != 1 ||
+path_identity="$(/usr/bin/stat -Lc '%d %i %s' -- "$engine")"; if [[ "$owner" != "$EUID" || "$mode" != 644 || "$links" != 1 ||
       "$size" -gt 1048576 || "$path_identity" != "$device $inode $size" ]]; then
   printf 'Guard rebuild engine authority metadata differs\n' >&2
   exit 1
 fi
-engine_sha256="$(/usr/bin/sha256sum -- "/proc/$$/fd/$engine_fd")"
-if [[ "${engine_sha256%% *}" != "$expected_engine_sha256" || -L "$engine" ||
+engine_sha256="$(/usr/bin/sha256sum -- "/proc/$$/fd/$engine_fd")"; if [[ "${engine_sha256%% *}" != "$expected_engine_sha256" || -L "$engine" ||
       "$(/usr/bin/stat -Lc '%d %i %s' -- "$engine")" != "$path_identity" ]]; then
   printf 'Guard rebuild engine authority differs\n' >&2
   exit 1
 fi
-engine_fd_path="/proc/self/fd/$engine_fd"
-if (( $# == 1 )); then
+engine_fd_path="/proc/self/fd/$engine_fd"; if (( $# == 1 )); then
   exec /usr/bin/python3 -I -B -S "$engine_fd_path" --test-only
 fi
 if [[ -v LLM_GUARD_REBUILD_TEST_ONLY ]]; then
@@ -48,5 +42,23 @@ for name in CACHE_ROOT SOURCE_DIR SOURCE_REPO SOURCE_BRANCH SERVICE_BIN LOG_DIR 
     exit 64
   fi
 done
+python_logical=/usr/bin/python3; python_resolved=/usr/bin/python3.11; python_sha256=6d972cf21be56fe3c947ab6ba257ff8d08c342dd2714442986791bd9a6dfabfe
+if [[ "$(/usr/bin/readlink -e -- "$python_logical")" != "$python_resolved" ]]; then
+  printf 'reviewed Python resolved path differs\n' >&2
+  exit 1
+fi
+exec {python_fd}<"$python_resolved"
+read -r python_owner python_mode python_links < <(
+  /usr/bin/stat -Lc '%u %a %h' -- "/proc/$$/fd/$python_fd"
+)
+held_python_sha="$(/usr/bin/sha256sum -- "/proc/$$/fd/$python_fd")"
+python_path_identity="$(/usr/bin/stat -Lc '%d %i %s' -- "$python_resolved")"
+python_fd_identity="$(/usr/bin/stat -Lc '%d %i %s' -- "/proc/$$/fd/$python_fd")"
+if [[ "$python_owner" != 0 || "$python_mode" != 755 || "$python_links" != 1 ||
+      "${held_python_sha%% *}" != "$python_sha256" ||
+      "$python_path_identity" != "$python_fd_identity" ]]; then
+  printf 'reviewed Python object authority differs\n' >&2
+  exit 1
+fi
 exec /usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C LANG=C \
-  /usr/bin/python3 -I -B -S "$engine_fd_path"
+  "/proc/self/fd/$python_fd" -I -B -S "$engine_fd_path"
