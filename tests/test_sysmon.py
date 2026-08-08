@@ -7,6 +7,7 @@ import csv
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import tempfile
 import textwrap
@@ -200,7 +201,7 @@ class SysmonFixtureTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def _run(self) -> Path:
+    def _run(self, extra_env: dict[str, str] | None = None) -> Path:
         env = os.environ.copy()
         env.update(
             {
@@ -215,6 +216,8 @@ class SysmonFixtureTests(unittest.TestCase):
                 "SYSMON_GPU_LINE": "40, 120.5, 75, 1800",
             }
         )
+        if extra_env:
+            env.update(extra_env)
         subprocess.run(
             ["bash", str(SCRIPT), "--test-only"],
             cwd=ROOT,
@@ -320,6 +323,39 @@ class SysmonFixtureTests(unittest.TestCase):
         self.assertIn("--test-only", result.stderr)
         self.assertEqual(list(self.log_dir.iterdir()), [])
 
+    def test_production_unit_ignores_inherited_bash_env(self) -> None:
+        marker = self.root / "bash-env-ran"
+        bash_env = self.root / "hostile-bash-env"
+        bash_env.write_text('printf x > "$SYSMON_BASH_ENV_MARKER"\n')
+        exec_start = next(
+            line.partition("=")[2]
+            for line in UNIT.read_text().splitlines()
+            if line.startswith("ExecStart=")
+        )
+        command = [
+            str(SCRIPT) if part == "%h/.local/bin/sysmon.sh" else part
+            for part in shlex.split(exec_start)
+        ]
+        env = os.environ.copy()
+        env.update(
+            {
+                "BASH_ENV": str(bash_env),
+                "SYSMON_BASH_ENV_MARKER": str(marker),
+                "SYSMON_MAX_SAMPLES": "1",
+            }
+        )
+        result = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=env,
+            check=False,
+            timeout=2,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
+        self.assertFalse(marker.exists(), "inherited BASH_ENV ran before sysmon")
+
     def test_boot_id_fifo_is_rejected_without_blocking(self) -> None:
         boot_id = self.proc / "sys" / "kernel" / "random" / "boot_id"
         boot_id.unlink()
@@ -336,6 +372,30 @@ class SysmonFixtureTests(unittest.TestCase):
         self.assertEqual(rows[0]["memory_some_avg10"], "N/A")
         self.assertEqual(rows[0]["memory_full_avg10"], "N/A")
         self.assertEqual(rows[0]["boot_id"], "12345678-1234-4abc-8def-1234567890ab")
+
+    def test_path_swap_to_fifo_degrades_without_blocking(self) -> None:
+        boot_id = self.proc / "sys" / "kernel" / "random" / "boot_id"
+        bash_env = self.root / "swap-before-open"
+        bash_env.write_text(
+            "set -T\n"
+            "trap 'if [[ $BASH_COMMAND == *\"read -r -N \"* || "
+            "$BASH_COMMAND == *\"/usr/bin/python3 -I - \"* ]]; then "
+            "trap - DEBUG; rm -f -- \"$SYSMON_SWAP_PATH\"; "
+            "mkfifo -- \"$SYSMON_SWAP_PATH\"; fi' DEBUG\n"
+        )
+        try:
+            rows = self._rows(
+                self._run(
+                    {
+                        "BASH_ENV": str(bash_env),
+                        "SYSMON_SWAP_PATH": str(boot_id),
+                    }
+                )
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("sysmon blocked after a regular-file-to-FIFO swap")
+        self.assertEqual(rows[0]["boot_id"], "N/A")
+        self.assertEqual(rows[0]["memory_some_avg10"], "1.23")
 
     def test_symlink_device_and_non_regular_inputs_degrade_to_na(self) -> None:
         boot_id = self.proc / "sys" / "kernel" / "random" / "boot_id"
