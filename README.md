@@ -64,6 +64,10 @@ graph TD
    `memory_some_avg10`, `memory_full_avg10`, `io_full_avg10`, and
    `cpu_some_avg10`. A 2–3 second loop overrun is recorded as such; the service
    does not claim a guaranteed 1 Hz sampling rate and performs no recovery action.
+   Production rejects inherited `SYSMON_*` fixture selectors and uses real
+   `/proc`, the real clock, and `~/log`. Only hermetic tests invoke `--test-only`;
+   boot-ID and PSI inputs are byte-bounded regular files, with hostile input
+   recorded as `N/A`.
 
 ### Integrated Guardian
 `llm-guard-proxy` owns the only automatic low-memory recovery path. The GB10

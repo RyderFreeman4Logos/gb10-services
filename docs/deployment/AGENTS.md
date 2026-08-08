@@ -389,6 +389,12 @@ systemctl --user status vllm-embedding vllm-aeon-27b-dflash vllm-querit-4b-reran
 tail -n 20 ~/log/sysmon_$(date +%Y-%m-%d).csv
 ```
 
+The production unit uses `UnsetEnvironment=` for every `SYSMON_*` fixture
+selector and invokes the script without arguments, which hard-binds real `/proc`,
+the real clock, and `~/log`. `--test-only` is solely for hermetic source tests;
+bounded boot-ID/PSI readers degrade non-regular, symlinked, oversized,
+nonterminated, duplicate, missing, or malformed input to `N/A`.
+
 ### View Live Service logs
 ```bash
 # View last 50 log lines for chat service

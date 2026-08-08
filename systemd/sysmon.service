@@ -6,6 +6,8 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# Production cannot inherit the explicit --test-only fixture selectors.
+UnsetEnvironment=SYSMON_LOG_DIR SYSMON_INTERVAL_SECONDS SYSMON_PROC_ROOT SYSMON_CLOCK_FILE SYSMON_MAX_SAMPLES SYSMON_TEST_MODE SYSMON_GPU_LINE
 ExecStart=%h/.local/bin/sysmon.sh
 Restart=always
 RestartSec=5
