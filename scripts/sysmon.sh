@@ -10,8 +10,8 @@
 # analysis continuity.
 #
 # v3 (2026-06-12): add swap usage and top-5 RSS process IDs. Process IDs are
-# stable per process name in ~/log/sysmon_process_names.csv, keeping the main
-# 1 Hz CSV compact while preserving enough context to diagnose memory spikes.
+# stable per process name in ~/log/sysmon_process_names.csv, keeping the
+# one-second-target CSV compact while preserving memory-spike context.
 #
 # v4 (2026-06-13): append disk IO rates, swap-in/out rates, and top-5 swap
 # processes. Existing v3 columns keep their order; new fields are appended.
@@ -20,6 +20,9 @@
 # start-to-start cadence, loop-body elapsed time, and overrun lag. Existing v4
 # columns retain their byte-for-byte order. The loop sleeps only the remaining
 # interval, so a slow body is reported honestly rather than described as 1 Hz.
+#
+# v6 (2026-08-07): append the current boot ID plus bounded memory, IO, and CPU
+# PSI avg10 values. Missing or malformed proc fields remain explicit N/A values.
 
 LOG_DIR="${SYSMON_LOG_DIR:-$HOME/log}"
 INTERVAL="${SYSMON_INTERVAL_SECONDS:-1}"
@@ -30,7 +33,7 @@ MAX_SAMPLES="${SYSMON_MAX_SAMPLES:-0}"
 TEST_MODE="${SYSMON_TEST_MODE:-0}"
 CLOCK_FILE="${SYSMON_CLOCK_FILE:-}"
 
-HEADER="timestamp,load_1m,load_5m,load_15m,mem_used_mb,mem_total_mb,swap_used_mb,swap_total_mb,tz0,tz1,tz2,tz3,tz4,tz5,tz6,nvme_c,nvme_s1,nvme_s2,gpu_temp_c,gpu_power_w,gpu_util_pct,gpu_clock_mhz,top1_proc_id,top1_rss_mb,top2_proc_id,top2_rss_mb,top3_proc_id,top3_rss_mb,top4_proc_id,top4_rss_mb,top5_proc_id,top5_rss_mb,disk_read_mb_s,disk_write_mb_s,disk_io_ms_s,swap_in_mb_s,swap_out_mb_s,top1_swap_pid,top1_swap_proc_id,top1_swap_mb,top2_swap_pid,top2_swap_proc_id,top2_swap_mb,top3_swap_pid,top3_swap_proc_id,top3_swap_mb,top4_swap_pid,top4_swap_proc_id,top4_swap_mb,top5_swap_pid,top5_swap_proc_id,top5_swap_mb,mem_available_mb,sample_cadence_ms,sample_elapsed_ms,sample_lag_ms"
+HEADER="timestamp,load_1m,load_5m,load_15m,mem_used_mb,mem_total_mb,swap_used_mb,swap_total_mb,tz0,tz1,tz2,tz3,tz4,tz5,tz6,nvme_c,nvme_s1,nvme_s2,gpu_temp_c,gpu_power_w,gpu_util_pct,gpu_clock_mhz,top1_proc_id,top1_rss_mb,top2_proc_id,top2_rss_mb,top3_proc_id,top3_rss_mb,top4_proc_id,top4_rss_mb,top5_proc_id,top5_rss_mb,disk_read_mb_s,disk_write_mb_s,disk_io_ms_s,swap_in_mb_s,swap_out_mb_s,top1_swap_pid,top1_swap_proc_id,top1_swap_mb,top2_swap_pid,top2_swap_proc_id,top2_swap_mb,top3_swap_pid,top3_swap_proc_id,top3_swap_mb,top4_swap_pid,top4_swap_proc_id,top4_swap_mb,top5_swap_pid,top5_swap_proc_id,top5_swap_mb,mem_available_mb,sample_cadence_ms,sample_elapsed_ms,sample_lag_ms,boot_id,memory_some_avg10,memory_full_avg10,io_full_avg10,cpu_some_avg10"
 
 rotate_log() {
     local epoch_seconds="$1"
@@ -43,7 +46,7 @@ rotate_log() {
         IFS= read -r existing_header < "$logfile" || true
     fi
     if [[ -f "$logfile" && "$existing_header" != "$HEADER" ]]; then
-        mv "$logfile" "${logfile%.csv}.pre-v5.${hhmmss}.csv"
+        mv "$logfile" "${logfile%.csv}.pre-v6.${hhmmss}.csv"
     fi
     if [[ ! -f "$logfile" ]]; then
         printf '%s\n' "$HEADER" > "$logfile"
@@ -129,6 +132,50 @@ read_mem_available_mb() {
         fi
     done < "$PROC_ROOT/meminfo"
     return 1
+}
+
+read_boot_id() {
+    local path="$PROC_ROOT/sys/kernel/random/boot_id" value
+    BOOT_ID="N/A"
+    if [[ -r "$path" ]]; then
+        value=$(< "$path") 2>/dev/null || return 0
+        if [[ "$value" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            BOOT_ID="$value"
+        fi
+    fi
+    return 0
+}
+
+valid_psi_avg10() {
+    local value="$1"
+    [[ "$value" =~ ^([0-9]{1,2}|100)\.[0-9]{2}$ ]] || return 1
+    [[ "$value" != 100.* || "$value" == "100.00" ]]
+}
+
+read_psi_avg10() {
+    local resource="$1" wanted_class="$2"
+    local path="$PROC_ROOT/pressure/$resource" pressure_class rest field value
+    local count
+    local -a fields
+    PSI_AVG10="N/A"
+    [[ -r "$path" ]] || return 0
+    while read -r pressure_class rest; do
+        [[ "$pressure_class" == "$wanted_class" ]] || continue
+        count=0
+        value=""
+        read -r -a fields <<< "$rest"
+        for field in "${fields[@]}"; do
+            if [[ "${field%%=*}" == "avg10" ]]; then
+                value="${field#*=}"
+                count=$((count + 1))
+            fi
+        done
+        if (( count == 1 )) && valid_psi_avg10 "$value"; then
+            PSI_AVG10="$value"
+        fi
+        return 0
+    done < "$path"
+    return 0
 }
 
 mb_rate() {
@@ -243,6 +290,16 @@ while true; do
     mem_used="${mem_info##*,}"
     read_mem_available_mb || mem_available_mb=""
     mem_available_mb="$MEM_AVAILABLE_MB"
+    read_boot_id
+    boot_id="$BOOT_ID"
+    read_psi_avg10 memory some
+    memory_some_avg10="$PSI_AVG10"
+    read_psi_avg10 memory full
+    memory_full_avg10="$PSI_AVG10"
+    read_psi_avg10 io full
+    io_full_avg10="$PSI_AVG10"
+    read_psi_avg10 cpu some
+    cpu_some_avg10="$PSI_AVG10"
 
     # Swap (MB). Read /proc/meminfo directly to avoid localized free(1) labels.
     swap_info=$(awk '
@@ -288,7 +345,7 @@ while true; do
     fi
 
     # Top RSS processes. Store process-name dictionary IDs in the hot CSV and
-    # keep names in sysmon_process_names.csv to limit 1 Hz log volume.
+    # keep names in sysmon_process_names.csv to limit target-interval log volume.
     top_fields=()
     mapfile -t top_processes < <(ps -eo comm=,rss= --sort=-rss | head -n 5)
     for i in 0 1 2 3 4; do
@@ -341,7 +398,7 @@ while true; do
         sample_lag_ms=0
     fi
 
-    echo "${ts},${load1},${load5},${load15},${mem_used},${mem_total},${swap_used},${swap_total},${tz[0]},${tz[1]},${tz[2]},${tz[3]},${tz[4]},${tz[5]},${tz[6]},${nvme_c},${nvme_s1},${nvme_s2},${gpu_temp:-N/A},${gpu_power:-N/A},${gpu_util:-N/A},${gpu_clock:-N/A},${top_fields[0]},${top_fields[1]},${top_fields[2]},${top_fields[3]},${top_fields[4]},${top_fields[5]},${top_fields[6]},${top_fields[7]},${top_fields[8]},${top_fields[9]},${disk_read_mb_s},${disk_write_mb_s},${disk_io_ms_s},${swap_in_mb_s},${swap_out_mb_s},${top_swap_fields[0]},${top_swap_fields[1]},${top_swap_fields[2]},${top_swap_fields[3]},${top_swap_fields[4]},${top_swap_fields[5]},${top_swap_fields[6]},${top_swap_fields[7]},${top_swap_fields[8]},${top_swap_fields[9]},${top_swap_fields[10]},${top_swap_fields[11]},${top_swap_fields[12]},${top_swap_fields[13]},${top_swap_fields[14]},${mem_available_mb},${sample_cadence_ms},${sample_elapsed_ms},${sample_lag_ms}" >> "$logfile"
+    echo "${ts},${load1},${load5},${load15},${mem_used},${mem_total},${swap_used},${swap_total},${tz[0]},${tz[1]},${tz[2]},${tz[3]},${tz[4]},${tz[5]},${tz[6]},${nvme_c},${nvme_s1},${nvme_s2},${gpu_temp:-N/A},${gpu_power:-N/A},${gpu_util:-N/A},${gpu_clock:-N/A},${top_fields[0]},${top_fields[1]},${top_fields[2]},${top_fields[3]},${top_fields[4]},${top_fields[5]},${top_fields[6]},${top_fields[7]},${top_fields[8]},${top_fields[9]},${disk_read_mb_s},${disk_write_mb_s},${disk_io_ms_s},${swap_in_mb_s},${swap_out_mb_s},${top_swap_fields[0]},${top_swap_fields[1]},${top_swap_fields[2]},${top_swap_fields[3]},${top_swap_fields[4]},${top_swap_fields[5]},${top_swap_fields[6]},${top_swap_fields[7]},${top_swap_fields[8]},${top_swap_fields[9]},${top_swap_fields[10]},${top_swap_fields[11]},${top_swap_fields[12]},${top_swap_fields[13]},${top_swap_fields[14]},${mem_available_mb},${sample_cadence_ms},${sample_elapsed_ms},${sample_lag_ms},${boot_id},${memory_some_avg10},${memory_full_avg10},${io_full_avg10},${cpu_some_avg10}" >> "$logfile"
 
     previous_sample_start_us="$sample_start_us"
     sample_count=$((sample_count + 1))

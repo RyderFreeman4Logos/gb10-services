@@ -1,7 +1,6 @@
 [Unit]
 # Observer-only telemetry. Recovery remains exclusively owned by the Rust guardian.
 Description=Observer-only system monitor (1s target interval; measured cadence)
-After=default.target
 # Prevent systemd from ever giving up on restarts.
 StartLimitIntervalSec=0
 
