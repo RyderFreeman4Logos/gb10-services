@@ -174,9 +174,13 @@ scratch:
 
 The script keeps build artifacts in
 `~/.cache/cargo-target/llm-guard-proxy-main` and relinks
-`~/.local/bin/llm-guard-proxy` to the workspace-built release binary. If a
-standalone rebuild leaves the running guard process on a deleted old inode, the
-script restarts only `llm-guard-proxy.service` and smokes `/health`; it does not
+`~/.local/bin/llm-guard-proxy` to the workspace-built release binary. Its
+content-free completion receipt binds the source commit/tree, Cargo and rustc
+identities, ELF build ID, installed Guard config/unit hashes, and exact
+SHA-256/device:inode identity across the built binary, service symlink, and
+running `/proc/$MainPID/exe`; any mismatch fails closed. If a standalone
+rebuild leaves the running guard process on a deleted old inode, the script
+restarts only `llm-guard-proxy.service` and smokes `/health`; it does not
 restart any vLLM backend.
 
 ### 4. Verify the integrated guardian

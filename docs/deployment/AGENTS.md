@@ -147,7 +147,11 @@ The cached rebuild script keeps Cargo build artifacts under
 `/home/obj/.cache/cargo-target/llm-guard-proxy-main`, then atomically relinks
 `/home/obj/.local/bin/llm-guard-proxy` to the workspace-built release binary.
 It explicitly builds with Cargo feature `guard`; production must not inherit the
-package's empty default feature set.
+package's empty default feature set. Its content-free completion receipt binds
+the source commit/tree, Cargo and rustc identities, ELF build ID, installed
+Guard config/unit hashes, and SHA-256/device:inode identity across the built
+binary, service symlink, and running `/proc/$MainPID/exe`; mismatches fail
+closed.
 If the running guard process still points at a deleted old inode after a
 standalone rebuild, the script restarts only `llm-guard-proxy.service` and
 smokes `/health`; it does not restart any vLLM backend.
