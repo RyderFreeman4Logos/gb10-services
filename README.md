@@ -60,10 +60,10 @@ graph TD
    A lightweight observer-only system monitor targeting a one-second interval,
    recording system load, exact Linux `MemAvailable`, temperatures, GPU metrics,
    disk I/O rates, swap-in/out, top process RSS/swap memory, and observed cadence.
-   CSV v5 appends `mem_available_mb`, `sample_cadence_ms`,
-   `sample_elapsed_ms`, and `sample_lag_ms` without reordering v4 columns. A
-   2–3 second loop overrun is recorded as such; the service does not claim a
-   guaranteed 1 Hz sampling rate and performs no recovery action.
+   CSV v6 preserves every v5 column and appends content-free `boot_id`,
+   `memory_some_avg10`, `memory_full_avg10`, `io_full_avg10`, and
+   `cpu_some_avg10`. A 2–3 second loop overrun is recorded as such; the service
+   does not claim a guaranteed 1 Hz sampling rate and performs no recovery action.
 
 ### Integrated Guardian
 `llm-guard-proxy` owns the only automatic low-memory recovery path. The GB10

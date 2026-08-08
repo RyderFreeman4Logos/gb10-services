@@ -381,7 +381,7 @@ systemctl --user status vllm-embedding vllm-aeon-27b-dflash vllm-querit-4b-reran
 
 ### Retrieve System Resource Log (sysmon output)
 ```bash
-# View last 20 samples from 1Hz monitor
+# View the last 20 target-interval samples and their measured cadence
 tail -n 20 ~/log/sysmon_$(date +%Y-%m-%d).csv
 ```
 
