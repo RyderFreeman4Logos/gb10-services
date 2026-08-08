@@ -174,10 +174,9 @@ Build/update the proxy binary on the host from the reviewed main branch:
 
 Production invocation accepts no override environment variables. With no
 arguments, the script hard-binds the canonical source, cache, installed Guard
-config/unit, service symlink, receipt directory, real `/proc`, and a fixed tool
-path. Hermetic tests alone use `--test-only`; they emit an unmistakable test-only
-marker and a test-only receipt that cannot equal the production completion
-contract.
+config/unit, service symlink, owner-only recovery state, real `/proc`, and a
+fixed tool path. Hermetic tests alone use `--test-only`; their marker cannot
+equal the production completion contract.
 
 The rebuild fetches the reviewed commit, creates a verified immutable Git
 archive, extracts it into a private read-only snapshot, and runs Cargo only from
@@ -188,21 +187,28 @@ under `~/.cache/cargo-target/llm-guard-proxy-main/releases/` is linked into
 `~/.local/bin/llm-guard-proxy`; Cargo intermediates remain cached under the same
 cache root.
 
-Before mutation, the script validates and snapshots the exact prior symlink or
-absence plus the prior `MainPID`, `InvocationID`, monotonic systemd start,
-boot ID, and `/proc/<pid>/stat` starttime. It hashes/stats/build-ID-checks one
-held `/proc/<pid>/exe` file descriptor and proves at publication that the same
-systemd generation and inode are still current. Cutover stays rollback-armed
-through restart, bounded health check, receipt persistence, and terminal output.
-Any later failure restores the exact prior link/absence and, after a candidate
-restart, restarts and verifies the prior Guard generation. It never restarts a
-vLLM backend.
+Before Git or build work, the script takes nonblocking `flock` authority at
+`~/.local/state/llm-guard-proxy-rebuild/lock.v1` and resolves any durable
+`transaction.v1/state.json`. It keeps content-addressed prior bytes under
+`rollback/` and archives metadata-only committed state under `receipts/<txid>/`;
+directories are owner `0700`, state/lock files are owner `0600`, and every
+phase publication uses file and directory `fsync` plus atomic rename.
 
-A successful production run writes a metadata-only owner-`0600` temporary
-receipt, flushes it, performs file `fsync`, atomic rename, and directory `fsync`,
-then emits the unique terminal
-`LLM_GUARD_REBUILD_PRODUCTION_COMPLETE` line with the receipt digest. No other
-line is a production completion claim.
+The WAL records the exact prior symlink or absence, `MainPID`, `InvocationID`,
+monotonic systemd start, boot ID, `/proc/<pid>/stat` starttime, and the exact executable
+identity from a held `/proc/<pid>/exe` file descriptor. `prestate`, `mutated`, and `committed` are the only
+phases. Recovery cancels only exact matching Guard job IDs, restores and proves
+the exact prior executable generation, and exits 75 before any new build.
+Malformed state, unprovable rollback, or a nonterminal manager job keeps the WAL
+and blocks completion; it never restarts a vLLM backend.
+
+The forward transaction has one 1,800-second monotonic deadline. Failure or
+stale-WAL handling receives an independent 180-second recovery deadline. A
+durable `committed` generation is never rolled back merely because the terminal
+stdout sink fails. Only
+`LLM_GUARD_PROXY_REBUILD_COMPLETE receipt_sha256=<64hex>` is a production
+completion claim; absence of that line is not proof that a committed generation
+was rolled back.
 
 ### 4. Verify the integrated guardian
 
@@ -227,7 +233,8 @@ install -m 0755 scripts/aeon_text_stop_start.sh /home/obj/scripts/aeon_text_stop
 cp scripts/aeon_chat_ready.py ~/.local/bin/
 cp scripts/gb10_apply_aeon_querit_profile.sh ~/.local/bin/
 cp scripts/gb10_check_mem_available.sh ~/.local/bin/
-cp scripts/llm_guard_proxy_cached_rebuild.sh ~/.local/bin/
+install -m 0755 scripts/llm_guard_proxy_cached_rebuild.sh ~/.local/bin/llm_guard_proxy_cached_rebuild.sh
+install -m 0644 scripts/llm_guard_proxy_cached_rebuild.py scripts/gb10_bounded_process.py ~/.local/bin/
 cp scripts/llm_guard_proxy_publish_cgroup_registration.sh ~/.local/bin/
 install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py ~/.local/bin/gb10_verify_vllm_no_swap_core.py
 install -m 0755 scripts/gb10_verify_vllm_no_swap.sh ~/.local/bin/gb10_verify_vllm_no_swap.sh

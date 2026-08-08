@@ -111,7 +111,8 @@ cp scripts/aeon_hang_guard.py /home/obj/scripts/
 install -m 0755 scripts/aeon_text_stop_start.sh /home/obj/scripts/aeon_text_stop_start.sh
 cp scripts/aeon_chat_ready.py /home/obj/.local/bin/
 cp scripts/gb10_check_mem_available.sh /home/obj/.local/bin/
-cp scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/
+install -m 0755 scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/llm_guard_proxy_cached_rebuild.sh
+install -m 0644 scripts/llm_guard_proxy_cached_rebuild.py scripts/gb10_bounded_process.py /home/obj/.local/bin/
 cp scripts/llm_guard_proxy_publish_cgroup_registration.sh /home/obj/.local/bin/
 install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py /home/obj/.local/bin/gb10_verify_vllm_no_swap_core.py
 install -m 0755 scripts/gb10_verify_vllm_no_swap.sh /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh
@@ -144,10 +145,9 @@ cp config/llm-guard-proxy/config.toml /home/obj/.config/llm-guard-proxy/config.t
 
 Production invocation accepts no override environment variables. With no
 arguments, the cached rebuild hard-binds the canonical repository/branch,
-source/cache paths, installed config/unit, service symlink, receipt directory,
-real `/proc`, and fixed tool path. `--test-only` is exclusively for hermetic
-tests and emits a test-only marker and receipt that cannot equal the production
-completion contract.
+source/cache paths, installed config/unit, service symlink, owner-only recovery
+state, real `/proc`, and fixed tool path. `--test-only` is exclusively for
+hermetic tests and cannot emit the production completion contract.
 
 The script verifies a commit-bearing immutable Git archive, extracts a private
 read-only snapshot, and builds package `llm-guard-proxy` with feature `guard`
@@ -162,13 +162,22 @@ absence plus `MainPID`, `InvocationID`, monotonic start, boot ID, and
 that object and generation at publication. Same-content replacement, PID reuse,
 exec drift, and systemd generation drift fail closed.
 
-Cutover remains rollback-armed through candidate restart, bounded `/health`,
-receipt creation/write/file-`fsync`/atomic rename/directory `fsync`, and the
-terminal sink. Every later failure restores exact prior link/absence; after a
-candidate restart, rollback restarts and verifies the prior Guard generation and
-readiness. The script never restarts a vLLM backend. The only production success
-claim is the final `LLM_GUARD_REBUILD_PRODUCTION_COMPLETE` line with the durable
-receipt digest.
+The owner-`0700` state root
+`/home/obj/.local/state/llm-guard-proxy-rebuild/` contains `lock.v1`, active
+`transaction.v1/state.json`, content-addressed `rollback/`, and committed
+`receipts/<txid>/state.json`. The only WAL phases are `prestate`, `mutated`, and
+`committed`; owner-`0600` state publication is ordered by write, file `fsync`,
+atomic rename, and directory `fsync`.
+
+Cutover and every external command share one 1,800-second forward deadline.
+Failure or stale-WAL recovery gets a fresh 180 seconds, cancels only exact
+matching Guard systemd job IDs, and exits 75 before a new build after successful
+recovery. An unsafe WAL, unprovable exact prior generation, or nonterminal job
+is retained and blocks completion; operators must preserve it for diagnosis.
+The script never restarts a vLLM backend. A durable `committed` generation is
+not rolled back for a later stdout failure. The only production success claim is
+`LLM_GUARD_PROXY_REBUILD_COMPLETE receipt_sha256=<64hex>`; marker absence alone
+does not imply rollback.
 
 ### 4. Verify the integrated guardian profile
 

@@ -19,8 +19,8 @@ REBUILD_ENGINE = ROOT / "scripts" / "llm_guard_proxy_cached_rebuild.py"
 GUARD_CONFIG = ROOT / "config" / "llm-guard-proxy" / "config.toml"
 README = ROOT / "README.md"
 DEPLOYMENT_GUIDE = ROOT / "docs" / "deployment" / "AGENTS.md"
-PRODUCTION_COMPLETE = "LLM_GUARD_REBUILD_PRODUCTION_COMPLETE"
-TEST_COMPLETE = "LLM_GUARD_REBUILD_TEST_ONLY_COMPLETE"
+PRODUCTION_COMPLETE = "LLM_GUARD_PROXY_REBUILD_COMPLETE"
+TEST_COMPLETE = "LLM_GUARD_PROXY_REBUILD_TEST_ONLY_COMPLETE"
 
 
 class GuardProductionFeatureContractTests(unittest.TestCase):
@@ -128,37 +128,36 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
             self.assertEqual(os.readlink(fixture.service_bin), str(fixture.candidate))
             state = fixture.reload_state()
             self.assertEqual(state["running_target"], str(fixture.candidate))
-            receipts = list(fixture.receipt_dir.glob("*.receipt.json"))
+            receipts = fixture.receipt_paths()
             self.assertEqual(len(receipts), 1)
             self.assertEqual(stat.S_IMODE(receipts[0].stat().st_mode), 0o600)
             completion = re.search(
-                rf"{TEST_COMPLETE} receipt_sha256=([0-9a-f]{{64}}) receipt=(\S+)",
+                rf"{TEST_COMPLETE} receipt_sha256=([0-9a-f]{{64}})",
                 output,
             )
             self.assertIsNotNone(completion)
             assert completion is not None
-            self.assertEqual(Path(completion.group(2)), receipts[0])
             self.assertEqual(
                 completion.group(1), hashlib.sha256(receipts[0].read_bytes()).hexdigest()
             )
             receipt = json.loads(receipts[0].read_text())
-            self.assertEqual(receipt["schema"], 2)
+            self.assertEqual(receipt["schema"], 1)
+            self.assertEqual(receipt["phase"], "committed")
             self.assertEqual(receipt["mode"], "test-only")
-            self.assertEqual(receipt["source_commit"], fixture.source_commit)
-            self.assertEqual(receipt["source_tree"], fixture.source_tree)
-            self.assertRegex(receipt["source_archive_sha256"], r"^[0-9a-f]{64}$")
-            self.assertRegex(receipt["snapshot_content_sha256"], r"^[0-9a-f]{64}$")
-            self.assertRegex(receipt["metadata_closure_sha256"], r"^[0-9a-f]{64}$")
-            self.assertRegex(receipt["sandbox_contract_sha256"], r"^[0-9a-f]{64}$")
-            self.assertEqual(
-                receipt["build_inputs"]["metadata_target"]["files"],
-                [".rustc_info.json"],
-            )
-            self.assertEqual(set(receipt["tool_authorities"]), {
+            authorities = receipt["authorities"]
+            self.assertEqual(authorities["source_commit"], fixture.source_commit)
+            self.assertEqual(authorities["source_tree"], fixture.source_tree)
+            self.assertRegex(authorities["source_archive_sha256"], r"^[0-9a-f]{64}$")
+            self.assertRegex(authorities["snapshot_content_sha256"], r"^[0-9a-f]{64}$")
+            self.assertRegex(authorities["metadata_closure_sha256"], r"^[0-9a-f]{64}$")
+            self.assertRegex(authorities["sandbox_contract_sha256"], r"^[0-9a-f]{64}$")
+            self.assertRegex(authorities["build_inputs_sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(set(authorities["tool_authorities"]), {
                 "ar", "bwrap", "cargo", "cc", "curl", "git",
                 "git_remote_https", "ionice", "ld", "nice", "readelf",
                 "rustc", "systemctl",
             })
+            self.assertEqual(receipt["candidate"]["identity"]["sha256"], fixture.binary_sha256)
             serialized = receipts[0].read_text()
             for forbidden in (
                 "private_config_payload",
@@ -205,14 +204,11 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
             fixture.assert_no_backend_lifecycle(self)
 
     def test_wrong_hash_and_same_hash_other_inode_roll_back(self) -> None:
-        for mode, diagnostic in (
-            ("wrong-hash", "SHA-256"),
-            ("same-hash-different-inode", "inode"),
-        ):
+        for mode in ("wrong-hash", "same-hash-different-inode"):
             with self.subTest(mode=mode), RebuildFixture() as fixture:
                 fixture.set_state(candidate_restart_mode=mode)
                 output = self.assert_failed_without_completion(fixture.run())
-                self.assertIn(diagnostic, output)
+                self.assertIn("identity", output)
                 fixture.assert_prior_restored(self)
                 fixture.assert_no_backend_lifecycle(self)
 
@@ -253,7 +249,7 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
                 restart_calls = fixture.reload_state()["restart_calls"]
                 if not isinstance(restart_calls, int):
                     self.fail("fixture restart count is not an integer")
-                self.assertGreaterEqual(restart_calls, 2)
+                self.assertGreaterEqual(restart_calls, 1)
                 fixture.assert_no_backend_lifecycle(self)
 
     def test_every_receipt_failure_rolls_back_and_emits_no_completion(self) -> None:
@@ -264,7 +260,6 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
             "rename",
             "dir-fsync",
             "enospc",
-            "completion-sink",
         ):
             with self.subTest(stage=stage), RebuildFixture() as fixture:
                 result = fixture.run(
@@ -272,7 +267,8 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
                 )
                 self.assert_failed_without_completion(result)
                 fixture.assert_prior_restored(self)
-                self.assertEqual(list(fixture.receipt_dir.iterdir()), [])
+                self.assertEqual(fixture.receipt_paths(), [])
+                fixture.assert_transaction_clean(self)
                 fixture.assert_no_backend_lifecycle(self)
 
     def test_source_mutation_and_restore_during_cargo_is_rejected_pre_cutover(self) -> None:
@@ -287,19 +283,56 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
     def test_generation_and_proc_drift_after_attestation_roll_back(self) -> None:
         for kind in ("pid", "invocation", "starttime", "pid-reuse"):
             with self.subTest(kind=kind), RebuildFixture() as fixture:
-                fixture.set_state(drift_on_show=5, drift_kind=kind)
+                fixture.set_state(drift_after="candidate-attestation", drift_kind=kind)
                 output = self.assert_failed_without_completion(fixture.run())
                 self.assertIn("generation changed", output)
+                self.assertTrue(fixture.reload_state()["drifted"])
+                fixture.assert_call_order(
+                    self,
+                    "systemctl --user restart --no-block --job-mode=fail -- llm-guard-proxy.service",
+                    "curl -fsS ",
+                    "systemctl --user show ",
+                    "systemctl --user show ",
+                )
                 fixture.assert_prior_restored(self)
                 fixture.assert_no_backend_lifecycle(self)
 
     def test_generation_drift_at_durable_publication_removes_receipt(self) -> None:
         with RebuildFixture() as fixture:
-            fixture.set_state(drift_on_show=6, drift_kind="invocation")
+            fixture.set_state(
+                drift_after="first-publication-bracket", drift_kind="invocation"
+            )
             output = self.assert_failed_without_completion(fixture.run())
             self.assertIn("generation changed", output)
-            self.assertEqual(list(fixture.receipt_dir.glob("*.receipt.json")), [])
+            self.assertTrue(fixture.reload_state()["drifted"])
+            fixture.assert_call_order(
+                self,
+                "curl -fsS ",
+                "systemctl --user show ",
+                "cargo --version --verbose",
+                "systemctl --user list-jobs --output=json",
+                "cargo --version --verbose",
+                "systemctl --user show ",
+            )
+            self.assertEqual(fixture.receipt_paths(), [])
             fixture.assert_prior_restored(self)
+            fixture.assert_no_backend_lifecycle(self)
+
+    def test_committed_drift_blocks_completion_without_rollback(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(
+                drift_after="second-publication-bracket", drift_kind="invocation"
+            )
+            output = self.assert_failed_without_completion(fixture.run())
+            self.assertIn("committed candidate generation cannot be proven", output)
+            self.assertEqual(os.readlink(fixture.service_bin), str(fixture.candidate))
+            state = fixture.reload_state()
+            self.assertTrue(state["drifted"])
+            self.assertEqual(state["restart_calls"], 1)
+            receipts = fixture.receipt_paths()
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual(json.loads(receipts[0].read_text())["phase"], "committed")
+            fixture.assert_transaction_clean(self)
             fixture.assert_no_backend_lifecycle(self)
 
     def test_executable_replacement_during_held_fd_hash_rolls_back(self) -> None:
