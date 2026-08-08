@@ -167,65 +167,94 @@ read_mem_available_mb() {
     return 1
 }
 
-read_bounded_regular_file() {
-    local path="$1" max_bytes="$2" value="" LC_ALL=C
-    BOUNDED_FILE_CONTENT=""
-    [[ -f "$path" && ! -L "$path" ]] || return 1
-    IFS= read -r -N "$((max_bytes + 1))" value < "$path" || true
-    (( ${#value} <= max_bytes )) || return 1
-    [[ "$value" == *$'\n' && "$value" != *$'\r'* ]] || return 1
-    BOUNDED_FILE_CONTENT="$value"
-}
+read_boot_pressure() {
+    /usr/bin/python3 -I - "$PROC_ROOT" <<'PY'
+import os
+import re
+import stat
+import sys
 
-read_boot_id() {
-    local path="$PROC_ROOT/sys/kernel/random/boot_id" value
-    BOOT_ID="N/A"
-    read_bounded_regular_file "$path" 64 || return 0
-    value="${BOUNDED_FILE_CONTENT%$'\n'}"
-    [[ "$value" != *$'\n'* ]] || return 0
-    if [[ "$value" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-        BOOT_ID="$value"
-    fi
-    return 0
-}
+root = sys.argv[1]
+unavailable = "N/A"
 
-valid_psi_avg10() {
-    local value="$1"
-    [[ "$value" =~ ^([0-9]{1,2}|100)\.[0-9]{2}$ ]] || return 1
-    [[ "$value" != 100.* || "$value" == "100.00" ]]
-}
 
-read_psi_avg10() {
-    local resource="$1" wanted_class="$2"
-    local path="$PROC_ROOT/pressure/$resource" line pressure_class field value
-    local class_count=0 avg10_count candidate="" candidate_valid=0
-    local -a fields
-    PSI_AVG10="N/A"
-    read_bounded_regular_file "$path" 512 || return 0
-    value="${BOUNDED_FILE_CONTENT%$'\n'}"
-    while IFS= read -r line; do
-        (( ${#line} <= 255 )) || return 0
-        read -r -a fields <<< "$line"
-        pressure_class="${fields[0]:-}"
-        [[ "$pressure_class" == "$wanted_class" ]] || continue
-        ((class_count += 1))
-        avg10_count=0
-        candidate=""
-        for field in "${fields[@]:1}"; do
-            if [[ "${field%%=*}" == "avg10" ]]; then
-                candidate="${field#*=}"
-                ((avg10_count += 1))
-            fi
-        done
-        candidate_valid=0
-        if (( avg10_count == 1 )) && valid_psi_avg10 "$candidate"; then
-            candidate_valid=1
-        fi
-    done <<< "$value"
-    if (( class_count == 1 && candidate_valid == 1 )); then
-        PSI_AVG10="$candidate"
-    fi
-    return 0
+def read_regular(relative_path, limit):
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        fd = os.open(os.path.join(root, relative_path), flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks = []
+        remaining = limit + 1
+        while remaining:
+            try:
+                chunk = os.read(fd, remaining)
+            except OSError:
+                return None
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    if len(data) > limit or not data.endswith(b"\n") or b"\r" in data:
+        return None
+    try:
+        return data.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+
+
+boot = read_regular("sys/kernel/random/boot_id", 64)
+if boot is None or re.fullmatch(
+    r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\n", boot
+) is None:
+    boot = unavailable
+else:
+    boot = boot[:-1]
+
+
+def psi_avg10(resource, wanted_class):
+    content = read_regular(f"pressure/{resource}", 512)
+    if content is None:
+        return unavailable
+    matches = []
+    for line in content.splitlines():
+        if len(line) > 255:
+            return unavailable
+        fields = line.split()
+        if not fields or fields[0] != wanted_class:
+            continue
+        values = [
+            field.partition("=")[2]
+            for field in fields[1:]
+            if field.partition("=")[0] == "avg10"
+        ]
+        value = values[0] if len(values) == 1 else ""
+        if re.fullmatch(r"(?:[0-9]{1,2}|100)\.[0-9]{2}", value) is None:
+            value = ""
+        if value.startswith("100.") and value != "100.00":
+            value = ""
+        matches.append(value)
+    return matches[0] if len(matches) == 1 and matches[0] else unavailable
+
+
+print(
+    ",".join(
+        (
+            boot,
+            psi_avg10("memory", "some"),
+            psi_avg10("memory", "full"),
+            psi_avg10("io", "full"),
+            psi_avg10("cpu", "some"),
+        )
+    )
+)
+PY
 }
 
 mb_rate() {
@@ -340,16 +369,13 @@ while true; do
     mem_used="${mem_info##*,}"
     read_mem_available_mb || mem_available_mb=""
     mem_available_mb="$MEM_AVAILABLE_MB"
-    read_boot_id
-    boot_id="$BOOT_ID"
-    read_psi_avg10 memory some
-    memory_some_avg10="$PSI_AVG10"
-    read_psi_avg10 memory full
-    memory_full_avg10="$PSI_AVG10"
-    read_psi_avg10 io full
-    io_full_avg10="$PSI_AVG10"
-    read_psi_avg10 cpu some
-    cpu_some_avg10="$PSI_AVG10"
+    boot_id="N/A"
+    memory_some_avg10="N/A"
+    memory_full_avg10="N/A"
+    io_full_avg10="N/A"
+    cpu_some_avg10="N/A"
+    IFS=, read -r boot_id memory_some_avg10 memory_full_avg10 \
+        io_full_avg10 cpu_some_avg10 < <(read_boot_pressure) || true
 
     # Swap (MB). Read /proc/meminfo directly to avoid localized free(1) labels.
     swap_info=$(awk '
