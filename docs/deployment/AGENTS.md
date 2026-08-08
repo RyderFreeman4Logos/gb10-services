@@ -137,24 +137,38 @@ cp config/llm-guard-proxy/config.toml /home/obj/.config/llm-guard-proxy/config.t
 
 ### 3. Build llm-guard-proxy
 ```bash
-# Build/update the reviewed main branch from a local workspace checkout with a
-# persistent Cargo target cache. The script uses CARGO_BUILD_JOBS=1 and
-# ionice/nice so rebuilds are safer while the GB10 vLLM stack is resident.
+# Build/update the reviewed main branch from a private immutable snapshot while
+# reusing the Cargo target cache. Production accepts no environment overrides.
 /home/obj/.local/bin/llm_guard_proxy_cached_rebuild.sh
 ```
 
-The cached rebuild script keeps Cargo build artifacts under
-`/home/obj/.cache/cargo-target/llm-guard-proxy-main`, then atomically relinks
-`/home/obj/.local/bin/llm-guard-proxy` to the workspace-built release binary.
-It explicitly builds with Cargo feature `guard`; production must not inherit the
-package's empty default feature set. Its content-free completion receipt binds
-the source commit/tree, Cargo and rustc identities, ELF build ID, installed
-Guard config/unit hashes, and SHA-256/device:inode identity across the built
-binary, service symlink, and running `/proc/$MainPID/exe`; mismatches fail
-closed.
-If the running guard process still points at a deleted old inode after a
-standalone rebuild, the script restarts only `llm-guard-proxy.service` and
-smokes `/health`; it does not restart any vLLM backend.
+Production invocation accepts no override environment variables. With no
+arguments, the cached rebuild hard-binds the canonical repository/branch,
+source/cache paths, installed config/unit, service symlink, receipt directory,
+real `/proc`, and fixed tool path. `--test-only` is exclusively for hermetic
+tests and emits a test-only marker and receipt that cannot equal the production
+completion contract.
+
+The script verifies a commit-bearing immutable Git archive, extracts a private
+read-only snapshot, and builds package `llm-guard-proxy` with feature `guard`
+only from that snapshot. The metadata-only receipt binds commit/tree, archive
+and snapshot-content SHA-256, Cargo/rustc identities, installed config/unit
+hashes, and candidate ELF SHA-256/build-ID/device:inode.
+
+Before any link mutation it snapshots and validates exact prior symlink or
+absence plus `MainPID`, `InvocationID`, monotonic start, boot ID, and
+`/proc/<pid>/stat` starttime. It hashes/stats/build-ID-checks one held
+`/proc/<pid>/exe` file descriptor, then proves the current proc entry still names
+that object and generation at publication. Same-content replacement, PID reuse,
+exec drift, and systemd generation drift fail closed.
+
+Cutover remains rollback-armed through candidate restart, bounded `/health`,
+receipt creation/write/file-`fsync`/atomic rename/directory `fsync`, and the
+terminal sink. Every later failure restores exact prior link/absence; after a
+candidate restart, rollback restarts and verifies the prior Guard generation and
+readiness. The script never restarts a vLLM backend. The only production success
+claim is the final `LLM_GUARD_REBUILD_PRODUCTION_COMPLETE` line with the durable
+receipt digest.
 
 ### 4. Verify the integrated guardian profile
 
