@@ -39,6 +39,7 @@ def production_config(engine_path: Path) -> RuntimeConfig:
         deadline_seconds=300,
         rollback_seconds=180,
         verifier_authority=(
+            repository / "scripts/gb10_bounded_process.py",
             repository / "scripts/gb10_verify_embedding_profile.py",
             repository / "scripts/gb10_embedding_profile_contract.py",
             repository / "scripts/gb10_embedding_verifier_runtime.py",

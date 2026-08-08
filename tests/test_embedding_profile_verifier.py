@@ -113,6 +113,39 @@ class StrictUnitParserTests(unittest.TestCase):
 
 
 class BoundedCommandTests(unittest.TestCase):
+    def test_shared_command_supports_exact_cwd_env_and_passed_fd(self) -> None:
+        verifier = _load_verifier()
+        self.assertEqual(verifier.command.__module__, "gb10_bounded_process")
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"held-authority")
+            os.close(write_fd)
+            write_fd = -1
+            with tempfile.TemporaryDirectory() as temporary:
+                output = verifier.command(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import json,os,sys; print(json.dumps({"
+                        "'cwd':os.getcwd(),'only':os.environ.get('ONLY'),"
+                        "'hostile':os.environ.get('HOSTILE'),"
+                        "'fd':os.read(int(sys.argv[1]),64).decode()}))",
+                        str(read_fd),
+                    ],
+                    cwd=temporary,
+                    env={"LC_ALL": "C", "ONLY": "bound"},
+                    pass_fds=(read_fd,),
+                )
+            payload = json.loads(output)
+            self.assertEqual(payload["cwd"], temporary)
+            self.assertEqual(payload["only"], "bound")
+            self.assertIsNone(payload["hostile"])
+            self.assertEqual(payload["fd"], "held-authority")
+        finally:
+            os.close(read_fd)
+            if write_fd >= 0:
+                os.close(write_fd)
+
     def test_timeout_terminates_and_reaps_descendant_process_group(self) -> None:
         verifier = _load_verifier()
         with tempfile.TemporaryDirectory() as temporary:
