@@ -7,7 +7,7 @@ if (( $# > 1 )) || (( $# == 1 )) && [[ "$1" != "--test-only" ]]; then
   exit 64
 fi
 script_dir="$(cd -P -- "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"; engine="$script_dir/llm_guard_proxy_cached_rebuild.py"
-expected_engine_sha256="beb4d91d18d3f8bc86debd4f21bfe4d63175440d60f8de55fb0ea363241145f5"
+expected_engine_sha256="b5af8832be937b3817e360f7fd14de458c0916beed62afc8489d81ab82b13a77"
 if [[ -L "$engine" || ! -f "$engine" ]]; then
   printf 'Guard rebuild engine authority is unsafe\n' >&2
   exit 1
@@ -35,7 +35,7 @@ fi
 for name in CACHE_ROOT SOURCE_DIR SOURCE_REPO SOURCE_BRANCH SERVICE_BIN LOG_DIR LOG_FILE PATH \
   LLM_GUARD_PROXY_REBUILD_GUARD_CONFIG LLM_GUARD_PROXY_REBUILD_GUARD_UNIT \
   LLM_GUARD_PROXY_REBUILD_PROC_ROOT LLM_GUARD_PROXY_REBUILD_RECEIPT_DIR \
-  LLM_GUARD_REBUILD_TEST_CONFIG XDG_RUNTIME_DIR HOME BASH_ENV ENV PYTHONPATH \
+  LLM_GUARD_REBUILD_TEST_CONFIG LLM_GUARD_REBUILD_TEST_MISSING_TOOL LLM_GUARD_REBUILD_TEST_FAIL_RECEIPT_STAGE LLM_GUARD_REBUILD_TEST_REPLACE_EXE_DURING_HASH LLM_GUARD_REBUILD_TEST_FORWARD_SECONDS LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS LLM_GUARD_REBUILD_TEST_CRASH_POINT LLM_GUARD_REBUILD_TEST_CRASH_MARKER XDG_RUNTIME_DIR HOME BASH_ENV ENV PYTHONPATH \
   PYTHONHOME PYTHONSTARTUP PYTHONINSPECT; do
   if [[ -v "$name" ]]; then
     printf 'production rebuild override %s requires --test-only\n' "$name" >&2

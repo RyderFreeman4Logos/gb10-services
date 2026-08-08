@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import importlib
 import json
@@ -10,7 +11,6 @@ import secrets
 import shlex
 import signal
 import stat
-import subprocess
 import sys
 import tarfile
 import tempfile
@@ -19,11 +19,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 __all__: list[str] = []
 
-EXPECTED_BOUNDED_PROCESS_SHA256 = "4a7e3cb50fe46d9e8c02728ff9b100553472abcdb6b055b081290218649bb205"
+EXPECTED_BOUNDED_PROCESS_SHA256 = "60ad55a0d3a36d70cb79df77166fa28dc81c17147ade8c10ba311a6300262cb3"
 _SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 _BOUNDED_PROCESS_PATH = _SCRIPT_DIRECTORY / "gb10_bounded_process.py"
 _bounded_fd = os.open(
@@ -50,8 +50,13 @@ run_bounded = importlib.import_module("gb10_bounded_process").command
 
 UNIT = "llm-guard-proxy.service"
 HEALTH_URL = "http://100.105.4.92:18009/health"
-PRODUCTION_COMPLETE = "LLM_GUARD_REBUILD_PRODUCTION_COMPLETE"
-TEST_COMPLETE = "LLM_GUARD_REBUILD_TEST_ONLY_COMPLETE"
+PRODUCTION_COMPLETE = "LLM_GUARD_PROXY_REBUILD_COMPLETE"
+TEST_COMPLETE = "LLM_GUARD_PROXY_REBUILD_TEST_ONLY_COMPLETE"
+RECOVERY_COMPLETE = "LLM_GUARD_PROXY_REBUILD_RECOVERED"
+FORWARD_SECONDS = 1800.0
+RECOVERY_SECONDS = 180.0
+STATE_MAX_BYTES = 64 * 1024
+PHASES = {"prestate", "mutated", "committed"}
 MAX_EXECUTABLE_BYTES = 128 * 1024 * 1024
 GENERATION_FIELDS = (
     "LoadState",
@@ -61,7 +66,9 @@ GENERATION_FIELDS = (
     "DropInPaths",
     "MainPID",
     "InvocationID",
-    "ExecMainStartTimestampMonotonic",
+    "ActiveEnterTimestampMonotonic",
+    "Result",
+    "Job",
 )
 TEST_OVERRIDES = (
     "SOURCE_REPO",
@@ -78,11 +85,18 @@ TEST_OVERRIDES = (
     "LLM_GUARD_PROXY_REBUILD_PROC_ROOT",
     "LLM_GUARD_PROXY_REBUILD_RECEIPT_DIR",
     "LLM_GUARD_REBUILD_TEST_ONLY",
+    "LLM_GUARD_REBUILD_TEST_CONFIG",
     "LLM_GUARD_REBUILD_TEST_MISSING_TOOL",
     "LLM_GUARD_REBUILD_TEST_FAIL_RECEIPT_STAGE",
     "LLM_GUARD_REBUILD_TEST_REPLACE_EXE_DURING_HASH",
+    "LLM_GUARD_REBUILD_TEST_FORWARD_SECONDS",
+    "LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS",
+    "LLM_GUARD_REBUILD_TEST_CRASH_POINT",
+    "LLM_GUARD_REBUILD_TEST_CRASH_MARKER",
 )
 rollback_logging = False
+operation_deadline: float | None = None
+test_only_mode = False
 
 
 class RebuildError(RuntimeError):
@@ -98,7 +112,7 @@ def log(message: str) -> None:
             raise
 
 
-def fail(message: str) -> None:
+def fail(message: str) -> NoReturn:
     raise RebuildError(message)
 
 
@@ -727,27 +741,29 @@ def execute(
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
 ) -> bytes:
+    del capture
+    deadline = operation_deadline
+    if deadline is None:
+        fail("bounded command invoked without a transaction deadline")
+    budget = deadline - time.monotonic()
+    if budget <= 0:
+        fail("transaction command deadline exhausted")
     log("+ " + shlex.join(command))
     used = [tool for tool in held_tools.values() if tool.exec_path in command]
     effective_fds = tuple(sorted(set(pass_fds + _tool_fds())))
     try:
-        try:
-            result = subprocess.run(
-                command,
-                check=True,
-                env=child_env if env is None else env,
-                cwd=cwd,
-                stdout=subprocess.PIPE if capture else None,
-                stderr=subprocess.PIPE if capture else None,
-                pass_fds=effective_fds,
-            )
-        except subprocess.CalledProcessError as error:
-            fail(f"command failed ({error.returncode}): {Path(command[0]).name}")
-        output = result.stdout or b""
-        error_output = result.stderr or b""
-        if len(output) > 4 * 1024 * 1024 or len(error_output) > 4 * 1024 * 1024:
-            fail(f"command output exceeded bound: {Path(command[0]).name}")
-        return output
+        output = run_bounded(
+            command,
+            timeout=budget,
+            deadline=operation_deadline,
+            cwd=cwd,
+            env=child_env if env is None else env,
+            pass_fds=effective_fds,
+            cleanup_reserve=min(5.0, max(0.0, budget / 2)),
+        )
+        return output.encode("utf-8")
+    except RuntimeError as error:
+        raise RebuildError(f"bounded command failed: {Path(command[0]).name}") from error
     finally:
         for tool in used:
             tool.verify()
@@ -1548,14 +1564,14 @@ def _run_sandbox(
         index.descriptor,
         arguments,
     )
-    log("+ " + shlex.join(command))
     try:
-        return run_bounded(
+        return execute(
             command,
+            capture=True,
             cwd=Path("/"),
             env=child_env,
             pass_fds=pass_fds,
-        )
+        ).decode("utf-8")
     finally:
         for name in ("nice", "ionice", "bwrap", "cargo", "rustc", "cc", "ld", "ar"):
             held_tools[name].verify()
@@ -1957,9 +1973,11 @@ class Generation:
     invocation: str
     started: int
     fragment: str
+    result: str
+    job: int | None
 
 
-def query_generation() -> Generation:
+def query_generation(*, require_running: bool = True) -> Generation:
     command = [
         require_tool("systemctl"),
         "--user",
@@ -1972,7 +1990,11 @@ def query_generation() -> Generation:
     if len(payload) > 8192 or b"\x00" in payload or b"\r" in payload:
         fail("systemd generation output is malformed")
     values: dict[str, str] = {}
-    for row in payload.decode("ascii").splitlines():
+    try:
+        rows = payload.decode("ascii").splitlines()
+    except UnicodeDecodeError as error:
+        raise RebuildError("systemd generation output is not ASCII") from error
+    for row in rows:
         key, separator, value = row.partition("=")
         if separator != "=" or key not in GENERATION_FIELDS or key in values:
             fail("systemd generation output has duplicate or extra fields")
@@ -1981,22 +2003,47 @@ def query_generation() -> Generation:
         fail("systemd generation output is missing fields")
     if (
         values["LoadState"] != "loaded"
-        or values["ActiveState"] != "active"
-        or values["SubState"] != "running"
         or values["FragmentPath"] != str(guard_unit)
         or values["DropInPaths"]
-        or not re.fullmatch(r"[1-9][0-9]*", values["MainPID"])
-        or not re.fullmatch(r"[0-9a-f]{32}", values["InvocationID"])
-        or not re.fullmatch(
-            r"[1-9][0-9]*", values["ExecMainStartTimestampMonotonic"]
-        )
+        or not re.fullmatch(r"[0-9]+", values["MainPID"])
+        or not re.fullmatch(r"[0-9]+", values["ActiveEnterTimestampMonotonic"])
     ):
-        fail("llm-guard-proxy.service is inactive or has unsupported authority")
+        fail("llm-guard-proxy.service has unsupported authority")
+    pid = int(values["MainPID"])
+    started = int(values["ActiveEnterTimestampMonotonic"])
+    invocation = values["InvocationID"]
+    job_text = values["Job"]
+    if job_text in {"", "0"}:
+        job = None
+    elif re.fullmatch(r"[1-9][0-9]*", job_text):
+        job = int(job_text)
+    else:
+        fail("systemd Job authority is malformed")
+    running = (values["ActiveState"], values["SubState"]) == ("active", "running")
+    if running:
+        if (
+            pid <= 0
+            or started <= 0
+            or re.fullmatch(r"[0-9a-f]{32}", invocation) is None
+            or values["Result"] != "success"
+        ):
+            fail("running Guard generation is malformed")
+    elif (
+        pid != 0
+        or (invocation and re.fullmatch(r"[0-9a-f]{32}", invocation) is None)
+        or values["ActiveState"]
+        not in {"inactive", "failed", "activating", "deactivating"}
+    ):
+        fail("non-running Guard generation is malformed")
+    if require_running and not running:
+        fail("llm-guard-proxy.service is not active and running")
     return Generation(
-        pid=int(values["MainPID"]),
-        invocation=values["InvocationID"],
-        started=int(values["ExecMainStartTimestampMonotonic"]),
+        pid=pid,
+        invocation=invocation,
+        started=started,
         fragment=values["FragmentPath"],
+        result=values["Result"],
+        job=job,
     )
 
 
@@ -2009,7 +2056,15 @@ def read_small_regular(path: Path, limit: int) -> bytes:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             fail(f"non-regular proc authority: {path}")
-        payload = os.read(descriptor, limit + 1)
+        chunks: list[bytes] = []
+        remaining_bytes = limit + 1
+        while remaining_bytes:
+            chunk = os.read(descriptor, min(65536, remaining_bytes))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining_bytes -= len(chunk)
+        payload = b"".join(chunks)
         if len(payload) > limit:
             fail(f"proc authority exceeded byte bound: {path}")
         return payload
@@ -2028,6 +2083,8 @@ def boot_id() -> str:
 
 
 def proc_starttime(pid: int) -> int:
+    if pid <= 0:
+        return 0
     payload = read_small_regular(proc_root / str(pid) / "stat", 4096)
     if not payload.endswith(b"\n") or b"\x00" in payload or b"\r" in payload:
         fail("proc stat is malformed")
@@ -2063,6 +2120,9 @@ class ExecutableIdentity:
     ctime_ns: int
     sha256: str
     build_id: str
+    mode: int
+    uid: int
+    nlink: int
 
 
 def fd_identity(
@@ -2091,26 +2151,30 @@ def fd_identity(
         if during_hash is not None and not hook_called:
             during_hash()
             hook_called = True
-    after_hash = os.fstat(descriptor)
     fields_before = (
         before.st_dev,
         before.st_ino,
         before.st_size,
         before.st_mtime_ns,
         before.st_ctime_ns,
+        stat.S_IMODE(before.st_mode),
+        before.st_uid,
+        before.st_nlink,
     )
+    after_hash = os.fstat(descriptor)
     fields_after = (
         after_hash.st_dev,
         after_hash.st_ino,
         after_hash.st_size,
         after_hash.st_mtime_ns,
         after_hash.st_ctime_ns,
+        stat.S_IMODE(after_hash.st_mode),
+        after_hash.st_uid,
+        after_hash.st_nlink,
     )
     if fields_before != fields_after:
         fail("held executable changed during hash")
-    build_id = elf_build_id(
-        f"/proc/self/fd/{descriptor}", pass_fd=descriptor
-    )
+    build_id = elf_build_id(f"/proc/self/fd/{descriptor}", pass_fd=descriptor)
     after_build_id = os.fstat(descriptor)
     if fields_before != (
         after_build_id.st_dev,
@@ -2118,9 +2182,34 @@ def fd_identity(
         after_build_id.st_size,
         after_build_id.st_mtime_ns,
         after_build_id.st_ctime_ns,
+        stat.S_IMODE(after_build_id.st_mode),
+        after_build_id.st_uid,
+        after_build_id.st_nlink,
     ):
         fail("held executable changed during build-ID read")
-    return ExecutableIdentity(*fields_before, digest.hexdigest(), build_id)
+    return ExecutableIdentity(
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+        digest.hexdigest(),
+        build_id,
+        stat.S_IMODE(before.st_mode),
+        before.st_uid,
+        before.st_nlink,
+    )
+
+
+def file_identity(path: Path) -> ExecutableIdentity:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        return fd_identity(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def open_runtime_executable(
@@ -2128,8 +2217,8 @@ def open_runtime_executable(
 ) -> tuple[int, str, ExecutableIdentity]:
     proc_exe = proc_root / str(pid) / "exe"
     link = os.readlink(proc_exe)
-    if link.endswith(" (deleted)"):
-        fail("running Guard executable is a deleted inode")
+    if link.endswith(" (deleted)") or not _safe_absolute(link):
+        fail("running Guard executable link is unsafe")
     descriptor = os.open(proc_exe, os.O_RDONLY | os.O_CLOEXEC)
 
     def replace_proc_entry() -> None:
@@ -2151,15 +2240,29 @@ def same_object(left: os.stat_result, right: ExecutableIdentity) -> bool:
     return (left.st_dev, left.st_ino) == (right.device, right.inode)
 
 
+def identity_equal(left: ExecutableIdentity, right: ExecutableIdentity) -> bool:
+    return left == right
+
+
 @dataclass
 class Prestate:
     link_target: str | None
     generation: Generation
     boot: str
     proc_start: int
-    descriptor: int
+    descriptor: int | None
     running_link: str
     executable: ExecutableIdentity
+
+
+def _safe_absolute(value: str) -> bool:
+    return (
+        isinstance(value, str)
+        and "\x00" not in value
+        and Path(value).is_absolute()
+        and os.path.normpath(value) == value
+        and ".." not in Path(value).parts
+    )
 
 
 def snapshot_prestate() -> Prestate:
@@ -2172,7 +2275,11 @@ def snapshot_prestate() -> Prestate:
         if not stat.S_ISLNK(metadata.st_mode):
             fail("service binary prestate is neither an exact symlink nor absence")
         link_target = os.readlink(service_bin)
+        if not _safe_absolute(link_target):
+            fail("service binary prestate target is not a safe absolute path")
     generation = query_generation()
+    if generation.job is not None:
+        fail("Guard has an existing manager job before prestate")
     current_boot = boot_id()
     starttime = proc_starttime(generation.pid)
     descriptor, running_link, executable = open_runtime_executable(generation.pid)
@@ -2201,15 +2308,20 @@ def service_link_matches(target: str | None) -> bool:
         metadata = service_bin.lstat()
     except FileNotFoundError:
         return target is None
-    return stat.S_ISLNK(metadata.st_mode) and target is not None and os.readlink(
-        service_bin
-    ) == target
+    return (
+        stat.S_ISLNK(metadata.st_mode)
+        and target is not None
+        and os.readlink(service_bin) == target
+    )
 
 
 def assert_prestate_unchanged(prestate: Prestate) -> None:
     if query_generation() != prestate.generation:
         fail("systemd generation changed before cutover")
-    if boot_id() != prestate.boot or proc_starttime(prestate.generation.pid) != prestate.proc_start:
+    if (
+        boot_id() != prestate.boot
+        or proc_starttime(prestate.generation.pid) != prestate.proc_start
+    ):
         fail("runtime generation changed before cutover")
     current = os.stat(proc_root / str(prestate.generation.pid) / "exe")
     if not same_object(current, prestate.executable):
@@ -2218,9 +2330,13 @@ def assert_prestate_unchanged(prestate: Prestate) -> None:
         fail("runtime executable link changed before cutover")
     if not service_link_matches(prestate.link_target):
         fail("service binary link changed before cutover")
+    if prestate.descriptor is not None and fd_identity(prestate.descriptor) != prestate.executable:
+        fail("held prior executable changed before cutover")
 
 
 def set_service_link(target: str) -> None:
+    if not _safe_absolute(target):
+        fail("refusing unsafe service link target")
     temporary = service_bin.with_name(
         f".{service_bin.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
     )
@@ -2236,6 +2352,7 @@ def remove_service_link() -> None:
     try:
         metadata = service_bin.lstat()
     except FileNotFoundError:
+        fsync_directory(service_bin.parent)
         return
     if not stat.S_ISLNK(metadata.st_mode):
         fail("service binary changed to unsupported type during transaction")
@@ -2243,8 +2360,757 @@ def remove_service_link() -> None:
     fsync_directory(service_bin.parent)
 
 
-def restart_guard() -> None:
-    execute([require_tool("systemctl"), "--user", "restart", UNIT])
+def _secure_directory(path: Path, *, create: bool = False) -> None:
+    if create:
+        try:
+            path.mkdir(mode=0o700, parents=True)
+            fsync_directory(path.parent)
+        except FileExistsError:
+            pass
+    metadata = path.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        fail(f"unsafe rebuild state directory: {path}")
+
+
+def _secure_state_file(path: Path) -> os.stat_result:
+    metadata = path.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size > STATE_MAX_BYTES
+    ):
+        fail(f"unsafe rebuild state file: {path}")
+    return metadata
+
+
+def _secure_backup_file(path: Path) -> os.stat_result:
+    metadata = path.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_size > MAX_EXECUTABLE_BYTES
+    ):
+        fail(f"unsafe rollback backup: {path}")
+    return metadata
+
+
+def acquire_rebuild_lock() -> int:
+    _secure_directory(receipt_dir, create=True)
+    lock_path = receipt_dir / "lock.v1"
+    existed = lock_path.exists() or lock_path.is_symlink()
+    descriptor = os.open(
+        lock_path,
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            fail("unsafe rebuild lock authority")
+        if not existed:
+            os.fsync(descriptor)
+            fsync_directory(receipt_dir)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RebuildError("rebuild lock is already held") from error
+        for name in ("rollback", "receipts"):
+            _secure_directory(receipt_dir / name, create=True)
+        fsync_directory(receipt_dir)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _transaction_dir() -> Path:
+    return receipt_dir / "transaction.v1"
+
+
+def _state_path() -> Path:
+    return _transaction_dir() / "state.json"
+
+
+def _identity_payload(identity: ExecutableIdentity) -> dict[str, object]:
+    return {
+        "device": identity.device,
+        "inode": identity.inode,
+        "size": identity.size,
+        "mtime_ns": identity.mtime_ns,
+        "ctime_ns": identity.ctime_ns,
+        "sha256": identity.sha256,
+        "build_id": identity.build_id,
+        "mode": identity.mode,
+        "uid": identity.uid,
+        "nlink": identity.nlink,
+    }
+
+
+def _generation_payload(generation: Generation, proc_start: int) -> dict[str, object]:
+    return {
+        "pid": generation.pid,
+        "invocation": generation.invocation,
+        "started": generation.started,
+        "proc_start": proc_start,
+        "fragment": generation.fragment,
+        "result": generation.result,
+        "job": generation.job,
+    }
+
+
+def _exact_keys(value: object, keys: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != keys:
+        fail(f"{label} schema is malformed")
+    return cast(dict[str, Any], value)
+
+
+def _strict_int(value: object, label: str, *, minimum: int = 0) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        fail(f"{label} is malformed")
+    return value
+
+
+def _strict_hex(value: object, label: str, length: int = 64) -> str:
+    if not isinstance(value, str) or re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is None:
+        fail(f"{label} is malformed")
+    return value
+
+
+def _identity_from_payload(value: object, label: str) -> ExecutableIdentity:
+    payload = _exact_keys(
+        value,
+        {
+            "device",
+            "inode",
+            "size",
+            "mtime_ns",
+            "ctime_ns",
+            "sha256",
+            "build_id",
+            "mode",
+            "uid",
+            "nlink",
+        },
+        label,
+    )
+    identity = ExecutableIdentity(
+        _strict_int(payload["device"], f"{label}.device"),
+        _strict_int(payload["inode"], f"{label}.inode", minimum=1),
+        _strict_int(payload["size"], f"{label}.size", minimum=1),
+        _strict_int(payload["mtime_ns"], f"{label}.mtime_ns"),
+        _strict_int(payload["ctime_ns"], f"{label}.ctime_ns"),
+        _strict_hex(payload["sha256"], f"{label}.sha256"),
+        cast(str, payload["build_id"]),
+        _strict_int(payload["mode"], f"{label}.mode"),
+        _strict_int(payload["uid"], f"{label}.uid"),
+        _strict_int(payload["nlink"], f"{label}.nlink", minimum=1),
+    )
+    if (
+        not isinstance(identity.build_id, str)
+        or re.fullmatch(r"[0-9a-f]{8,128}", identity.build_id) is None
+        or identity.size > MAX_EXECUTABLE_BYTES
+        or identity.uid != os.geteuid()
+        or identity.nlink != 1
+        or identity.mode not in {0o700, 0o755}
+    ):
+        fail(f"{label} identity is unsafe")
+    return identity
+
+
+def _generation_from_payload(value: object, label: str) -> tuple[Generation, int]:
+    payload = _exact_keys(
+        value,
+        {"pid", "invocation", "started", "proc_start", "fragment", "result", "job"},
+        label,
+    )
+    job_value = payload["job"]
+    if job_value is not None:
+        job_value = _strict_int(job_value, f"{label}.job", minimum=1)
+    generation = Generation(
+        _strict_int(payload["pid"], f"{label}.pid", minimum=1),
+        cast(str, payload["invocation"]),
+        _strict_int(payload["started"], f"{label}.started", minimum=1),
+        cast(str, payload["fragment"]),
+        cast(str, payload["result"]),
+        cast(int | None, job_value),
+    )
+    proc_value = _strict_int(payload["proc_start"], f"{label}.proc_start", minimum=1)
+    if (
+        re.fullmatch(r"[0-9a-f]{32}", generation.invocation) is None
+        or generation.fragment != str(guard_unit)
+        or generation.result != "success"
+    ):
+        fail(f"{label} generation is unsafe")
+    return generation, proc_value
+
+
+def _validate_tool_receipt(value: object, label: str) -> None:
+    payload = _exact_keys(
+        value,
+        {
+            "logical_path",
+            "resolved_path",
+            "expected_uid",
+            "expected_gid",
+            "expected_mode",
+            "device",
+            "inode",
+            "size",
+            "nlink",
+            "mtime_ns",
+            "ctime_ns",
+            "sha256",
+        },
+        label,
+    )
+    for key in ("logical_path", "resolved_path"):
+        if not isinstance(payload[key], str) or not _safe_absolute(payload[key]):
+            fail(f"{label}.{key} is unsafe")
+    for key in (
+        "expected_uid",
+        "expected_gid",
+        "expected_mode",
+        "device",
+        "inode",
+        "size",
+        "nlink",
+        "mtime_ns",
+        "ctime_ns",
+    ):
+        _strict_int(payload[key], f"{label}.{key}")
+    _strict_hex(payload["sha256"], f"{label}.sha256")
+
+
+def _validate_authorities(value: object) -> dict[str, Any]:
+    payload = _exact_keys(
+        value,
+        {
+            "canonical_source_url",
+            "canonical_source_ref",
+            "source_commit",
+            "source_tree",
+            "source_archive_sha256",
+            "snapshot_content_sha256",
+            "source_file_count",
+            "source_byte_count",
+            "git_config_sha256",
+            "metadata_closure_sha256",
+            "sandbox_contract_sha256",
+            "build_inputs_sha256",
+            "cargo_identity_sha256",
+            "rustc_identity_sha256",
+            "guard_config_sha256",
+            "guard_unit_sha256",
+            "tool_authorities",
+            "python_runtime_authority_sha256",
+        },
+        "authorities",
+    )
+    if (
+        payload["canonical_source_url"] != source_repo
+        or payload["canonical_source_ref"] != source_ref
+    ):
+        fail("canonical source authority differs")
+    for key in ("source_commit", "source_tree"):
+        _strict_hex(payload[key], f"authorities.{key}", length=40)
+    for key in (
+        "source_archive_sha256",
+        "snapshot_content_sha256",
+        "git_config_sha256",
+        "metadata_closure_sha256",
+        "sandbox_contract_sha256",
+        "build_inputs_sha256",
+        "cargo_identity_sha256",
+        "rustc_identity_sha256",
+        "guard_config_sha256",
+        "guard_unit_sha256",
+        "python_runtime_authority_sha256",
+    ):
+        _strict_hex(payload[key], f"authorities.{key}")
+    _strict_int(payload["source_file_count"], "authorities.source_file_count", minimum=1)
+    _strict_int(payload["source_byte_count"], "authorities.source_byte_count", minimum=1)
+    tools = payload["tool_authorities"]
+    if not isinstance(tools, dict) or set(tools) != TOOL_NAMES:
+        fail("tool authority closure is malformed")
+    for name, authority in tools.items():
+        _validate_tool_receipt(authority, f"tool_authorities.{name}")
+    return payload
+
+
+def validate_wal(value: object) -> dict[str, Any]:
+    wal = _exact_keys(
+        value,
+        {
+            "schema",
+            "phase",
+            "txid",
+            "mode",
+            "service_bin",
+            "guard_config",
+            "guard_unit",
+            "proc_root",
+            "snapshot_root",
+            "candidate",
+            "prior",
+            "authorities",
+            "manager_job_ids",
+            "committed",
+            "error",
+        },
+        "transaction",
+    )
+    if wal["schema"] != 1 or wal["phase"] not in PHASES:
+        fail("transaction version or phase is unsupported")
+    _strict_hex(wal["txid"], "transaction.txid", length=32)
+    expected_mode = "test-only" if test_only else "production"
+    if wal["mode"] != expected_mode or wal["error"] is not None:
+        fail("transaction mode or error field is unsafe")
+    expected_paths = {
+        "service_bin": service_bin,
+        "guard_config": guard_config,
+        "guard_unit": guard_unit,
+        "proc_root": proc_root,
+    }
+    for key, expected in expected_paths.items():
+        if wal[key] != str(expected) or not _safe_absolute(wal[key]):
+            fail(f"transaction {key} authority differs")
+    snapshot = wal["snapshot_root"]
+    if not isinstance(snapshot, str) or not _safe_absolute(snapshot):
+        fail("transaction snapshot path is unsafe")
+    try:
+        Path(snapshot).relative_to(cache_root)
+    except ValueError:
+        fail("transaction snapshot escaped cache root")
+    if not Path(snapshot).name.startswith(".rebuild-input-"):
+        fail("transaction snapshot name is unsafe")
+    candidate = _exact_keys(wal["candidate"], {"path", "identity"}, "candidate")
+    candidate_path = candidate["path"]
+    if not isinstance(candidate_path, str) or not _safe_absolute(candidate_path):
+        fail("candidate path is unsafe")
+    try:
+        Path(candidate_path).relative_to(cache_root / "releases")
+    except ValueError:
+        fail("candidate escaped release root")
+    candidate["identity"] = _identity_from_payload(candidate["identity"], "candidate.identity")
+    prior = _exact_keys(
+        wal["prior"],
+        {"link_target", "boot_id", "generation", "running_link", "executable", "backup"},
+        "prior",
+    )
+    if prior["link_target"] is not None and (
+        not isinstance(prior["link_target"], str) or not _safe_absolute(prior["link_target"])
+    ):
+        fail("prior link target is unsafe")
+    if (
+        not isinstance(prior["running_link"], str)
+        or not _safe_absolute(prior["running_link"])
+        or not isinstance(prior["boot_id"], str)
+        or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            prior["boot_id"],
+        )
+        is None
+    ):
+        fail("prior runtime authority is malformed")
+    generation, proc_value = _generation_from_payload(prior["generation"], "prior.generation")
+    prior["generation"] = (generation, proc_value)
+    prior["executable"] = _identity_from_payload(prior["executable"], "prior.executable")
+    backup = _exact_keys(prior["backup"], {"path", "identity"}, "prior.backup")
+    expected_backup = receipt_dir / "rollback" / f"{prior['executable'].sha256}.bin"
+    if backup["path"] != str(expected_backup) or not _safe_absolute(backup["path"]):
+        fail("prior backup path is unsafe")
+    backup_identity = _identity_from_payload(
+        backup["identity"], "prior.backup.identity"
+    )
+    if (
+        backup_identity.sha256,
+        backup_identity.build_id,
+        backup_identity.size,
+        backup_identity.uid,
+    ) != (
+        prior["executable"].sha256,
+        prior["executable"].build_id,
+        prior["executable"].size,
+        prior["executable"].uid,
+    ) or backup_identity.mode != 0o700:
+        fail("prior backup identity differs from prior executable")
+    backup["identity"] = backup_identity
+    _validate_authorities(wal["authorities"])
+    jobs = wal["manager_job_ids"]
+    if not isinstance(jobs, list):
+        fail("manager job ledger is malformed")
+    parsed_jobs = [_strict_int(job, "manager job ID", minimum=1) for job in jobs]
+    if len(parsed_jobs) > 32 or len(set(parsed_jobs)) != len(parsed_jobs):
+        fail("manager job ledger is unsafe")
+    wal["manager_job_ids"] = parsed_jobs
+    committed = wal["committed"]
+    if wal["phase"] == "committed":
+        committed_payload = _exact_keys(
+            committed,
+            {"generation", "boot_id", "running_link", "executable"},
+            "committed",
+        )
+        committed_payload["generation"] = _generation_from_payload(
+            committed_payload["generation"], "committed.generation"
+        )
+        committed_payload["executable"] = _identity_from_payload(
+            committed_payload["executable"], "committed.executable"
+        )
+        if (
+            committed_payload["boot_id"] != prior["boot_id"]
+            or committed_payload["running_link"] != candidate_path
+        ):
+            fail("committed runtime authority differs")
+    elif committed is not None:
+        fail("precommit transaction has committed evidence")
+    return wal
+
+
+def load_wal() -> dict[str, Any] | None:
+    transaction = _transaction_dir()
+    try:
+        _secure_directory(transaction)
+    except FileNotFoundError:
+        return None
+    state_path = _state_path()
+    _secure_state_file(state_path)
+    descriptor = os.open(
+        state_path,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        payload = bytearray()
+        while len(payload) <= STATE_MAX_BYTES:
+            chunk = os.read(descriptor, min(65536, STATE_MAX_BYTES + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+    finally:
+        os.close(descriptor)
+    if len(payload) > STATE_MAX_BYTES:
+        fail("transaction state exceeds byte bound")
+    try:
+        value = json.loads(
+            bytes(payload),
+            object_pairs_hook=_reject_duplicate_json,
+            parse_constant=lambda item: fail(f"invalid JSON constant: {item}"),
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise RebuildError("transaction state JSON is malformed") from error
+    return validate_wal(value)
+
+
+def _state_bytes(wal: dict[str, Any]) -> bytes:
+    serializable = _serializable_wal(wal)
+    payload = (
+        json.dumps(serializable, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n"
+    ).encode("ascii")
+    if len(payload) > STATE_MAX_BYTES:
+        fail("transaction state exceeds byte bound")
+    return payload
+
+
+def _serializable_wal(wal: dict[str, Any]) -> dict[str, Any]:
+    def convert(value: Any) -> Any:
+        if isinstance(value, ExecutableIdentity):
+            return _identity_payload(value)
+        if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], Generation):
+            return _generation_payload(value[0], value[1])
+        if isinstance(value, dict):
+            return {key: convert(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [convert(item) for item in value]
+        return value
+
+    return cast(dict[str, Any], convert(wal))
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    written = 0
+    while written < len(payload):
+        count = os.write(descriptor, payload[written:])
+        if count <= 0:
+            raise OSError(errno.EIO, "short state write")
+        written += count
+
+
+def persist_wal(wal: dict[str, Any], *, initial: bool = False) -> None:
+    transaction = _transaction_dir()
+    if initial:
+        try:
+            transaction.mkdir(mode=0o700)
+        except FileExistsError:
+            fail("transaction directory already exists")
+        fsync_directory(receipt_dir)
+    _secure_directory(transaction)
+    payload = _state_bytes(wal)
+    failure = (
+        os.environ.get("LLM_GUARD_REBUILD_TEST_FAIL_RECEIPT_STAGE", "")
+        if test_only and wal["phase"] == "committed"
+        else ""
+    )
+    if failure and failure != "completion-sink":
+        raise RebuildError(f"test-only injected committed-state failure: {failure}")
+    temporary = transaction / f".state.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        _write_all(descriptor, payload)
+        os.fchmod(descriptor, 0o600)
+        metadata = os.fstat(descriptor)
+        if (
+            metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            fail("temporary state file authority is unsafe")
+        os.fsync(descriptor)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, _state_path())
+    _secure_state_file(_state_path())
+    fsync_directory(transaction)
+    fsync_directory(receipt_dir / "rollback")
+    fsync_directory(receipt_dir / "receipts")
+    fsync_directory(receipt_dir)
+
+
+def persist_phase(
+    wal: dict[str, Any], phase: str, *, committed: dict[str, Any] | None = None
+) -> None:
+    if phase not in PHASES:
+        fail("invalid transaction phase")
+    updated = dict(wal)
+    updated["phase"] = phase
+    updated["committed"] = committed
+    persist_wal(updated)
+    wal.clear()
+    wal.update(updated)
+
+
+def _test_boundary(name: str) -> None:
+    if not test_only or os.environ.get("LLM_GUARD_REBUILD_TEST_CRASH_POINT") != name:
+        return
+    marker_text = os.environ.get("LLM_GUARD_REBUILD_TEST_CRASH_MARKER", "")
+    if not marker_text or not _safe_absolute(marker_text):
+        fail("test-only crash boundary lacks a safe marker")
+    marker = Path(marker_text)
+    descriptor = os.open(
+        marker,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        _write_all(descriptor, (name + "\n").encode("ascii"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    fsync_directory(marker.parent)
+    while True:
+        signal.pause()
+
+
+def _make_backup(prestate: Prestate) -> tuple[Path, ExecutableIdentity]:
+    if prestate.descriptor is None:
+        fail("prior executable descriptor is unavailable")
+    rollback_dir = receipt_dir / "rollback"
+    backup = rollback_dir / f"{prestate.executable.sha256}.bin"
+    if backup.exists() or backup.is_symlink():
+        _secure_backup_file(backup)
+        identity = file_identity(backup)
+    else:
+        before = fd_identity(prestate.descriptor)
+        if before != prestate.executable:
+            fail("prior held executable changed before backup")
+        atomic_copy_fd(prestate.descriptor, backup, 0o700)
+        identity = file_identity(backup)
+        if fd_identity(prestate.descriptor) != before:
+            fail("prior held executable changed during backup")
+        fsync_directory(rollback_dir)
+        fsync_directory(receipt_dir)
+    if (
+        identity.sha256 != prestate.executable.sha256
+        or identity.build_id != prestate.executable.build_id
+        or identity.size != prestate.executable.size
+        or identity.mode != 0o700
+        or identity.uid != prestate.executable.uid
+        or identity.nlink != 1
+    ):
+        fail("prior runtime backup proof differs")
+    return backup, identity
+
+
+def _prestate_from_wal(wal: dict[str, Any]) -> Prestate:
+    prior = cast(dict[str, Any], wal["prior"])
+    generation, proc_value = cast(tuple[Generation, int], prior["generation"])
+    return Prestate(
+        cast(str | None, prior["link_target"]),
+        generation,
+        cast(str, prior["boot_id"]),
+        proc_value,
+        None,
+        cast(str, prior["running_link"]),
+        cast(ExecutableIdentity, prior["executable"]),
+    )
+
+
+def _assert_fixed_authorities(wal: dict[str, Any]) -> None:
+    authorities = cast(dict[str, Any], wal["authorities"])
+    if (
+        sha256_file(guard_config) != authorities["guard_config_sha256"]
+        or sha256_file(guard_unit) != authorities["guard_unit_sha256"]
+    ):
+        fail("installed Guard config or unit differs from transaction authority")
+    _verify_all_tools()
+    for name, held in held_tools.items():
+        if held.receipt() != authorities["tool_authorities"][name]:
+            fail(f"held tool differs from transaction authority: {name}")
+
+
+def _matching_jobs() -> list[int]:
+    payload = execute(
+        [
+            require_tool("systemctl"),
+            "--user",
+            "list-jobs",
+            "--output=json",
+        ],
+        capture=True,
+    )
+    if len(payload) > 128 * 1024 or b"\x00" in payload:
+        fail("systemd job list exceeded its bound")
+    try:
+        value = json.loads(payload, object_pairs_hook=_reject_duplicate_json)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise RebuildError("systemd job list is malformed") from error
+    if not isinstance(value, list) or len(value) > 256:
+        fail("systemd job list root is malformed")
+    jobs: list[int] = []
+    for row in value:
+        item = _exact_keys(row, {"job", "unit", "type", "state"}, "systemd job")
+        if item["unit"] != UNIT:
+            continue
+        job = _strict_int(item["job"], "systemd job ID", minimum=1)
+        if not all(isinstance(item[key], str) for key in ("unit", "type", "state")):
+            fail("systemd job fields are malformed")
+        jobs.append(job)
+    if len(set(jobs)) != len(jobs):
+        fail("systemd job list contains duplicates")
+    return sorted(jobs)
+
+
+def _sleep_poll() -> None:
+    deadline = operation_deadline
+    if deadline is None or deadline <= time.monotonic():
+        fail("transaction deadline exhausted while polling")
+    time.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
+
+
+def _record_job(wal: dict[str, Any], job: int) -> None:
+    jobs = cast(list[int], wal["manager_job_ids"])
+    if job not in jobs:
+        updated = dict(wal)
+        updated["manager_job_ids"] = [*jobs, job]
+        persist_wal(updated)
+        wal.clear()
+        wal.update(updated)
+
+
+def prove_no_manager_job() -> None:
+    generation = query_generation(require_running=False)
+    jobs = _matching_jobs()
+    if generation.job is not None or jobs:
+        fail("Guard has a nonterminal manager job")
+
+
+def restart_guard(wal: dict[str, Any], *, boundary: str | None = None) -> int:
+    prove_no_manager_job()
+    execute(
+        [
+            require_tool("systemctl"),
+            "--user",
+            "restart",
+            "--no-block",
+            "--job-mode=fail",
+            "--",
+            UNIT,
+        ]
+    )
+    jobs = _matching_jobs()
+    if len(jobs) != 1:
+        fail("restart did not publish exactly one matching manager job")
+    job = jobs[0]
+    _record_job(wal, job)
+    if boundary is not None:
+        _test_boundary(boundary)
+    while True:
+        current = _matching_jobs()
+        if job not in current:
+            if current:
+                fail("unexpected matching manager job appeared")
+            break
+        if current != [job]:
+            fail("matching manager job identity drifted")
+        _sleep_poll()
+    if query_generation(require_running=False).job is not None:
+        fail("systemd still reports a manager job after restart")
+    return job
+
+
+def cancel_manager_jobs() -> None:
+    jobs = _matching_jobs()
+    for job in jobs:
+        execute(
+            [
+                require_tool("systemctl"),
+                "--user",
+                "cancel",
+                str(job),
+            ]
+        )
+    while True:
+        remaining_jobs = _matching_jobs()
+        if not remaining_jobs:
+            break
+        if any(job not in jobs for job in remaining_jobs):
+            fail("unknown matching manager job appeared during cancellation")
+        _sleep_poll()
+    if query_generation(require_running=False).job is not None:
+        fail("systemd manager job remained after exact cancellation")
 
 
 def health_check() -> None:
@@ -2261,15 +3127,13 @@ def health_check() -> None:
     )
 
 
-def sleep_after_restart() -> None:
-    time.sleep(2)
-
-
 def generation_is_new(before: Generation, after: Generation) -> bool:
     return (
         after.pid != before.pid
         and after.invocation != before.invocation
         and after.started > before.started
+        and after.result == "success"
+        and after.job is None
     )
 
 
@@ -2295,15 +3159,9 @@ def attest_candidate(candidate: Path, expected: ExecutableIdentity) -> RuntimeAt
     descriptor, running_link, executable = open_runtime_executable(
         generation.pid, replacement
     )
-    if executable.sha256 != expected.sha256:
+    if executable != expected:
         os.close(descriptor)
-        fail("running executable SHA-256 does not match candidate")
-    if (executable.device, executable.inode) != (expected.device, expected.inode):
-        os.close(descriptor)
-        fail("running executable inode does not match candidate")
-    if executable.build_id != expected.build_id:
-        os.close(descriptor)
-        fail("running executable build ID does not match candidate")
+        fail("running executable identity does not match candidate")
     if not service_link_matches(str(candidate)):
         os.close(descriptor)
         fail("service symlink does not name candidate")
@@ -2326,186 +3184,334 @@ def final_runtime_attestation(
 ) -> None:
     if query_generation() != accepted.generation:
         fail("systemd generation changed during attestation")
-    if boot_id() != accepted.boot or proc_starttime(accepted.generation.pid) != accepted.proc_start:
+    if (
+        boot_id() != accepted.boot
+        or proc_starttime(accepted.generation.pid) != accepted.proc_start
+    ):
         fail("runtime generation changed during attestation")
     current_proc = os.stat(proc_root / str(accepted.generation.pid) / "exe")
     if not same_object(current_proc, accepted.executable):
         fail("current proc executable no longer names held inode")
     if os.readlink(proc_root / str(accepted.generation.pid) / "exe") != accepted.running_link:
         fail("current proc executable link changed during attestation")
-    held = os.fstat(accepted.descriptor)
-    held_fields = (
-        held.st_dev,
-        held.st_ino,
-        held.st_size,
-        held.st_mtime_ns,
-        held.st_ctime_ns,
-    )
-    expected_fields = (
-        accepted.executable.device,
-        accepted.executable.inode,
-        accepted.executable.size,
-        accepted.executable.mtime_ns,
-        accepted.executable.ctime_ns,
-    )
-    if held_fields != expected_fields:
-        fail("held executable metadata changed during attestation")
-    current_candidate = os.stat(candidate)
-    if (
-        current_candidate.st_dev,
-        current_candidate.st_ino,
-        current_candidate.st_size,
-        current_candidate.st_mtime_ns,
-        current_candidate.st_ctime_ns,
-    ) != expected_fields:
-        fail("candidate executable metadata changed during attestation")
+    if fd_identity(accepted.descriptor) != accepted.executable:
+        fail("held executable changed during attestation")
+    if file_identity(candidate) != expected:
+        fail("candidate executable changed during attestation")
     if not service_link_matches(str(candidate)) or not same_object(
         os.stat(service_bin), expected
     ):
         fail("service symlink changed during attestation")
 
 
-def materialize_runtime_backup(prestate: Prestate) -> Path:
-    backup = (
-        cache_root
-        / "rollback"
-        / f"{prestate.executable.sha256}-{prestate.executable.build_id}"
-        / "llm-guard-proxy"
-    )
-    if backup.exists():
-        require_secure_regular(backup, executable=True)
-        descriptor = os.open(backup, os.O_RDONLY | os.O_CLOEXEC)
-        try:
-            identity = fd_identity(descriptor)
-        finally:
-            os.close(descriptor)
-        if (
-            identity.sha256 != prestate.executable.sha256
-            or identity.build_id != prestate.executable.build_id
-        ):
-            fail("prior runtime backup identity differs")
-    else:
-        atomic_copy_fd(prestate.descriptor, backup, 0o755)
-    return backup
-
-
-def attest_restored_runtime(prestate: Prestate, require_same_inode: bool) -> None:
-    generation = query_generation()
-    if boot_id() != prestate.boot:
-        fail("rollback crossed boot generation")
-    starttime = proc_starttime(generation.pid)
-    if starttime <= 0:
-        fail("rollback proc generation is invalid")
-    descriptor, _, identity = open_runtime_executable(generation.pid)
+def _exact_prior_running(wal: dict[str, Any]) -> bool:
+    prestate = _prestate_from_wal(wal)
+    if not service_link_matches(prestate.link_target) or boot_id() != prestate.boot:
+        return False
     try:
-        if (
-            identity.sha256 != prestate.executable.sha256
-            or identity.build_id != prestate.executable.build_id
-        ):
-            fail("rollback runtime binary differs from prior Guard")
-        if require_same_inode and (
-            identity.device,
-            identity.inode,
-        ) != (prestate.executable.device, prestate.executable.inode):
-            fail("rollback runtime inode differs from prior Guard")
-        current = os.stat(proc_root / str(generation.pid) / "exe")
-        if not same_object(current, identity):
-            fail("rollback proc entry does not name held executable")
+        generation = query_generation()
+    except RebuildError:
+        return False
+    if generation != prestate.generation:
+        return False
+    try:
+        starttime = proc_starttime(generation.pid)
+        descriptor, running_link, identity = open_runtime_executable(generation.pid)
+    except (OSError, RebuildError):
+        return False
+    try:
+        return (
+            starttime == prestate.proc_start
+            and running_link == prestate.running_link
+            and identity == prestate.executable
+            and same_object(os.stat(proc_root / str(generation.pid) / "exe"), identity)
+        )
     finally:
         os.close(descriptor)
 
 
-def rollback(prestate: Prestate, restart_attempted: bool, backup: Path | None) -> None:
+def _remove_backup(wal: dict[str, Any]) -> None:
+    backup = Path(cast(dict[str, Any], wal["prior"])["backup"]["path"])
+    try:
+        metadata = backup.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        fail("rollback backup became unsafe")
+    backup.unlink()
+    fsync_directory(backup.parent)
+    fsync_directory(receipt_dir)
+
+
+def sweep_orphan_backups() -> None:
+    rollback = receipt_dir / "rollback"
+    entries = list(rollback.iterdir())
+    if len(entries) > 64:
+        fail("rollback backup inventory exceeded its bound")
+    for entry in entries:
+        if re.fullmatch(r"[0-9a-f]{64}\.bin", entry.name) is None:
+            fail("rollback directory contains an unknown entry")
+        _secure_backup_file(entry)
+        entry.unlink()
+    if entries:
+        fsync_directory(rollback)
+        fsync_directory(receipt_dir)
+
+
+def cleanup_transaction(wal: dict[str, Any]) -> None:
+    cleanup_snapshot(Path(cast(str, wal["snapshot_root"])))
+    _remove_backup(wal)
+    state_path = _state_path()
+    _secure_state_file(state_path)
+    state_path.unlink()
+    fsync_directory(_transaction_dir())
+    _transaction_dir().rmdir()
+    fsync_directory(receipt_dir)
+
+
+def _wait_fresh_generation(
+    failed_generation: Generation,
+    failed_proc_start: int,
+    prior_generation: Generation,
+    expected_boot: str,
+) -> tuple[Generation, int]:
+    while True:
+        generation = query_generation()
+        starttime = proc_starttime(generation.pid)
+        if (
+            generation_is_new(failed_generation, generation)
+            and generation.started > prior_generation.started
+            and starttime != failed_proc_start
+            and boot_id() == expected_boot
+        ):
+            return generation, starttime
+        _sleep_poll()
+
+
+def rollback_wal(wal: dict[str, Any]) -> None:
     log("ROLLBACK_BEGIN=1")
+    _assert_fixed_authorities(wal)
+    cancel_manager_jobs()
+    prestate = _prestate_from_wal(wal)
+    if _exact_prior_running(wal):
+        health_check()
+        if not _exact_prior_running(wal):
+            fail("exact prior generation drifted during rollback health check")
+        cleanup_transaction(wal)
+        log("ROLLBACK_RESTORED=1")
+        return
+    failed = query_generation(require_running=False)
+    failed_proc = proc_starttime(failed.pid) if failed.pid else 0
     if prestate.link_target is None:
         remove_service_link()
     else:
+        prior_target = Path(prestate.link_target)
+        if file_identity(prior_target) != prestate.executable:
+            fail("prior-present rollback target no longer names exact prior object")
         set_service_link(prestate.link_target)
-    if restart_attempted:
-        if prestate.link_target is None:
-            if backup is None:
-                fail("rollback lacks prior runtime backup")
-            set_service_link(str(backup))
-        restart_guard()
-        sleep_after_restart()
+    if _exact_prior_running(wal):
         health_check()
-        attest_restored_runtime(prestate, prestate.link_target is not None)
-        if prestate.link_target is None:
-            remove_service_link()
+        if not _exact_prior_running(wal):
+            fail("exact prior generation drifted during rollback health check")
+        cleanup_transaction(wal)
+        log("ROLLBACK_RESTORED=1")
+        return
+    backup_record = cast(dict[str, Any], cast(dict[str, Any], wal["prior"])["backup"])
+    backup = Path(cast(str, backup_record["path"]))
+    backup_identity = cast(ExecutableIdentity, backup_record["identity"])
+    if file_identity(backup) != backup_identity:
+        fail("rollback backup identity changed")
+    if prestate.link_target is None:
+        set_service_link(str(backup))
+        expected_object = backup_identity
     else:
-        assert_prestate_unchanged(prestate)
+        expected_object = prestate.executable
+    restart_guard(wal)
+    restored_generation, restored_start = _wait_fresh_generation(
+        failed, failed_proc, prestate.generation, prestate.boot
+    )
+    health_check()
+    descriptor, running_link, identity = open_runtime_executable(restored_generation.pid)
+    try:
+        if identity != expected_object:
+            fail("rollback runtime did not execute the exact prior object")
+        if running_link != (
+            str(backup) if prestate.link_target is None else prestate.running_link
+        ):
+            fail("rollback runtime link differs from exact prior authority")
+        if query_generation() != restored_generation:
+            fail("rollback generation drifted after health")
+        if proc_starttime(restored_generation.pid) != restored_start:
+            fail("rollback proc starttime drifted after health")
+        current = os.stat(proc_root / str(restored_generation.pid) / "exe")
+        if not same_object(current, identity) or fd_identity(descriptor) != identity:
+            fail("rollback held executable proof drifted")
+    finally:
+        os.close(descriptor)
+    if prestate.link_target is None:
+        remove_service_link()
     if not service_link_matches(prestate.link_target):
         fail("rollback did not restore exact prior service link state")
+    cleanup_transaction(wal)
     log("ROLLBACK_RESTORED=1")
 
 
-def publish_receipt(payload: dict[str, object]) -> tuple[Path, str]:
-    ensure_private_directory(receipt_dir)
-    receipt_bytes = (
-        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        + "\n"
-    ).encode("ascii")
-    digest = sha256_bytes(receipt_bytes)
-    final = receipt_dir / f"rebuild-{payload['receipt_id']}.receipt.json"
-    temporary = receipt_dir / f".{final.name}.tmp.{os.getpid()}"
-    failure = (
-        os.environ.get("LLM_GUARD_REBUILD_TEST_FAIL_RECEIPT_STAGE", "")
-        if test_only
-        else ""
-    )
-    descriptor: int | None = None
-    renamed = False
+def _verify_committed(wal: dict[str, Any], *, cancel_jobs: bool = True) -> None:
+    _assert_fixed_authorities(wal)
+    if cancel_jobs:
+        cancel_manager_jobs()
+    else:
+        prove_no_manager_job()
+    committed = cast(dict[str, Any], wal["committed"])
+    generation, proc_value = cast(tuple[Generation, int], committed["generation"])
+    candidate_record = cast(dict[str, Any], wal["candidate"])
+    candidate = Path(cast(str, candidate_record["path"]))
+    expected = cast(ExecutableIdentity, candidate_record["identity"])
+    if (
+        not service_link_matches(str(candidate))
+        or file_identity(candidate) != expected
+        or boot_id() != committed["boot_id"]
+        or query_generation() != generation
+        or proc_starttime(generation.pid) != proc_value
+    ):
+        fail("committed candidate generation cannot be proven")
+    descriptor, running_link, identity = open_runtime_executable(generation.pid)
     try:
-        if failure == "create":
-            raise OSError(errno.EIO, "injected receipt create failure")
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | os.O_CLOEXEC
-            | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-        if failure == "enospc":
-            raise OSError(errno.ENOSPC, "injected receipt ENOSPC")
-        written = 0
-        while written < len(receipt_bytes):
-            if failure == "write":
-                raise OSError(errno.EIO, "injected receipt write failure")
-            written += os.write(descriptor, receipt_bytes[written:])
-        os.fchmod(descriptor, 0o600)
-        if failure == "fsync":
-            raise OSError(errno.EIO, "injected receipt fsync failure")
-        os.fsync(descriptor)
+        if (
+            running_link != committed["running_link"]
+            or identity != expected
+            or fd_identity(descriptor) != expected
+        ):
+            fail("committed executable proof differs")
+        health_check()
+        if query_generation() != generation or proc_starttime(generation.pid) != proc_value:
+            fail("committed generation drifted during recovery")
+    finally:
         os.close(descriptor)
-        descriptor = None
-        if failure == "rename":
-            raise OSError(errno.EIO, "injected receipt rename failure")
-        os.replace(temporary, final)
-        renamed = True
-        directory = os.open(
-            receipt_dir,
-            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-        )
-        try:
-            if failure == "dir-fsync":
-                raise OSError(errno.EIO, "injected receipt directory fsync failure")
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    except BaseException as error:
-        if descriptor is not None:
-            os.close(descriptor)
-        temporary.unlink(missing_ok=True)
-        if renamed:
-            final.unlink(missing_ok=True)
-            try:
-                fsync_directory(receipt_dir)
-            except OSError:
-                pass
-        raise RebuildError(f"durable receipt publication failed: {error}") from error
-    return final, digest
+
+
+def archive_committed(wal: dict[str, Any]) -> tuple[Path, str]:
+    if wal["phase"] != "committed":
+        fail("only committed state may be archived")
+    cleanup_snapshot(Path(cast(str, wal["snapshot_root"])))
+    _remove_backup(wal)
+    receipts = receipt_dir / "receipts"
+    destination = receipts / cast(str, wal["txid"])
+    if destination.exists() or destination.is_symlink():
+        fail("committed receipt destination already exists")
+    os.rename(_transaction_dir(), destination)
+    _secure_directory(destination)
+    state_path = destination / "state.json"
+    _secure_state_file(state_path)
+    fsync_directory(destination)
+    fsync_directory(receipts)
+    fsync_directory(receipt_dir)
+    return state_path, sha256_file(state_path)
+
+
+def recover_stale_transaction(wal: dict[str, Any]) -> None:
+    phase = cast(str, wal["phase"])
+    if phase == "committed":
+        _verify_committed(wal)
+        archive_committed(wal)
+    elif phase == "prestate" and _exact_prior_running(wal):
+        _assert_fixed_authorities(wal)
+        prove_no_manager_job()
+        cleanup_transaction(wal)
+    else:
+        if phase == "prestate":
+            persist_phase(wal, "mutated")
+        rollback_wal(wal)
+    print(
+        f"{RECOVERY_COMPLETE} phase={phase} txid={wal['txid']}",
+        flush=True,
+    )
+
+
+def _build_wal(
+    prestate: Prestate,
+    backup: Path,
+    backup_identity: ExecutableIdentity,
+    snapshot: Path,
+    candidate: Path,
+    candidate_identity: ExecutableIdentity,
+    authorities: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema": 1,
+        "phase": "prestate",
+        "txid": secrets.token_hex(16),
+        "mode": "test-only" if test_only else "production",
+        "service_bin": str(service_bin),
+        "guard_config": str(guard_config),
+        "guard_unit": str(guard_unit),
+        "proc_root": str(proc_root),
+        "snapshot_root": str(snapshot),
+        "candidate": {
+            "path": str(candidate),
+            "identity": candidate_identity,
+        },
+        "prior": {
+            "link_target": prestate.link_target,
+            "boot_id": prestate.boot,
+            "generation": (prestate.generation, prestate.proc_start),
+            "running_link": prestate.running_link,
+            "executable": prestate.executable,
+            "backup": {
+                "path": str(backup),
+                "identity": backup_identity,
+            },
+        },
+        "authorities": authorities,
+        "manager_job_ids": [],
+        "committed": None,
+        "error": None,
+    }
+
+
+def _test_deadline(name: str, default: float) -> float:
+    if not test_only:
+        return default
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    if re.fullmatch(r"[1-9][0-9]*(?:\.[0-9]+)?", value) is None:
+        fail(f"invalid test-only deadline: {name}")
+    parsed = float(value)
+    if not 0.5 <= parsed <= default:
+        fail(f"test-only deadline outside bound: {name}")
+    return parsed
+
+
+def final_commit_bracket(
+    source: SourceBundle,
+    accepted: RuntimeAttestation,
+    candidate: Path,
+    candidate_identity: ExecutableIdentity,
+    config_sha256: str,
+    unit_sha256: str,
+    cargo_identity: bytes,
+    rustc_identity: bytes,
+) -> None:
+    source.verify()
+    if (
+        config_sha256 != sha256_file(guard_config)
+        or unit_sha256 != sha256_file(guard_unit)
+    ):
+        fail("installed Guard config or unit changed before publication")
+    if cargo_identity != capture_tool("cargo", "--version", "--verbose"):
+        fail("Cargo toolchain identity changed before publication")
+    if rustc_identity != capture_tool("rustc", "-vV"):
+        fail("rustc toolchain identity changed before publication")
+    _verify_all_tools()
+    final_runtime_attestation(accepted, candidate, candidate_identity)
+    prove_no_manager_job()
 
 
 def signal_handler(signum: int, _frame: object) -> None:
@@ -2516,198 +3522,234 @@ for caught_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
     signal.signal(caught_signal, signal_handler)
 
 
-snapshot_root: Path | None = None
-source_bundle: SourceBundle | None = None
-prestate: Prestate | None = None
-accepted: RuntimeAttestation | None = None
-rollback_armed = False
-restart_attempted = False
-runtime_backup: Path | None = None
-published_receipt: Path | None = None
-try:
-    _open_all_tools()
-    require_secure_regular(guard_config)
-    require_secure_regular(guard_unit)
-    config_sha_initial = sha256_file(guard_config)
-    unit_sha_initial = sha256_file(guard_unit)
-    cargo_identity_initial = capture_tool("cargo", "--version", "--verbose")
-    rustc_identity_initial = capture_tool("rustc", "-vV")
-    _validate_reviewed_tool_versions(cargo_identity_initial, rustc_identity_initial)
-    cargo_identity_sha = sha256_bytes(cargo_identity_initial)
-    rustc_identity_sha = sha256_bytes(rustc_identity_initial)
+def run_transaction() -> int:
+    global operation_deadline, rollback_logging
 
-    prestate = snapshot_prestate()
+    lock_descriptor: int | None = None
+    snapshot_root: Path | None = None
+    source_bundle: SourceBundle | None = None
+    prestate: Prestate | None = None
+    accepted: RuntimeAttestation | None = None
+    wal: dict[str, Any] | None = None
+    lock_acquired = False
+    try:
+        lock_descriptor = acquire_rebuild_lock()
+        lock_acquired = True
+        operation_deadline = time.monotonic() + _test_deadline(
+            "LLM_GUARD_REBUILD_TEST_FORWARD_SECONDS", FORWARD_SECONDS
+        )
+        stale = load_wal()
+        if stale is not None:
+            _open_all_tools()
+            operation_deadline = time.monotonic() + _test_deadline(
+                "LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS", RECOVERY_SECONDS
+            )
+            recover_stale_transaction(stale)
+            return 75
 
-    ensure_private_directory(cache_root)
-    snapshot_root = Path(tempfile.mkdtemp(prefix=".rebuild-input-", dir=cache_root))
-    snapshot_root.chmod(0o700)
-    source_bundle = prepare_canonical_source(snapshot_root)
-    build_bundle = build_sandboxed_candidate(source_bundle)
-    source_commit = source_bundle.commit
-    source_tree = source_bundle.tree
-    source_archive_sha = source_bundle.archive_sha256
-    snapshot_content_sha = source_bundle.tree_ledger_sha256
-    candidate = build_bundle.candidate
-    candidate_identity = build_bundle.identity
-    source_bundle.verify()
+        sweep_orphan_backups()
+        _open_all_tools()
+        require_secure_regular(guard_config)
+        require_secure_regular(guard_unit)
+        config_sha_initial = sha256_file(guard_config)
+        unit_sha_initial = sha256_file(guard_unit)
+        cargo_identity_initial = capture_tool("cargo", "--version", "--verbose")
+        rustc_identity_initial = capture_tool("rustc", "-vV")
+        _validate_reviewed_tool_versions(cargo_identity_initial, rustc_identity_initial)
+        cargo_identity_sha = sha256_bytes(cargo_identity_initial)
+        rustc_identity_sha = sha256_bytes(rustc_identity_initial)
 
-    assert_prestate_unchanged(prestate)
-    if config_sha_initial != sha256_file(guard_config) or unit_sha_initial != sha256_file(guard_unit):
-        fail("installed Guard config or unit changed before cutover")
-    if cargo_identity_initial != capture_tool("cargo", "--version", "--verbose"):
-        fail("Cargo toolchain identity changed before cutover")
-    if rustc_identity_initial != capture_tool("rustc", "-vV"):
-        fail("rustc toolchain identity changed before cutover")
-
-    rollback_armed = True
-    if not service_link_matches(str(candidate)):
-        set_service_link(str(candidate))
-    needs_restart = (
-        prestate.executable.device,
-        prestate.executable.inode,
-    ) != (candidate_identity.device, candidate_identity.inode)
-    if needs_restart:
-        require_tool("curl")
-        if prestate.link_target is None:
-            runtime_backup = materialize_runtime_backup(prestate)
-        restart_attempted = True
-        restart_guard()
-        sleep_after_restart()
-        restarted_generation = query_generation()
-        restarted_start = proc_starttime(restarted_generation.pid)
+        prestate = snapshot_prestate()
+        prove_no_manager_job()
+        ensure_private_directory(cache_root)
+        snapshot_root = Path(tempfile.mkdtemp(prefix=".rebuild-input-", dir=cache_root))
+        snapshot_root.chmod(0o700)
+        source_bundle = prepare_canonical_source(snapshot_root)
+        build_bundle = build_sandboxed_candidate(source_bundle)
+        candidate = build_bundle.candidate
+        candidate_identity = build_bundle.identity
+        source_bundle.verify()
+        assert_prestate_unchanged(prestate)
+        prove_no_manager_job()
         if (
-            not generation_is_new(prestate.generation, restarted_generation)
-            or restarted_start == prestate.proc_start
-            or boot_id() != prestate.boot
+            config_sha_initial != sha256_file(guard_config)
+            or unit_sha_initial != sha256_file(guard_unit)
         ):
-            fail("proxy restart did not create a new runtime generation")
-        health_check()
-    accepted = attest_candidate(candidate, candidate_identity)
-    if needs_restart and (
-        accepted.generation != restarted_generation
-        or accepted.proc_start != restarted_start
-        or accepted.boot != prestate.boot
-    ):
-        fail("systemd generation changed during health check")
-    if needs_restart and not generation_is_new(
-        prestate.generation, accepted.generation
-    ):
-        fail("accepted candidate lacks a new systemd generation")
-    if not needs_restart and (
-        accepted.generation != prestate.generation
-        or accepted.proc_start != prestate.proc_start
-        or accepted.boot != prestate.boot
-    ):
-        fail("unchanged candidate runtime generation drifted")
+            fail("installed Guard config or unit changed before cutover")
+        if cargo_identity_initial != capture_tool("cargo", "--version", "--verbose"):
+            fail("Cargo toolchain identity changed before cutover")
+        if rustc_identity_initial != capture_tool("rustc", "-vV"):
+            fail("rustc toolchain identity changed before cutover")
 
-    source_bundle.verify()
-    if config_sha_initial != sha256_file(guard_config) or unit_sha_initial != sha256_file(guard_unit):
-        fail("installed Guard config or unit changed before publication")
-    if cargo_identity_initial != capture_tool("cargo", "--version", "--verbose"):
-        fail("Cargo toolchain identity changed before publication")
-    if rustc_identity_initial != capture_tool("rustc", "-vV"):
-        fail("rustc toolchain identity changed before publication")
-    final_runtime_attestation(accepted, candidate, candidate_identity)
-
-    receipt_id = secrets.token_hex(16)
-    receipt_payload: dict[str, object] = {
-        "schema": 2,
-        "mode": "test-only" if test_only else "production",
-        "receipt_id": receipt_id,
-        "canonical_source_url": source_repo,
-        "canonical_source_ref": source_ref,
-        "source_commit": source_commit,
-        "source_tree": source_tree,
-        "source_archive_sha256": source_archive_sha,
-        "snapshot_content_sha256": snapshot_content_sha,
-        "source_file_count": source_bundle.file_count,
-        "source_byte_count": source_bundle.byte_count,
-        "git_config_sha256": source_bundle.config_sha256,
-        "metadata_closure_sha256": build_bundle.metadata_closure_sha256,
-        "sandbox_contract_sha256": build_bundle.sandbox_contract_sha256,
-        "build_inputs": build_bundle.inputs,
-        "tool_authorities": {
+        backup, backup_identity = _make_backup(prestate)
+        tool_receipts = {
             name: held.receipt() for name, held in sorted(held_tools.items())
-        },
-        "python_runtime_authority": _runtime_python_authority(),
-        "cargo_identity_sha256": cargo_identity_sha,
-        "rustc_identity_sha256": rustc_identity_sha,
-        "guard_config_sha256": config_sha_initial,
-        "guard_unit_sha256": unit_sha_initial,
-        "binary_sha256": candidate_identity.sha256,
-        "binary_size": candidate_identity.size,
-        "elf_build_id": candidate_identity.build_id,
-        "binary_device": candidate_identity.device,
-        "binary_inode": candidate_identity.inode,
-        "boot_id": accepted.boot,
-        "main_pid": accepted.generation.pid,
-        "invocation_id": accepted.generation.invocation,
-        "systemd_start_monotonic": accepted.generation.started,
-        "proc_starttime": accepted.proc_start,
-    }
-    published_receipt, receipt_digest = publish_receipt(receipt_payload)
-    if config_sha_initial != sha256_file(guard_config) or unit_sha_initial != sha256_file(guard_unit):
-        fail("installed Guard config or unit changed at publication")
-    if cargo_identity_initial != capture_tool("cargo", "--version", "--verbose"):
-        fail("Cargo toolchain identity changed at publication")
-    if rustc_identity_initial != capture_tool("rustc", "-vV"):
-        fail("rustc toolchain identity changed at publication")
-    source_bundle.verify()
-    _verify_all_tools()
-    final_runtime_attestation(accepted, candidate, candidate_identity)
-    if (
-        test_only
-        and os.environ.get("LLM_GUARD_REBUILD_TEST_FAIL_RECEIPT_STAGE")
-        == "completion-sink"
-    ):
-        os.close(sys.stdout.fileno())
-    marker = TEST_COMPLETE if test_only else PRODUCTION_COMPLETE
-    print(
-        f"{marker} receipt_sha256={receipt_digest} receipt={published_receipt}",
-        flush=True,
-    )
-    rollback_armed = False
-except Exception as error:  # noqa: BLE001 - every late failure must roll back.
-    rollback_logging = True
-    rollback_error: Exception | None = None
-    if rollback_armed and prestate is not None:
-        previous_handlers = {
-            signum: signal.signal(signum, signal.SIG_IGN)
-            for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
         }
-        receipt_cleanup_error: Exception | None = None
-        if published_receipt is not None:
+        authorities: dict[str, Any] = {
+            "canonical_source_url": source_repo,
+            "canonical_source_ref": source_ref,
+            "source_commit": source_bundle.commit,
+            "source_tree": source_bundle.tree,
+            "source_archive_sha256": source_bundle.archive_sha256,
+            "snapshot_content_sha256": source_bundle.tree_ledger_sha256,
+            "source_file_count": source_bundle.file_count,
+            "source_byte_count": source_bundle.byte_count,
+            "git_config_sha256": source_bundle.config_sha256,
+            "metadata_closure_sha256": build_bundle.metadata_closure_sha256,
+            "sandbox_contract_sha256": build_bundle.sandbox_contract_sha256,
+            "build_inputs_sha256": sha256_bytes(
+                json.dumps(
+                    build_bundle.inputs,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("ascii")
+            ),
+            "cargo_identity_sha256": cargo_identity_sha,
+            "rustc_identity_sha256": rustc_identity_sha,
+            "guard_config_sha256": config_sha_initial,
+            "guard_unit_sha256": unit_sha_initial,
+            "tool_authorities": tool_receipts,
+            "python_runtime_authority_sha256": sha256_bytes(
+                json.dumps(
+                    _runtime_python_authority(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("ascii")
+            ),
+        }
+        wal = _build_wal(
+            prestate,
+            backup,
+            backup_identity,
+            snapshot_root,
+            candidate,
+            candidate_identity,
+            authorities,
+        )
+        persist_wal(wal, initial=True)
+        _test_boundary("prestate-fsynced")
+        persist_phase(wal, "mutated")
+        _test_boundary("mutated-fsynced")
+
+        if not service_link_matches(str(candidate)):
+            set_service_link(str(candidate))
+        _test_boundary("link-renamed")
+        needs_restart = (
+            prestate.executable.device,
+            prestate.executable.inode,
+        ) != (candidate_identity.device, candidate_identity.inode)
+        restarted_generation: Generation | None = None
+        restarted_start = 0
+        if needs_restart:
+            restart_guard(wal, boundary="forward-job")
+            restarted_generation = query_generation()
+            restarted_start = proc_starttime(restarted_generation.pid)
+            if (
+                not generation_is_new(prestate.generation, restarted_generation)
+                or restarted_start == prestate.proc_start
+                or boot_id() != prestate.boot
+            ):
+                fail("proxy restart did not create a new runtime generation")
+        health_check()
+        accepted = attest_candidate(candidate, candidate_identity)
+        if needs_restart and (
+            accepted.generation != restarted_generation
+            or accepted.proc_start != restarted_start
+            or accepted.boot != prestate.boot
+        ):
+            fail("systemd generation changed during health check")
+        if not needs_restart and (
+            accepted.generation != prestate.generation
+            or accepted.proc_start != prestate.proc_start
+            or accepted.boot != prestate.boot
+        ):
+            fail("unchanged candidate runtime generation drifted")
+
+        final_commit_bracket(
+            source_bundle,
+            accepted,
+            candidate,
+            candidate_identity,
+            config_sha_initial,
+            unit_sha_initial,
+            cargo_identity_initial,
+            rustc_identity_initial,
+        )
+        _test_boundary("candidate-attested")
+        final_commit_bracket(
+            source_bundle,
+            accepted,
+            candidate,
+            candidate_identity,
+            config_sha_initial,
+            unit_sha_initial,
+            cargo_identity_initial,
+            rustc_identity_initial,
+        )
+        committed = {
+            "generation": (accepted.generation, accepted.proc_start),
+            "boot_id": accepted.boot,
+            "running_link": accepted.running_link,
+            "executable": accepted.executable,
+        }
+        persist_phase(wal, "committed", committed=committed)
+        _test_boundary("committed-fsynced")
+        _, receipt_digest = archive_committed(wal)
+        _verify_committed(wal, cancel_jobs=False)
+        if (
+            test_only
+            and os.environ.get("LLM_GUARD_REBUILD_TEST_FAIL_RECEIPT_STAGE")
+            == "completion-sink"
+        ):
+            raise OSError(errno.EPIPE, "test-only completion sink failure")
+        marker = TEST_COMPLETE if test_only else PRODUCTION_COMPLETE
+        print(f"{marker} receipt_sha256={receipt_digest}", flush=True)
+        return 0
+    except Exception as error:  # noqa: BLE001 - transaction boundary is fail-closed.
+        rollback_logging = True
+        rollback_error: Exception | None = None
+        if lock_acquired and wal is not None and wal.get("phase") != "committed":
+            operation_deadline = time.monotonic() + _test_deadline(
+                "LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS", RECOVERY_SECONDS
+            )
+            previous_handlers = {
+                signum: signal.signal(signum, signal.SIG_IGN)
+                for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+            }
             try:
-                published_receipt.unlink(missing_ok=True)
-                fsync_directory(published_receipt.parent)
-            except Exception as failure:  # noqa: BLE001 - still attempt rollback.
-                receipt_cleanup_error = failure
+                rollback_wal(wal)
+            except Exception as failure:  # noqa: BLE001 - retain WAL and report.
+                rollback_error = failure
+            finally:
+                for signum, handler in previous_handlers.items():
+                    signal.signal(signum, handler)
         try:
-            rollback(prestate, restart_attempted, runtime_backup)
-        except Exception as failure:  # noqa: BLE001 - report failed rollback.
-            rollback_error = failure
-        if receipt_cleanup_error is not None:
-            if rollback_error is None:
-                rollback_error = receipt_cleanup_error
-            else:
-                rollback_error = RebuildError(
-                    f"receipt cleanup failed: {receipt_cleanup_error}; "
-                    f"runtime rollback failed: {rollback_error}"
+            print(f"ERROR: {error}", file=sys.stderr, flush=True)
+            if rollback_error is not None:
+                print(
+                    f"ERROR: rollback blocked; transaction retained: {rollback_error}",
+                    file=sys.stderr,
+                    flush=True,
                 )
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
-    print(f"ERROR: {error}", file=sys.stderr, flush=True)
-    if rollback_error is not None:
-        print(f"ERROR: rollback failed: {rollback_error}", file=sys.stderr, flush=True)
-    raise SystemExit(1)
-finally:
-    if accepted is not None:
-        os.close(accepted.descriptor)
-    if prestate is not None:
-        os.close(prestate.descriptor)
-    if source_bundle is not None:
-        source_bundle.close()
-    cleanup_snapshot(snapshot_root)
-    for held in reversed(list(held_tools.values())):
-        held.close()
-    held_tools.clear()
+        except OSError:
+            pass
+        return 1
+    finally:
+        if accepted is not None:
+            os.close(accepted.descriptor)
+        if prestate is not None and prestate.descriptor is not None:
+            os.close(prestate.descriptor)
+        if source_bundle is not None:
+            source_bundle.close()
+        cleanup_snapshot(snapshot_root)
+        for held in reversed(list(held_tools.values())):
+            held.close()
+        held_tools.clear()
+        operation_deadline = None
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+
+
+raise SystemExit(run_transaction())

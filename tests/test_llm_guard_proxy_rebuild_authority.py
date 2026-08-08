@@ -97,12 +97,14 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             second = fixture.run()
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
             self.assertFalse(hook_marker.exists())
-            receipts = sorted(fixture.receipt_dir.glob("*.receipt.json"))
+            receipts = fixture.receipt_paths()
             self.assertEqual(len(receipts), 2)
             receipt = json.loads(receipts[-1].read_text())
-            self.assertEqual(receipt["source_commit"], fixture.source_commit)
             self.assertEqual(
-                receipt["canonical_source_url"],
+                receipt["authorities"]["source_commit"], fixture.source_commit
+            )
+            self.assertEqual(
+                receipt["authorities"]["canonical_source_url"],
                 str(fixture.remote),
             )
 
@@ -180,9 +182,13 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertFalse(marker.exists())
-            receipt = json.loads(next(fixture.receipt_dir.glob("*.receipt.json")).read_text())
-            self.assertEqual(receipt["source_commit"], fixture.source_commit)
-            self.assertEqual(receipt["binary_sha256"], fixture.binary_sha256)
+            receipt = json.loads(fixture.receipt_paths()[0].read_text())
+            self.assertEqual(
+                receipt["authorities"]["source_commit"], fixture.source_commit
+            )
+            self.assertEqual(
+                receipt["candidate"]["identity"]["sha256"], fixture.binary_sha256
+            )
 
     def test_held_bwrap_swap_and_source_mount_rename_fail_pre_cutover(self) -> None:
         for state_key, diagnostic in (
@@ -210,8 +216,8 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             self._refresh_fixture_source_identity(fixture)
             result = fixture.run()
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            receipt = json.loads(next(fixture.receipt_dir.glob("*.receipt.json")).read_text())
-            self.assertEqual(receipt["binary_sha256"], false_sha)
+            receipt = json.loads(fixture.receipt_paths()[0].read_text())
+            self.assertEqual(receipt["candidate"]["identity"]["sha256"], false_sha)
 
     def test_unsafe_raw_artifact_objects_fail_before_adoption(self) -> None:
         for artifact_mode in (

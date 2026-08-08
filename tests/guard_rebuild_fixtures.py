@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from typing import Self
@@ -51,6 +54,8 @@ class RebuildFixture:
         self.guard_unit = self.root / "systemd" / "llm-guard-proxy.service"
         self.proc_root = self.root / "proc"
         self.receipt_dir = self.root / "receipts"
+        self.crash_marker = self.root / "crash.marker"
+        self.descendant_pids = self.root / "descendants.pid"
         self.state_path = self.root / "state.json"
         self.tool_log = self.root / "tools.log"
         self.prior = self.root / "prior-llm-guard-proxy"
@@ -106,14 +111,22 @@ class RebuildFixture:
             "restart_failures": 0,
             "health_failures": 0,
             "health_generation_drift": False,
-            "show_calls": 0,
+            "health_passed": False,
             "candidate_restart_mode": "exact",
-            "drift_on_show": 0,
+            "drift_after": "",
             "drift_kind": "",
+            "drifted": False,
+            "publication_job_checks": 0,
             "mutate_source_during_cargo": False,
             "replace_bwrap_during_use": False,
             "rename_source_mount": False,
             "artifact_mode": "",
+            "jobs": {},
+            "next_job_id": 41,
+            "job_behavior": "normal",
+            "job_polls_remaining": 1,
+            "restart_noop_after": 0,
+            "hang_restart_calls": [],
         }
         self.save_state()
         self._write_proc()
@@ -139,6 +152,7 @@ class RebuildFixture:
             "SOURCE_REPO": str(self.remote),
             "EXPECTED_CANDIDATE": str(self.candidate),
             "TZ": "UTC",
+            "GUARD_TEST_DESCENDANT_PIDS": str(self.descendant_pids),
         }
         self.env["LLM_GUARD_REBUILD_TEST_CONFIG"] = str(self.authority_config)
         self._write_authority_config()
@@ -147,7 +161,38 @@ class RebuildFixture:
         return self
 
     def __exit__(self, *_: object) -> None:
-        self.temp.cleanup()
+        try:
+            self._cleanup_recorded_descendants()
+        finally:
+            self.temp.cleanup()
+
+    def _cleanup_recorded_descendants(self) -> None:
+        if not self.descendant_pids.exists():
+            return
+        root = str(self.root).encode()
+        pids = {
+            int(line)
+            for line in self.descendant_pids.read_text().splitlines()
+            if line.isdigit()
+        }
+        owned: set[int] = set()
+        for pid in pids:
+            try:
+                command = Path(f"/proc/{pid}/cmdline").read_bytes()
+            except OSError:
+                continue
+            if root not in command:
+                continue
+            owned.add(pid)
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + 2
+        while owned and time.monotonic() < deadline:
+            owned = {pid for pid in owned if Path(f"/proc/{pid}").exists()}
+            if owned:
+                time.sleep(0.01)
 
     def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
         env = {
@@ -221,6 +266,163 @@ class RebuildFixture:
         shutil.copyfile(self.build_source, self.candidate)
         self.candidate.chmod(0o755)
 
+    @staticmethod
+    def _build_id(path: Path) -> str:
+        output = subprocess.run(
+            ["/usr/bin/x86_64-linux-gnu-readelf", "-n", "--", str(path)],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout
+        matches = re.findall(r"(?m)^\s*Build ID:\s*([0-9A-Fa-f]+)\s*$", output)
+        if len(matches) != 1:
+            raise AssertionError(f"fixture ELF build ID unavailable: {path}")
+        return matches[0].lower()
+
+    @classmethod
+    def _identity(cls, path: Path) -> dict[str, object]:
+        info = path.stat()
+        return {
+            "device": info.st_dev,
+            "inode": info.st_ino,
+            "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns,
+            "ctime_ns": info.st_ctime_ns,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "build_id": cls._build_id(path),
+            "mode": stat.S_IMODE(info.st_mode),
+            "uid": info.st_uid,
+            "nlink": info.st_nlink,
+        }
+
+    def use_prior_bytes_for_candidate(self) -> None:
+        self.build_source = self.prior
+        self.binary_sha256 = hashlib.sha256(self.prior.read_bytes()).hexdigest()
+        self.candidate = (
+            self.cache_root
+            / "releases"
+            / f"{self.source_commit}-{self.binary_sha256}"
+            / "llm-guard-proxy"
+        )
+        self.env["FIXTURE_BUILD_SOURCE"] = str(self.prior)
+        self.env["EXPECTED_CANDIDATE"] = str(self.candidate)
+
+    def write_wal(self, phase: str, *, mutate: bool = False) -> Path:
+        """Create one future-schema WAL for actual-script recovery RED controls."""
+
+        state_root = self.receipt_dir
+        transaction = state_root / "transaction.v1"
+        rollback = state_root / "rollback"
+        receipts = state_root / "receipts"
+        for directory in (state_root, transaction, rollback, receipts):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            directory.chmod(0o700)
+        self.ensure_candidate()
+        prior_identity = self._identity(self.prior)
+        backup = rollback / f"{prior_identity['sha256']}.bin"
+        shutil.copyfile(self.prior, backup)
+        backup.chmod(0o700)
+        tool_authorities: dict[str, dict[str, object]] = {}
+        config = json.loads(self.authority_config.read_text())
+        for name, spec in config["tools"].items():
+            info = Path(spec["logical"]).stat(follow_symlinks=False)
+            tool_authorities[name] = {
+                "logical_path": spec["logical"],
+                "resolved_path": spec["resolved"],
+                "expected_uid": spec["uid"],
+                "expected_gid": spec["gid"],
+                "expected_mode": spec["mode"],
+                "device": info.st_dev,
+                "inode": info.st_ino,
+                "size": info.st_size,
+                "nlink": info.st_nlink,
+                "mtime_ns": info.st_mtime_ns,
+                "ctime_ns": info.st_ctime_ns,
+                "sha256": hashlib.sha256(Path(spec["logical"]).read_bytes()).hexdigest(),
+            }
+        payload = {
+            "schema": 1,
+            "phase": phase,
+            "txid": "a" * 32,
+            "mode": "test-only",
+            "service_bin": str(self.service_bin),
+            "guard_config": str(self.guard_config),
+            "guard_unit": str(self.guard_unit),
+            "proc_root": str(self.proc_root),
+            "snapshot_root": str(self.cache_root / ".rebuild-input-stale"),
+            "candidate": {
+                "path": str(self.candidate),
+                "identity": self._identity(self.candidate),
+            },
+            "prior": {
+                "link_target": str(self.prior),
+                "boot_id": "12345678-1234-4abc-8def-1234567890ab",
+                "generation": {
+                    "pid": 4242,
+                    "invocation": "1" * 32,
+                    "started": 1000,
+                    "proc_start": 2000,
+                    "fragment": str(self.guard_unit),
+                    "result": "success",
+                    "job": None,
+                },
+                "running_link": str(self.prior),
+                "executable": prior_identity,
+                "backup": {
+                    "path": str(backup),
+                    "identity": self._identity(backup),
+                },
+            },
+            "authorities": {
+                "canonical_source_url": str(self.remote),
+                "canonical_source_ref": "refs/heads/main",
+                "source_commit": self.source_commit,
+                "source_tree": self.source_tree,
+                "source_archive_sha256": "3" * 64,
+                "snapshot_content_sha256": "4" * 64,
+                "source_file_count": 1,
+                "source_byte_count": 1,
+                "git_config_sha256": "5" * 64,
+                "metadata_closure_sha256": "6" * 64,
+                "sandbox_contract_sha256": "7" * 64,
+                "build_inputs_sha256": "8" * 64,
+                "cargo_identity_sha256": "9" * 64,
+                "rustc_identity_sha256": "a" * 64,
+                "guard_config_sha256": hashlib.sha256(self.guard_config.read_bytes()).hexdigest(),
+                "guard_unit_sha256": hashlib.sha256(self.guard_unit.read_bytes()).hexdigest(),
+                "tool_authorities": tool_authorities,
+                "python_runtime_authority_sha256": "b" * 64,
+            },
+            "manager_job_ids": [],
+            "committed": None,
+            "error": None,
+        }
+        state_path = transaction / "state.json"
+        state_path.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        state_path.chmod(0o600)
+        if mutate:
+            self.service_bin.unlink(missing_ok=True)
+            self.service_bin.symlink_to(self.candidate)
+            self.set_state(
+                pid=4243,
+                invocation="2" * 32,
+                systemd_start=1100,
+                proc_start=2100,
+                running_target=str(self.candidate),
+            )
+        return state_path
+
+    def hold_rebuild_lock(self) -> tuple[int, Path]:
+        self.receipt_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.receipt_dir.chmod(0o700)
+        lock = self.receipt_dir / "lock.v1"
+        descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return descriptor, lock
+
     def set_prior_absent_with_candidate_runtime(self) -> None:
         self.ensure_candidate()
         self.service_bin.unlink()
@@ -236,7 +438,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import subprocess
 import sys
+import time
 
 name = "__TOOL_NAME__"
 args = sys.argv[1:]
@@ -273,6 +478,24 @@ def activate(target):
     state["sub"] = "running"
     state["running_target"] = str(target)
     write_proc(target)
+    save()
+
+def drift():
+    kind = state.get("drift_kind")
+    if kind == "invocation":
+        state["invocation"] = "e" * 32
+    elif kind == "pid":
+        state["pid"] += 1
+        state["proc_start"] += 1
+        write_proc(state["running_target"])
+    elif kind == "starttime":
+        state["systemd_start"] += 1
+    elif kind == "pid-reuse":
+        state["proc_start"] += 1
+        write_proc(state["running_target"])
+    else:
+        raise SystemExit(96)
+    state["drifted"] = True
     save()
 
 if name == "cargo":
@@ -394,19 +617,6 @@ elif name == "systemctl":
     if joined == "--user show -p MainPID --value llm-guard-proxy.service":
         print(state["pid"] if state["active"] else 0)
     elif " show " in f" {joined} " or joined.startswith("--user show "):
-        state["show_calls"] += 1
-        if state.get("drift_on_show") == state["show_calls"]:
-            kind = state.get("drift_kind")
-            if kind == "invocation":
-                state["invocation"] = "e" * 32
-            elif kind == "pid":
-                state["pid"] += 1
-                state["proc_start"] += 1
-                write_proc(state["running_target"])
-            elif kind in {"starttime", "pid-reuse"}:
-                state["proc_start"] += 1
-                write_proc(state["running_target"])
-        save()
         values = {
             "LoadState": "loaded",
             "ActiveState": "active" if state["active"] else "inactive",
@@ -418,14 +628,68 @@ elif name == "systemctl":
             "ExecMainStartTimestampMonotonic": str(
                 state["systemd_start"] if state["active"] else 0
             ),
+            "ActiveEnterTimestampMonotonic": str(
+                state["systemd_start"] if state["active"] else 0
+            ),
+            "Result": "success" if state["active"] else "exit-code",
+            "Job": next(iter(state.get("jobs", {})), ""),
         }
-        for key in (
-            "LoadState", "ActiveState", "SubState", "FragmentPath",
-            "DropInPaths", "MainPID", "InvocationID",
-            "ExecMainStartTimestampMonotonic",
-        ):
+        requested = [
+            argument.split("=", 1)[1]
+            for argument in args
+            if argument.startswith("--property=")
+        ]
+        for key in requested:
             print(f"{key}={values[key]}")
-    elif joined == "--user restart llm-guard-proxy.service":
+        if (
+            state.get("drift_after") == "candidate-attestation"
+            and state.get("health_passed")
+            and not state.get("drifted")
+        ):
+            drift()
+    elif joined == "--user list-jobs --output=json":
+        jobs = state.get("jobs", {})
+        output = [
+            {
+                "job": int(job_id),
+                "unit": "llm-guard-proxy.service",
+                "type": "restart",
+                "state": "running",
+            }
+            for job_id in sorted(jobs, key=int)
+        ]
+        print(json.dumps(output, separators=(",", ":")))
+        if jobs and state.get("job_behavior") == "normal":
+            remaining = int(state.get("job_polls_remaining", 1)) - 1
+            state["job_polls_remaining"] = remaining
+            if remaining <= 0:
+                job_id, target = next(iter(jobs.items()))
+                noop_after = int(state.get("restart_noop_after", 0))
+                if not noop_after or state["restart_calls"] <= noop_after:
+                    activate(target)
+                state["jobs"].pop(job_id, None)
+                state["job_polls_remaining"] = 1
+        if state.get("health_passed"):
+            state["publication_job_checks"] += 1
+        save()
+        expected_check = {
+            "first-publication-bracket": 1,
+            "second-publication-bracket": 2,
+        }.get(state.get("drift_after"))
+        if (
+            expected_check == state.get("publication_job_checks")
+            and not state.get("drifted")
+        ):
+            drift()
+    elif joined.startswith("--user cancel "):
+        job_id = args[-1]
+        if state.get("job_behavior") != "cancel-still-present":
+            state.get("jobs", {}).pop(job_id, None)
+        save()
+    elif joined in {
+        "--user restart llm-guard-proxy.service",
+        "--user restart --no-block --job-mode=fail -- llm-guard-proxy.service",
+    }:
         state["restart_calls"] += 1
         link = Path(os.environ["SERVICE_BIN"])
         target = Path(os.readlink(link))
@@ -437,7 +701,40 @@ elif name == "systemctl":
                 target = Path(os.environ["WRONG_HASH_TARGET"])
             elif mode == "same-hash-different-inode":
                 target = Path(os.environ["SAME_HASH_TARGET"])
-        activate(target)
+        if state["restart_calls"] in state.get("hang_restart_calls", []):
+            pid_path = Path(os.environ["GUARD_TEST_DESCENDANT_PIDS"])
+            with pid_path.open("a") as stream:
+                stream.write(str(os.getpid()) + "\n")
+            code = (
+                "import os,signal,sys,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "open(sys.argv[1], 'a').write(str(os.getpid())+'\\n'); "
+                "chunk=b'x'*65536; "
+                "[(os.write(1,chunk),os.write(2,chunk)) for _ in iter(int,1)]"
+            )
+            child = subprocess.Popen(
+                [sys.executable, "-c", code, str(pid_path)],
+                start_new_session=True,
+            )
+            with pid_path.open("a") as stream:
+                stream.write(str(child.pid) + "\n")
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            while True:
+                os.write(1, b"p" * 65536)
+                os.write(2, b"e" * 65536)
+                time.sleep(0.001)
+        if "--no-block" in args:
+            job_id = str(state["next_job_id"])
+            state["next_job_id"] += 1
+            state.setdefault("jobs", {})[job_id] = str(target)
+            save()
+        elif (
+            int(state.get("restart_noop_after", 0))
+            and state["restart_calls"] > int(state["restart_noop_after"])
+        ):
+            pass
+        else:
+            activate(target)
         if state.get("restart_failures", 0):
             state["restart_failures"] -= 1
             save()
@@ -453,6 +750,8 @@ elif name == "curl":
     if state.get("health_generation_drift"):
         state["health_generation_drift"] = False
         activate(state["running_target"])
+    state["health_passed"] = True
+    save()
 elif name == "sleep":
     pass
 elif name == "sha256sum":
@@ -516,6 +815,7 @@ else:
             "FIXTURE_BUILD_SOURCE": str(self.build_source),
             "GUARD_TEST_STATE": str(self.state_path),
             "GUARD_TEST_TOOL_LOG": str(self.tool_log),
+            "GUARD_TEST_DESCENDANT_PIDS": str(self.descendant_pids),
             "LLM_GUARD_PROXY_REBUILD_GUARD_UNIT": str(self.guard_unit),
             "LLM_GUARD_PROXY_REBUILD_PROC_ROOT": str(self.proc_root),
             "SAME_HASH_TARGET": str(self.same_hash_other_inode),
@@ -534,14 +834,11 @@ else:
         self.authority_config.write_text(json.dumps(payload, sort_keys=True))
         self.authority_config.chmod(0o600)
 
-    def run(
+    def _run_arguments(
         self,
-        *,
-        test_only: bool = True,
-        extra_env: dict[str, str] | None = None,
-        timeout: int = 30,
-        cwd: Path = ROOT,
-    ) -> subprocess.CompletedProcess[str]:
+        test_only: bool,
+        extra_env: dict[str, str] | None,
+    ) -> tuple[list[str], dict[str, str]]:
         self._write_authority_config()
         env = dict(self.env)
         env.update(
@@ -555,6 +852,35 @@ else:
         command = [str(REBUILD_SCRIPT)]
         if test_only:
             command.append("--test-only")
+        return command, env
+
+    def popen(
+        self,
+        *,
+        test_only: bool = True,
+        extra_env: dict[str, str] | None = None,
+        cwd: Path = ROOT,
+    ) -> subprocess.Popen[str]:
+        command, env = self._run_arguments(test_only, extra_env)
+        return subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+
+    def run(
+        self,
+        *,
+        test_only: bool = True,
+        extra_env: dict[str, str] | None = None,
+        timeout: int = 30,
+        cwd: Path = ROOT,
+    ) -> subprocess.CompletedProcess[str]:
+        command, env = self._run_arguments(test_only, extra_env)
         return subprocess.run(
             command,
             cwd=cwd,
@@ -567,6 +893,23 @@ else:
 
     def calls(self) -> str:
         return self.tool_log.read_text() if self.tool_log.exists() else ""
+
+    def assert_call_order(self, test: unittest.TestCase, *needles: str) -> None:
+        calls = self.calls()
+        cursor = 0
+        for needle in needles:
+            cursor = calls.find(needle, cursor)
+            test.assertNotEqual(cursor, -1, calls)
+            cursor += len(needle)
+
+    def receipt_paths(self) -> list[Path]:
+        return sorted((self.receipt_dir / "receipts").glob("*/state.json"))
+
+    def assert_transaction_clean(self, test: unittest.TestCase) -> None:
+        test.assertFalse((self.receipt_dir / "transaction.v1").exists())
+        rollback = self.receipt_dir / "rollback"
+        if rollback.exists():
+            test.assertEqual(list(rollback.iterdir()), [])
 
     def assert_no_backend_lifecycle(self, test: unittest.TestCase) -> None:
         calls = self.calls()
