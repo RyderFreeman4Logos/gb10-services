@@ -24,14 +24,47 @@
 # v6 (2026-08-07): append the current boot ID plus bounded memory, IO, and CPU
 # PSI avg10 values. Missing or malformed proc fields remain explicit N/A values.
 
-LOG_DIR="${SYSMON_LOG_DIR:-$HOME/log}"
-INTERVAL="${SYSMON_INTERVAL_SECONDS:-1}"
+TEST_MODE=0
+case "$#" in
+    0)
+        for name in \
+            SYSMON_LOG_DIR SYSMON_INTERVAL_SECONDS SYSMON_PROC_ROOT \
+            SYSMON_CLOCK_FILE SYSMON_MAX_SAMPLES SYSMON_TEST_MODE \
+            SYSMON_GPU_LINE; do
+            if [[ -v "$name" ]]; then
+                printf 'sysmon test override %s requires --test-only\n' "$name" >&2
+                exit 64
+            fi
+        done
+        ;;
+    1)
+        [[ "$1" == "--test-only" ]] || {
+            printf 'usage: %s [--test-only]\n' "$0" >&2
+            exit 64
+        }
+        TEST_MODE=1
+        ;;
+    *)
+        printf 'usage: %s [--test-only]\n' "$0" >&2
+        exit 64
+        ;;
+esac
+
+if (( TEST_MODE )); then
+    LOG_DIR="${SYSMON_LOG_DIR:-$HOME/log}"
+    INTERVAL="${SYSMON_INTERVAL_SECONDS:-1}"
+    PROC_ROOT="${SYSMON_PROC_ROOT:-/proc}"
+    MAX_SAMPLES="${SYSMON_MAX_SAMPLES:-0}"
+    CLOCK_FILE="${SYSMON_CLOCK_FILE:-}"
+else
+    LOG_DIR="$HOME/log"
+    INTERVAL=1
+    PROC_ROOT=/proc
+    MAX_SAMPLES=0
+    CLOCK_FILE=""
+fi
 GPU_LOOP_MS=$((INTERVAL * 1000))
 PROC_MAP="$LOG_DIR/sysmon_process_names.csv"
-PROC_ROOT="${SYSMON_PROC_ROOT:-/proc}"
-MAX_SAMPLES="${SYSMON_MAX_SAMPLES:-0}"
-TEST_MODE="${SYSMON_TEST_MODE:-0}"
-CLOCK_FILE="${SYSMON_CLOCK_FILE:-}"
 
 HEADER="timestamp,load_1m,load_5m,load_15m,mem_used_mb,mem_total_mb,swap_used_mb,swap_total_mb,tz0,tz1,tz2,tz3,tz4,tz5,tz6,nvme_c,nvme_s1,nvme_s2,gpu_temp_c,gpu_power_w,gpu_util_pct,gpu_clock_mhz,top1_proc_id,top1_rss_mb,top2_proc_id,top2_rss_mb,top3_proc_id,top3_rss_mb,top4_proc_id,top4_rss_mb,top5_proc_id,top5_rss_mb,disk_read_mb_s,disk_write_mb_s,disk_io_ms_s,swap_in_mb_s,swap_out_mb_s,top1_swap_pid,top1_swap_proc_id,top1_swap_mb,top2_swap_pid,top2_swap_proc_id,top2_swap_mb,top3_swap_pid,top3_swap_proc_id,top3_swap_mb,top4_swap_pid,top4_swap_proc_id,top4_swap_mb,top5_swap_pid,top5_swap_proc_id,top5_swap_mb,mem_available_mb,sample_cadence_ms,sample_elapsed_ms,sample_lag_ms,boot_id,memory_some_avg10,memory_full_avg10,io_full_avg10,cpu_some_avg10"
 
@@ -134,14 +167,24 @@ read_mem_available_mb() {
     return 1
 }
 
+read_bounded_regular_file() {
+    local path="$1" max_bytes="$2" value="" LC_ALL=C
+    BOUNDED_FILE_CONTENT=""
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    IFS= read -r -N "$((max_bytes + 1))" value < "$path" || true
+    (( ${#value} <= max_bytes )) || return 1
+    [[ "$value" == *$'\n' && "$value" != *$'\r'* ]] || return 1
+    BOUNDED_FILE_CONTENT="$value"
+}
+
 read_boot_id() {
     local path="$PROC_ROOT/sys/kernel/random/boot_id" value
     BOOT_ID="N/A"
-    if [[ -r "$path" ]]; then
-        value=$(< "$path") 2>/dev/null || return 0
-        if [[ "$value" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-            BOOT_ID="$value"
-        fi
+    read_bounded_regular_file "$path" 64 || return 0
+    value="${BOUNDED_FILE_CONTENT%$'\n'}"
+    [[ "$value" != *$'\n'* ]] || return 0
+    if [[ "$value" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        BOOT_ID="$value"
     fi
     return 0
 }
@@ -154,27 +197,34 @@ valid_psi_avg10() {
 
 read_psi_avg10() {
     local resource="$1" wanted_class="$2"
-    local path="$PROC_ROOT/pressure/$resource" pressure_class rest field value
-    local count
+    local path="$PROC_ROOT/pressure/$resource" line pressure_class field value
+    local class_count=0 avg10_count candidate="" candidate_valid=0
     local -a fields
     PSI_AVG10="N/A"
-    [[ -r "$path" ]] || return 0
-    while read -r pressure_class rest; do
+    read_bounded_regular_file "$path" 512 || return 0
+    value="${BOUNDED_FILE_CONTENT%$'\n'}"
+    while IFS= read -r line; do
+        (( ${#line} <= 255 )) || return 0
+        read -r -a fields <<< "$line"
+        pressure_class="${fields[0]:-}"
         [[ "$pressure_class" == "$wanted_class" ]] || continue
-        count=0
-        value=""
-        read -r -a fields <<< "$rest"
-        for field in "${fields[@]}"; do
+        ((class_count += 1))
+        avg10_count=0
+        candidate=""
+        for field in "${fields[@]:1}"; do
             if [[ "${field%%=*}" == "avg10" ]]; then
-                value="${field#*=}"
-                count=$((count + 1))
+                candidate="${field#*=}"
+                ((avg10_count += 1))
             fi
         done
-        if (( count == 1 )) && valid_psi_avg10 "$value"; then
-            PSI_AVG10="$value"
+        candidate_valid=0
+        if (( avg10_count == 1 )) && valid_psi_avg10 "$candidate"; then
+            candidate_valid=1
         fi
-        return 0
-    done < "$path"
+    done <<< "$value"
+    if (( class_count == 1 && candidate_valid == 1 )); then
+        PSI_AVG10="$candidate"
+    fi
     return 0
 }
 

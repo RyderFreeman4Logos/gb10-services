@@ -99,6 +99,12 @@ class SysmonSchemaContractTests(unittest.TestCase):
 
         unit = UNIT.read_text()
         assert_start_contract(unit)
+        self.assertIn(
+            "UnsetEnvironment=SYSMON_LOG_DIR SYSMON_INTERVAL_SECONDS "
+            "SYSMON_PROC_ROOT SYSMON_CLOCK_FILE SYSMON_MAX_SAMPLES "
+            "SYSMON_TEST_MODE SYSMON_GPU_LINE",
+            unit,
+        )
         hostile = unit.replace("[Unit]\n", "[Unit]\nAfter=default.target\n", 1)
         self.assertNotEqual(hostile, unit)
         with self.assertRaises(AssertionError):
@@ -118,6 +124,9 @@ class SysmonSchemaContractTests(unittest.TestCase):
         self.assertIn("observed cadence", readme)
         self.assertIn("target interval", unit)
         self.assertIn("CSV v6", readme)
+        self.assertIn("`--test-only`", readme)
+        self.assertIn("rejects inherited `SYSMON_*`", readme)
+        self.assertIn("`UnsetEnvironment=`", deployment)
         for field in (
             "boot_id",
             "memory_some_avg10",
@@ -207,7 +216,7 @@ class SysmonFixtureTests(unittest.TestCase):
             }
         )
         subprocess.run(
-            ["bash", str(SCRIPT)],
+            ["bash", str(SCRIPT), "--test-only"],
             cwd=ROOT,
             env=env,
             check=True,
@@ -216,6 +225,23 @@ class SysmonFixtureTests(unittest.TestCase):
             capture_output=True,
         )
         return self.log_dir / "sysmon_2023-11-14.csv"
+
+    @staticmethod
+    def _rows(logfile: Path) -> list[dict[str, str]]:
+        with logfile.open(newline="") as handle:
+            return list(csv.DictReader(handle))
+
+    def _assert_pressure_unavailable(self, row: dict[str, str]) -> None:
+        self.assertEqual(
+            [
+                row.get("boot_id"),
+                row.get("memory_some_avg10"),
+                row.get("memory_full_avg10"),
+                row.get("io_full_avg10"),
+                row.get("cpu_some_avg10"),
+            ],
+            ["N/A"] * 5,
+        )
 
     def test_fixture_records_exact_memavailable_and_actual_overrun(self) -> None:
         logfile = self._run()
@@ -264,16 +290,110 @@ class SysmonFixtureTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         for row in rows:
             self.assertNotIn(None, row)
-            self.assertEqual(
-                [
-                    row.get("boot_id"),
-                    row.get("memory_some_avg10"),
-                    row.get("memory_full_avg10"),
-                    row.get("io_full_avg10"),
-                    row.get("cpu_some_avg10"),
-                ],
-                ["N/A"] * 5,
-            )
+            self._assert_pressure_unavailable(row)
+
+    def test_production_rejects_test_overrides_before_sampling(self) -> None:
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(self.home),
+                "PATH": f"{self.fake_bin}:/usr/bin:/bin",
+                "TZ": "UTC",
+                "SYSMON_LOG_DIR": str(self.log_dir),
+                "SYSMON_PROC_ROOT": str(self.proc),
+                "SYSMON_CLOCK_FILE": str(self.root / "clock"),
+                "SYSMON_MAX_SAMPLES": "1",
+                "SYSMON_TEST_MODE": "1",
+                "SYSMON_GPU_LINE": "40, 120.5, 75, 1800",
+            }
+        )
+        result = subprocess.run(
+            ["bash", str(SCRIPT)],
+            cwd=ROOT,
+            env=env,
+            check=False,
+            timeout=2,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("--test-only", result.stderr)
+        self.assertEqual(list(self.log_dir.iterdir()), [])
+
+    def test_boot_id_fifo_is_rejected_without_blocking(self) -> None:
+        boot_id = self.proc / "sys" / "kernel" / "random" / "boot_id"
+        boot_id.unlink()
+        os.mkfifo(boot_id)
+        rows = self._rows(self._run())
+        self.assertEqual(rows[0]["boot_id"], "N/A")
+        self.assertEqual(rows[0]["memory_some_avg10"], "1.23")
+
+    def test_psi_fifo_is_rejected_without_blocking(self) -> None:
+        memory = self.proc / "pressure" / "memory"
+        memory.unlink()
+        os.mkfifo(memory)
+        rows = self._rows(self._run())
+        self.assertEqual(rows[0]["memory_some_avg10"], "N/A")
+        self.assertEqual(rows[0]["memory_full_avg10"], "N/A")
+        self.assertEqual(rows[0]["boot_id"], "12345678-1234-4abc-8def-1234567890ab")
+
+    def test_symlink_device_and_non_regular_inputs_degrade_to_na(self) -> None:
+        boot_id = self.proc / "sys" / "kernel" / "random" / "boot_id"
+        boot_id.unlink()
+        boot_id.symlink_to("/dev/null")
+        memory = self.proc / "pressure" / "memory"
+        memory.unlink()
+        memory.symlink_to("/dev/null")
+        io_pressure = self.proc / "pressure" / "io"
+        io_pressure.unlink()
+        io_pressure.mkdir()
+        cpu = self.proc / "pressure" / "cpu"
+        cpu.unlink()
+        cpu.symlink_to("/dev/null")
+        self._assert_pressure_unavailable(self._rows(self._run())[0])
+
+    def test_oversize_boot_and_psi_inputs_degrade_to_na(self) -> None:
+        (self.proc / "sys" / "kernel" / "random" / "boot_id").write_text(
+            "a" * 1024 + "\n"
+        )
+        (self.proc / "pressure" / "memory").write_text(
+            "x" * 1024
+            + "\nsome avg10=1.23 total=1\nfull avg10=0.04 total=2\n"
+        )
+        rows = self._rows(self._run())
+        self.assertEqual(rows[0]["boot_id"], "N/A")
+        self.assertEqual(rows[0]["memory_some_avg10"], "N/A")
+        self.assertEqual(rows[0]["memory_full_avg10"], "N/A")
+
+    def test_missing_final_newlines_degrade_to_na(self) -> None:
+        (self.proc / "sys" / "kernel" / "random" / "boot_id").write_text(
+            "12345678-1234-4abc-8def-1234567890ab"
+        )
+        (self.proc / "pressure" / "memory").write_text(
+            "some avg10=1.23 total=1\nfull avg10=0.04 total=2"
+        )
+        (self.proc / "pressure" / "io").write_text("full avg10=5.67 total=3")
+        (self.proc / "pressure" / "cpu").write_text("some avg10=9.87 total=4")
+        self._assert_pressure_unavailable(self._rows(self._run())[0])
+
+    def test_duplicate_class_and_avg10_degrade_to_na(self) -> None:
+        (self.proc / "pressure" / "memory").write_text(
+            "some avg10=1.23 total=1\nsome avg10=2.34 total=2\n"
+            "full avg10=0.04 total=3\n"
+        )
+        (self.proc / "pressure" / "io").write_text(
+            "full avg10=5.67 avg10=6.78 total=4\n"
+        )
+        rows = self._rows(self._run())
+        self.assertEqual(rows[0]["memory_some_avg10"], "N/A")
+        self.assertEqual(rows[0]["memory_full_avg10"], "0.04")
+        self.assertEqual(rows[0]["io_full_avg10"], "N/A")
+
+    def test_all_boot_pressure_inputs_missing_degrade_to_na(self) -> None:
+        (self.proc / "sys" / "kernel" / "random" / "boot_id").unlink()
+        for resource in ("memory", "io", "cpu"):
+            (self.proc / "pressure" / resource).unlink()
+        self._assert_pressure_unavailable(self._rows(self._run())[0])
 
     def test_old_v5_schema_rotates_before_v6_rows_are_written(self) -> None:
         old = self.log_dir / "sysmon_2023-11-14.csv"
