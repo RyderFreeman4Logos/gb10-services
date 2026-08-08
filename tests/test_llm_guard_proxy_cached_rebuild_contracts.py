@@ -18,6 +18,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 REBUILD_SCRIPT = ROOT / "scripts" / "llm_guard_proxy_cached_rebuild.sh"
+REBUILD_ENGINE = ROOT / "scripts" / "llm_guard_proxy_cached_rebuild.py"
 GUARD_CONFIG = ROOT / "config" / "llm-guard-proxy" / "config.toml"
 README = ROOT / "README.md"
 DEPLOYMENT_GUIDE = ROOT / "docs" / "deployment" / "AGENTS.md"
@@ -462,6 +463,24 @@ else:
 
 
 class GuardRebuildProvenanceTests(unittest.TestCase):
+    def test_launcher_hash_pins_real_module_without_embedded_python(self) -> None:
+        launcher = REBUILD_SCRIPT.read_text()
+        self.assertTrue(REBUILD_ENGINE.is_file(), "real rebuild engine is missing")
+        self.assertTrue(launcher.startswith("#!/usr/bin/bash -p\n"))
+        self.assertLessEqual(len(launcher.splitlines()), 64)
+        self.assertNotIn("<<'PY'", launcher)
+        self.assertIn("/usr/bin/env -i", launcher)
+        self.assertIn("/usr/bin/python3 -I -B -S", launcher)
+        match = re.search(
+            r'^expected_engine_sha256="([0-9a-f]{64})"$', launcher, re.MULTILINE
+        )
+        self.assertIsNotNone(match, "launcher engine authority is missing")
+        assert match is not None
+        self.assertEqual(
+            hashlib.sha256(REBUILD_ENGINE.read_bytes()).hexdigest(), match.group(1)
+        )
+        self.assertIn("class RebuildError", REBUILD_ENGINE.read_text())
+
     @staticmethod
     def output(result: subprocess.CompletedProcess[str]) -> str:
         return result.stdout + result.stderr

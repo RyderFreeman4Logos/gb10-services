@@ -844,6 +844,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
     def test_dependency_substitution_is_rejected_before_import_side_effects(self) -> None:
         production_files = (
             ACTIVATION_ENGINE,
+            ACTIVATION_ENGINE.parent / "gb10_bounded_process.py",
             ACTIVATION_ENGINE.parent / "gb10_embedding_activation_checks.py",
             ACTIVATION_ENGINE.parent / "gb10_embedding_activation_config.py",
             ACTIVATION_ENGINE.parent / "gb10_embedding_activation_storage.py",
