@@ -16,6 +16,57 @@ ENGINE = ROOT / "scripts" / "llm_guard_proxy_cached_rebuild.py"
 
 
 class GuardCanonicalAuthorityTests(unittest.TestCase):
+    def test_bounded_helper_loads_from_verified_bytes_after_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            copied = Path(temporary)
+            engine = copied / ENGINE.name
+            helper = copied / "gb10_bounded_process.py"
+            replacement = copied / "replacement.py"
+            marker = copied / "replacement-imported"
+            swapped = copied / "helper-swapped"
+            engine.write_bytes(ENGINE.read_bytes())
+            helper.write_bytes((ROOT / "scripts/gb10_bounded_process.py").read_bytes())
+            replacement.write_text(
+                f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
+                "raise SystemExit(88)\n"
+            )
+            bootstrap = (
+                "import os,runpy,sys\n"
+                "engine,helper,replacement,swapped=sys.argv[1:]\n"
+                "original_close=os.close; done=False\n"
+                "def close(descriptor):\n"
+                " global done\n"
+                " try: target=os.readlink(f'/proc/self/fd/{descriptor}')\n"
+                " except OSError: target=''\n"
+                " original_close(descriptor)\n"
+                " if not done and target==helper:\n"
+                "  os.replace(replacement,helper); open(swapped,'w').close(); done=True\n"
+                "os.close=close; sys.argv=[engine,'--test-only']\n"
+                "try: runpy.run_path(engine,run_name='guard_import_test')\n"
+                "except BaseException: pass\n"
+            )
+            result = subprocess.run(
+                [
+                    "/usr/bin/python3",
+                    "-I",
+                    "-B",
+                    "-S",
+                    "-c",
+                    bootstrap,
+                    str(engine),
+                    str(helper),
+                    str(replacement),
+                    str(swapped),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(swapped.exists())
+            self.assertFalse(marker.exists(), result.stdout + result.stderr)
+
     @staticmethod
     def _git(path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

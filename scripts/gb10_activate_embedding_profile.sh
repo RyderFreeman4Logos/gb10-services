@@ -8,16 +8,18 @@ if (( $# != 0 )); then
 fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 engine="$script_dir/gb10_embedding_activation.py"
-expected_engine_sha256="00a29d8be772b17c3eee1a8aedc3717da4119195124c5793c1622405c8bafdcb"
+expected_engine_sha256="af156483da9fb2ed1644938dff5361cd1c24870701ebaa81685a4af76f5c2b64"
 if [[ -L "$engine" || ! -f "$engine" ]]; then
   echo "embedding activation engine authority is unsafe" >&2
   exit 1
 fi
-engine_metadata="$(/usr/bin/stat --format='%u:%a:%h' -- "$engine")"
-engine_sha256="$(/usr/bin/sha256sum -- "$engine")"
-if [[ "$engine_metadata" != "$EUID:644:1" ||
+exec {engine_fd}<"$engine"
+engine_metadata="$(/usr/bin/stat -L --format='%u:%a:%h:%d:%i:%s' -- "/proc/$$/fd/$engine_fd")"
+path_identity="$(/usr/bin/stat --format='%d:%i:%s' -- "$engine")"
+engine_sha256="$(/usr/bin/sha256sum -- "/proc/$$/fd/$engine_fd")"
+if [[ "$engine_metadata" != "$EUID:644:1:$path_identity" ||
       "${engine_sha256%% *}" != "$expected_engine_sha256" ]]; then
   echo "embedding activation engine authority differs" >&2
   exit 1
 fi
-exec /usr/bin/python3 -I -B -S "$engine"
+exec /usr/bin/python3 -I -B -S "/proc/self/fd/$engine_fd"

@@ -3,7 +3,6 @@ from __future__ import annotations
 import errno
 import fcntl
 import hashlib
-import importlib
 import json
 import os
 import re
@@ -15,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import types
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,7 +23,7 @@ from typing import Any, NoReturn, cast
 
 __all__: list[str] = []
 
-EXPECTED_BOUNDED_PROCESS_SHA256 = "60ad55a0d3a36d70cb79df77166fa28dc81c17147ade8c10ba311a6300262cb3"
+EXPECTED_BOUNDED_PROCESS_SHA256 = "8787dba9c1545e146f08db3e5d395ffeea60c7bd2ea05f687270cf65ad401264"
 _SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 _BOUNDED_PROCESS_PATH = _SCRIPT_DIRECTORY / "gb10_bounded_process.py"
 _bounded_fd = os.open(
@@ -32,21 +32,34 @@ _bounded_fd = os.open(
 )
 try:
     _bounded_metadata = os.fstat(_bounded_fd)
-    _bounded_digest = hashlib.sha256()
+    _bounded_chunks: list[bytes] = []
+    _bounded_size = 0
     while _bounded_chunk := os.read(_bounded_fd, 65536):
-        _bounded_digest.update(_bounded_chunk)
+        _bounded_size += len(_bounded_chunk)
+        if _bounded_size > 1024 * 1024:
+            raise RuntimeError("Guard bounded-process import authority is oversized")
+        _bounded_chunks.append(_bounded_chunk)
 finally:
     os.close(_bounded_fd)
+_bounded_payload = b"".join(_bounded_chunks)
 if (
     not stat.S_ISREG(_bounded_metadata.st_mode)
     or _bounded_metadata.st_uid != os.geteuid()
     or _bounded_metadata.st_nlink != 1
     or _bounded_metadata.st_mode & 0o022
-    or _bounded_digest.hexdigest() != EXPECTED_BOUNDED_PROCESS_SHA256
+    or hashlib.sha256(_bounded_payload).hexdigest()
+    != EXPECTED_BOUNDED_PROCESS_SHA256
 ):
     raise RuntimeError("Guard bounded-process import authority differs")
-sys.path.insert(0, str(_SCRIPT_DIRECTORY))
-run_bounded = importlib.import_module("gb10_bounded_process").command
+_bounded_module = types.ModuleType("gb10_bounded_process")
+_bounded_module.__file__ = str(_BOUNDED_PROCESS_PATH)
+_bounded_module.__package__ = ""
+sys.modules[_bounded_module.__name__] = _bounded_module
+exec(
+    compile(_bounded_payload, str(_BOUNDED_PROCESS_PATH), "exec"),
+    _bounded_module.__dict__,
+)
+run_bounded = _bounded_module.command
 
 UNIT = "llm-guard-proxy.service"
 HEALTH_URL = "http://100.105.4.92:18009/health"

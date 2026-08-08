@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import errno
 import importlib.util
 import json
 import os
@@ -11,6 +12,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from guard_rebuild_fixtures import ROOT, RebuildFixture
 
@@ -399,6 +401,51 @@ class SharedBoundedProcessRecoveryTests(unittest.TestCase):
                         os.kill(pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+
+    def test_pidfd_failure_still_contains_escaped_descendant_only(self) -> None:
+        bounded = self._load_bounded()
+        unrelated = subprocess.Popen(["/usr/bin/sleep", "30"])
+        escaped_pid = 0
+        with tempfile.TemporaryDirectory() as temporary:
+            pid_path = Path(temporary) / "escaped.pid"
+            hostile = Path(temporary) / "escaped.py"
+            hostile.write_text(
+                "import os,signal,sys,time\n"
+                "child=os.fork()\n"
+                "if child==0:\n"
+                " os.setsid(); signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                " open(sys.argv[1],'w').write(str(os.getpid()))\n"
+                " while True: time.sleep(1)\n"
+                "while True: time.sleep(1)\n"
+            )
+            try:
+                with patch.object(
+                    bounded.os,
+                    "pidfd_open",
+                    side_effect=OSError(errno.EMFILE, "forced pidfd exhaustion"),
+                ), self.assertRaises(RuntimeError):
+                    bounded.command(
+                        [sys.executable, str(hostile), str(pid_path)], timeout=1
+                    )
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline and not pid_path.exists():
+                    time.sleep(0.01)
+                self.assertTrue(pid_path.exists(), "escaped child did not publish PID")
+                escaped_pid = int(pid_path.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(escaped_pid, 0)
+                self.assertIsNone(unrelated.poll(), "unrelated process was disturbed")
+            finally:
+                for pid in (escaped_pid, unrelated.pid):
+                    if pid:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            os.waitpid(pid, 0)
+                        except (ChildProcessError, ProcessLookupError):
+                            pass
 
 
 if __name__ == "__main__":

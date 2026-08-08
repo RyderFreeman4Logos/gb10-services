@@ -179,12 +179,20 @@ class _ProcessTree:
             except ProcessLookupError:
                 pass
         for owned in self.descendants(table):
-            if owned.pidfd is None or not hasattr(signal, "pidfd_send_signal"):
-                continue
-            try:
-                signal.pidfd_send_signal(owned.pidfd, number, None, 0)
-            except ProcessLookupError:
-                pass
+            if owned.pidfd is not None and hasattr(signal, "pidfd_send_signal"):
+                try:
+                    signal.pidfd_send_signal(owned.pidfd, number, None, 0)
+                    continue
+                except ProcessLookupError:
+                    continue
+                except OSError:
+                    pass
+            row = _proc_row(owned.pid)
+            if row is not None and row[1] == owned.starttime:
+                try:
+                    os.kill(owned.pid, number)
+                except ProcessLookupError:
+                    pass
 
     def reap_adopted(self) -> None:
         table = self.scan()
@@ -459,4 +467,9 @@ def command(
             f"command failed ({process.returncode}): {arguments[0]}\n"
             f"stdout:\n{stdout}\nstderr:\n{stderr}"
         )
-    return stdout
+    try:
+        return bytes(captures["stdout"].retained).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise BoundedProcessError(
+            f"command stdout is not valid UTF-8: {arguments[0]}"
+        ) from error

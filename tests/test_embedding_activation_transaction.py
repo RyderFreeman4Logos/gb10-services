@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import ctypes
 import hashlib
 import importlib.util
 import json
@@ -11,6 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -841,6 +843,54 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 99, result.stdout + result.stderr)
             self.assertFalse(marker.exists())
 
+    def test_wrapper_executes_held_engine_after_post_hash_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            copied = Path(temporary)
+            wrapper = copied / ACTIVATOR.name
+            engine = copied / ACTIVATION_ENGINE.name
+            replacement = copied / "replacement.py"
+            marker = copied / "replacement-executed"
+            swapped = copied / "engine-swapped"
+            wrapper.write_bytes(ACTIVATOR.read_bytes())
+            wrapper.chmod(0o755)
+            engine.write_bytes(ACTIVATION_ENGINE.read_bytes())
+            replacement.write_text(
+                f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
+                "raise SystemExit(88)\n"
+            )
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            inotify_fd = libc.inotify_init1(os.O_CLOEXEC)
+            self.assertGreaterEqual(inotify_fd, 0)
+            self.assertGreaterEqual(
+                libc.inotify_add_watch(inotify_fd, os.fsencode(engine), 0x10), 0
+            )  # IN_CLOSE_NOWRITE
+
+            def replace_after_hash() -> None:
+                os.read(inotify_fd, 4096)
+                os.replace(replacement, engine)
+                swapped.touch()
+
+            watcher = threading.Thread(target=replace_after_hash)
+            watcher.start()
+            try:
+                result = subprocess.run(
+                    ["/usr/bin/bash", str(wrapper)],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
+                )
+                watcher.join(2)
+                self.assertFalse(watcher.is_alive(), "engine replacement did not run")
+                self.assertTrue(swapped.exists())
+                self.assertNotIn(
+                    "embedding activation engine authority differs", result.stderr
+                )
+                self.assertFalse(marker.exists(), result.stdout + result.stderr)
+            finally:
+                os.close(inotify_fd)
+
     def test_dependency_substitution_is_rejected_before_import_side_effects(self) -> None:
         production_files = (
             ACTIVATION_ENGINE,
@@ -881,6 +931,61 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertFalse(marker.exists())
+
+    def test_dependencies_load_from_verified_bytes_after_path_replacement(self) -> None:
+        names = _literal_string_map(ACTIVATION_ENGINE, "EXPECTED_IMPORT_AUTHORITY")
+        production_files = (
+            ACTIVATION_ENGINE,
+            *(ACTIVATION_ENGINE.parent / name for name in names),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            copied = Path(temporary)
+            for source in production_files:
+                (copied / source.name).write_bytes(source.read_bytes())
+            dependency = copied / "gb10_embedding_verifier_runtime.py"
+            replacement = copied / "replacement.py"
+            marker = copied / "replacement-imported"
+            swapped = copied / "dependency-swapped"
+            replacement.write_text(
+                f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
+                "raise SystemExit(88)\n"
+            )
+            bootstrap = (
+                "import os,runpy,sys\n"
+                "engine,dependency,replacement,swapped=sys.argv[1:]\n"
+                "original_close=os.close; done=False\n"
+                "def close(descriptor):\n"
+                " global done\n"
+                " try: target=os.readlink(f'/proc/self/fd/{descriptor}')\n"
+                " except OSError: target=''\n"
+                " original_close(descriptor)\n"
+                " if not done and target==dependency:\n"
+                "  os.replace(replacement,dependency); open(swapped,'w').close(); done=True\n"
+                "os.close=close; sys.argv=[engine]\n"
+                "try: runpy.run_path(engine,run_name='activation_import_test')\n"
+                "except BaseException: pass\n"
+            )
+            result = subprocess.run(
+                [
+                    "/usr/bin/python3",
+                    "-I",
+                    "-B",
+                    "-S",
+                    "-c",
+                    bootstrap,
+                    str(copied / ACTIVATION_ENGINE.name),
+                    str(dependency),
+                    str(replacement),
+                    str(swapped),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(swapped.exists())
+            self.assertFalse(marker.exists(), result.stdout + result.stderr)
 
     def test_insecure_state_parent_is_rejected_before_transaction_creation(self) -> None:
         with ActivationFixture() as fixture:

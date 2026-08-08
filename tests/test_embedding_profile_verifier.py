@@ -207,6 +207,13 @@ class BoundedCommandTests(unittest.TestCase):
                 input_text="x" * (5 * 1024 * 1024),
             )
 
+    def test_success_output_must_be_strict_utf8(self) -> None:
+        verifier = _load_verifier()
+        with self.assertRaisesRegex(RuntimeError, "UTF-8"):
+            verifier.command(
+                [sys.executable, "-c", "import os; os.write(1, bytes([255]))"]
+            )
+
     def test_nonzero_parent_cannot_leave_an_orphaned_process_group(self) -> None:
         verifier = _load_verifier()
         with tempfile.TemporaryDirectory() as temporary:
