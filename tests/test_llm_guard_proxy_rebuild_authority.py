@@ -602,7 +602,7 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                     "usr/lib",
                     "/lib",
                     "--symlink",
-                    "usr/lib64",
+                    "usr/lib/x86_64-linux-gnu",
                     "/lib64",
                     "--ro-bind",
                     f"/proc/self/fd/{source_fd}",
