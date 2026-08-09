@@ -91,6 +91,170 @@ class GuardRebuildRecoveryTests(unittest.TestCase):
             self.assert_no_completion(output)
             fixture.assert_no_backend_lifecycle(self)
 
+    def test_recovery_rejects_replaced_snapshot_root_without_touching_target(
+        self,
+    ) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("mutated", mutate=True)
+            snapshot = Path(json.loads(state.read_text())["snapshot_root"])
+            owned = snapshot.with_name(snapshot.name + ".owned")
+            snapshot.rename(owned)
+            victim = fixture.root / "external-snapshot-target"
+            victim.mkdir()
+            sentinel = victim / "keep.txt"
+            sentinel.write_text("keep\n")
+            snapshot.symlink_to(victim, target_is_directory=True)
+
+            result = fixture.run(timeout=15)
+            output = self.output(result)
+
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertTrue(sentinel.exists(), output)
+            self.assertTrue(snapshot.is_symlink(), output)
+            self.assertTrue(state.exists(), output)
+            self.assert_no_completion(output)
+
+    def test_recovery_rejects_snapshot_directory_and_leaf_replacements(self) -> None:
+        for replacement in ("directory", "leaf"):
+            with self.subTest(replacement=replacement), RebuildFixture() as fixture:
+                state = fixture.write_wal("mutated", mutate=True)
+                snapshot = Path(json.loads(state.read_text())["snapshot_root"])
+                snapshot.rename(snapshot.with_name(snapshot.name + ".owned"))
+                if replacement == "directory":
+                    snapshot.mkdir()
+                    sentinel = snapshot / "keep.txt"
+                    sentinel.write_text("keep\n")
+                else:
+                    snapshot.write_text("keep\n")
+                    sentinel = snapshot
+
+                result = fixture.run(timeout=15)
+                output = self.output(result)
+
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertEqual(sentinel.read_text(), "keep\n")
+                self.assertTrue(state.exists(), output)
+                self.assert_no_completion(output)
+
+    def test_recovery_tombstones_transaction_with_orphan_state_temp(self) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("mutated", mutate=True)
+            orphan = state.parent / ".state.tmp.1234.deadbeef"
+            orphan.write_bytes(state.read_bytes())
+            orphan.chmod(0o600)
+
+            first = fixture.run(timeout=15)
+            first_output = self.output(first)
+
+            self.assertEqual(first.returncode, 75, first_output)
+            self.assertIn(RECOVERED, first_output)
+            self.assertFalse(state.parent.exists(), first_output)
+            self.assertFalse(orphan.exists(), first_output)
+            fixture.assert_prior_restored(self)
+
+            second = fixture.run(timeout=20)
+            second_output = self.output(second)
+            self.assertEqual(second.returncode, 0, second_output)
+            self.assertIn(TEST_COMPLETE, second_output)
+            self.assertFalse(self.transaction_state(fixture).exists())
+
+    def test_recovery_finishes_exact_snapshot_cleanup_tombstone(self) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("mutated", mutate=True)
+            snapshot = Path(json.loads(state.read_text())["snapshot_root"])
+            nested = snapshot / "read-only" / "input.txt"
+            nested.parent.mkdir()
+            nested.write_text("owned\n")
+            nested.parent.chmod(0o500)
+            tombstone = snapshot.with_name(
+                f".{snapshot.name}.cleanup.1234.deadbeef"
+            )
+            snapshot.rename(tombstone)
+
+            first = fixture.run(timeout=15)
+            first_output = self.output(first)
+
+            self.assertEqual(first.returncode, 75, first_output)
+            self.assertFalse(tombstone.exists(), first_output)
+            self.assertFalse(state.exists(), first_output)
+            fixture.assert_prior_restored(self)
+
+            second = fixture.run(timeout=20)
+            self.assertEqual(second.returncode, 0, self.output(second))
+
+    def test_exact_snapshot_cleanup_does_not_follow_nested_symlink(self) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("mutated", mutate=True)
+            snapshot = Path(json.loads(state.read_text())["snapshot_root"])
+            victim = fixture.root / "external-cleanup-target"
+            victim.mkdir()
+            sentinel = victim / "keep.txt"
+            sentinel.write_text("keep\n")
+            (snapshot / "escape").symlink_to(victim, target_is_directory=True)
+
+            result = fixture.run(timeout=15)
+            output = self.output(result)
+
+            self.assertEqual(result.returncode, 75, output)
+            self.assertEqual(sentinel.read_text(), "keep\n")
+            self.assertFalse(state.exists(), output)
+            fixture.assert_prior_restored(self)
+
+    def test_complete_initial_publication_temp_is_promoted_and_recovered(self) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("mutated", mutate=True)
+            temporary = state.parent.with_name(
+                ".transaction.v1.tmp.1234.deadbeef"
+            )
+            state.parent.rename(temporary)
+            fixture.tool_log.unlink(missing_ok=True)
+
+            result = fixture.run(timeout=15)
+            output = self.output(result)
+
+            self.assertEqual(result.returncode, 75, output)
+            self.assertIn(RECOVERED, output)
+            self.assertFalse(temporary.exists(), output)
+            self.assertFalse(self.transaction_state(fixture).exists(), output)
+            self.assertNotIn("cargo build", fixture.calls())
+            fixture.assert_prior_restored(self)
+
+    def test_incomplete_initial_publication_temp_is_retained_and_refused(self) -> None:
+        with RebuildFixture() as fixture:
+            temporary = fixture.receipt_dir / ".transaction.v1.tmp.1234.deadbeef"
+            temporary.mkdir(mode=0o700, parents=True)
+            fixture.receipt_dir.chmod(0o700)
+            partial = temporary / ".state.tmp.1234.deadbeef"
+            partial.write_text('{"schema":1')
+            partial.chmod(0o600)
+            fixture.tool_log.unlink(missing_ok=True)
+
+            result = fixture.run(timeout=10)
+            output = self.output(result)
+
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("prepublication", output)
+            self.assertTrue(temporary.exists(), output)
+            self.assertTrue(partial.exists(), output)
+            self.assertEqual(fixture.calls(), "")
+            self.assert_no_completion(output)
+
+    def test_empty_initial_publication_temp_is_retained_and_classified(self) -> None:
+        with RebuildFixture() as fixture:
+            temporary = fixture.receipt_dir / ".transaction.v1.tmp.1234.deadbeef"
+            temporary.mkdir(mode=0o700, parents=True)
+            fixture.receipt_dir.chmod(0o700)
+            fixture.tool_log.unlink(missing_ok=True)
+
+            result = fixture.run(timeout=10)
+            output = self.output(result)
+
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("empty prepublication", output)
+            self.assertTrue(temporary.exists(), output)
+            self.assertEqual(fixture.calls(), "")
+            self.assert_no_completion(output)
+
     def test_stale_python_runtime_mismatch_blocks_before_tools_or_mutation(
         self,
     ) -> None:
@@ -120,6 +284,91 @@ class GuardRebuildRecoveryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 75, output)
             self.assertFalse(state.exists())
             fixture.assert_prior_restored(self)
+
+    def test_committed_executable_one_field_mismatch_matrix_is_rejected(self) -> None:
+        mutations: dict[str, object] = {
+            "device": 1,
+            "inode": 1,
+            "size": 1,
+            "mtime_ns": 1,
+            "ctime_ns": 1,
+            "sha256": "f" * 64,
+            "build_id": "abcdef12",
+            "mode": 0o700,
+            "uid": os.geteuid() + 1,
+            "nlink": 2,
+        }
+        for field, replacement in mutations.items():
+            with self.subTest(field=field), RebuildFixture() as fixture:
+                state = fixture.write_wal("committed", mutate=True)
+                payload = json.loads(state.read_text())
+                current = payload["committed"]["executable"][field]
+                if isinstance(replacement, int) and field not in {"mode", "uid", "nlink"}:
+                    replacement = current + replacement
+                payload["committed"]["executable"][field] = replacement
+                state.write_text(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+                )
+                fixture.tool_log.unlink(missing_ok=True)
+
+                result = fixture.run(timeout=10)
+                output = self.output(result)
+
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertTrue(state.exists(), output)
+                self.assertEqual(fixture.receipt_paths(), [])
+
+    def test_exact_committed_executable_evidence_archives(self) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("committed", mutate=True)
+
+            result = fixture.run(timeout=15)
+            output = self.output(result)
+
+            self.assertEqual(result.returncode, 75, output)
+            self.assertFalse(state.exists(), output)
+            receipts = fixture.receipt_paths()
+            self.assertEqual(len(receipts), 1, output)
+            receipt = json.loads(receipts[0].read_text())
+            self.assertEqual(
+                receipt["committed"]["executable"],
+                receipt["candidate"]["identity"],
+            )
+
+    def test_committed_archive_discards_recognized_state_temp(self) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("committed", mutate=True)
+            orphan = state.parent / ".state.tmp.1234.deadbeef"
+            orphan.write_bytes(state.read_bytes())
+            orphan.chmod(0o600)
+
+            result = fixture.run(timeout=15)
+            output = self.output(result)
+
+            self.assertEqual(result.returncode, 75, output)
+            receipts = fixture.receipt_paths()
+            self.assertEqual(len(receipts), 1, output)
+            self.assertEqual(
+                sorted(path.name for path in receipts[0].parent.iterdir()),
+                ["state.json"],
+            )
+
+    def test_prior_absence_requires_stable_original_path_before_build(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.service_bin.unlink()
+            original = fixture.prior.with_name("prior-held-object")
+            fixture.prior.rename(original)
+            fixture.prior.symlink_to(original)
+            fixture.tool_log.unlink(missing_ok=True)
+
+            result = fixture.run(timeout=10)
+            output = self.output(result)
+
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertFalse(fixture.service_bin.exists())
+            self.assertFalse(self.transaction_state(fixture).exists())
+            self.assertNotIn("cargo build", fixture.calls())
+            self.assert_no_completion(output)
 
     def test_malformed_and_unsafe_wal_block_before_tools(self) -> None:
         cases = {
@@ -189,9 +438,32 @@ class GuardRebuildRecoveryTests(unittest.TestCase):
             )
             blocked = json.loads(state_path.read_text())
             self.assertEqual(
-                os.readlink(fixture.service_bin), blocked["prior"]["backup"]["path"]
+                os.readlink(fixture.service_bin), blocked["prior"]["running_link"]
             )
             self.assert_no_completion(output)
+
+    def test_prior_absence_rollback_restarts_exact_stable_original_path(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.service_bin.unlink()
+
+            result = fixture.run(
+                extra_env={
+                    "LLM_GUARD_REBUILD_TEST_FAIL_RECEIPT_STAGE": "write",
+                    "LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS": "5",
+                },
+                timeout=20,
+            )
+            output = self.output(result)
+
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("ROLLBACK_RESTORED=1", output)
+            self.assertFalse(fixture.service_bin.exists())
+            self.assertFalse(fixture.service_bin.is_symlink())
+            self.assertEqual(
+                fixture.reload_state()["running_target"], str(fixture.prior)
+            )
+            self.assertTrue(fixture.prior.exists())
+            self.assertFalse(self.transaction_state(fixture).exists(), output)
 
     def test_nonterminal_manager_job_is_cancelled_by_exact_id_then_rolls_back(
         self,
@@ -214,6 +486,135 @@ class GuardRebuildRecoveryTests(unittest.TestCase):
             fixture.assert_prior_restored(self)
             self.assertFalse(self.transaction_state(fixture).exists())
             self.assert_no_completion(output)
+
+    def test_foreign_current_manager_job_is_waited_not_cancelled(self) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("mutated", mutate=True)
+            fixture.set_state(
+                jobs={"99": str(fixture.candidate)},
+                job_behavior="normal",
+                job_polls_remaining=1,
+                systemctl_call_limit=12,
+                systemctl_calls=0,
+            )
+            fixture.tool_log.unlink(missing_ok=True)
+
+            result = fixture.run(
+                extra_env={"LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS": "4"},
+                timeout=15,
+            )
+            output = self.output(result)
+
+            self.assertEqual(result.returncode, 75, output)
+            self.assertNotIn("systemctl --user cancel 99", fixture.calls())
+            self.assertNotIn("bounded command failed", output)
+            self.assertFalse(state.exists(), output)
+            fixture.assert_prior_restored(self)
+
+    def test_owned_exact_manager_job_is_cancelled(self) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("mutated", mutate=True)
+            payload = json.loads(state.read_text())
+            payload["manager_job_ids"] = [99]
+            payload["restart_intent"] = True
+            state.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+            )
+            fixture.set_state(
+                jobs={"99": str(fixture.candidate)},
+                job_behavior="cancel-owned-then-normal",
+            )
+            fixture.tool_log.unlink(missing_ok=True)
+
+            result = fixture.run(timeout=15)
+            output = self.output(result)
+
+            self.assertEqual(result.returncode, 75, output)
+            self.assertIn("systemctl --user cancel 99", fixture.calls())
+            self.assertFalse(state.exists(), output)
+            fixture.assert_prior_restored(self)
+
+    def test_manager_generation_drift_never_cancels_or_recovers(self) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("mutated", mutate=True)
+            payload = json.loads(state.read_text())
+            payload["manager_job_ids"] = [99]
+            payload["restart_intent"] = True
+            state.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+            )
+            fixture.set_state(
+                manager_invocation="e" * 32,
+                jobs={"99": str(fixture.candidate)},
+                job_behavior="nonterminal",
+            )
+            fixture.tool_log.unlink(missing_ok=True)
+
+            result = fixture.run(timeout=10)
+            output = self.output(result)
+
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("user manager generation differs", output)
+            self.assertNotIn("systemctl --user cancel 99", fixture.calls())
+            self.assertTrue(state.exists(), output)
+
+    def test_reused_job_id_with_foreign_type_is_never_cancelled(self) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("mutated", mutate=True)
+            payload = json.loads(state.read_text())
+            payload["manager_job_ids"] = [99]
+            payload["restart_intent"] = True
+            state.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+            )
+            fixture.set_state(
+                jobs={"99": str(fixture.candidate)},
+                job_behavior="nonterminal",
+                job_type="start",
+                systemctl_call_limit=12,
+                systemctl_calls=0,
+            )
+            fixture.tool_log.unlink(missing_ok=True)
+
+            result = fixture.run(
+                extra_env={"LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS": "1"},
+                timeout=10,
+            )
+            output = self.output(result)
+
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertNotIn("systemctl --user cancel 99", fixture.calls())
+            self.assertTrue(state.exists(), output)
+            self.assertIn("deadline", output)
+            self.assertNotIn("bounded command failed", output)
+
+    def test_dispatch_to_record_crash_gap_waits_unknown_job(self) -> None:
+        with RebuildFixture() as fixture:
+            marker = fixture.root / "crash-forward-job-dispatched"
+            process = fixture.popen(
+                extra_env={
+                    "LLM_GUARD_REBUILD_TEST_CRASH_POINT": "forward-job-dispatched",
+                    "LLM_GUARD_REBUILD_TEST_CRASH_MARKER": str(marker),
+                }
+            )
+            try:
+                self.assertTrue(self.wait_for_path(marker, process, 15))
+            finally:
+                self.kill_fixture_process(process)
+            self.assertEqual(process.returncode, -signal.SIGKILL)
+            state = self.transaction_state(fixture)
+            payload = json.loads(state.read_text())
+            self.assertTrue(payload["restart_intent"])
+            self.assertEqual(payload["manager_job_ids"], [])
+            fixture.tool_log.unlink(missing_ok=True)
+
+            recovered = fixture.run(timeout=15)
+            output = self.output(recovered)
+
+            self.assertEqual(recovered.returncode, 75, output)
+            self.assertNotIn("systemctl --user cancel 41", fixture.calls())
+            self.assertFalse(state.exists(), output)
+            fixture.assert_prior_restored(self)
 
     def test_cancelled_job_still_present_blocks_and_retains_wal(self) -> None:
         with RebuildFixture() as fixture:
@@ -268,6 +669,29 @@ class GuardRebuildRecoveryTests(unittest.TestCase):
             for pid in pids:
                 self.assertFalse(Path(f"/proc/{pid}").exists(), f"survivor pid={pid}")
             self.assert_no_completion(output)
+
+    def test_direct_recovery_stages_share_one_absolute_deadline(self) -> None:
+        for stage in ("filesystem-read", "snapshot-cleanup", "rollback", "diagnostic"):
+            with self.subTest(stage=stage), RebuildFixture() as fixture:
+                state = fixture.write_wal("mutated", mutate=True)
+                started = time.monotonic()
+
+                result = fixture.run(
+                    extra_env={
+                        "LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS": "1",
+                        "LLM_GUARD_REBUILD_TEST_DELAY_STAGE": stage,
+                        "LLM_GUARD_REBUILD_TEST_DELAY_SECONDS": "3",
+                    },
+                    timeout=3,
+                )
+                elapsed = time.monotonic() - started
+                output = self.output(result)
+
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertLess(elapsed, 1.8, (stage, elapsed, output))
+                self.assertIn("deadline", output)
+                self.assertTrue(state.exists(), output)
+                self.assert_no_completion(output)
 
     def test_sigkill_boundary_matrix_next_holder_recovers_without_build(self) -> None:
         points = (
@@ -359,6 +783,8 @@ class GuardRebuildRecoveryTests(unittest.TestCase):
             "LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS": "1",
             "LLM_GUARD_REBUILD_TEST_CRASH_POINT": "after-lock",
             "LLM_GUARD_REBUILD_TEST_CRASH_MARKER": "/tmp/never-created",
+            "LLM_GUARD_REBUILD_TEST_DELAY_STAGE": "filesystem-read",
+            "LLM_GUARD_REBUILD_TEST_DELAY_SECONDS": "1",
         }
         for name, value in names.items():
             with self.subTest(name=name):

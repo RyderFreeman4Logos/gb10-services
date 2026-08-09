@@ -167,13 +167,31 @@ The owner-`0700` state root
 `transaction.v1/state.json`, content-addressed `rollback/`, and committed
 `receipts/<txid>/state.json`. The only WAL phases are `prestate`, `mutated`, and
 `committed`; owner-`0600` state publication is ordered by write, file `fsync`,
-atomic rename, and directory `fsync`.
+atomic rename, and directory `fsync`. Initial publication atomically renames one
+complete, tightly named sibling directory. Startup promotes only that complete
+form, retains an incomplete publication temp, and finishes exact owner-only
+cleanup tombstones. Transaction cleanup renames the whole directory before
+FD-relative removal; it never unlinks canonical state while siblings remain.
+
+The WAL binds the snapshot-root device/inode. Cleanup opens that exact root
+relative to a held owner-safe parent, quarantines it atomically, and uses the
+stdlib symlink-resistant FD-relative walker; a replacement symlink, directory,
+or leaf is preserved and the WAL remains. If the prior service link was absent,
+the original runtime pathname must be a held no-follow exact executable before
+forward mutation, remains the rollback restart pathname, and is re-proved after
+link absence and cleanup are restored.
 
 Cutover and every external command share one 1,800-second forward deadline.
-Failure or stale-WAL recovery gets a fresh 180 seconds, cancels only exact
-matching Guard systemd job IDs, and exits 75 before a new build after successful
-recovery. An unsafe WAL, unprovable exact prior generation, or nonterminal job
-is retained and blocks completion; operators must preserve it for diagnosis.
+Failure or stale-WAL recovery gets a fresh 180 seconds shared by direct
+reads/hashes, job waits, rollback, diagnostics, and cleanup. Restart intent and
+the user-manager generation are durable before dispatch. Recovery cancels only
+a recorded Guard restart job ID whose unit/type/state remain exact under that
+unchanged generation. Foreign jobs, generation drift, ID reuse, and the
+dispatch-to-record gap are waited out within the deadline and are never adopted.
+Committed executable evidence must exactly equal the candidate identity and
+held runtime before archival. Successful recovery exits 75 before a new build.
+An unsafe WAL or unprovable exact prior generation is retained and blocks
+completion; operators must preserve it for diagnosis.
 The script never restarts a vLLM backend. A durable `committed` generation is
 not rolled back for a later stdout failure. The only production success claim is
 `LLM_GUARD_PROXY_REBUILD_COMPLETE receipt_sha256=<64hex>`; marker absence alone

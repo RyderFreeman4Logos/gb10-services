@@ -95,6 +95,8 @@ GENERATION_FIELDS = (
     "Environment",
     "EnvironmentFiles",
 )
+MANAGER_FIELDS = ("InvocationID", "UserspaceTimestampMonotonic")
+MANAGER_POLL_SECONDS = 0.2
 TEST_OVERRIDES = (
     "SOURCE_REPO",
     "SOURCE_BRANCH",
@@ -118,6 +120,8 @@ TEST_OVERRIDES = (
     "LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS",
     "LLM_GUARD_REBUILD_TEST_CRASH_POINT",
     "LLM_GUARD_REBUILD_TEST_CRASH_MARKER",
+    "LLM_GUARD_REBUILD_TEST_DELAY_STAGE",
+    "LLM_GUARD_REBUILD_TEST_DELAY_SECONDS",
 )
 rollback_logging = False
 operation_deadline: float | None = None
@@ -128,13 +132,47 @@ class RebuildError(RuntimeError):
     pass
 
 
+def _deadline_checkpoint(label: str) -> None:
+    deadline = operation_deadline
+    if deadline is None:
+        return
+    if (
+        test_only
+        and os.environ.get("LLM_GUARD_REBUILD_TEST_DELAY_STAGE") == label
+    ):
+        raw = os.environ.get("LLM_GUARD_REBUILD_TEST_DELAY_SECONDS", "")
+        if re.fullmatch(r"[1-9][0-9]*(?:\.[0-9]+)?", raw) is None:
+            fail("test-only deadline delay is malformed")
+        time.sleep(min(float(raw), max(0.0, deadline - time.monotonic())))
+    if time.monotonic() >= deadline:
+        fail(f"{label} deadline exhausted")
+
+
 def log(message: str) -> None:
+    _deadline_checkpoint("diagnostic")
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    descriptor = sys.stdout.fileno()
+    blocking = os.get_blocking(descriptor)
     try:
-        print(f"[{stamp}] {message}", flush=True)
-    except OSError:
+        os.set_blocking(descriptor, False)
+        os.write(descriptor, f"[{stamp}] {message}\n".encode())
+    except (BlockingIOError, OSError):
         if not rollback_logging:
             raise
+    finally:
+        os.set_blocking(descriptor, blocking)
+
+
+def _report_error(message: str) -> None:
+    descriptor = sys.stderr.fileno()
+    blocking = os.get_blocking(descriptor)
+    try:
+        os.set_blocking(descriptor, False)
+        os.write(descriptor, f"ERROR: {message}\n".encode())
+    except (BlockingIOError, OSError):
+        pass
+    finally:
+        os.set_blocking(descriptor, blocking)
 
 
 def fail(message: str) -> NoReturn:
@@ -166,11 +204,13 @@ def sha256_file(path: Path) -> str:
 
 
 def fsync_directory(path: Path) -> None:
+    _deadline_checkpoint("filesystem-write")
     descriptor = os.open(
         path, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
     )
     try:
         os.fsync(descriptor)
+        _deadline_checkpoint("filesystem-write")
     finally:
         os.close(descriptor)
 
@@ -2054,6 +2094,7 @@ def build_sandboxed_candidate(source: SourceBundle) -> BuildBundle:
     ]
     target_root = Path(tempfile.mkdtemp(prefix=".build-target-", dir=cache_root))
     target = _open_directory_authority("build target", target_root)
+    target_identity = (target.metadata[0], target.metadata[1])
     try:
         metadata_output = _run_sandbox(
             source,
@@ -2218,7 +2259,7 @@ def build_sandboxed_candidate(source: SourceBundle) -> BuildBundle:
         target.close()
         for authority in reversed(authorities):
             authority.close()
-        cleanup_snapshot(target_root)
+        cleanup_snapshot(target_root, target_identity)
 
 
 def _validate_reviewed_tool_versions(cargo: bytes, rustc: bytes) -> None:
@@ -2238,33 +2279,150 @@ def _validate_reviewed_tool_versions(cargo: bytes, rustc: bytes) -> None:
         fail("reviewed Cargo/rustc version contract differs")
 
 
-def cleanup_snapshot(root: Path | None) -> None:
-    if root is None or not root.exists():
+def _directory_identity(path: Path) -> tuple[int, int]:
+    _deadline_checkpoint("filesystem-read")
+    metadata = os.stat(path, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o022
+    ):
+        fail(f"unsafe owned directory: {path}")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _remove_tree_contents(directory_fd: int, expected_device: int) -> None:
+    _deadline_checkpoint("snapshot-cleanup")
+    metadata = os.fstat(directory_fd)
+    if metadata.st_uid != os.geteuid() or metadata.st_dev != expected_device:
+        fail("owned cleanup tree crossed its filesystem authority")
+    os.fchmod(directory_fd, 0o700)
+    for entry in os.scandir(directory_fd):
+        _deadline_checkpoint("snapshot-cleanup")
+        if not entry.is_dir(follow_symlinks=False):
+            os.unlink(entry.name, dir_fd=directory_fd)
+            continue
+        child_fd = os.open(
+            entry.name,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        try:
+            _remove_tree_contents(child_fd, expected_device)
+        finally:
+            os.close(child_fd)
+        os.rmdir(entry.name, dir_fd=directory_fd)
+
+
+def cleanup_snapshot(
+    root: Path | None, expected_identity: tuple[int, int] | None = None
+) -> None:
+    if root is None:
         return
-    for directory, directories, files in os.walk(root, topdown=False):
-        Path(directory).chmod(0o700)
-        for name in files:
-            path = Path(directory) / name
-            try:
-                path.chmod(0o600, follow_symlinks=False)
-            except (FileNotFoundError, NotImplementedError):
-                pass
-            path.unlink(missing_ok=True)
-        for name in directories:
-            path = Path(directory) / name
-            try:
-                path.chmod(0o700, follow_symlinks=False)
-            except (FileNotFoundError, NotImplementedError):
-                pass
-            try:
-                path.rmdir()
-            except FileNotFoundError:
-                pass
+    if expected_identity is None:
+        fail("owned directory cleanup lacks exact identity")
+    _deadline_checkpoint("snapshot-cleanup")
+    parent_fd = os.open(
+        root.parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    )
     try:
-        root.chmod(0o700)
-    except FileNotFoundError:
-        return
-    root.rmdir()
+        parent = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != os.geteuid()
+            or parent.st_mode & 0o022
+        ):
+            fail(f"unsafe owned cleanup parent: {root.parent}")
+        cleanup_pattern = re.compile(
+            rf"\.{re.escape(root.name)}\.cleanup\.[1-9][0-9]*\.[0-9a-f]{{8}}"
+        )
+        tombstones: list[str] = []
+        for entry in os.scandir(parent_fd):
+            _deadline_checkpoint("snapshot-cleanup")
+            if cleanup_pattern.fullmatch(entry.name):
+                tombstones.append(entry.name)
+        if len(tombstones) > 1:
+            fail(f"owned directory cleanup inventory is ambiguous: {root}")
+        try:
+            root_fd = os.open(
+                root.name,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_CLOEXEC
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            if expected_identity is None or not tombstones:
+                return
+            owned_name = tombstones[0]
+        else:
+            if tombstones:
+                os.close(root_fd)
+                fail(f"owned directory conflicts with cleanup tombstone: {root}")
+            owned_name = root.name
+        if owned_name != root.name:
+            root_fd = os.open(
+                owned_name,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_CLOEXEC
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        try:
+            metadata = os.fstat(root_fd)
+            actual = (metadata.st_dev, metadata.st_ino)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & 0o022
+                or actual != expected_identity
+            ):
+                fail(f"owned directory identity differs: {root}")
+        finally:
+            os.close(root_fd)
+        tombstone = owned_name
+        if owned_name == root.name:
+            tombstone = f".{root.name}.cleanup.{os.getpid()}.{secrets.token_hex(4)}"
+            _deadline_checkpoint("snapshot-cleanup")
+            os.rename(
+                root.name, tombstone, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
+            )
+        moved = os.stat(tombstone, dir_fd=parent_fd, follow_symlinks=False)
+        if (moved.st_dev, moved.st_ino) != actual or not stat.S_ISDIR(moved.st_mode):
+            fail(f"owned directory changed during quarantine: {root}")
+        os.fsync(parent_fd)
+        tombstone_fd = os.open(
+            tombstone,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            quarantined = os.fstat(tombstone_fd)
+            if (
+                not stat.S_ISDIR(quarantined.st_mode)
+                or quarantined.st_uid != os.geteuid()
+                or quarantined.st_mode & 0o022
+                or (quarantined.st_dev, quarantined.st_ino) != actual
+            ):
+                fail(f"owned directory changed after quarantine: {root}")
+            _remove_tree_contents(tombstone_fd, actual[0])
+        finally:
+            os.close(tombstone_fd)
+        _deadline_checkpoint("snapshot-cleanup")
+        os.rmdir(tombstone, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        _deadline_checkpoint("snapshot-cleanup")
+    finally:
+        os.close(parent_fd)
 
 
 @dataclass(frozen=True)
@@ -2275,6 +2433,19 @@ class Generation:
     fragment: str
     result: str
     job: int | None
+
+
+@dataclass(frozen=True)
+class ManagerGeneration:
+    invocation: str
+    started: int
+
+
+@dataclass(frozen=True)
+class ManagerJob:
+    job_id: int
+    job_type: str
+    state: str
 
 
 def _verify_manager_contract(values: dict[str, str]) -> None:
@@ -2304,6 +2475,40 @@ def _verify_manager_contract(values: dict[str, str]) -> None:
         or any(values[key] != value for key, value in expected.items())
     ):
         fail("manager-loaded Guard contract differs")
+
+
+def query_manager_generation() -> ManagerGeneration:
+    payload = execute(
+        [
+            require_tool("systemctl"),
+            "--user",
+            "show",
+            *(f"--property={field}" for field in MANAGER_FIELDS),
+        ],
+        capture=True,
+    )
+    if len(payload) > 1024 or b"\x00" in payload or b"\r" in payload:
+        fail("user manager generation output is malformed")
+    values: dict[str, str] = {}
+    try:
+        rows = payload.decode("ascii").splitlines()
+    except UnicodeDecodeError as error:
+        raise RebuildError("user manager generation output is not ASCII") from error
+    for row in rows:
+        key, separator, value = row.partition("=")
+        if separator != "=" or key not in MANAGER_FIELDS or key in values:
+            fail("user manager generation output has duplicate or extra fields")
+        values[key] = value
+    if (
+        set(values) != set(MANAGER_FIELDS)
+        or re.fullmatch(r"[0-9a-f]{32}", values["InvocationID"]) is None
+        or re.fullmatch(r"[1-9][0-9]*", values["UserspaceTimestampMonotonic"])
+        is None
+    ):
+        fail("user manager generation is malformed")
+    return ManagerGeneration(
+        values["InvocationID"], int(values["UserspaceTimestampMonotonic"])
+    )
 
 
 def query_generation(*, require_running: bool = True) -> Generation:
@@ -2378,6 +2583,7 @@ def query_generation(*, require_running: bool = True) -> Generation:
 
 
 def read_small_regular(path: Path, limit: int) -> bytes:
+    _deadline_checkpoint("filesystem-read")
     descriptor = os.open(
         path,
         os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
@@ -2389,6 +2595,7 @@ def read_small_regular(path: Path, limit: int) -> bytes:
         chunks: list[bytes] = []
         remaining_bytes = limit + 1
         while remaining_bytes:
+            _deadline_checkpoint("filesystem-read")
             chunk = os.read(descriptor, min(65536, remaining_bytes))
             if not chunk:
                 break
@@ -2566,6 +2773,7 @@ def fd_identity(
 
 
 def file_identity(path: Path) -> ExecutableIdentity:
+    _deadline_checkpoint("filesystem-read")
     descriptor = os.open(
         path,
         os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
@@ -2579,6 +2787,7 @@ def file_identity(path: Path) -> ExecutableIdentity:
 def open_runtime_executable(
     pid: int, replacement_during_hash: str = ""
 ) -> tuple[int, str, ExecutableIdentity]:
+    _deadline_checkpoint("filesystem-read")
     proc_exe = proc_root / str(pid) / "exe"
     link = os.readlink(proc_exe)
     if link.endswith(" (deleted)") or not _safe_absolute(link):
@@ -2615,6 +2824,7 @@ class Prestate:
     boot: str
     proc_start: int
     descriptor: int | None
+    restart_descriptor: int | None
     running_link: str
     executable: ExecutableIdentity
 
@@ -2648,6 +2858,7 @@ def snapshot_prestate() -> Prestate:
     current_boot = boot_id()
     starttime = proc_starttime(generation.pid)
     descriptor, running_link, executable = open_runtime_executable(generation.pid)
+    restart_descriptor: int | None = None
     if link_target is not None:
         try:
             linked = os.stat(service_bin)
@@ -2657,18 +2868,36 @@ def snapshot_prestate() -> Prestate:
         if not same_object(linked, executable):
             os.close(descriptor)
             fail("prior service symlink does not name the running executable")
+    else:
+        if not _safe_absolute(running_link):
+            os.close(descriptor)
+            fail("prior absent-link runtime lacks a stable pathname")
+        try:
+            restart_descriptor = os.open(
+                running_link,
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            )
+            if fd_identity(restart_descriptor) != executable:
+                fail("prior absent-link stable pathname differs from runtime")
+        except BaseException:
+            if restart_descriptor is not None:
+                os.close(restart_descriptor)
+            os.close(descriptor)
+            raise
     return Prestate(
         link_target,
         generation,
         current_boot,
         starttime,
         descriptor,
+        restart_descriptor,
         running_link,
         executable,
     )
 
 
 def service_link_matches(target: str | None) -> bool:
+    _deadline_checkpoint("filesystem-read")
     try:
         metadata = service_bin.lstat()
     except FileNotFoundError:
@@ -2703,9 +2932,16 @@ def assert_prestate_unchanged(prestate: Prestate) -> None:
         and fd_identity(prestate.descriptor) != prestate.executable
     ):
         fail("held prior executable changed before cutover")
+    if prestate.link_target is None and (
+        prestate.restart_descriptor is None
+        or fd_identity(prestate.restart_descriptor) != prestate.executable
+        or file_identity(Path(prestate.running_link)) != prestate.executable
+    ):
+        fail("prior absent-link stable pathname changed before cutover")
 
 
 def set_service_link(target: str) -> None:
+    _deadline_checkpoint("rollback")
     if not _safe_absolute(target):
         fail("refusing unsafe service link target")
     temporary = service_bin.with_name(
@@ -2720,6 +2956,7 @@ def set_service_link(target: str) -> None:
 
 
 def remove_service_link() -> None:
+    _deadline_checkpoint("rollback")
     try:
         metadata = service_bin.lstat()
     except FileNotFoundError:
@@ -2732,6 +2969,7 @@ def remove_service_link() -> None:
 
 
 def _secure_directory(path: Path, *, create: bool = False) -> None:
+    _deadline_checkpoint("filesystem-read")
     if create:
         try:
             path.mkdir(mode=0o700, parents=True)
@@ -2749,6 +2987,7 @@ def _secure_directory(path: Path, *, create: bool = False) -> None:
 
 
 def _secure_state_file(path: Path) -> os.stat_result:
+    _deadline_checkpoint("filesystem-read")
     metadata = path.lstat()
     if (
         not stat.S_ISREG(metadata.st_mode)
@@ -2763,6 +3002,7 @@ def _secure_state_file(path: Path) -> os.stat_result:
 
 
 def _secure_backup_file(path: Path) -> os.stat_result:
+    _deadline_checkpoint("filesystem-read")
     metadata = path.lstat()
     if (
         not stat.S_ISREG(metadata.st_mode)
@@ -2818,6 +3058,91 @@ def _state_path() -> Path:
     return _transaction_dir() / "state.json"
 
 
+def _transaction_artifacts() -> list[Path]:
+    _deadline_checkpoint("filesystem-read")
+    patterns = (
+        r"\.transaction\.v1\.tmp\.[1-9][0-9]*\.[0-9a-f]{8}",
+        r"\.transaction\.v1\.cleanup\.[1-9][0-9]*\.[0-9a-f]{8}",
+    )
+    artifacts: list[Path] = []
+    for entry in receipt_dir.iterdir():
+        _deadline_checkpoint("filesystem-read")
+        if entry.name == "transaction.v1" or any(
+            re.fullmatch(pattern, entry.name) for pattern in patterns
+        ):
+            artifacts.append(entry)
+    return sorted(artifacts, key=lambda path: path.name)
+
+
+def _prepare_transaction_namespace() -> bool:
+    _deadline_checkpoint("filesystem-read")
+    artifacts = _transaction_artifacts()
+    if len(artifacts) > 2:
+        fail("transaction recovery artifact inventory exceeded its bound")
+    canonical = _transaction_dir()
+    cleanups = [
+        path
+        for path in artifacts
+        if re.fullmatch(
+            r"\.transaction\.v1\.cleanup\.[1-9][0-9]*\.[0-9a-f]{8}",
+            path.name,
+        )
+    ]
+    temporaries = [
+        path
+        for path in artifacts
+        if re.fullmatch(
+            r"\.transaction\.v1\.tmp\.[1-9][0-9]*\.[0-9a-f]{8}", path.name
+        )
+    ]
+    if len(cleanups) > 1 or len(temporaries) > 1:
+        fail("transaction recovery artifact inventory is ambiguous")
+    for cleanup in cleanups:
+        cleanup_snapshot(cleanup, _directory_identity(cleanup))
+    if canonical.exists() or canonical.is_symlink():
+        if temporaries:
+            fail("canonical transaction conflicts with prepublication temp")
+        _secure_directory(canonical)
+        entries = []
+        for path in canonical.iterdir():
+            _deadline_checkpoint("filesystem-read")
+            entries.append(path.name)
+        entries.sort()
+        if "state.json" not in entries or any(
+            name != "state.json"
+            and re.fullmatch(r"\.state\.tmp\.[1-9][0-9]*\.[0-9a-f]{8}", name)
+            is None
+            for name in entries
+        ):
+            fail("transaction contains an unknown publication artifact")
+        for name in entries:
+            if name != "state.json":
+                _secure_state_file(canonical / name)
+        return bool(artifacts)
+    if not temporaries:
+        return bool(artifacts)
+    temporary = temporaries[0]
+    _secure_directory(temporary)
+    entries = []
+    for path in temporary.iterdir():
+        _deadline_checkpoint("filesystem-read")
+        entries.append(path.name)
+    entries.sort()
+    if not entries:
+        fail("empty prepublication transaction retained")
+    if entries == ["state.json"]:
+        _secure_state_file(temporary / "state.json")
+        os.rename(temporary, canonical)
+        fsync_directory(receipt_dir)
+        return True
+    if len(entries) == 1 and re.fullmatch(
+        r"\.state\.tmp\.[1-9][0-9]*\.[0-9a-f]{8}", entries[0]
+    ):
+        _secure_state_file(temporary / entries[0])
+        fail("incomplete prepublication transaction retained")
+    fail("prepublication transaction contains an unknown artifact")
+
+
 def _identity_payload(identity: ExecutableIdentity) -> dict[str, object]:
     return {
         "device": identity.device,
@@ -2843,6 +3168,10 @@ def _generation_payload(generation: Generation, proc_start: int) -> dict[str, ob
         "result": generation.result,
         "job": generation.job,
     }
+
+
+def _manager_generation_payload(generation: ManagerGeneration) -> dict[str, object]:
+    return {"invocation": generation.invocation, "started": generation.started}
 
 
 def _exact_keys(value: object, keys: set[str], label: str) -> dict[str, Any]:
@@ -2932,6 +3261,19 @@ def _generation_from_payload(value: object, label: str) -> tuple[Generation, int
     ):
         fail(f"{label} generation is unsafe")
     return generation, proc_value
+
+
+def _manager_generation_from_payload(value: object) -> ManagerGeneration:
+    payload = _exact_keys(
+        value, {"invocation", "started"}, "manager generation"
+    )
+    invocation = payload["invocation"]
+    started = _strict_int(
+        payload["started"], "manager generation.started", minimum=1
+    )
+    if not isinstance(invocation, str) or re.fullmatch(r"[0-9a-f]{32}", invocation) is None:
+        fail("manager generation.invocation is malformed")
+    return ManagerGeneration(invocation, started)
 
 
 def _validate_tool_receipt(value: object, label: str) -> None:
@@ -3069,10 +3411,13 @@ def validate_wal(value: object) -> dict[str, Any]:
             "guard_unit",
             "proc_root",
             "snapshot_root",
+            "snapshot_identity",
             "candidate",
             "prior",
             "authorities",
+            "manager_generation",
             "manager_job_ids",
+            "restart_intent",
             "committed",
             "error",
         },
@@ -3102,6 +3447,13 @@ def validate_wal(value: object) -> dict[str, Any]:
         fail("transaction snapshot escaped cache root")
     if not Path(snapshot).name.startswith(".rebuild-input-"):
         fail("transaction snapshot name is unsafe")
+    snapshot_identity = _exact_keys(
+        wal["snapshot_identity"], {"device", "inode"}, "snapshot identity"
+    )
+    wal["snapshot_identity"] = (
+        _strict_int(snapshot_identity["device"], "snapshot identity.device"),
+        _strict_int(snapshot_identity["inode"], "snapshot identity.inode", minimum=1),
+    )
     candidate = _exact_keys(wal["candidate"], {"path", "identity"}, "candidate")
     candidate_path = candidate["path"]
     if not isinstance(candidate_path, str) or not _safe_absolute(candidate_path):
@@ -3169,6 +3521,9 @@ def validate_wal(value: object) -> dict[str, Any]:
         fail("prior backup identity differs from prior executable")
     backup["identity"] = backup_identity
     _validate_authorities(wal["authorities"])
+    wal["manager_generation"] = _manager_generation_from_payload(
+        wal["manager_generation"]
+    )
     jobs = wal["manager_job_ids"]
     if not isinstance(jobs, list):
         fail("manager job ledger is malformed")
@@ -3176,6 +3531,8 @@ def validate_wal(value: object) -> dict[str, Any]:
     if len(parsed_jobs) > 32 or len(set(parsed_jobs)) != len(parsed_jobs):
         fail("manager job ledger is unsafe")
     wal["manager_job_ids"] = parsed_jobs
+    if not isinstance(wal["restart_intent"], bool):
+        fail("restart intent is malformed")
     committed = wal["committed"]
     if wal["phase"] == "committed":
         committed_payload = _exact_keys(
@@ -3192,6 +3549,9 @@ def validate_wal(value: object) -> dict[str, Any]:
         if (
             committed_payload["boot_id"] != prior["boot_id"]
             or committed_payload["running_link"] != candidate_path
+            or not identity_equal(
+                committed_payload["executable"], candidate["identity"]
+            )
         ):
             fail("committed runtime authority differs")
     elif committed is not None:
@@ -3200,6 +3560,7 @@ def validate_wal(value: object) -> dict[str, Any]:
 
 
 def load_wal() -> dict[str, Any] | None:
+    _deadline_checkpoint("filesystem-read")
     transaction = _transaction_dir()
     try:
         _secure_directory(transaction)
@@ -3214,6 +3575,7 @@ def load_wal() -> dict[str, Any] | None:
     try:
         payload = bytearray()
         while len(payload) <= STATE_MAX_BYTES:
+            _deadline_checkpoint("filesystem-read")
             chunk = os.read(descriptor, min(65536, STATE_MAX_BYTES + 1 - len(payload)))
             if not chunk:
                 break
@@ -3248,6 +3610,8 @@ def _serializable_wal(wal: dict[str, Any]) -> dict[str, Any]:
     def convert(value: Any) -> Any:
         if isinstance(value, ExecutableIdentity):
             return _identity_payload(value)
+        if isinstance(value, ManagerGeneration):
+            return _manager_generation_payload(value)
         if (
             isinstance(value, tuple)
             and len(value) == 2
@@ -3266,6 +3630,7 @@ def _serializable_wal(wal: dict[str, Any]) -> dict[str, Any]:
 def _write_all(descriptor: int, payload: bytes) -> None:
     written = 0
     while written < len(payload):
+        _deadline_checkpoint("filesystem-write")
         count = os.write(descriptor, payload[written:])
         if count <= 0:
             raise OSError(errno.EIO, "short state write")
@@ -3275,11 +3640,14 @@ def _write_all(descriptor: int, payload: bytes) -> None:
 def persist_wal(wal: dict[str, Any], *, initial: bool = False) -> None:
     transaction = _transaction_dir()
     if initial:
+        temporary_transaction = receipt_dir / (
+            f".transaction.v1.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+        )
         try:
-            transaction.mkdir(mode=0o700)
+            temporary_transaction.mkdir(mode=0o700)
         except FileExistsError:
-            fail("transaction directory already exists")
-        fsync_directory(receipt_dir)
+            fail("transaction publication temp already exists")
+        transaction = temporary_transaction
     _secure_directory(transaction)
     payload = _state_bytes(wal)
     failure = (
@@ -3315,7 +3683,14 @@ def persist_wal(wal: dict[str, Any], *, initial: bool = False) -> None:
         raise
     finally:
         os.close(descriptor)
-    os.replace(temporary, _state_path())
+    if initial:
+        os.replace(temporary, transaction / "state.json")
+        fsync_directory(transaction)
+        os.rename(transaction, _transaction_dir())
+        transaction = _transaction_dir()
+        fsync_directory(receipt_dir)
+    else:
+        os.replace(temporary, _state_path())
     _secure_state_file(_state_path())
     fsync_directory(transaction)
     fsync_directory(receipt_dir / "rollback")
@@ -3401,6 +3776,7 @@ def _prestate_from_wal(wal: dict[str, Any]) -> Prestate:
         cast(str, prior["boot_id"]),
         proc_value,
         None,
+        None,
         cast(str, prior["running_link"]),
         cast(ExecutableIdentity, prior["executable"]),
     )
@@ -3420,7 +3796,7 @@ def _assert_fixed_authorities(wal: dict[str, Any]) -> None:
             fail(f"held tool differs from transaction authority: {name}")
 
 
-def _matching_jobs() -> list[int]:
+def _matching_jobs() -> list[ManagerJob]:
     payload = execute(
         [
             require_tool("systemctl"),
@@ -3438,7 +3814,7 @@ def _matching_jobs() -> list[int]:
         raise RebuildError("systemd job list is malformed") from error
     if not isinstance(value, list) or len(value) > 256:
         fail("systemd job list root is malformed")
-    jobs: list[int] = []
+    jobs: list[ManagerJob] = []
     for row in value:
         item = _exact_keys(row, {"job", "unit", "type", "state"}, "systemd job")
         if item["unit"] != UNIT:
@@ -3446,17 +3822,19 @@ def _matching_jobs() -> list[int]:
         job = _strict_int(item["job"], "systemd job ID", minimum=1)
         if not all(isinstance(item[key], str) for key in ("unit", "type", "state")):
             fail("systemd job fields are malformed")
-        jobs.append(job)
-    if len(set(jobs)) != len(jobs):
+        jobs.append(ManagerJob(job, item["type"], item["state"]))
+    if len({job.job_id for job in jobs}) != len(jobs):
         fail("systemd job list contains duplicates")
-    return sorted(jobs)
+    return sorted(jobs, key=lambda job: job.job_id)
 
 
 def _sleep_poll() -> None:
     deadline = operation_deadline
-    if deadline is None or deadline <= time.monotonic():
+    if deadline is None or deadline - time.monotonic() <= MANAGER_POLL_SECONDS:
         fail("transaction deadline exhausted while polling")
-    time.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
+    time.sleep(MANAGER_POLL_SECONDS)
+    if deadline - time.monotonic() <= MANAGER_POLL_SECONDS:
+        fail("transaction deadline exhausted while polling")
 
 
 def _record_job(wal: dict[str, Any], job: int) -> None:
@@ -3469,6 +3847,28 @@ def _record_job(wal: dict[str, Any], job: int) -> None:
         wal.update(updated)
 
 
+def _set_restart_intent(wal: dict[str, Any], value: bool) -> None:
+    if wal["restart_intent"] == value:
+        return
+    updated = dict(wal)
+    updated["restart_intent"] = value
+    persist_wal(updated)
+    wal.clear()
+    wal.update(updated)
+
+
+def _wal_manager_generation(wal: dict[str, Any]) -> ManagerGeneration:
+    value = wal["manager_generation"]
+    if isinstance(value, ManagerGeneration):
+        return value
+    return _manager_generation_from_payload(value)
+
+
+def _require_same_manager(wal: dict[str, Any]) -> None:
+    if query_manager_generation() != _wal_manager_generation(wal):
+        fail("user manager generation differs from transaction")
+
+
 def prove_no_manager_job() -> None:
     generation = query_generation(require_running=False)
     jobs = _matching_jobs()
@@ -3477,7 +3877,9 @@ def prove_no_manager_job() -> None:
 
 
 def restart_guard(wal: dict[str, Any], *, boundary: str | None = None) -> int:
+    _require_same_manager(wal)
     prove_no_manager_job()
+    _set_restart_intent(wal, True)
     execute(
         [
             require_tool("systemctl"),
@@ -3489,44 +3891,61 @@ def restart_guard(wal: dict[str, Any], *, boundary: str | None = None) -> int:
             UNIT,
         ]
     )
+    _test_boundary("forward-job-dispatched")
     jobs = _matching_jobs()
     if len(jobs) != 1:
         fail("restart did not publish exactly one matching manager job")
-    job = jobs[0]
+    manager_job = jobs[0]
+    if manager_job.job_type != "restart" or manager_job.state not in {"running", "waiting"}:
+        fail("restart published an unsupported manager job")
+    job = manager_job.job_id
     _record_job(wal, job)
     if boundary is not None:
         _test_boundary(boundary)
     while True:
         current = _matching_jobs()
-        if job not in current:
+        current_ids = [item.job_id for item in current]
+        if job not in current_ids:
             if current:
                 fail("unexpected matching manager job appeared")
             break
-        if current != [job]:
+        if current != [manager_job]:
             fail("matching manager job identity drifted")
         _sleep_poll()
     if query_generation(require_running=False).job is not None:
         fail("systemd still reports a manager job after restart")
+    _set_restart_intent(wal, False)
     return job
 
 
-def cancel_manager_jobs() -> None:
-    jobs = _matching_jobs()
-    for job in jobs:
-        execute(
-            [
-                require_tool("systemctl"),
-                "--user",
-                "cancel",
-                str(job),
-            ]
-        )
+def cancel_manager_jobs(wal: dict[str, Any]) -> None:
+    _require_same_manager(wal)
+    owned = set(cast(list[int], wal["manager_job_ids"]))
     while True:
-        remaining_jobs = _matching_jobs()
-        if not remaining_jobs:
+        _require_same_manager(wal)
+        current = _matching_jobs()
+        if not current:
             break
-        if any(job not in jobs for job in remaining_jobs):
-            fail("unknown matching manager job appeared during cancellation")
+        cancellable = [
+            job
+            for job in current
+            if job.job_id in owned
+            and job.job_type == "restart"
+            and job.state in {"running", "waiting"}
+        ]
+        foreign = [job for job in current if job not in cancellable]
+        if foreign:
+            _sleep_poll()
+            continue
+        for job in cancellable:
+            execute(
+                [
+                    require_tool("systemctl"),
+                    "--user",
+                    "cancel",
+                    str(job.job_id),
+                ]
+            )
         _sleep_poll()
     if query_generation(require_running=False).job is not None:
         fail("systemd manager job remained after exact cancellation")
@@ -3633,9 +4052,9 @@ def final_runtime_attestation(
         fail("service symlink changed during attestation")
 
 
-def _exact_prior_running(wal: dict[str, Any]) -> bool:
+def _exact_prior_runtime(wal: dict[str, Any]) -> bool:
     prestate = _prestate_from_wal(wal)
-    if not service_link_matches(prestate.link_target) or boot_id() != prestate.boot:
+    if boot_id() != prestate.boot:
         return False
     try:
         generation = query_generation()
@@ -3659,7 +4078,13 @@ def _exact_prior_running(wal: dict[str, Any]) -> bool:
         os.close(descriptor)
 
 
+def _exact_prior_running(wal: dict[str, Any]) -> bool:
+    prestate = _prestate_from_wal(wal)
+    return service_link_matches(prestate.link_target) and _exact_prior_runtime(wal)
+
+
 def _remove_backup(wal: dict[str, Any]) -> None:
+    _deadline_checkpoint("rollback")
     backup = Path(cast(dict[str, Any], wal["prior"])["backup"]["path"])
     try:
         metadata = backup.lstat()
@@ -3679,8 +4104,12 @@ def _remove_backup(wal: dict[str, Any]) -> None:
 
 
 def sweep_orphan_backups() -> None:
+    _deadline_checkpoint("filesystem-read")
     rollback = receipt_dir / "rollback"
-    entries = list(rollback.iterdir())
+    entries = []
+    for entry in rollback.iterdir():
+        _deadline_checkpoint("filesystem-read")
+        entries.append(entry)
     if len(entries) > 64:
         fail("rollback backup inventory exceeded its bound")
     for entry in entries:
@@ -3693,15 +4122,22 @@ def sweep_orphan_backups() -> None:
         fsync_directory(receipt_dir)
 
 
+def _snapshot_wal_identity(wal: dict[str, Any]) -> tuple[int, int]:
+    value = wal["snapshot_identity"]
+    if isinstance(value, tuple):
+        return cast(tuple[int, int], value)
+    payload = cast(dict[str, int], value)
+    return payload["device"], payload["inode"]
+
+
 def cleanup_transaction(wal: dict[str, Any]) -> None:
-    cleanup_snapshot(Path(cast(str, wal["snapshot_root"])))
+    cleanup_snapshot(
+        Path(cast(str, wal["snapshot_root"])),
+        _snapshot_wal_identity(wal),
+    )
     _remove_backup(wal)
-    state_path = _state_path()
-    _secure_state_file(state_path)
-    state_path.unlink()
-    fsync_directory(_transaction_dir())
-    _transaction_dir().rmdir()
-    fsync_directory(receipt_dir)
+    transaction = _transaction_dir()
+    cleanup_snapshot(transaction, _directory_identity(transaction))
 
 
 def _wait_fresh_generation(
@@ -3725,8 +4161,9 @@ def _wait_fresh_generation(
 
 def rollback_wal(wal: dict[str, Any]) -> None:
     log("ROLLBACK_BEGIN=1")
+    _deadline_checkpoint("rollback")
     _assert_fixed_authorities(wal)
-    cancel_manager_jobs()
+    cancel_manager_jobs(wal)
     prestate = _prestate_from_wal(wal)
     if _exact_prior_running(wal):
         health_check()
@@ -3735,10 +4172,39 @@ def rollback_wal(wal: dict[str, Any]) -> None:
         cleanup_transaction(wal)
         log("ROLLBACK_RESTORED=1")
         return
+    stable_prior_fd: int | None = None
+    if prestate.link_target is None:
+        stable_prior_fd = os.open(
+            prestate.running_link,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        if fd_identity(stable_prior_fd) != prestate.executable:
+            os.close(stable_prior_fd)
+            fail("prior absent-link stable pathname is no longer exact")
+    if _exact_prior_runtime(wal):
+        try:
+            if prestate.link_target is None:
+                remove_service_link()
+            else:
+                set_service_link(prestate.link_target)
+            if not _exact_prior_running(wal):
+                fail("exact prior runtime or link drifted during rollback")
+            health_check()
+            cleanup_transaction(wal)
+            if stable_prior_fd is not None and (
+                fd_identity(stable_prior_fd) != prestate.executable
+                or file_identity(Path(prestate.running_link)) != prestate.executable
+            ):
+                fail("prior executable is not restartable after cleanup")
+            log("ROLLBACK_RESTORED=1")
+            return
+        finally:
+            if stable_prior_fd is not None:
+                os.close(stable_prior_fd)
     failed = query_generation(require_running=False)
     failed_proc = proc_starttime(failed.pid) if failed.pid else 0
     if prestate.link_target is None:
-        remove_service_link()
+        set_service_link(prestate.running_link)
     else:
         prior_target = Path(prestate.link_target)
         if file_identity(prior_target) != prestate.executable:
@@ -3756,47 +4222,54 @@ def rollback_wal(wal: dict[str, Any]) -> None:
     backup_identity = cast(ExecutableIdentity, backup_record["identity"])
     if file_identity(backup) != backup_identity:
         fail("rollback backup identity changed")
-    if prestate.link_target is None:
-        set_service_link(str(backup))
-        expected_object = backup_identity
-    else:
-        expected_object = prestate.executable
-    restart_guard(wal)
-    restored_generation, restored_start = _wait_fresh_generation(
-        failed, failed_proc, prestate.generation, prestate.boot
-    )
-    health_check()
-    descriptor, running_link, identity = open_runtime_executable(
-        restored_generation.pid
-    )
     try:
-        if identity != expected_object:
-            fail("rollback runtime did not execute the exact prior object")
-        if running_link != (
-            str(backup) if prestate.link_target is None else prestate.running_link
+        restart_guard(wal)
+        restored_generation, restored_start = _wait_fresh_generation(
+            failed, failed_proc, prestate.generation, prestate.boot
+        )
+        health_check()
+        descriptor, running_link, identity = open_runtime_executable(
+            restored_generation.pid
+        )
+        try:
+            if identity != prestate.executable:
+                fail("rollback runtime did not execute the exact prior object")
+            if running_link != prestate.running_link:
+                fail("rollback runtime link differs from exact prior authority")
+            if query_generation() != restored_generation:
+                fail("rollback generation drifted after health")
+            if proc_starttime(restored_generation.pid) != restored_start:
+                fail("rollback proc starttime drifted after health")
+            current = os.stat(proc_root / str(restored_generation.pid) / "exe")
+            if not same_object(current, identity) or fd_identity(descriptor) != identity:
+                fail("rollback held executable proof drifted")
+        finally:
+            os.close(descriptor)
+        if stable_prior_fd is not None and (
+            fd_identity(stable_prior_fd) != prestate.executable
+            or file_identity(Path(prestate.running_link)) != prestate.executable
         ):
-            fail("rollback runtime link differs from exact prior authority")
-        if query_generation() != restored_generation:
-            fail("rollback generation drifted after health")
-        if proc_starttime(restored_generation.pid) != restored_start:
-            fail("rollback proc starttime drifted after health")
-        current = os.stat(proc_root / str(restored_generation.pid) / "exe")
-        if not same_object(current, identity) or fd_identity(descriptor) != identity:
-            fail("rollback held executable proof drifted")
+            fail("prior absent-link stable pathname drifted during rollback")
+        if prestate.link_target is None:
+            remove_service_link()
+        if not service_link_matches(prestate.link_target):
+            fail("rollback did not restore exact prior service link state")
+        cleanup_transaction(wal)
+        if stable_prior_fd is not None and (
+            fd_identity(stable_prior_fd) != prestate.executable
+            or file_identity(Path(prestate.running_link)) != prestate.executable
+        ):
+            fail("prior executable is not restartable after cleanup")
+        log("ROLLBACK_RESTORED=1")
     finally:
-        os.close(descriptor)
-    if prestate.link_target is None:
-        remove_service_link()
-    if not service_link_matches(prestate.link_target):
-        fail("rollback did not restore exact prior service link state")
-    cleanup_transaction(wal)
-    log("ROLLBACK_RESTORED=1")
+        if stable_prior_fd is not None:
+            os.close(stable_prior_fd)
 
 
 def _verify_committed(wal: dict[str, Any], *, cancel_jobs: bool = True) -> None:
     _assert_fixed_authorities(wal)
     if cancel_jobs:
-        cancel_manager_jobs()
+        cancel_manager_jobs(wal)
     else:
         prove_no_manager_job()
     committed = cast(dict[str, Any], wal["committed"])
@@ -3804,12 +4277,14 @@ def _verify_committed(wal: dict[str, Any], *, cancel_jobs: bool = True) -> None:
     candidate_record = cast(dict[str, Any], wal["candidate"])
     candidate = Path(cast(str, candidate_record["path"]))
     expected = cast(ExecutableIdentity, candidate_record["identity"])
+    committed_expected = cast(ExecutableIdentity, committed["executable"])
     if candidate_authority is not None:
         candidate_authority.verify()
     if (
         not service_link_matches(str(candidate))
         or candidate_authority is None
         or fd_identity(candidate_authority.descriptor) != expected
+        or committed_expected != expected
         or boot_id() != committed["boot_id"]
         or query_generation() != generation
         or proc_starttime(generation.pid) != proc_value
@@ -3820,6 +4295,7 @@ def _verify_committed(wal: dict[str, Any], *, cancel_jobs: bool = True) -> None:
         if (
             running_link != committed["running_link"]
             or identity != expected
+            or identity != committed_expected
             or fd_identity(descriptor) != expected
         ):
             fail("committed executable proof differs")
@@ -3834,15 +4310,32 @@ def _verify_committed(wal: dict[str, Any], *, cancel_jobs: bool = True) -> None:
 
 
 def archive_committed(wal: dict[str, Any]) -> tuple[Path, str]:
+    _deadline_checkpoint("rollback")
     if wal["phase"] != "committed":
         fail("only committed state may be archived")
-    cleanup_snapshot(Path(cast(str, wal["snapshot_root"])))
+    cleanup_snapshot(
+        Path(cast(str, wal["snapshot_root"])),
+        _snapshot_wal_identity(wal),
+    )
     _remove_backup(wal)
     receipts = receipt_dir / "receipts"
     destination = receipts / cast(str, wal["txid"])
     if destination.exists() or destination.is_symlink():
         fail("committed receipt destination already exists")
-    os.rename(_transaction_dir(), destination)
+    transaction = _transaction_dir()
+    for entry in transaction.iterdir():
+        _deadline_checkpoint("filesystem-read")
+        if entry.name == "state.json":
+            continue
+        if re.fullmatch(
+            r"\.state\.tmp\.[1-9][0-9]*\.[0-9a-f]{8}", entry.name
+        ) is None:
+            fail("transaction contains an unknown publication artifact")
+        _secure_state_file(entry)
+        _deadline_checkpoint("filesystem-write")
+        entry.unlink()
+    fsync_directory(transaction)
+    os.rename(transaction, destination)
     _secure_directory(destination)
     state_path = destination / "state.json"
     _secure_state_file(state_path)
@@ -3876,6 +4369,8 @@ def _build_wal(
     backup: Path,
     backup_identity: ExecutableIdentity,
     snapshot: Path,
+    snapshot_identity: tuple[int, int],
+    manager_generation: ManagerGeneration,
     candidate: Path,
     candidate_identity: ExecutableIdentity,
     authorities: dict[str, Any],
@@ -3890,6 +4385,10 @@ def _build_wal(
         "guard_unit": str(guard_unit),
         "proc_root": str(proc_root),
         "snapshot_root": str(snapshot),
+        "snapshot_identity": {
+            "device": snapshot_identity[0],
+            "inode": snapshot_identity[1],
+        },
         "candidate": {
             "path": str(candidate),
             "identity": candidate_identity,
@@ -3906,7 +4405,9 @@ def _build_wal(
             },
         },
         "authorities": authorities,
+        "manager_generation": _manager_generation_payload(manager_generation),
         "manager_job_ids": [],
+        "restart_intent": False,
         "committed": None,
         "error": None,
     }
@@ -3965,6 +4466,7 @@ def run_transaction() -> int:
 
     lock_descriptor: int | None = None
     snapshot_root: Path | None = None
+    snapshot_root_identity: tuple[int, int] | None = None
     source_bundle: SourceBundle | None = None
     prestate: Prestate | None = None
     accepted: RuntimeAttestation | None = None
@@ -3974,13 +4476,11 @@ def run_transaction() -> int:
         lock_descriptor = acquire_rebuild_lock()
         lock_acquired = True
         operation_deadline = time.monotonic() + _test_deadline(
-            "LLM_GUARD_REBUILD_TEST_FORWARD_SECONDS", FORWARD_SECONDS
+            "LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS", RECOVERY_SECONDS
         )
+        recovered_namespace = _prepare_transaction_namespace()
         stale = load_wal()
         if stale is not None:
-            operation_deadline = time.monotonic() + _test_deadline(
-                "LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS", RECOVERY_SECONDS
-            )
             authorities = cast(dict[str, Any], stale["authorities"])
             if (
                 _runtime_python_authority_sha256()
@@ -4001,7 +4501,13 @@ def run_transaction() -> int:
             _open_all_tools()
             recover_stale_transaction(stale)
             return 75
+        if recovered_namespace:
+            print(f"{RECOVERY_COMPLETE} phase=cleanup txid=unknown", flush=True)
+            return 75
 
+        operation_deadline = time.monotonic() + _test_deadline(
+            "LLM_GUARD_REBUILD_TEST_FORWARD_SECONDS", FORWARD_SECONDS
+        )
         sweep_orphan_backups()
         _open_fixed_authorities()
         _open_all_tools()
@@ -4014,10 +4520,12 @@ def run_transaction() -> int:
         rustc_identity_sha = sha256_bytes(rustc_identity_initial)
 
         prestate = snapshot_prestate()
+        manager_generation = query_manager_generation()
         prove_no_manager_job()
         ensure_private_directory(cache_root)
         snapshot_root = Path(tempfile.mkdtemp(prefix=".rebuild-input-", dir=cache_root))
         snapshot_root.chmod(0o700)
+        snapshot_root_identity = _directory_identity(snapshot_root)
         source_bundle = prepare_canonical_source(snapshot_root)
         build_bundle = build_sandboxed_candidate(source_bundle)
         candidate_authority = build_bundle.authority
@@ -4037,6 +4545,8 @@ def run_transaction() -> int:
         if rustc_identity_initial != capture_tool("rustc", "-vV"):
             fail("rustc toolchain identity changed before cutover")
         candidate_authority.verify()
+        if query_manager_generation() != manager_generation:
+            fail("user manager generation changed before cutover")
 
         backup, backup_identity = _make_backup(prestate)
         tool_receipts = {
@@ -4075,6 +4585,8 @@ def run_transaction() -> int:
             backup,
             backup_identity,
             snapshot_root,
+            snapshot_root_identity,
+            manager_generation,
             candidate,
             candidate_identity,
             authorities,
@@ -4148,6 +4660,8 @@ def run_transaction() -> int:
         persist_phase(wal, "committed", committed=committed)
         _test_boundary("committed-fsynced")
         _, receipt_digest = archive_committed(wal)
+        snapshot_root = None
+        snapshot_root_identity = None
         _verify_committed(wal, cancel_jobs=False)
         if (
             test_only
@@ -4176,28 +4690,23 @@ def run_transaction() -> int:
             finally:
                 for signum, handler in previous_handlers.items():
                     signal.signal(signum, handler)
-        try:
-            print(f"ERROR: {error}", file=sys.stderr, flush=True)
-            if rollback_error is not None:
-                print(
-                    f"ERROR: rollback blocked; transaction retained: {rollback_error}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-        except OSError:
-            pass
+        _report_error(str(error))
+        if rollback_error is not None:
+            _report_error(f"rollback blocked; transaction retained: {rollback_error}")
         return 1
     finally:
         if accepted is not None:
             os.close(accepted.descriptor)
         if prestate is not None and prestate.descriptor is not None:
             os.close(prestate.descriptor)
+        if prestate is not None and prestate.restart_descriptor is not None:
+            os.close(prestate.restart_descriptor)
         if source_bundle is not None:
             source_bundle.close()
         if candidate_authority is not None:
             candidate_authority.close()
             candidate_authority = None
-        cleanup_snapshot(snapshot_root)
+        cleanup_snapshot(snapshot_root, snapshot_root_identity)
         for held in reversed(list(held_tools.values())):
             held.close()
         held_tools.clear()

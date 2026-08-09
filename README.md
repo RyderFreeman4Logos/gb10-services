@@ -192,20 +192,38 @@ Before Git or build work, the script takes nonblocking `flock` authority at
 `transaction.v1/state.json`. It keeps content-addressed prior bytes under
 `rollback/` and archives metadata-only committed state under `receipts/<txid>/`;
 directories are owner `0700`, state/lock files are owner `0600`, and every
-phase publication uses file and directory `fsync` plus atomic rename.
+phase publication uses file and directory `fsync` plus atomic rename. Initial
+publication renames one complete, tightly named sibling directory; startup
+promotes that complete form, retains an incomplete publication temp, and
+finishes an exact owner-only cleanup tombstone before proceeding. Cleanup first
+renames the complete transaction directory and never removes canonical
+`state.json` while sibling artifacts remain.
 
 The WAL records the exact prior symlink or absence, `MainPID`, `InvocationID`,
-monotonic systemd start, boot ID, `/proc/<pid>/stat` starttime, and the exact executable
-identity from a held `/proc/<pid>/exe` file descriptor. `prestate`, `mutated`, and `committed` are the only
-phases. Recovery cancels only exact matching Guard job IDs, restores and proves
-the exact prior executable generation, and exits 75 before any new build.
-Malformed state, unprovable rollback, or a nonterminal manager job keeps the WAL
-and blocks completion; it never restarts a vLLM backend.
+monotonic systemd start, boot ID, `/proc/<pid>/stat` starttime, snapshot-root
+device/inode, and the exact executable identity from a held `/proc/<pid>/exe`
+file descriptor. `prestate`, `mutated`, and `committed` are the only phases.
+Snapshot cleanup reopens the exact root through an owner-held parent descriptor,
+quarantines it by atomic rename, and uses symlink-resistant FD-relative removal;
+replacement entries are preserved and keep the WAL. For an absent prior service
+link, the unchanged original runtime pathname must remain an exact, held,
+no-follow restart authority before mutation and after cleanup.
+
+Restart intent and the user-manager generation are durable before dispatch.
+Recovery cancels only a recorded job ID under that unchanged generation after
+validating its unit, restart type, and nonterminal state. Foreign jobs, manager
+generation drift, ID reuse, and the dispatch-to-record crash gap are only waited
+out within the recovery deadline; they are never adopted. Committed executable
+evidence must exactly equal the candidate identity and the held runtime before
+archival. Recovery restores and proves the exact prior executable generation and
+exits 75 before any new build. Malformed state or unprovable rollback keeps the
+WAL and blocks completion; the script never restarts a vLLM backend.
 
 The forward transaction has one 1,800-second monotonic deadline. Failure or
-stale-WAL handling receives an independent 180-second recovery deadline. A
-durable `committed` generation is never rolled back merely because the terminal
-stdout sink fails. Only
+stale-WAL handling receives an independent 180-second recovery deadline shared
+by direct reads/hashes, job waits, rollback, diagnostics, and tombstone cleanup.
+A durable `committed` generation is never rolled back merely because the
+terminal stdout sink fails. Only
 `LLM_GUARD_PROXY_REBUILD_COMPLETE receipt_sha256=<64hex>` is a production
 completion claim; absence of that line is not proof that a committed generation
 was rolled back.

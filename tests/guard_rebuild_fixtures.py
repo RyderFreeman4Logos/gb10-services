@@ -131,9 +131,15 @@ class RebuildFixture:
             "candidate_path_swap": False,
             "build_finished": False,
             "jobs": {},
+            "manager_invocation": "f" * 32,
+            "manager_started": 500,
             "next_job_id": 41,
             "job_behavior": "normal",
+            "job_type": "restart",
+            "job_state": "running",
             "job_polls_remaining": 1,
+            "systemctl_call_limit": 0,
+            "systemctl_calls": 0,
             "restart_noop_after": 0,
             "hang_restart_calls": [],
             "manager_contract_mismatch": False,
@@ -371,6 +377,10 @@ class RebuildFixture:
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             directory.chmod(0o700)
         self.ensure_candidate()
+        snapshot = self.cache_root / ".rebuild-input-stale"
+        snapshot.mkdir(mode=0o700)
+        snapshot.chmod(0o700)
+        snapshot_info = snapshot.stat()
         prior_identity = self._identity(self.prior)
         backup = rollback / f"{prior_identity['sha256']}.bin"
         shutil.copyfile(self.prior, backup)
@@ -404,6 +414,23 @@ class RebuildFixture:
             "sysroot_include": {},
             "metadata_target": {},
         }
+        candidate_identity = self._identity(self.candidate)
+        committed = None
+        if phase == "committed":
+            committed = {
+                "generation": {
+                    "pid": 4243,
+                    "invocation": "2" * 32,
+                    "started": 1100,
+                    "proc_start": 2100,
+                    "fragment": str(self.guard_unit),
+                    "result": "success",
+                    "job": None,
+                },
+                "boot_id": "12345678-1234-4abc-8def-1234567890ab",
+                "running_link": str(self.candidate),
+                "executable": candidate_identity,
+            }
         payload = {
             "schema": 1,
             "phase": phase,
@@ -413,10 +440,14 @@ class RebuildFixture:
             "guard_config": str(self.guard_config),
             "guard_unit": str(self.guard_unit),
             "proc_root": str(self.proc_root),
-            "snapshot_root": str(self.cache_root / ".rebuild-input-stale"),
+            "snapshot_root": str(snapshot),
+            "snapshot_identity": {
+                "device": snapshot_info.st_dev,
+                "inode": snapshot_info.st_ino,
+            },
             "candidate": {
                 "path": str(self.candidate),
-                "identity": self._identity(self.candidate),
+                "identity": candidate_identity,
             },
             "prior": {
                 "link_target": str(self.prior),
@@ -466,8 +497,13 @@ class RebuildFixture:
                 "tool_authorities": tool_authorities,
                 "python_runtime_authority_sha256": self._python_runtime_authority_sha256(),
             },
+            "manager_generation": {
+                "invocation": self.state["manager_invocation"],
+                "started": self.state["manager_started"],
+            },
             "manager_job_ids": [],
-            "committed": None,
+            "restart_intent": False,
+            "committed": committed,
             "error": None,
         }
         state_path = transaction / "state.json"
@@ -523,6 +559,12 @@ log_path = Path(os.environ["GUARD_TEST_TOOL_LOG"])
 state = json.loads(state_path.read_text())
 with log_path.open("a") as log:
     log.write(name + " " + " ".join(args) + "\n")
+
+if name == "systemctl" and state.get("systemctl_call_limit", 0) and state.get("jobs"):
+    state["systemctl_calls"] = int(state.get("systemctl_calls", 0)) + 1
+    state_path.write_text(json.dumps(state, sort_keys=True))
+    if state["systemctl_calls"] > state["systemctl_call_limit"]:
+        raise SystemExit(21)
 
 def save():
     state_path.write_text(json.dumps(state, sort_keys=True))
@@ -732,6 +774,9 @@ elif name == "systemctl":
         raise SystemExit(0 if state["active"] else 3)
     if joined == "--user show -p MainPID --value llm-guard-proxy.service":
         print(state["pid"] if state["active"] else 0)
+    elif joined == "--user show --property=InvocationID --property=UserspaceTimestampMonotonic":
+        print(f"InvocationID={state['manager_invocation']}")
+        print(f"UserspaceTimestampMonotonic={state['manager_started']}")
     elif " show " in f" {joined} " or joined.startswith("--user show "):
         values = {
             "LoadState": "loaded",
@@ -787,8 +832,8 @@ elif name == "systemctl":
             {
                 "job": int(job_id),
                 "unit": "llm-guard-proxy.service",
-                "type": "restart",
-                "state": "running",
+                "type": state.get("job_type", "restart"),
+                "state": state.get("job_state", "running"),
             }
             for job_id in sorted(jobs, key=int)
         ]
@@ -819,6 +864,8 @@ elif name == "systemctl":
         job_id = args[-1]
         if state.get("job_behavior") != "cancel-still-present":
             state.get("jobs", {}).pop(job_id, None)
+        if state.get("job_behavior") == "cancel-owned-then-normal":
+            state["job_behavior"] = "normal"
         save()
     elif joined in {
         "--user restart llm-guard-proxy.service",
