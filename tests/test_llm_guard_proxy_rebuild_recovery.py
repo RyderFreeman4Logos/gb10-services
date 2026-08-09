@@ -465,6 +465,119 @@ class GuardRebuildRecoveryTests(unittest.TestCase):
             self.assertTrue(fixture.prior.exists())
             self.assertFalse(self.transaction_state(fixture).exists(), output)
 
+    def test_forward_accepts_restart_completed_before_first_job_observation(
+        self,
+    ) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(job_behavior="complete-before-observation")
+
+            result = fixture.run(timeout=20)
+            output = self.output(result)
+
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn(TEST_COMPLETE, output)
+            self.assertEqual(
+                fixture.reload_state()["running_target"], str(fixture.candidate)
+            )
+            self.assertNotIn("systemctl --user cancel", fixture.calls())
+
+    def test_recovery_accepts_restart_completed_before_first_job_observation(
+        self,
+    ) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("mutated", mutate=True)
+            fixture.set_state(job_behavior="complete-before-observation")
+            fixture.tool_log.unlink(missing_ok=True)
+
+            result = fixture.run(timeout=15)
+            output = self.output(result)
+
+            self.assertEqual(result.returncode, 75, output)
+            self.assertIn(RECOVERED, output)
+            self.assertFalse(state.exists(), output)
+            fixture.assert_prior_restored(self)
+            self.assertNotIn("systemctl --user cancel", fixture.calls())
+
+    def test_forward_accepts_same_restart_job_waiting_to_running(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(job_behavior="waiting-to-running", job_state="waiting")
+
+            result = fixture.run(timeout=20)
+            output = self.output(result)
+
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn(TEST_COMPLETE, output)
+            self.assertEqual(
+                fixture.reload_state()["running_target"], str(fixture.candidate)
+            )
+
+    def test_recovery_accepts_same_restart_job_waiting_to_running(self) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("mutated", mutate=True)
+            fixture.set_state(job_behavior="waiting-to-running", job_state="waiting")
+            fixture.tool_log.unlink(missing_ok=True)
+
+            result = fixture.run(timeout=15)
+            output = self.output(result)
+
+            self.assertEqual(result.returncode, 75, output)
+            self.assertIn(RECOVERED, output)
+            self.assertFalse(state.exists(), output)
+            fixture.assert_prior_restored(self)
+
+    def test_disappeared_restart_without_fresh_runtime_fails_closed(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(job_behavior="disappear-without-activation")
+
+            result = fixture.run(timeout=20)
+            output = self.output(result)
+
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assert_no_completion(output)
+            fixture.assert_prior_restored(self)
+
+    def test_foreign_unit_with_owned_job_id_is_never_cancelled(self) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("committed", mutate=True)
+            payload = json.loads(state.read_text())
+            payload["manager_job_ids"] = [99]
+            payload["restart_intent"] = True
+            state.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+            )
+            fixture.set_state(
+                jobs={"99": str(fixture.candidate)},
+                job_behavior="nonterminal",
+                job_unit="foreign.service",
+            )
+            fixture.tool_log.unlink(missing_ok=True)
+
+            result = fixture.run(timeout=15)
+            output = self.output(result)
+
+            self.assertEqual(result.returncode, 75, output)
+            self.assertNotIn("systemctl --user cancel 99", fixture.calls())
+            self.assertEqual(
+                fixture.reload_state()["jobs"], {"99": str(fixture.candidate)}
+            )
+            self.assertFalse(state.exists(), output)
+
+    def test_multiple_dispatched_jobs_are_never_adopted_or_cancelled(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(job_behavior="multiple-on-dispatch")
+
+            result = fixture.run(
+                extra_env={"LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS": "2"},
+                timeout=20,
+            )
+            output = self.output(result)
+
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assert_no_completion(output)
+            self.assertNotIn("systemctl --user cancel 41", fixture.calls())
+            self.assertNotIn("systemctl --user cancel 42", fixture.calls())
+            self.assertTrue(self.transaction_state(fixture).exists(), output)
+
     def test_nonterminal_manager_job_is_cancelled_by_exact_id_then_rolls_back(
         self,
     ) -> None:

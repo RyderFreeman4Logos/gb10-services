@@ -136,6 +136,7 @@ class RebuildFixture:
             "next_job_id": 41,
             "job_behavior": "normal",
             "job_type": "restart",
+            "job_unit": "llm-guard-proxy.service",
             "job_state": "running",
             "job_polls_remaining": 1,
             "systemctl_call_limit": 0,
@@ -793,7 +794,11 @@ elif name == "systemctl":
                 state["systemd_start"] if state["active"] else 0
             ),
             "Result": "success" if state["active"] else "exit-code",
-            "Job": next(iter(state.get("jobs", {})), ""),
+            "Job": (
+                next(iter(state.get("jobs", {})), "")
+                if state.get("job_unit") == "llm-guard-proxy.service"
+                else ""
+            ),
             "ExecStart": (
                 "{ path=" + os.environ["SERVICE_BIN"]
                 + " ; argv[]=" + os.environ["SERVICE_BIN"]
@@ -831,7 +836,7 @@ elif name == "systemctl":
         output = [
             {
                 "job": int(job_id),
-                "unit": "llm-guard-proxy.service",
+                "unit": state.get("job_unit", "llm-guard-proxy.service"),
                 "type": state.get("job_type", "restart"),
                 "state": state.get("job_state", "running"),
             }
@@ -848,6 +853,14 @@ elif name == "systemctl":
                     activate(target)
                 state["jobs"].pop(job_id, None)
                 state["job_polls_remaining"] = 1
+        elif jobs and state.get("job_behavior") == "waiting-to-running":
+            if state.get("job_state") == "waiting":
+                state["job_state"] = "running"
+            else:
+                job_id, target = next(iter(jobs.items()))
+                activate(target)
+                state["jobs"].pop(job_id, None)
+                state["job_state"] = "waiting"
         if state.get("health_passed"):
             state["publication_job_checks"] += 1
         save()
@@ -905,10 +918,19 @@ elif name == "systemctl":
                 os.write(2, b"e" * 65536)
                 time.sleep(0.001)
         if "--no-block" in args:
-            job_id = str(state["next_job_id"])
-            state["next_job_id"] += 1
-            state.setdefault("jobs", {})[job_id] = str(target)
-            save()
+            if state.get("job_behavior") == "complete-before-observation":
+                activate(target)
+            elif state.get("job_behavior") == "disappear-without-activation":
+                save()
+            else:
+                job_id = str(state["next_job_id"])
+                state["next_job_id"] += 1
+                state.setdefault("jobs", {})[job_id] = str(target)
+                if state.get("job_behavior") == "multiple-on-dispatch":
+                    second = str(state["next_job_id"])
+                    state["next_job_id"] += 1
+                    state["jobs"][second] = str(target)
+                save()
         elif (
             int(state.get("restart_noop_after", 0))
             and state["restart_calls"] > int(state["restart_noop_after"])

@@ -3876,7 +3876,60 @@ def prove_no_manager_job() -> None:
         fail("Guard has a nonterminal manager job")
 
 
-def restart_guard(wal: dict[str, Any], *, boundary: str | None = None) -> int:
+def _prove_restarted_runtime(
+    *,
+    service_link: str,
+    running_link: str,
+    expected: ExecutableIdentity,
+    replaced_generation: Generation,
+    replaced_proc_start: int,
+    prior_generation: Generation,
+    expected_boot: str,
+) -> tuple[Generation, int]:
+    generation = query_generation()
+    verify_running_config(generation.pid)
+    current_boot = boot_id()
+    starttime = proc_starttime(generation.pid)
+    if (
+        not generation_is_new(replaced_generation, generation)
+        or generation.started <= prior_generation.started
+        or starttime == replaced_proc_start
+        or current_boot != expected_boot
+    ):
+        fail("Guard restart did not create the expected fresh runtime generation")
+    descriptor, actual_link, identity = open_runtime_executable(generation.pid)
+    try:
+        if (
+            actual_link != running_link
+            or identity != expected
+            or fd_identity(descriptor) != expected
+            or not service_link_matches(service_link)
+            or not same_object(os.stat(service_bin), expected)
+        ):
+            fail("Guard restart did not execute the expected sealed runtime identity")
+        if (
+            query_generation() != generation
+            or boot_id() != current_boot
+            or proc_starttime(generation.pid) != starttime
+        ):
+            fail("Guard restart runtime generation drifted during proof")
+    finally:
+        os.close(descriptor)
+    return generation, starttime
+
+
+def restart_guard(
+    wal: dict[str, Any],
+    *,
+    service_link: str,
+    running_link: str,
+    expected: ExecutableIdentity,
+    replaced_generation: Generation,
+    replaced_proc_start: int,
+    prior_generation: Generation,
+    expected_boot: str,
+    boundary: str | None = None,
+) -> tuple[Generation, int]:
     _require_same_manager(wal)
     prove_no_manager_job()
     _set_restart_intent(wal, True)
@@ -3892,30 +3945,50 @@ def restart_guard(wal: dict[str, Any], *, boundary: str | None = None) -> int:
         ]
     )
     _test_boundary("forward-job-dispatched")
+    _require_same_manager(wal)
     jobs = _matching_jobs()
-    if len(jobs) != 1:
-        fail("restart did not publish exactly one matching manager job")
-    manager_job = jobs[0]
-    if manager_job.job_type != "restart" or manager_job.state not in {"running", "waiting"}:
-        fail("restart published an unsupported manager job")
-    job = manager_job.job_id
-    _record_job(wal, job)
+    _require_same_manager(wal)
+    if len(jobs) > 1:
+        fail("restart published multiple matching manager jobs")
+    job: int | None = None
+    if jobs:
+        manager_job = jobs[0]
+        if manager_job.job_type != "restart" or manager_job.state not in {
+            "running",
+            "waiting",
+        }:
+            fail("restart published an unsupported manager job")
+        job = manager_job.job_id
+        _record_job(wal, job)
     if boundary is not None:
         _test_boundary(boundary)
-    while True:
+    while job is not None:
+        _require_same_manager(wal)
         current = _matching_jobs()
-        current_ids = [item.job_id for item in current]
-        if job not in current_ids:
-            if current:
-                fail("unexpected matching manager job appeared")
+        if not current:
             break
-        if current != [manager_job]:
+        if (
+            len(current) != 1
+            or current[0].job_id != job
+            or current[0].job_type != "restart"
+            or current[0].state not in {"running", "waiting"}
+        ):
             fail("matching manager job identity drifted")
         _sleep_poll()
+    _require_same_manager(wal)
     if query_generation(require_running=False).job is not None:
         fail("systemd still reports a manager job after restart")
+    restarted = _prove_restarted_runtime(
+        service_link=service_link,
+        running_link=running_link,
+        expected=expected,
+        replaced_generation=replaced_generation,
+        replaced_proc_start=replaced_proc_start,
+        prior_generation=prior_generation,
+        expected_boot=expected_boot,
+    )
     _set_restart_intent(wal, False)
-    return job
+    return restarted
 
 
 def cancel_manager_jobs(wal: dict[str, Any]) -> None:
@@ -4140,25 +4213,6 @@ def cleanup_transaction(wal: dict[str, Any]) -> None:
     cleanup_snapshot(transaction, _directory_identity(transaction))
 
 
-def _wait_fresh_generation(
-    failed_generation: Generation,
-    failed_proc_start: int,
-    prior_generation: Generation,
-    expected_boot: str,
-) -> tuple[Generation, int]:
-    while True:
-        generation = query_generation()
-        starttime = proc_starttime(generation.pid)
-        if (
-            generation_is_new(failed_generation, generation)
-            and generation.started > prior_generation.started
-            and starttime != failed_proc_start
-            and boot_id() == expected_boot
-        ):
-            return generation, starttime
-        _sleep_poll()
-
-
 def rollback_wal(wal: dict[str, Any]) -> None:
     log("ROLLBACK_BEGIN=1")
     _deadline_checkpoint("rollback")
@@ -4223,9 +4277,19 @@ def rollback_wal(wal: dict[str, Any]) -> None:
     if file_identity(backup) != backup_identity:
         fail("rollback backup identity changed")
     try:
-        restart_guard(wal)
-        restored_generation, restored_start = _wait_fresh_generation(
-            failed, failed_proc, prestate.generation, prestate.boot
+        restored_generation, restored_start = restart_guard(
+            wal,
+            service_link=(
+                prestate.running_link
+                if prestate.link_target is None
+                else prestate.link_target
+            ),
+            running_link=prestate.running_link,
+            expected=prestate.executable,
+            replaced_generation=failed,
+            replaced_proc_start=failed_proc,
+            prior_generation=prestate.generation,
+            expected_boot=prestate.boot,
         )
         health_check()
         descriptor, running_link, identity = open_runtime_executable(
@@ -4606,15 +4670,17 @@ def run_transaction() -> int:
         restarted_generation: Generation | None = None
         restarted_start = 0
         if needs_restart:
-            restart_guard(wal, boundary="forward-job")
-            restarted_generation = query_generation()
-            restarted_start = proc_starttime(restarted_generation.pid)
-            if (
-                not generation_is_new(prestate.generation, restarted_generation)
-                or restarted_start == prestate.proc_start
-                or boot_id() != prestate.boot
-            ):
-                fail("proxy restart did not create a new runtime generation")
+            restarted_generation, restarted_start = restart_guard(
+                wal,
+                service_link=str(candidate),
+                running_link=str(candidate),
+                expected=candidate_identity,
+                replaced_generation=prestate.generation,
+                replaced_proc_start=prestate.proc_start,
+                prior_generation=prestate.generation,
+                expected_boot=prestate.boot,
+                boundary="forward-job",
+            )
         health_check()
         accepted = attest_candidate(candidate, candidate_identity)
         if needs_restart and (
