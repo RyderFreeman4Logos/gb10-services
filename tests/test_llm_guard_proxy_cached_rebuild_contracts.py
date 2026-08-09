@@ -7,6 +7,7 @@ import re
 import shlex
 import stat
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -73,6 +74,73 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
             hashlib.sha256(REBUILD_ENGINE.read_bytes()).hexdigest(), match.group(1)
         )
         self.assertIn("class RebuildError", REBUILD_ENGINE.read_text())
+
+    def test_launcher_rejects_invalid_argv_before_engine_execution(self) -> None:
+        usage = "usage: llm_guard_proxy_cached_rebuild.sh [--test-only]\n"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            launcher = root / REBUILD_SCRIPT.name
+            engine = root / REBUILD_ENGINE.name
+            marker = root / "engine-argv.json"
+            engine.write_text(
+                "import json\nimport sys\nfrom pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+            )
+            engine.chmod(0o644)
+            engine_sha256 = hashlib.sha256(engine.read_bytes()).hexdigest()
+            launcher_text = re.sub(
+                r'^expected_engine_sha256="[0-9a-f]{64}"$',
+                f'expected_engine_sha256="{engine_sha256}"',
+                REBUILD_SCRIPT.read_text(),
+                flags=re.MULTILINE,
+            )
+            launcher.write_text(
+                launcher_text.replace(
+                    '"$python_owner" != 0',
+                    f'"$python_owner" != {os.stat("/usr/bin/python3.11").st_uid}',
+                )
+            )
+            launcher.chmod(0o755)
+            cases: tuple[tuple[tuple[str, ...], int, list[str] | None], ...] = (
+                ((), 0, []),
+                (("--test-only",), 0, ["--test-only"]),
+                (("unexpected",), 64, None),
+                (("--test-only", "extra"), 64, None),
+                (("unexpected", "extra"), 64, None),
+                (("--test-only", "extra", "more"), 64, None),
+            )
+            for arguments, expected_returncode, expected_engine_argv in cases:
+                with self.subTest(arguments=arguments):
+                    marker.unlink(missing_ok=True)
+                    result = subprocess.run(
+                        [
+                            "/usr/bin/bash",
+                            "-p",
+                            "-c",
+                            'launcher=$1; shift; unset PATH; source "$launcher" "$@"',
+                            "_",
+                            str(launcher),
+                            *arguments,
+                        ],
+                        cwd=root,
+                        env={},
+                        text=True,
+                        capture_output=True,
+                        timeout=5,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        result.returncode, expected_returncode, self.output(result)
+                    )
+                    if expected_engine_argv is None:
+                        self.assertEqual(result.stdout, "")
+                        self.assertEqual(result.stderr, usage)
+                        self.assertFalse(marker.exists())
+                    else:
+                        self.assertEqual(result.stderr, "")
+                        self.assertEqual(
+                            json.loads(marker.read_text()), expected_engine_argv
+                        )
 
     @staticmethod
     def output(result: subprocess.CompletedProcess[str]) -> str:

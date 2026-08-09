@@ -2,10 +2,10 @@
 # Hash-pin the reviewed rebuild engine; production starts from an empty environment.
 set -euo pipefail
 umask 077
-if (( $# > 1 )) || (( $# == 1 )) && [[ "$1" != "--test-only" ]]; then
-  printf 'usage: llm_guard_proxy_cached_rebuild.sh [--test-only]\n' >&2
-  exit 64
-fi
+case "$#:${1-}" in
+  0:|1:--test-only) ;;
+  *) printf 'usage: llm_guard_proxy_cached_rebuild.sh [--test-only]\n' >&2; exit 64 ;;
+esac
 script_dir="$(cd -P -- "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"; engine="$script_dir/llm_guard_proxy_cached_rebuild.py"
 expected_engine_sha256="27e6c4cd9c2e8f98d496198153f0f88982e4dc7df15bc6f4cf15979dae69b5db"
 if [[ -L "$engine" || ! -f "$engine" ]]; then
