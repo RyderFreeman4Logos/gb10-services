@@ -7,7 +7,7 @@ if (( $# > 1 )) || (( $# == 1 )) && [[ "$1" != "--test-only" ]]; then
   exit 64
 fi
 script_dir="$(cd -P -- "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"; engine="$script_dir/llm_guard_proxy_cached_rebuild.py"
-expected_engine_sha256="b2857a42c9dfe59b2e38ce104d070dfdebba130d6d71d451ad234c4177267581"
+expected_engine_sha256="b70d5455b58c3739d1b89659ec846489440166888e5fbc55b3ca7afc128344e9"
 if [[ -L "$engine" || ! -f "$engine" ]]; then
   printf 'Guard rebuild engine authority is unsafe\n' >&2
   exit 1

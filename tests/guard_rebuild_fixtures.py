@@ -23,9 +23,7 @@ __all__ = ["RebuildFixture"]
 
 class RebuildFixture:
     cargo_identity = (
-        "cargo 1.90.0 (fixture)\n"
-        "release: 1.90.0\n"
-        "host: x86_64-unknown-linux-gnu\n"
+        "cargo 1.90.0 (fixture)\nrelease: 1.90.0\nhost: x86_64-unknown-linux-gnu\n"
     )
     rustc_identity = (
         "rustc 1.90.0 (fixture)\n"
@@ -45,6 +43,9 @@ class RebuildFixture:
         self.toolchain_bin = self.toolchain_root / "bin"
         self.registry_cache = self.root / "registry-cache"
         self.registry_index = self.root / "registry-index"
+        self.gcc_root = self.root / "gcc-root"
+        self.sysroot_lib = self.root / "sysroot-lib"
+        self.sysroot_include = self.root / "sysroot-include"
         self.authority_config = self.root / "authority.json"
         self.remote = self.root / "remote"
         self.source_dir = self.root / "source"
@@ -69,6 +70,9 @@ class RebuildFixture:
             self.toolchain_bin,
             self.registry_cache,
             self.registry_index,
+            self.gcc_root,
+            self.sysroot_lib,
+            self.sysroot_include,
             self.remote,
             self.service_bin.parent,
             self.guard_config.parent,
@@ -78,6 +82,9 @@ class RebuildFixture:
             directory.mkdir(parents=True, exist_ok=True)
 
         self._init_remote()
+        (self.gcc_root / "cc1").write_text("sealed cc1\n")
+        (self.sysroot_lib / "crt1.o").write_text("sealed crt\n")
+        (self.sysroot_include / "stddef.h").write_text("sealed include\n")
         self.source_commit = self._git("rev-parse", "HEAD").stdout.strip()
         self.source_tree = self._git("rev-parse", "HEAD^{tree}").stdout.strip()
         self.binary_sha256 = hashlib.sha256(self.build_source.read_bytes()).hexdigest()
@@ -121,12 +128,19 @@ class RebuildFixture:
             "replace_bwrap_during_use": False,
             "rename_source_mount": False,
             "artifact_mode": "",
+            "candidate_path_swap": False,
+            "build_finished": False,
             "jobs": {},
             "next_job_id": 41,
             "job_behavior": "normal",
             "job_polls_remaining": 1,
             "restart_noop_after": 0,
             "hang_restart_calls": [],
+            "manager_contract_mismatch": False,
+            "applied_config_override": "",
+            "mutate_gcc_closure_during_build": False,
+            "held_ld_consumed": False,
+            "ambient_usr_consumed": False,
         }
         self.save_state()
         self._write_proc()
@@ -222,16 +236,16 @@ class RebuildFixture:
         )
         (self.remote / "src").mkdir()
         (self.remote / "Cargo.toml").write_text(
-            "[workspace]\nmembers = [\"llm-guard-proxy\"]\nresolver = \"2\"\n"
+            '[workspace]\nmembers = ["llm-guard-proxy"]\nresolver = "2"\n'
         )
         (self.remote / "Cargo.lock").write_text(
-            "version = 4\n\n[[package]]\nname = \"llm-guard-proxy\"\nversion = \"0.0.0\"\n"
+            'version = 4\n\n[[package]]\nname = "llm-guard-proxy"\nversion = "0.0.0"\n'
         )
         crate = self.remote / "llm-guard-proxy"
         (crate / "src").mkdir(parents=True)
         (crate / "Cargo.toml").write_text(
-            "[package]\nname = \"llm-guard-proxy\"\nversion = \"0.0.0\"\n"
-            "edition = \"2021\"\n[features]\nguard = []\n"
+            '[package]\nname = "llm-guard-proxy"\nversion = "0.0.0"\n'
+            'edition = "2021"\n[features]\nguard = []\n'
         )
         (crate / "src" / "main.rs").write_text("fn main() {}\n")
         self._git("add", "--", "Cargo.toml", "Cargo.lock", "llm-guard-proxy")
@@ -254,6 +268,45 @@ class RebuildFixture:
         (pid_dir / "stat").write_text(
             f"{self.state['pid']} (guard (fixture) name) " + " ".join(fields) + "\n"
         )
+        (pid_dir / "cmdline").write_bytes(
+            str(self.service_bin).encode()
+            + b"\0--config\0/run/credentials/llm-guard-proxy.service/llm-guard-config\0"
+            + b"--guardian-runtime-dir\0/run/user/1001/gb10-memory-guardian\0"
+        )
+        credential = (
+            pid_dir / "root/run/credentials/llm-guard-proxy.service/llm-guard-config"
+        )
+        credential.parent.mkdir(parents=True, exist_ok=True)
+        credential.unlink(missing_ok=True)
+        override = str(self.state.get("applied_config_override", ""))
+        credential.write_bytes(
+            override.encode() if override else self.guard_config.read_bytes()
+        )
+        credential.chmod(0o400)
+
+    @staticmethod
+    def _python_runtime_authority_sha256() -> str:
+        path = Path("/usr/bin/python3.11")
+        info = path.stat()
+        authority = {
+            "logical_path": "/usr/bin/python3",
+            "resolved_path": "/usr/bin/python3.11",
+            "device": info.st_dev,
+            "inode": info.st_ino,
+            "size": info.st_size,
+            "nlink": info.st_nlink,
+            "uid": info.st_uid,
+            "gid": info.st_gid,
+            "mode": stat.S_IMODE(info.st_mode),
+            "mtime_ns": info.st_mtime_ns,
+            "ctime_ns": info.st_ctime_ns,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        return hashlib.sha256(
+            json.dumps(
+                authority, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode("ascii")
+        ).hexdigest()
 
     def set_state(self, **updates: object) -> None:
         self.reload_state()
@@ -338,8 +391,19 @@ class RebuildFixture:
                 "nlink": info.st_nlink,
                 "mtime_ns": info.st_mtime_ns,
                 "ctime_ns": info.st_ctime_ns,
-                "sha256": hashlib.sha256(Path(spec["logical"]).read_bytes()).hexdigest(),
+                "sha256": hashlib.sha256(
+                    Path(spec["logical"]).read_bytes()
+                ).hexdigest(),
             }
+        build_inputs = {
+            "toolchain": {},
+            "registry_cache": {},
+            "registry_index": {},
+            "gcc_closure": {},
+            "sysroot_lib": {},
+            "sysroot_include": {},
+            "metadata_target": {},
+        }
         payload = {
             "schema": 1,
             "phase": phase,
@@ -385,13 +449,22 @@ class RebuildFixture:
                 "git_config_sha256": "5" * 64,
                 "metadata_closure_sha256": "6" * 64,
                 "sandbox_contract_sha256": "7" * 64,
-                "build_inputs_sha256": "8" * 64,
+                "build_inputs": build_inputs,
+                "build_inputs_sha256": hashlib.sha256(
+                    json.dumps(
+                        build_inputs, sort_keys=True, separators=(",", ":")
+                    ).encode("ascii")
+                ).hexdigest(),
                 "cargo_identity_sha256": "9" * 64,
                 "rustc_identity_sha256": "a" * 64,
-                "guard_config_sha256": hashlib.sha256(self.guard_config.read_bytes()).hexdigest(),
-                "guard_unit_sha256": hashlib.sha256(self.guard_unit.read_bytes()).hexdigest(),
+                "guard_config_sha256": hashlib.sha256(
+                    self.guard_config.read_bytes()
+                ).hexdigest(),
+                "guard_unit_sha256": hashlib.sha256(
+                    self.guard_unit.read_bytes()
+                ).hexdigest(),
                 "tool_authorities": tool_authorities,
-                "python_runtime_authority_sha256": "b" * 64,
+                "python_runtime_authority_sha256": self._python_runtime_authority_sha256(),
             },
             "manager_job_ids": [],
             "committed": None,
@@ -432,7 +505,7 @@ class RebuildFixture:
         dispatcher = self.fake_bin / "fixture-tool"
         dispatcher.write_text(
             textwrap.dedent(
-                r'''#!/usr/bin/python3
+                r"""#!/usr/bin/python3
 import hashlib
 import json
 import os
@@ -468,6 +541,21 @@ def write_proc(target):
     (pid_dir / "stat").write_text(
         f"{state['pid']} (guard (fixture) name) " + " ".join(fields) + "\n"
     )
+    (pid_dir / "cmdline").write_bytes(
+        os.environ["SERVICE_BIN"].encode()
+        + b"\0--config\0/run/credentials/llm-guard-proxy.service/llm-guard-config\0"
+        + b"--guardian-runtime-dir\0/run/user/1001/gb10-memory-guardian\0"
+    )
+    credential = pid_dir / "root/run/credentials/llm-guard-proxy.service/llm-guard-config"
+    credential.parent.mkdir(parents=True, exist_ok=True)
+    credential.unlink(missing_ok=True)
+    override = state.get("applied_config_override", "")
+    credential.write_bytes(
+        override.encode() if override else Path(
+            os.environ["LLM_GUARD_PROXY_REBUILD_GUARD_CONFIG"]
+        ).read_bytes()
+    )
+    credential.chmod(0o400)
 
 def activate(target):
     state["pid"] += 1
@@ -538,6 +626,16 @@ elif name == "bwrap":
             and args[index + 2] in {"/src", "/target"}
         ):
             mounts[args[index + 2]] = Path(os.readlink(args[index + 1]))
+    for index, argument in enumerate(args):
+        if argument != "--ro-bind" or index + 2 >= len(args):
+            continue
+        source, destination = args[index + 1:index + 3]
+        if source == "/usr" and destination == "/usr":
+            state["ambient_usr_consumed"] = True
+        if destination == "/usr/bin/ld":
+            state["held_ld_consumed"] = os.readlink(source).endswith(
+                "x86_64-linux-gnu-ld.bfd"
+            )
     source_root = mounts["/src"]
     target_root = mounts["/target"]
     if state.get("replace_bwrap_during_use"):
@@ -580,6 +678,11 @@ elif name == "bwrap":
         }, sort_keys=True))
     elif "build" in args:
         source_file = source_root / "llm-guard-proxy" / "src" / "main.rs"
+        if state.get("mutate_gcc_closure_during_build"):
+            closure = Path(os.environ["GCC_ROOT"]) / "cc1"
+            original = closure.read_bytes()
+            closure.write_bytes(b"substituted helper\n")
+            closure.write_bytes(original)
         if state.get("mutate_source_during_cargo"):
             original = source_file.read_bytes()
             mode = source_file.stat().st_mode & 0o777
@@ -607,11 +710,24 @@ elif name == "bwrap":
             elif artifact_mode == "oversize":
                 with target.open("r+b") as stream:
                     stream.truncate(128 * 1024 * 1024 + 1)
+        state["build_finished"] = True
         save()
     else:
         raise SystemExit(95)
 elif name == "systemctl":
     joined = " ".join(args)
+    if (
+        state.get("candidate_path_swap")
+        and state.get("build_finished")
+        and not state.get("candidate_path_swapped")
+    ):
+        candidate = Path(os.environ["EXPECTED_CANDIDATE"])
+        replacement = candidate.with_name(candidate.name + ".replacement")
+        shutil.copyfile(candidate, replacement)
+        replacement.chmod(0o755)
+        os.replace(replacement, candidate)
+        state["candidate_path_swapped"] = True
+        save()
     if joined == "--user is-active --quiet llm-guard-proxy.service":
         raise SystemExit(0 if state["active"] else 3)
     if joined == "--user show -p MainPID --value llm-guard-proxy.service":
@@ -633,7 +749,25 @@ elif name == "systemctl":
             ),
             "Result": "success" if state["active"] else "exit-code",
             "Job": next(iter(state.get("jobs", {})), ""),
+            "ExecStart": (
+                "{ path=" + os.environ["SERVICE_BIN"]
+                + " ; argv[]=" + os.environ["SERVICE_BIN"]
+                + " --config /run/credentials/llm-guard-proxy.service/llm-guard-config"
+                + " --guardian-runtime-dir /run/user/1001/gb10-memory-guardian ; ignore_errors=no ; }"
+            ),
+            "LoadCredential": (
+                "llm-guard-config:" + os.environ["LLM_GUARD_PROXY_REBUILD_GUARD_CONFIG"]
+            ),
+            "NoNewPrivileges": "yes",
+            "PrivateTmp": "yes",
+            "ProtectSystem": "strict",
+            "ProtectHome": "read-only",
+            "UMask": "0077",
+            "Environment": "",
+            "EnvironmentFiles": "",
         }
+        if state.get("manager_contract_mismatch"):
+            values["ProtectSystem"] = "no"
         requested = [
             argument.split("=", 1)[1]
             for argument in args
@@ -766,7 +900,7 @@ elif name == "sha256sum":
 else:
     print("unexpected fixture tool: " + name, file=sys.stderr)
     raise SystemExit(94)
-'''
+"""
             )
         )
         template = dispatcher.read_text()
@@ -797,6 +931,7 @@ else:
             "cc": Path("/usr/bin/x86_64-linux-gnu-gcc-12"),
             "ld": Path("/usr/bin/x86_64-linux-gnu-ld.bfd"),
             "ar": Path("/usr/bin/x86_64-linux-gnu-ar"),
+            "as": Path("/usr/bin/x86_64-linux-gnu-as"),
         }
         tools = {}
         for name, path in tool_paths.items():
@@ -816,6 +951,8 @@ else:
             "GUARD_TEST_STATE": str(self.state_path),
             "GUARD_TEST_TOOL_LOG": str(self.tool_log),
             "GUARD_TEST_DESCENDANT_PIDS": str(self.descendant_pids),
+            "GCC_ROOT": str(self.gcc_root),
+            "LLM_GUARD_PROXY_REBUILD_GUARD_CONFIG": str(self.guard_config),
             "LLM_GUARD_PROXY_REBUILD_GUARD_UNIT": str(self.guard_unit),
             "LLM_GUARD_PROXY_REBUILD_PROC_ROOT": str(self.proc_root),
             "SAME_HASH_TARGET": str(self.same_hash_other_inode),
@@ -827,6 +964,9 @@ else:
             "schema": 1,
             "registry_cache": str(self.registry_cache),
             "registry_index": str(self.registry_index),
+            "gcc_root": str(self.gcc_root),
+            "sysroot_lib": str(self.sysroot_lib),
+            "sysroot_include": str(self.sysroot_include),
             "test_env": test_env,
             "toolchain_root": str(self.toolchain_root),
             "tools": tools,

@@ -7,6 +7,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -16,7 +17,9 @@ ENGINE = ROOT / "scripts" / "llm_guard_proxy_cached_rebuild.py"
 
 
 class GuardCanonicalAuthorityTests(unittest.TestCase):
-    def test_bounded_helper_loads_from_verified_bytes_after_path_replacement(self) -> None:
+    def test_bounded_helper_loads_from_verified_bytes_after_path_replacement(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             copied = Path(temporary)
             engine = copied / ENGINE.name
@@ -86,7 +89,9 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
         )
 
     def _refresh_fixture_source_identity(self, fixture: RebuildFixture) -> None:
-        fixture.source_commit = self._git(fixture.remote, "rev-parse", "HEAD").stdout.strip()
+        fixture.source_commit = self._git(
+            fixture.remote, "rev-parse", "HEAD"
+        ).stdout.strip()
         fixture.source_tree = self._git(
             fixture.remote, "rev-parse", "HEAD^{tree}"
         ).stdout.strip()
@@ -114,7 +119,7 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             alternate = fixture.root / "alternate-remote"
             shutil.copytree(fixture.remote, alternate)
             source = alternate / "llm-guard-proxy" / "src" / "main.rs"
-            source.write_text("fn main() { println!(\"alternate\"); }\n")
+            source.write_text('fn main() { println!("alternate"); }\n')
             self._git(alternate, "add", "--", str(source.relative_to(alternate)))
             self._git(alternate, "commit", "-m", "alternate source")
             subprocess.run(
@@ -167,20 +172,123 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             output = result.stdout + result.stderr
             self.assertNotEqual(result.returncode, 0, output)
             self.assertIn("bwrap", output)
-            self.assertNotIn("cargo build", fixture.calls())
+
+    def test_config_and_unit_special_files_fail_closed_within_deadline(self) -> None:
+        cases = ("fifo", "symlink", "device", "oversize")
+        for target in ("config", "unit"):
+            for kind in cases:
+                with (
+                    self.subTest(target=target, kind=kind),
+                    RebuildFixture() as fixture,
+                ):
+                    original_link = os.readlink(fixture.service_bin)
+                    path = (
+                        fixture.guard_config
+                        if target == "config"
+                        else fixture.guard_unit
+                    )
+                    if kind == "fifo":
+                        path.unlink()
+                        os.mkfifo(path, 0o600)
+                    elif kind == "symlink":
+                        path.unlink()
+                        path.symlink_to(fixture.prior)
+                    elif kind == "device":
+                        name = (
+                            "LLM_GUARD_PROXY_REBUILD_GUARD_CONFIG"
+                            if target == "config"
+                            else "LLM_GUARD_PROXY_REBUILD_GUARD_UNIT"
+                        )
+                        fixture.env[name] = "/dev/null"
+                    else:
+                        path.write_bytes(b"x" * (1024 * 1024 + 1))
+                    started = time.monotonic()
+                    result = fixture.run(
+                        extra_env={"LLM_GUARD_REBUILD_TEST_FORWARD_SECONDS": "2"},
+                        timeout=6,
+                    )
+                    elapsed = time.monotonic() - started
+                    output = result.stdout + result.stderr
+                    self.assertNotEqual(result.returncode, 0, output)
+                    self.assertLess(elapsed, 5, f"{kind} blocked for {elapsed:.3f}s")
+                    self.assertEqual(os.readlink(fixture.service_bin), original_link)
+                    self.assertNotIn("cargo build", fixture.calls())
+
+    def test_manager_loaded_contract_mismatch_prevents_link_mutation(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(manager_contract_mismatch=True)
+            before = os.readlink(fixture.service_bin)
+            result = fixture.run(timeout=20)
+            output = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("manager-loaded Guard contract differs", output)
+            self.assertEqual(os.readlink(fixture.service_bin), before)
+            self.assertEqual(fixture.reload_state()["restart_calls"], 0)
+
+    def test_running_config_credential_mismatch_is_not_adopted(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(applied_config_override="substituted-config\n")
+            result = fixture.run(timeout=20)
+            output = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("running Guard config authority differs", output)
             fixture.assert_prior_restored(self)
+
+    def test_exact_running_config_credential_generation_passes(self) -> None:
+        with RebuildFixture() as fixture:
+            result = fixture.run(timeout=20)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("LLM_GUARD_PROXY_REBUILD_TEST_ONLY_COMPLETE", output)
+
+    def test_sealed_gcc_closure_is_consumed_and_ambient_usr_is_not(self) -> None:
+        with RebuildFixture() as fixture:
+            result = fixture.run(timeout=20)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            state = fixture.reload_state()
+            self.assertTrue(state["held_ld_consumed"])
+            self.assertFalse(state["ambient_usr_consumed"])
+            receipt = json.loads(fixture.receipt_paths()[0].read_text())
+            inputs = receipt["authorities"]["build_inputs"]
+            self.assertIn("gcc_closure", inputs)
+            self.assertIn("sysroot_lib", inputs)
+            self.assertIn("sysroot_include", inputs)
+
+    def test_mutated_consumed_gcc_closure_is_rejected_without_adoption(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(mutate_gcc_closure_during_build=True)
+            before = os.readlink(fixture.service_bin)
+            result = fixture.run(timeout=20)
+            output = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("directory authority ledger changed: gcc closure", output)
+            self.assertEqual(os.readlink(fixture.service_bin), before)
+            self.assertEqual(fixture.reload_state()["restart_calls"], 0)
+            fixture.assert_prior_restored(self)
+
+    def test_candidate_path_swap_after_fd_check_is_rejected(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(candidate_path_swap=True)
+            before = os.readlink(fixture.service_bin)
+            result = fixture.run(timeout=20)
+            output = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("candidate executable authority changed", output)
+            self.assertEqual(os.readlink(fixture.service_bin), before)
+            self.assertEqual(fixture.reload_state()["restart_calls"], 0)
 
     def test_forbidden_tree_and_path_dependency_classes_fail_pre_cutover(self) -> None:
         cases = {
-            "symlink": lambda fixture: (
-                fixture.remote / "host-link"
-            ).symlink_to("/etc/passwd"),
+            "symlink": lambda fixture: (fixture.remote / "host-link").symlink_to(
+                "/etc/passwd"
+            ),
             "git-attributes": lambda fixture: (
                 fixture.remote / ".gitattributes"
             ).write_text("* filter=hostile\n"),
-            "git-modules": lambda fixture: (
-                fixture.remote / ".gitmodules"
-            ).write_text("[submodule 'vendor']\npath=vendor\nurl=https://example.invalid\n"),
+            "git-modules": lambda fixture: (fixture.remote / ".gitmodules").write_text(
+                "[submodule 'vendor']\npath=vendor\nurl=https://example.invalid\n"
+            ),
             "gitlink": self._add_gitlink,
             "cargo-config": lambda fixture: (
                 fixture.remote / ".cargo" / "config.toml"
@@ -202,9 +310,7 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                 self._git(fixture.remote, "commit", "-m", f"hostile {name}")
                 self._refresh_fixture_source_identity(fixture)
                 result = fixture.run()
-                self.assertNotEqual(
-                    result.returncode, 0, result.stdout + result.stderr
-                )
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(fixture.reload_state()["restart_calls"], 0)
                 fixture.assert_prior_restored(self)
 
@@ -214,9 +320,7 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             shim = ambient / "bin"
             shim.mkdir(parents=True)
             marker = ambient / "shim-ran"
-            (shim / "cargo").write_text(
-                f"#!/bin/sh\ntouch {marker}\nexec /bin/false\n"
-            )
+            (shim / "cargo").write_text(f"#!/bin/sh\ntouch {marker}\nexec /bin/false\n")
             (shim / "cargo").chmod(0o755)
             (ambient / "Cargo.toml").write_text("hostile ambient manifest\n")
             git_config = ambient / "gitconfig"
@@ -243,7 +347,10 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
 
     def test_held_bwrap_swap_and_source_mount_rename_fail_pre_cutover(self) -> None:
         for state_key, diagnostic in (
-            ("replace_bwrap_during_use", "held tool pathname or metadata changed: bwrap"),
+            (
+                "replace_bwrap_during_use",
+                "held tool pathname or metadata changed: bwrap",
+            ),
             ("rename_source_mount", "directory authority changed: canonical source"),
         ):
             with self.subTest(state_key=state_key), RebuildFixture() as fixture:
@@ -258,8 +365,10 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
     def test_fake_sandbox_artifact_bytes_vary_with_canonical_source(self) -> None:
         with RebuildFixture() as fixture:
             source = fixture.remote / "llm-guard-proxy" / "src" / "main.rs"
-            source.write_text("fn main() { println!(\"alternate\"); }\n")
-            self._git(fixture.remote, "add", "--", str(source.relative_to(fixture.remote)))
+            source.write_text('fn main() { println!("alternate"); }\n')
+            self._git(
+                fixture.remote, "add", "--", str(source.relative_to(fixture.remote))
+            )
             self._git(fixture.remote, "commit", "-m", "alternate artifact")
             false_sha = hashlib.sha256(Path("/usr/bin/false").read_bytes()).hexdigest()
             self.assertNotEqual(false_sha, fixture.binary_sha256)
@@ -310,7 +419,9 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
         ):
             self.assertIn(required, source)
         self.assertNotIn("shutil.which", source)
-        self.assertNotIn("clone\",\n                \"--filter=blob:none", source)
+        self.assertNotIn('"--ro-bind",\n        "/usr",\n        "/usr"', source)
+        self.assertIn('held_tools["ld"].exec_path', source)
+        self.assertNotIn('clone",\n                "--filter=blob:none', source)
 
     @unittest.skipUnless(
         os.environ.get("JUST_NO_DOTENV") == "true",
@@ -346,6 +457,16 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                 Path("/usr/bin/x86_64-linux-gnu-ar"),
                 (0, 0, 0o755),
                 "3acbee2794e3668a74bcb90f2eaf7d981211fb95288ab940f0e3ac380e8f6023",
+            ),
+            "as": (
+                Path("/usr/bin/x86_64-linux-gnu-as"),
+                (0, 0, 0o755),
+                "41fe4f5a03389ea5cf7c92d6753fa1ecc69b45b12534fd8713c53bba0e2d7e17",
+            ),
+            "ld": (
+                Path("/usr/bin/x86_64-linux-gnu-ld.bfd"),
+                (0, 0, 0o755),
+                "f6d71a1bcd45764550a42dfaa179bc43b63ee879ec6f875bfd39fca013515da7",
             ),
         }
         held: dict[str, int] = {}
@@ -394,12 +515,21 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                     "[features]\nguard=[]\n"
                 )
                 (source / "Cargo.lock").write_text(
-                    "version = 4\n\n[[package]]\nname = \"llm-guard-proxy\"\n"
-                    "version = \"0.0.0\"\n"
+                    'version = 4\n\n[[package]]\nname = "llm-guard-proxy"\n'
+                    'version = "0.0.0"\n'
                 )
                 (source / "src" / "main.rs").write_text("fn main() {}\n")
 
-                mount_paths = (source, target, toolchain, cache, index)
+                mount_paths = (
+                    source,
+                    target,
+                    toolchain,
+                    cache,
+                    index,
+                    Path("/usr/lib/gcc/x86_64-linux-gnu/12"),
+                    Path("/usr/lib/x86_64-linux-gnu"),
+                    Path("/usr/include"),
+                )
                 for path in mount_paths:
                     directory_fds.append(
                         os.open(
@@ -410,44 +540,140 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                             | getattr(os, "O_NOFOLLOW", 0),
                         )
                     )
-                source_fd, target_fd, toolchain_fd, cache_fd, index_fd = directory_fds
+                (
+                    source_fd,
+                    target_fd,
+                    toolchain_fd,
+                    cache_fd,
+                    index_fd,
+                    gcc_fd,
+                    sysroot_lib_fd,
+                    sysroot_include_fd,
+                ) = directory_fds
                 base = [
                     f"/proc/self/fd/{held['bwrap']}",
-                    "--unshare-user", "--unshare-all", "--disable-userns",
-                    "--die-with-parent", "--new-session", "--cap-drop", "ALL",
-                    "--proc", "/proc", "--dev", "/dev",
-                    "--ro-bind", "/usr", "/usr", "--tmpfs", "/usr/local",
-                    "--tmpfs", "/home", "--dir", "/etc",
-                    "--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache",
-                    "--symlink", "usr/lib", "/lib",
-                    "--symlink", "usr/lib64", "/lib64",
-                    "--ro-bind", f"/proc/self/fd/{source_fd}", "/src",
-                    "--ro-bind", f"/proc/self/fd/{toolchain_fd}", "/toolchain",
-                    "--ro-bind", f"/proc/self/fd/{held['cargo']}",
-                    "/toolchain/bin/cargo",
-                    "--ro-bind", f"/proc/self/fd/{held['rustc']}",
-                    "/toolchain/bin/rustc",
-                    "--dir", "/cargo-home", "--dir", "/cargo-home/registry",
-                    "--ro-bind", f"/proc/self/fd/{cache_fd}",
-                    "/cargo-home/registry/cache",
-                    "--ro-bind", f"/proc/self/fd/{index_fd}",
-                    "/cargo-home/registry/index",
-                    "--bind", f"/proc/self/fd/{target_fd}", "/target",
-                    "--tmpfs", "/tmp", "--clearenv",
-                    "--setenv", "HOME", "/nonexistent",
-                    "--setenv", "PATH", "/toolchain/bin:/usr/bin:/bin",
-                    "--setenv", "LC_ALL", "C", "--setenv", "LANG", "C",
-                    "--setenv", "CARGO_HOME", "/cargo-home",
-                    "--setenv", "CARGO_TARGET_DIR", "/target",
-                    "--setenv", "CARGO_NET_OFFLINE", "true",
-                    "--setenv", "CARGO_INCREMENTAL", "0",
-                    "--setenv", "CARGO_BUILD_JOBS", "1",
-                    "--setenv", "RUSTC", "/toolchain/bin/rustc",
-                    "--setenv", "CC", f"/proc/self/fd/{held['cc']}",
-                    "--setenv", "AR", f"/proc/self/fd/{held['ar']}",
-                    "--setenv", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+                    "--unshare-user",
+                    "--unshare-all",
+                    "--disable-userns",
+                    "--die-with-parent",
+                    "--new-session",
+                    "--cap-drop",
+                    "ALL",
+                    "--proc",
+                    "/proc",
+                    "--dev",
+                    "/dev",
+                    "--dir",
+                    "/usr",
+                    "--dir",
+                    "/usr/bin",
+                    "--dir",
+                    "/usr/lib",
+                    "--dir",
+                    "/usr/lib/gcc",
+                    "--dir",
+                    "/usr/lib/gcc/x86_64-linux-gnu",
+                    "--ro-bind",
+                    f"/proc/self/fd/{gcc_fd}",
+                    "/usr/lib/gcc/x86_64-linux-gnu/12",
+                    "--ro-bind",
+                    f"/proc/self/fd/{sysroot_lib_fd}",
+                    "/usr/lib/x86_64-linux-gnu",
+                    "--ro-bind",
+                    f"/proc/self/fd/{sysroot_include_fd}",
+                    "/usr/include",
+                    "--ro-bind",
                     f"/proc/self/fd/{held['cc']}",
-                    "--chdir", "/src", "--",
+                    "/usr/bin/x86_64-linux-gnu-gcc-12",
+                    "--ro-bind",
+                    f"/proc/self/fd/{held['as']}",
+                    "/usr/bin/as",
+                    "--ro-bind",
+                    f"/proc/self/fd/{held['ld']}",
+                    "/usr/bin/ld",
+                    "--ro-bind",
+                    f"/proc/self/fd/{held['ar']}",
+                    "/usr/bin/x86_64-linux-gnu-ar",
+                    "--tmpfs",
+                    "/usr/local",
+                    "--tmpfs",
+                    "/home",
+                    "--symlink",
+                    "usr/lib",
+                    "/lib",
+                    "--symlink",
+                    "usr/lib64",
+                    "/lib64",
+                    "--ro-bind",
+                    f"/proc/self/fd/{source_fd}",
+                    "/src",
+                    "--ro-bind",
+                    f"/proc/self/fd/{toolchain_fd}",
+                    "/toolchain",
+                    "--ro-bind",
+                    f"/proc/self/fd/{held['cargo']}",
+                    "/toolchain/bin/cargo",
+                    "--ro-bind",
+                    f"/proc/self/fd/{held['rustc']}",
+                    "/toolchain/bin/rustc",
+                    "--dir",
+                    "/cargo-home",
+                    "--dir",
+                    "/cargo-home/registry",
+                    "--ro-bind",
+                    f"/proc/self/fd/{cache_fd}",
+                    "/cargo-home/registry/cache",
+                    "--ro-bind",
+                    f"/proc/self/fd/{index_fd}",
+                    "/cargo-home/registry/index",
+                    "--bind",
+                    f"/proc/self/fd/{target_fd}",
+                    "/target",
+                    "--tmpfs",
+                    "/tmp",
+                    "--clearenv",
+                    "--setenv",
+                    "HOME",
+                    "/nonexistent",
+                    "--setenv",
+                    "PATH",
+                    "/toolchain/bin:/usr/bin",
+                    "--setenv",
+                    "LC_ALL",
+                    "C",
+                    "--setenv",
+                    "LANG",
+                    "C",
+                    "--setenv",
+                    "CARGO_HOME",
+                    "/cargo-home",
+                    "--setenv",
+                    "CARGO_TARGET_DIR",
+                    "/target",
+                    "--setenv",
+                    "CARGO_NET_OFFLINE",
+                    "true",
+                    "--setenv",
+                    "CARGO_INCREMENTAL",
+                    "0",
+                    "--setenv",
+                    "CARGO_BUILD_JOBS",
+                    "1",
+                    "--setenv",
+                    "RUSTC",
+                    "/toolchain/bin/rustc",
+                    "--setenv",
+                    "CC",
+                    "/usr/bin/x86_64-linux-gnu-gcc-12",
+                    "--setenv",
+                    "AR",
+                    "/usr/bin/x86_64-linux-gnu-ar",
+                    "--setenv",
+                    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+                    "/usr/bin/x86_64-linux-gnu-gcc-12",
+                    "--chdir",
+                    "/src",
+                    "--",
                 ]
                 pass_fds = (*held.values(), *directory_fds)
 
@@ -462,7 +688,9 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
                     )
 
-                cargo_version = sandbox("/toolchain/bin/cargo", "--version", "--verbose")
+                cargo_version = sandbox(
+                    "/toolchain/bin/cargo", "--version", "--verbose"
+                )
                 self.assertEqual(
                     cargo_version.returncode,
                     0,
@@ -484,29 +712,41 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                 )
                 self.assertIn("LLVM version: 22.1.6", rustc_version.stdout)
                 metadata = sandbox(
-                    "/toolchain/bin/cargo", "metadata", "--format-version=1",
-                    "--frozen", "--locked", "--offline", "--filter-platform",
+                    "/toolchain/bin/cargo",
+                    "metadata",
+                    "--format-version=1",
+                    "--frozen",
+                    "--locked",
+                    "--offline",
+                    "--filter-platform",
                     "x86_64-unknown-linux-gnu",
                 )
-                self.assertEqual(metadata.returncode, 0, metadata.stdout + metadata.stderr)
+                self.assertEqual(
+                    metadata.returncode, 0, metadata.stdout + metadata.stderr
+                )
                 metadata_payload = json.loads(metadata.stdout)
                 self.assertEqual(metadata_payload["workspace_root"], "/src")
                 self.assertEqual(metadata_payload["target_directory"], "/target")
                 self.assertEqual(
                     [path.name for path in target.iterdir()], [".rustc_info.json"]
                 )
-                rustc_info = (target / ".rustc_info.json").stat(
-                    follow_symlinks=False
-                )
+                rustc_info = (target / ".rustc_info.json").stat(follow_symlinks=False)
                 self.assertTrue(stat.S_ISREG(rustc_info.st_mode))
                 self.assertEqual(rustc_info.st_uid, os.geteuid())
                 self.assertEqual(rustc_info.st_nlink, 1)
                 self.assertFalse(rustc_info.st_mode & 0o022)
                 self.assertGreater(rustc_info.st_size, 0)
                 result = sandbox(
-                    "/toolchain/bin/cargo", "build", "--release", "--frozen",
-                    "--locked", "--offline", "--target",
-                    "x86_64-unknown-linux-gnu", "--features", "guard",
+                    "/toolchain/bin/cargo",
+                    "build",
+                    "--release",
+                    "--frozen",
+                    "--locked",
+                    "--offline",
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "--features",
+                    "guard",
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 artifact = (

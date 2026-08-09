@@ -35,7 +35,9 @@ class GuardRebuildRecoveryTests(unittest.TestCase):
         self.assertNotIn("LLM_GUARD_REBUILD_TEST_ONLY_COMPLETE", output)
 
     @staticmethod
-    def wait_for_path(path: Path, process: subprocess.Popen[str], timeout: float) -> bool:
+    def wait_for_path(
+        path: Path, process: subprocess.Popen[str], timeout: float
+    ) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if path.exists():
@@ -88,6 +90,36 @@ class GuardRebuildRecoveryTests(unittest.TestCase):
             self.assertFalse(wal.exists())
             self.assert_no_completion(output)
             fixture.assert_no_backend_lifecycle(self)
+
+    def test_stale_python_runtime_mismatch_blocks_before_tools_or_mutation(
+        self,
+    ) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("mutated", mutate=True)
+            payload = json.loads(state.read_text())
+            payload["authorities"]["python_runtime_authority_sha256"] = "f" * 64
+            state.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+            )
+            fixture.tool_log.unlink(missing_ok=True)
+            before_link = os.readlink(fixture.service_bin)
+            result = fixture.run(timeout=10)
+            output = self.output(result)
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("Python runtime authority differs", output)
+            self.assertEqual(fixture.calls(), "")
+            self.assertEqual(os.readlink(fixture.service_bin), before_link)
+            self.assertTrue(state.exists())
+
+    def test_exact_python_runtime_authority_allows_stale_recovery(self) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("mutated", mutate=True)
+            fixture.tool_log.unlink(missing_ok=True)
+            result = fixture.run(timeout=15)
+            output = self.output(result)
+            self.assertEqual(result.returncode, 75, output)
+            self.assertFalse(state.exists())
+            fixture.assert_prior_restored(self)
 
     def test_malformed_and_unsafe_wal_block_before_tools(self) -> None:
         cases = {
@@ -161,7 +193,9 @@ class GuardRebuildRecoveryTests(unittest.TestCase):
             )
             self.assert_no_completion(output)
 
-    def test_nonterminal_manager_job_is_cancelled_by_exact_id_then_rolls_back(self) -> None:
+    def test_nonterminal_manager_job_is_cancelled_by_exact_id_then_rolls_back(
+        self,
+    ) -> None:
         with RebuildFixture() as fixture:
             fixture.set_state(job_behavior="nonterminal")
             result = fixture.run(
@@ -199,7 +233,9 @@ class GuardRebuildRecoveryTests(unittest.TestCase):
             self.assertEqual(json.loads(state_path.read_text())["phase"], "mutated")
             self.assert_no_completion(output)
 
-    def test_forward_exhaustion_keeps_independent_recovery_budget_and_reaps_tree(self) -> None:
+    def test_forward_exhaustion_keeps_independent_recovery_budget_and_reaps_tree(
+        self,
+    ) -> None:
         with RebuildFixture() as fixture:
             fixture.set_state(hang_restart_calls=[1])
             try:
@@ -419,11 +455,14 @@ class SharedBoundedProcessRecoveryTests(unittest.TestCase):
                 "while True: time.sleep(1)\n"
             )
             try:
-                with patch.object(
-                    bounded.os,
-                    "pidfd_open",
-                    side_effect=OSError(errno.EMFILE, "forced pidfd exhaustion"),
-                ), self.assertRaises(RuntimeError):
+                with (
+                    patch.object(
+                        bounded.os,
+                        "pidfd_open",
+                        side_effect=OSError(errno.EMFILE, "forced pidfd exhaustion"),
+                    ),
+                    self.assertRaises(RuntimeError),
+                ):
                     bounded.command(
                         [sys.executable, str(hostile), str(pid_path)], timeout=1
                     )

@@ -23,15 +23,25 @@ from typing import Any, NoReturn, cast
 
 __all__: list[str] = []
 
-EXPECTED_BOUNDED_PROCESS_SHA256 = "8787dba9c1545e146f08db3e5d395ffeea60c7bd2ea05f687270cf65ad401264"
+EXPECTED_BOUNDED_PROCESS_SHA256 = (
+    "8787dba9c1545e146f08db3e5d395ffeea60c7bd2ea05f687270cf65ad401264"
+)
 _SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 _BOUNDED_PROCESS_PATH = _SCRIPT_DIRECTORY / "gb10_bounded_process.py"
 _bounded_fd = os.open(
     _BOUNDED_PROCESS_PATH,
-    os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
 )
 try:
     _bounded_metadata = os.fstat(_bounded_fd)
+    if (
+        not stat.S_ISREG(_bounded_metadata.st_mode)
+        or _bounded_metadata.st_uid != os.geteuid()
+        or _bounded_metadata.st_nlink != 1
+        or _bounded_metadata.st_mode & 0o022
+        or not 0 < _bounded_metadata.st_size <= 1024 * 1024
+    ):
+        raise RuntimeError("Guard bounded-process import authority differs")
     _bounded_chunks: list[bytes] = []
     _bounded_size = 0
     while _bounded_chunk := os.read(_bounded_fd, 65536):
@@ -42,14 +52,7 @@ try:
 finally:
     os.close(_bounded_fd)
 _bounded_payload = b"".join(_bounded_chunks)
-if (
-    not stat.S_ISREG(_bounded_metadata.st_mode)
-    or _bounded_metadata.st_uid != os.geteuid()
-    or _bounded_metadata.st_nlink != 1
-    or _bounded_metadata.st_mode & 0o022
-    or hashlib.sha256(_bounded_payload).hexdigest()
-    != EXPECTED_BOUNDED_PROCESS_SHA256
-):
+if hashlib.sha256(_bounded_payload).hexdigest() != EXPECTED_BOUNDED_PROCESS_SHA256:
     raise RuntimeError("Guard bounded-process import authority differs")
 _bounded_module = types.ModuleType("gb10_bounded_process")
 _bounded_module.__file__ = str(_BOUNDED_PROCESS_PATH)
@@ -82,6 +85,15 @@ GENERATION_FIELDS = (
     "ActiveEnterTimestampMonotonic",
     "Result",
     "Job",
+    "ExecStart",
+    "LoadCredential",
+    "NoNewPrivileges",
+    "PrivateTmp",
+    "ProtectSystem",
+    "ProtectHome",
+    "UMask",
+    "Environment",
+    "EnvironmentFiles",
 )
 TEST_OVERRIDES = (
     "SOURCE_REPO",
@@ -134,11 +146,23 @@ def sha256_bytes(payload: bytes) -> str:
 
 
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or info.st_mode & 0o022
+            or not 0 < info.st_size <= MAX_EXECUTABLE_BYTES
+        ):
+            fail(f"unsafe regular file authority: {path}")
+        return sha256_bytes(_read_fd_limited(descriptor, info.st_size, str(path)))
+    finally:
+        os.close(descriptor)
 
 
 def fsync_directory(path: Path) -> None:
@@ -152,16 +176,24 @@ def fsync_directory(path: Path) -> None:
 
 
 def require_secure_regular(path: Path, *, executable: bool = False) -> os.stat_result:
-    metadata = path.lstat()
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or stat.S_ISLNK(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or metadata.st_nlink != 1
-        or (executable and not metadata.st_mode & stat.S_IXUSR)
-    ):
-        fail(f"unsafe regular file authority: {path}")
-    return metadata
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o022
+            or not 0 < metadata.st_size <= MAX_EXECUTABLE_BYTES
+            or (executable and not metadata.st_mode & stat.S_IXUSR)
+        ):
+            fail(f"unsafe regular file authority: {path}")
+        return metadata
+    finally:
+        os.close(descriptor)
 
 
 def ensure_private_directory(path: Path) -> None:
@@ -256,6 +288,7 @@ def atomic_copy_fd(source_fd: int, destination: Path, mode: int) -> None:
 
 TOOL_NAMES = {
     "ar",
+    "as",
     "bwrap",
     "cargo",
     "cc",
@@ -286,12 +319,11 @@ class ToolSpec:
         if not isinstance(payload, dict) or set(payload) != keys:
             fail(f"test-only tool authority is malformed: {name}")
         values = cast(dict[str, object], payload)
-        if (
-            not all(isinstance(values[key], str) for key in ("logical", "resolved", "sha256"))
-            or not all(
-                isinstance(values[key], int) and not isinstance(values[key], bool)
-                for key in ("uid", "gid", "mode")
-            )
+        if not all(
+            isinstance(values[key], str) for key in ("logical", "resolved", "sha256")
+        ) or not all(
+            isinstance(values[key], int) and not isinstance(values[key], bool)
+            for key in ("uid", "gid", "mode")
         ):
             fail(f"test-only tool numeric authority is malformed: {name}")
         spec = cls(
@@ -303,8 +335,14 @@ class ToolSpec:
             sha256=cast(str, values["sha256"]),
         )
         if (
-            not all(isinstance(value, str) for value in (spec.logical, spec.resolved, spec.sha256))
-            or not all(isinstance(value, int) and value >= 0 for value in (spec.uid, spec.gid, spec.mode))
+            not all(
+                isinstance(value, str)
+                for value in (spec.logical, spec.resolved, spec.sha256)
+            )
+            or not all(
+                isinstance(value, int) and value >= 0
+                for value in (spec.uid, spec.gid, spec.mode)
+            )
             or not Path(spec.logical).is_absolute()
             or not Path(spec.resolved).is_absolute()
             or not re.fullmatch(r"[0-9a-f]{64}", spec.sha256)
@@ -392,11 +430,100 @@ class HeldTool:
         os.close(self.descriptor)
 
 
-def _sha256_fd(descriptor: int) -> str:
+@dataclass
+class FileAuthority:
+    label: str
+    path: Path
+    descriptor: int
+    fields: tuple[int, ...]
+    sha256: str
+    max_bytes: int
+
+    def verify(self) -> None:
+        held = os.fstat(self.descriptor)
+        try:
+            current = os.stat(self.path, follow_symlinks=False)
+        except OSError as error:
+            raise RebuildError(f"{self.label} authority changed") from error
+        held_fields = _file_fields(held)
+        if (
+            held_fields != self.fields
+            or _file_fields(current) != self.fields
+            or _sha256_fd(self.descriptor, self.max_bytes, self.label) != self.sha256
+        ):
+            fail(f"{self.label} authority changed")
+
+    def close(self) -> None:
+        os.close(self.descriptor)
+
+
+def _file_fields(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_uid,
+        info.st_gid,
+        info.st_mode,
+        info.st_size,
+        info.st_nlink,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _open_file_authority(
+    label: str,
+    path: Path,
+    *,
+    expected_mode: int,
+    max_bytes: int,
+) -> FileAuthority:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != expected_mode
+            or not 0 < info.st_size <= max_bytes
+        ):
+            fail(f"unsafe {label} authority")
+        payload = _read_fd_limited(descriptor, max_bytes, label)
+        authority = FileAuthority(
+            label,
+            path,
+            descriptor,
+            _file_fields(info),
+            sha256_bytes(payload),
+            max_bytes,
+        )
+        authority.verify()
+        return authority
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _sha256_fd(
+    descriptor: int,
+    limit: int = MAX_EXECUTABLE_BYTES,
+    label: str = "file authority",
+) -> str:
     digest = hashlib.sha256()
     offset = 0
-    while chunk := os.pread(descriptor, 1024 * 1024, offset):
+    while True:
+        if operation_deadline is not None and time.monotonic() >= operation_deadline:
+            fail(f"{label} hash deadline exhausted")
+        chunk = os.pread(descriptor, min(1024 * 1024, limit + 1 - offset), offset)
+        if not chunk:
+            break
         offset += len(chunk)
+        if offset > limit:
+            fail(f"{label} exceeded byte bound")
         digest.update(chunk)
     return digest.hexdigest()
 
@@ -414,16 +541,13 @@ def _runtime_python_authority() -> dict[str, object]:
         info.st_uid != 0
         or stat.S_IMODE(info.st_mode) != 0o755
         or info.st_nlink != 1
-        or digest
-        != "6d972cf21be56fe3c947ab6ba257ff8d08c342dd2714442986791bd9a6dfabfe"
+        or digest != "6d972cf21be56fe3c947ab6ba257ff8d08c342dd2714442986791bd9a6dfabfe"
     ):
         fail("Python runtime object authority differs")
     return {
         "logical_path": "/usr/bin/python3" if not test_only else sys.executable,
         "resolved_path": (
-            "/usr/bin/python3.11"
-            if not test_only
-            else os.readlink("/proc/self/exe")
+            "/usr/bin/python3.11" if not test_only else os.readlink("/proc/self/exe")
         ),
         "device": info.st_dev,
         "inode": info.st_ino,
@@ -436,6 +560,17 @@ def _runtime_python_authority() -> dict[str, object]:
         "ctime_ns": info.st_ctime_ns,
         "sha256": digest,
     }
+
+
+def _runtime_python_authority_sha256() -> str:
+    return sha256_bytes(
+        json.dumps(
+            _runtime_python_authority(),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("ascii")
+    )
 
 
 def _reject_symlink_ancestors(path: Path) -> None:
@@ -502,7 +637,10 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
         "stable-x86_64-unknown-linux-gnu"
     )
     return {
-        "git": root("/usr/bin/git", "2540879925a6881e3877ff7e3330746ba3027b04edf16a3a12dccd1644c4f32d"),
+        "git": root(
+            "/usr/bin/git",
+            "2540879925a6881e3877ff7e3330746ba3027b04edf16a3a12dccd1644c4f32d",
+        ),
         "git_remote_https": root(
             "/usr/lib/git-core/git-remote-http",
             "4d3b7807ab261652ae6ae4340e5331c8ce2c6d27a58bbed69e90c175e436adc3",
@@ -559,6 +697,10 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
             "/usr/bin/x86_64-linux-gnu-ar",
             "3acbee2794e3668a74bcb90f2eaf7d981211fb95288ab940f0e3ac380e8f6023",
         ),
+        "as": root(
+            "/usr/bin/x86_64-linux-gnu-as",
+            "41fe4f5a03389ea5cf7c92d6753fa1ecc69b45b12534fd8713c53bba0e2d7e17",
+        ),
     }
 
 
@@ -596,6 +738,9 @@ def _load_test_authority_config(path: Path) -> dict[str, Any]:
         "schema",
         "registry_cache",
         "registry_index",
+        "gcc_root",
+        "sysroot_lib",
+        "sysroot_include",
         "test_env",
         "toolchain_root",
         "tools",
@@ -607,7 +752,14 @@ def _load_test_authority_config(path: Path) -> dict[str, Any]:
     parsed["tools"] = {
         name: ToolSpec.from_json(name, value) for name, value in parsed["tools"].items()
     }
-    for key in ("registry_cache", "registry_index", "toolchain_root"):
+    for key in (
+        "registry_cache",
+        "registry_index",
+        "toolchain_root",
+        "gcc_root",
+        "sysroot_lib",
+        "sysroot_include",
+    ):
         if not isinstance(parsed[key], str) or not Path(parsed[key]).is_absolute():
             fail(f"test-only authority path is invalid: {key}")
     if not isinstance(parsed["test_env"], dict) or any(
@@ -660,6 +812,9 @@ if not test_only:
     registry_index = Path(
         "/home/obj/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f"
     )
+    gcc_root = Path("/usr/lib/gcc/x86_64-linux-gnu/12")
+    sysroot_lib = Path("/usr/lib/x86_64-linux-gnu")
+    sysroot_include = Path("/usr/include")
     tool_specs = _production_tool_specs()
     child_env = {
         "HOME": str(home),
@@ -698,6 +853,9 @@ else:
     toolchain_root = Path(authority_config["toolchain_root"])
     registry_cache = Path(authority_config["registry_cache"])
     registry_index = Path(authority_config["registry_index"])
+    gcc_root = Path(authority_config["gcc_root"])
+    sysroot_lib = Path(authority_config["sysroot_lib"])
+    sysroot_include = Path(authority_config["sysroot_include"])
     tool_specs = authority_config["tools"]
     child_env = dict(authority_config["test_env"])
     child_env.update(
@@ -713,6 +871,41 @@ missing_test_tool = (
     os.environ.get("LLM_GUARD_REBUILD_TEST_MISSING_TOOL", "") if test_only else ""
 )
 held_tools: dict[str, HeldTool] = {}
+fixed_authorities: dict[str, FileAuthority] = {}
+candidate_authority: FileAuthority | None = None
+
+
+def _open_fixed_authorities(expected: dict[str, Any] | None = None) -> None:
+    opened = {
+        "config": _open_file_authority(
+            "installed Guard config",
+            guard_config,
+            expected_mode=0o644,
+            max_bytes=1024 * 1024,
+        ),
+        "unit": _open_file_authority(
+            "installed Guard unit",
+            guard_unit,
+            expected_mode=0o644,
+            max_bytes=1024 * 1024,
+        ),
+    }
+    try:
+        if expected is not None and (
+            opened["config"].sha256 != expected["guard_config_sha256"]
+            or opened["unit"].sha256 != expected["guard_unit_sha256"]
+        ):
+            fail("installed Guard config or unit differs from transaction authority")
+        fixed_authorities.update(opened)
+    except BaseException:
+        for authority in opened.values():
+            authority.close()
+        raise
+
+
+def _verify_fixed_authorities() -> None:
+    for authority in fixed_authorities.values():
+        authority.verify()
 
 
 def _open_all_tools() -> None:
@@ -776,7 +969,9 @@ def execute(
         )
         return output.encode("utf-8")
     except RuntimeError as error:
-        raise RebuildError(f"bounded command failed: {Path(command[0]).name}") from error
+        raise RebuildError(
+            f"bounded command failed: {Path(command[0]).name}"
+        ) from error
     finally:
         for tool in used:
             tool.verify()
@@ -954,7 +1149,9 @@ def _directory_ledger(root_fd: int, label: str) -> DirectoryLedger:
             )
             try:
                 before = os.fstat(descriptor)
-                digest = _sha256_fd(descriptor)
+                digest = _sha256_fd(
+                    descriptor, 8 * 1024 * 1024 * 1024, f"{label}/{relative}"
+                )
                 after = os.fstat(descriptor)
             finally:
                 os.close(descriptor)
@@ -976,14 +1173,13 @@ def _directory_ledger(root_fd: int, label: str) -> DirectoryLedger:
             byte_count += info.st_size
             if file_count > 100_000 or byte_count > 8 * 1024 * 1024 * 1024:
                 fail(f"directory authority bound exceeded: {label}")
-            content.update(f"F\0{relative}\0{mode:o}\0{info.st_size}\0{digest}\n".encode())
+            content.update(
+                f"F\0{relative}\0{mode:o}\0{info.st_size}\0{digest}\n".encode()
+            )
 
     fresh_root = os.open(
         ".",
-        os.O_RDONLY
-        | os.O_DIRECTORY
-        | os.O_CLOEXEC
-        | getattr(os, "O_NOFOLLOW", 0),
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
         dir_fd=root_fd,
     )
     try:
@@ -1001,10 +1197,7 @@ def _open_directory_authority(name: str, path: Path) -> DirectoryAuthority:
     _reject_symlink_ancestors(path)
     descriptor = os.open(
         path,
-        os.O_RDONLY
-        | os.O_DIRECTORY
-        | os.O_CLOEXEC
-        | getattr(os, "O_NOFOLLOW", 0),
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
         info = os.fstat(descriptor)
@@ -1032,6 +1225,8 @@ def _read_fd_limited(descriptor: int, limit: int, label: str) -> bytes:
     offset = 0
     total = 0
     while True:
+        if operation_deadline is not None and time.monotonic() >= operation_deadline:
+            fail(f"{label} read deadline exhausted")
         chunk = os.pread(descriptor, min(1024 * 1024, limit + 1 - total), offset)
         if not chunk:
             return b"".join(chunks)
@@ -1097,7 +1292,9 @@ def _validate_raw_git_config(repo_fd: int) -> tuple[int, tuple[int, ...], str]:
     return config_fd, fields, sha256_bytes(payload)
 
 
-def _verify_git_config(repo_fd: int, config_fd: int, fields: tuple[int, ...], digest: str) -> None:
+def _verify_git_config(
+    repo_fd: int, config_fd: int, fields: tuple[int, ...], digest: str
+) -> None:
     held = os.fstat(config_fd)
     current = os.stat("config", dir_fd=repo_fd, follow_symlinks=False)
     held_fields = (
@@ -1114,7 +1311,11 @@ def _verify_git_config(repo_fd: int, config_fd: int, fields: tuple[int, ...], di
         current.st_mtime_ns,
         current.st_ctime_ns,
     )
-    if held_fields != fields or current_fields != fields or _sha256_fd(config_fd) != digest:
+    if (
+        held_fields != fields
+        or current_fields != fields
+        or _sha256_fd(config_fd) != digest
+    ):
         fail("private Git config changed")
 
 
@@ -1149,9 +1350,18 @@ def _parse_tree(payload: bytes) -> list[TreeEntry]:
         ):
             fail("canonical Git tree path or identity is unsafe")
         seen.add(path)
-        forbidden = path in {".gitmodules", ".gitattributes"} or path.endswith(
-            ("/.gitmodules", "/.gitattributes", "/.cargo/config", "/.cargo/config.toml")
-        ) or path in {".cargo/config", ".cargo/config.toml"}
+        forbidden = (
+            path in {".gitmodules", ".gitattributes"}
+            or path.endswith(
+                (
+                    "/.gitmodules",
+                    "/.gitattributes",
+                    "/.cargo/config",
+                    "/.cargo/config.toml",
+                )
+            )
+            or path in {".cargo/config", ".cargo/config.toml"}
+        )
         if forbidden:
             fail(f"canonical Git tree contains forbidden build control: {path}")
         size = int(size_text)
@@ -1164,7 +1374,9 @@ def _parse_tree(payload: bytes) -> list[TreeEntry]:
     return entries
 
 
-def _extract_archive(archive_path: Path, source_path: Path, commit: str, entries: list[TreeEntry]) -> str:
+def _extract_archive(
+    archive_path: Path, source_path: Path, commit: str, entries: list[TreeEntry]
+) -> str:
     expected = {entry.path: entry for entry in entries}
     seen: set[str] = set()
     content = hashlib.sha256()
@@ -1317,18 +1529,38 @@ def prepare_canonical_source(snapshot_root: Path) -> SourceBundle:
         )
         held_tools["git_remote_https"].verify()
         _verify_git_config(repo_fd, config_fd, config_fields, config_sha)
-        commit = execute(
-            [require_tool("git"), *_git_options(), git_dir, "rev-parse", "refs/gb10/rebuild^{commit}"],
-            capture=True,
-            env=git_env,
-            pass_fds=(repo_fd, exec_fd),
-        ).decode("ascii").strip()
-        tree = execute(
-            [require_tool("git"), *_git_options(), git_dir, "rev-parse", f"{commit}^{{tree}}"],
-            capture=True,
-            env=git_env,
-            pass_fds=(repo_fd, exec_fd),
-        ).decode("ascii").strip()
+        commit = (
+            execute(
+                [
+                    require_tool("git"),
+                    *_git_options(),
+                    git_dir,
+                    "rev-parse",
+                    "refs/gb10/rebuild^{commit}",
+                ],
+                capture=True,
+                env=git_env,
+                pass_fds=(repo_fd, exec_fd),
+            )
+            .decode("ascii")
+            .strip()
+        )
+        tree = (
+            execute(
+                [
+                    require_tool("git"),
+                    *_git_options(),
+                    git_dir,
+                    "rev-parse",
+                    f"{commit}^{{tree}}",
+                ],
+                capture=True,
+                env=git_env,
+                pass_fds=(repo_fd, exec_fd),
+            )
+            .decode("ascii")
+            .strip()
+        )
         if not re.fullmatch(r"[0-9a-f]{40}", commit) or not re.fullmatch(
             r"[0-9a-f]{40}", tree
         ):
@@ -1430,12 +1662,15 @@ def _sandbox_command(
     toolchain_fd: int,
     cache_fd: int,
     index_fd: int,
+    gcc_fd: int,
+    sysroot_lib_fd: int,
+    sysroot_include_fd: int,
     cargo_arguments: list[str],
 ) -> list[str]:
     cargo = "/toolchain/bin/cargo"
     rustc = "/toolchain/bin/rustc"
-    cc = held_tools["cc"].exec_path
-    ar = held_tools["ar"].exec_path
+    cc = "/usr/bin/x86_64-linux-gnu-gcc-12"
+    ar = "/usr/bin/x86_64-linux-gnu-ar"
     return [
         require_tool("nice"),
         "-n",
@@ -1454,23 +1689,46 @@ def _sandbox_command(
         "/proc",
         "--dev",
         "/dev",
+        "--dir",
+        "/usr",
+        "--dir",
+        "/usr/bin",
+        "--dir",
+        "/usr/lib",
+        "--dir",
+        "/usr/lib/gcc",
+        "--dir",
+        "/usr/lib/gcc/x86_64-linux-gnu",
         "--ro-bind",
-        "/usr",
-        "/usr",
+        f"/proc/self/fd/{gcc_fd}",
+        "/usr/lib/gcc/x86_64-linux-gnu/12",
+        "--ro-bind",
+        f"/proc/self/fd/{sysroot_lib_fd}",
+        "/usr/lib/x86_64-linux-gnu",
+        "--ro-bind",
+        f"/proc/self/fd/{sysroot_include_fd}",
+        "/usr/include",
+        "--ro-bind",
+        held_tools["cc"].exec_path,
+        cc,
+        "--ro-bind",
+        held_tools["as"].exec_path,
+        "/usr/bin/as",
+        "--ro-bind",
+        held_tools["ld"].exec_path,
+        "/usr/bin/ld",
+        "--ro-bind",
+        held_tools["ar"].exec_path,
+        ar,
         "--tmpfs",
         "/usr/local",
         "--tmpfs",
         "/home",
-        "--dir",
-        "/etc",
-        "--ro-bind",
-        "/etc/ld.so.cache",
-        "/etc/ld.so.cache",
         "--symlink",
         "usr/lib",
         "/lib",
         "--symlink",
-        "usr/lib64",
+        "usr/lib/x86_64-linux-gnu",
         "/lib64",
         "--ro-bind",
         f"/proc/self/fd/{source_fd}",
@@ -1505,7 +1763,7 @@ def _sandbox_command(
         "/nonexistent",
         "--setenv",
         "PATH",
-        "/toolchain/bin:/usr/bin:/bin",
+        "/toolchain/bin:/usr/bin",
         "--setenv",
         "LC_ALL",
         "C",
@@ -1553,6 +1811,9 @@ def _run_sandbox(
     toolchain: DirectoryAuthority,
     cache: DirectoryAuthority,
     index: DirectoryAuthority,
+    gcc: DirectoryAuthority,
+    sysroot_lib_authority: DirectoryAuthority,
+    sysroot_include_authority: DirectoryAuthority,
     arguments: list[str],
 ) -> str:
     pass_fds = tuple(
@@ -1565,6 +1826,9 @@ def _run_sandbox(
                     toolchain.descriptor,
                     cache.descriptor,
                     index.descriptor,
+                    gcc.descriptor,
+                    sysroot_lib_authority.descriptor,
+                    sysroot_include_authority.descriptor,
                 )
             )
         )
@@ -1575,6 +1839,9 @@ def _run_sandbox(
         toolchain.descriptor,
         cache.descriptor,
         index.descriptor,
+        gcc.descriptor,
+        sysroot_lib_authority.descriptor,
+        sysroot_include_authority.descriptor,
         arguments,
     )
     try:
@@ -1597,12 +1864,19 @@ def _validate_metadata(payload: str) -> str:
         raise RebuildError("Cargo metadata output is malformed") from error
     if not isinstance(metadata, dict):
         fail("Cargo metadata root is malformed")
-    if metadata.get("workspace_root") != "/src" or metadata.get("target_directory") != "/target":
+    if (
+        metadata.get("workspace_root") != "/src"
+        or metadata.get("target_directory") != "/target"
+    ):
         fail("Cargo metadata escaped sandbox roots")
     packages = metadata.get("packages")
     members = metadata.get("workspace_members")
     resolution = metadata.get("resolve")
-    if not isinstance(packages, list) or not isinstance(members, list) or not isinstance(resolution, dict):
+    if (
+        not isinstance(packages, list)
+        or not isinstance(members, list)
+        or not isinstance(resolution, dict)
+    ):
         fail("Cargo metadata closure is incomplete")
     package_ids: set[str] = set()
     closure = hashlib.sha256()
@@ -1613,14 +1887,20 @@ def _validate_metadata(payload: str) -> str:
         manifest = package.get("manifest_path")
         source = package.get("source")
         dependencies = package.get("dependencies")
-        if not isinstance(package_id, str) or not isinstance(manifest, str) or not isinstance(dependencies, list):
+        if (
+            not isinstance(package_id, str)
+            or not isinstance(manifest, str)
+            or not isinstance(dependencies, list)
+        ):
             fail("Cargo metadata package fields are malformed")
         if source is None:
             if not (manifest == "/src/Cargo.toml" or manifest.startswith("/src/")):
                 fail("Cargo path dependency escaped canonical workspace")
         elif not (
             isinstance(source, str)
-            and source.startswith("registry+https://github.com/rust-lang/crates.io-index")
+            and source.startswith(
+                "registry+https://github.com/rust-lang/crates.io-index"
+            )
         ):
             fail("Cargo metadata contains non-registry external source")
         for dependency in dependencies:
@@ -1639,7 +1919,8 @@ def _validate_metadata(payload: str) -> str:
         fail("Cargo workspace member is absent from package closure")
     nodes = resolution.get("nodes")
     if not isinstance(nodes, list) or any(
-        not isinstance(node, dict) or node.get("id") not in package_ids for node in nodes
+        not isinstance(node, dict) or node.get("id") not in package_ids
+        for node in nodes
     ):
         fail("Cargo resolve closure is malformed")
     return closure.hexdigest()
@@ -1696,9 +1977,7 @@ def _normalize_target_artifact_link(target_fd: int, artifact_fd: int) -> None:
             )
             os.close(release_fd)
             release_fd = child
-        current = os.stat(
-            "llm-guard-proxy", dir_fd=release_fd, follow_symlinks=False
-        )
+        current = os.stat("llm-guard-proxy", dir_fd=release_fd, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
             fail("built artifact path changed after same-FD open")
         if before.st_nlink == 2:
@@ -1728,9 +2007,8 @@ def _normalize_target_artifact_link(target_fd: int, artifact_fd: int) -> None:
             finally:
                 os.close(deps_fd)
         after = os.fstat(artifact_fd)
-        current = os.stat(
-            "llm-guard-proxy", dir_fd=release_fd, follow_symlinks=False
-        )
+        current = os.stat("llm-guard-proxy", dir_fd=release_fd, follow_symlinks=False)
+
         def stable(info: os.stat_result) -> tuple[int, ...]:
             return (
                 info.st_dev,
@@ -1741,6 +2019,7 @@ def _normalize_target_artifact_link(target_fd: int, artifact_fd: int) -> None:
                 info.st_size,
                 info.st_mtime_ns,
             )
+
         if (
             after.st_nlink != 1
             or current.st_nlink != 1
@@ -1761,6 +2040,7 @@ class BuildBundle:
     metadata_closure_sha256: str
     sandbox_contract_sha256: str
     inputs: dict[str, object]
+    authority: FileAuthority
 
 
 def build_sandboxed_candidate(source: SourceBundle) -> BuildBundle:
@@ -1768,6 +2048,9 @@ def build_sandboxed_candidate(source: SourceBundle) -> BuildBundle:
         _open_directory_authority("toolchain", toolchain_root),
         _open_directory_authority("registry cache", registry_cache),
         _open_directory_authority("registry index", registry_index),
+        _open_directory_authority("gcc closure", gcc_root),
+        _open_directory_authority("sysroot lib", sysroot_lib),
+        _open_directory_authority("sysroot include", sysroot_include),
     ]
     target_root = Path(tempfile.mkdtemp(prefix=".build-target-", dir=cache_root))
     target = _open_directory_authority("build target", target_root)
@@ -1778,6 +2061,9 @@ def build_sandboxed_candidate(source: SourceBundle) -> BuildBundle:
             authorities[0],
             authorities[1],
             authorities[2],
+            authorities[3],
+            authorities[4],
+            authorities[5],
             [
                 "metadata",
                 "--format-version=1",
@@ -1791,10 +2077,7 @@ def build_sandboxed_candidate(source: SourceBundle) -> BuildBundle:
         metadata_closure = _validate_metadata(metadata_output)
         inventory_fd = os.open(
             ".",
-            os.O_RDONLY
-            | os.O_DIRECTORY
-            | os.O_CLOEXEC
-            | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=target.descriptor,
         )
         try:
@@ -1809,9 +2092,7 @@ def build_sandboxed_candidate(source: SourceBundle) -> BuildBundle:
             )
         except OSError as error:
             raise RebuildError("Cargo metadata target state differs") from error
-        metadata_target_ledger = _directory_ledger(
-            target.descriptor, "metadata target"
-        )
+        metadata_target_ledger = _directory_ledger(target.descriptor, "metadata target")
         if (
             metadata_target_names != [".rustc_info.json"]
             or not stat.S_ISREG(metadata_target_info.st_mode)
@@ -1850,6 +2131,9 @@ def build_sandboxed_candidate(source: SourceBundle) -> BuildBundle:
                     authorities[0].descriptor,
                     authorities[1].descriptor,
                     authorities[2].descriptor,
+                    authorities[3].descriptor,
+                    authorities[4].descriptor,
+                    authorities[5].descriptor,
                     build_arguments,
                 )
             ).encode()
@@ -1860,6 +2144,9 @@ def build_sandboxed_candidate(source: SourceBundle) -> BuildBundle:
             authorities[0],
             authorities[1],
             authorities[2],
+            authorities[3],
+            authorities[4],
+            authorities[5],
             build_arguments,
         )
         artifact_fd = _open_target_artifact(target.descriptor)
@@ -1882,20 +2169,22 @@ def build_sandboxed_candidate(source: SourceBundle) -> BuildBundle:
                     existing_identity = fd_identity(existing)
                 finally:
                     os.close(existing)
-                if existing_identity.sha256 != raw_identity.sha256 or existing_identity.build_id != raw_identity.build_id:
+                if (
+                    existing_identity.sha256 != raw_identity.sha256
+                    or existing_identity.build_id != raw_identity.build_id
+                ):
                     fail("existing content-addressed candidate identity differs")
             else:
                 atomic_copy_fd(artifact_fd, candidate, 0o755)
         finally:
             os.close(artifact_fd)
-        candidate_fd = os.open(
+        candidate_file = _open_file_authority(
+            "candidate executable",
             candidate,
-            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            expected_mode=0o755,
+            max_bytes=MAX_EXECUTABLE_BYTES,
         )
-        try:
-            candidate_identity = fd_identity(candidate_fd)
-        finally:
-            os.close(candidate_fd)
+        candidate_identity = fd_identity(candidate_file.descriptor)
         if (
             candidate_identity.size,
             candidate_identity.sha256,
@@ -1923,6 +2212,7 @@ def build_sandboxed_candidate(source: SourceBundle) -> BuildBundle:
             metadata_closure,
             sandbox_contract,
             inputs,
+            candidate_file,
         )
     finally:
         target.close()
@@ -1940,8 +2230,7 @@ def _validate_reviewed_tool_versions(cargo: bytes, rustc: bytes) -> None:
         cargo_text.splitlines()[0] != "cargo 1.97.1 (c980f4866 2026-06-30)"
         or "release: 1.97.1" not in cargo_text.splitlines()
         or "host: x86_64-unknown-linux-gnu" not in cargo_text.splitlines()
-        or rustc_text.splitlines()[0]
-        != "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+        or rustc_text.splitlines()[0] != "rustc 1.97.1 (8bab26f4f 2026-07-14)"
         or "host: x86_64-unknown-linux-gnu" not in rustc_text.splitlines()
         or "release: 1.97.1" not in rustc_text.splitlines()
         or "LLVM version: 22.1.6" not in rustc_text.splitlines()
@@ -1978,8 +2267,6 @@ def cleanup_snapshot(root: Path | None) -> None:
     root.rmdir()
 
 
-
-
 @dataclass(frozen=True)
 class Generation:
     pid: int
@@ -1988,6 +2275,35 @@ class Generation:
     fragment: str
     result: str
     job: int | None
+
+
+def _verify_manager_contract(values: dict[str, str]) -> None:
+    credential = "/run/credentials/llm-guard-proxy.service/llm-guard-config"
+    runtime_dir = f"/run/user/{os.getuid()}/gb10-memory-guardian"
+    expected_argv = (
+        f"{service_bin} --config {credential} --guardian-runtime-dir {runtime_dir}"
+    )
+    match = re.fullmatch(
+        r"\{ path=([^ ]+) ; argv\[\]=(.+?) ; ignore_errors=no(?: ; .*)? ; \}",
+        values["ExecStart"],
+    )
+    expected = {
+        "LoadCredential": f"llm-guard-config:{guard_config}",
+        "NoNewPrivileges": "yes",
+        "PrivateTmp": "yes",
+        "ProtectSystem": "strict",
+        "ProtectHome": "read-only",
+        "UMask": "0077",
+        "Environment": "",
+        "EnvironmentFiles": "",
+    }
+    if (
+        match is None
+        or match.group(1) != str(service_bin)
+        or match.group(2) != expected_argv
+        or any(values[key] != value for key, value in expected.items())
+    ):
+        fail("manager-loaded Guard contract differs")
 
 
 def query_generation(*, require_running: bool = True) -> Generation:
@@ -2014,6 +2330,7 @@ def query_generation(*, require_running: bool = True) -> Generation:
         values[key] = value
     if set(values) != set(GENERATION_FIELDS):
         fail("systemd generation output is missing fields")
+    _verify_manager_contract(values)
     if (
         values["LoadState"] != "loaded"
         or values["FragmentPath"] != str(guard_unit)
@@ -2063,7 +2380,7 @@ def query_generation(*, require_running: bool = True) -> Generation:
 def read_small_regular(path: Path, limit: int) -> bytes:
     descriptor = os.open(
         path,
-        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
         metadata = os.fstat(descriptor)
@@ -2111,6 +2428,34 @@ def proc_starttime(pid: int) -> int:
     return int(fields[19])
 
 
+def verify_running_config(pid: int) -> None:
+    if "config" not in fixed_authorities:
+        fail("installed Guard config authority is unavailable")
+    credential = "/run/credentials/llm-guard-proxy.service/llm-guard-config"
+    expected_cmdline = (
+        str(service_bin).encode()
+        + b"\0--config\0"
+        + credential.encode()
+        + b"\0--guardian-runtime-dir\0"
+        + f"/run/user/{os.getuid()}/gb10-memory-guardian".encode()
+        + b"\0"
+    )
+    if read_small_regular(proc_root / str(pid) / "cmdline", 4096) != expected_cmdline:
+        fail("running Guard launch argv differs")
+    applied = _open_file_authority(
+        "running Guard config",
+        proc_root / str(pid) / "root" / credential.lstrip("/"),
+        expected_mode=0o400,
+        max_bytes=1024 * 1024,
+    )
+    try:
+        if applied.sha256 != fixed_authorities["config"].sha256:
+            fail("running Guard config authority differs")
+        applied.verify()
+    finally:
+        applied.close()
+
+
 def elf_build_id(path: str, *, pass_fd: int | None = None) -> str:
     pass_fds = (pass_fd,) if pass_fd is not None else ()
     output = execute(
@@ -2156,10 +2501,16 @@ def fd_identity(
     offset = 0
     hook_called = False
     while True:
-        chunk = os.pread(descriptor, 1024 * 1024, offset)
+        if operation_deadline is not None and time.monotonic() >= operation_deadline:
+            fail("executable identity hash deadline exhausted")
+        chunk = os.pread(
+            descriptor, min(1024 * 1024, MAX_EXECUTABLE_BYTES + 1 - offset), offset
+        )
         if not chunk:
             break
         offset += len(chunk)
+        if offset > MAX_EXECUTABLE_BYTES:
+            fail("executable identity exceeded byte bound")
         digest.update(chunk)
         if during_hash is not None and not hook_called:
             during_hash()
@@ -2291,6 +2642,7 @@ def snapshot_prestate() -> Prestate:
         if not _safe_absolute(link_target):
             fail("service binary prestate target is not a safe absolute path")
     generation = query_generation()
+    verify_running_config(generation.pid)
     if generation.job is not None:
         fail("Guard has an existing manager job before prestate")
     current_boot = boot_id()
@@ -2339,11 +2691,17 @@ def assert_prestate_unchanged(prestate: Prestate) -> None:
     current = os.stat(proc_root / str(prestate.generation.pid) / "exe")
     if not same_object(current, prestate.executable):
         fail("runtime executable changed before cutover")
-    if os.readlink(proc_root / str(prestate.generation.pid) / "exe") != prestate.running_link:
+    if (
+        os.readlink(proc_root / str(prestate.generation.pid) / "exe")
+        != prestate.running_link
+    ):
         fail("runtime executable link changed before cutover")
     if not service_link_matches(prestate.link_target):
         fail("service binary link changed before cutover")
-    if prestate.descriptor is not None and fd_identity(prestate.descriptor) != prestate.executable:
+    if (
+        prestate.descriptor is not None
+        and fd_identity(prestate.descriptor) != prestate.executable
+    ):
         fail("held prior executable changed before cutover")
 
 
@@ -2424,10 +2782,7 @@ def acquire_rebuild_lock() -> int:
     existed = lock_path.exists() or lock_path.is_symlink()
     descriptor = os.open(
         lock_path,
-        os.O_RDWR
-        | os.O_CREAT
-        | os.O_CLOEXEC
-        | getattr(os, "O_NOFOLLOW", 0),
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
         0o600,
     )
     try:
@@ -2503,7 +2858,10 @@ def _strict_int(value: object, label: str, *, minimum: int = 0) -> int:
 
 
 def _strict_hex(value: object, label: str, length: int = 64) -> str:
-    if not isinstance(value, str) or re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is None:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is None
+    ):
         fail(f"{label} is malformed")
     return value
 
@@ -2628,6 +2986,7 @@ def _validate_authorities(value: object) -> dict[str, Any]:
             "git_config_sha256",
             "metadata_closure_sha256",
             "sandbox_contract_sha256",
+            "build_inputs",
             "build_inputs_sha256",
             "cargo_identity_sha256",
             "rustc_identity_sha256",
@@ -2659,8 +3018,36 @@ def _validate_authorities(value: object) -> dict[str, Any]:
         "python_runtime_authority_sha256",
     ):
         _strict_hex(payload[key], f"authorities.{key}")
-    _strict_int(payload["source_file_count"], "authorities.source_file_count", minimum=1)
-    _strict_int(payload["source_byte_count"], "authorities.source_byte_count", minimum=1)
+    build_inputs = payload["build_inputs"]
+    if (
+        not isinstance(build_inputs, dict)
+        or set(build_inputs)
+        != {
+            "toolchain",
+            "registry_cache",
+            "registry_index",
+            "gcc_closure",
+            "sysroot_lib",
+            "sysroot_include",
+            "metadata_target",
+        }
+        or sha256_bytes(
+            json.dumps(
+                build_inputs,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("ascii")
+        )
+        != payload["build_inputs_sha256"]
+    ):
+        fail("build input ledger differs")
+    _strict_int(
+        payload["source_file_count"], "authorities.source_file_count", minimum=1
+    )
+    _strict_int(
+        payload["source_byte_count"], "authorities.source_byte_count", minimum=1
+    )
     tools = payload["tool_authorities"]
     if not isinstance(tools, dict) or set(tools) != TOOL_NAMES:
         fail("tool authority closure is malformed")
@@ -2723,14 +3110,24 @@ def validate_wal(value: object) -> dict[str, Any]:
         Path(candidate_path).relative_to(cache_root / "releases")
     except ValueError:
         fail("candidate escaped release root")
-    candidate["identity"] = _identity_from_payload(candidate["identity"], "candidate.identity")
+    candidate["identity"] = _identity_from_payload(
+        candidate["identity"], "candidate.identity"
+    )
     prior = _exact_keys(
         wal["prior"],
-        {"link_target", "boot_id", "generation", "running_link", "executable", "backup"},
+        {
+            "link_target",
+            "boot_id",
+            "generation",
+            "running_link",
+            "executable",
+            "backup",
+        },
         "prior",
     )
     if prior["link_target"] is not None and (
-        not isinstance(prior["link_target"], str) or not _safe_absolute(prior["link_target"])
+        not isinstance(prior["link_target"], str)
+        or not _safe_absolute(prior["link_target"])
     ):
         fail("prior link target is unsafe")
     if (
@@ -2744,9 +3141,13 @@ def validate_wal(value: object) -> dict[str, Any]:
         is None
     ):
         fail("prior runtime authority is malformed")
-    generation, proc_value = _generation_from_payload(prior["generation"], "prior.generation")
+    generation, proc_value = _generation_from_payload(
+        prior["generation"], "prior.generation"
+    )
     prior["generation"] = (generation, proc_value)
-    prior["executable"] = _identity_from_payload(prior["executable"], "prior.executable")
+    prior["executable"] = _identity_from_payload(
+        prior["executable"], "prior.executable"
+    )
     backup = _exact_keys(prior["backup"], {"path", "identity"}, "prior.backup")
     expected_backup = receipt_dir / "rollback" / f"{prior['executable'].sha256}.bin"
     if backup["path"] != str(expected_backup) or not _safe_absolute(backup["path"]):
@@ -2847,7 +3248,11 @@ def _serializable_wal(wal: dict[str, Any]) -> dict[str, Any]:
     def convert(value: Any) -> Any:
         if isinstance(value, ExecutableIdentity):
             return _identity_payload(value)
-        if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], Generation):
+        if (
+            isinstance(value, tuple)
+            and len(value) == 2
+            and isinstance(value[0], Generation)
+        ):
             return _generation_payload(value[0], value[1])
         if isinstance(value, dict):
             return {key: convert(item) for key, item in value.items()}
@@ -3003,9 +3408,10 @@ def _prestate_from_wal(wal: dict[str, Any]) -> Prestate:
 
 def _assert_fixed_authorities(wal: dict[str, Any]) -> None:
     authorities = cast(dict[str, Any], wal["authorities"])
+    _verify_fixed_authorities()
     if (
-        sha256_file(guard_config) != authorities["guard_config_sha256"]
-        or sha256_file(guard_unit) != authorities["guard_unit_sha256"]
+        fixed_authorities["config"].sha256 != authorities["guard_config_sha256"]
+        or fixed_authorities["unit"].sha256 != authorities["guard_unit_sha256"]
     ):
         fail("installed Guard config or unit differs from transaction authority")
     _verify_all_tools()
@@ -3160,8 +3566,11 @@ class RuntimeAttestation:
     executable: ExecutableIdentity
 
 
-def attest_candidate(candidate: Path, expected: ExecutableIdentity) -> RuntimeAttestation:
+def attest_candidate(
+    candidate: Path, expected: ExecutableIdentity
+) -> RuntimeAttestation:
     generation = query_generation()
+    verify_running_config(generation.pid)
     current_boot = boot_id()
     starttime = proc_starttime(generation.pid)
     replacement = (
@@ -3197,6 +3606,7 @@ def final_runtime_attestation(
 ) -> None:
     if query_generation() != accepted.generation:
         fail("systemd generation changed during attestation")
+    verify_running_config(accepted.generation.pid)
     if (
         boot_id() != accepted.boot
         or proc_starttime(accepted.generation.pid) != accepted.proc_start
@@ -3205,11 +3615,17 @@ def final_runtime_attestation(
     current_proc = os.stat(proc_root / str(accepted.generation.pid) / "exe")
     if not same_object(current_proc, accepted.executable):
         fail("current proc executable no longer names held inode")
-    if os.readlink(proc_root / str(accepted.generation.pid) / "exe") != accepted.running_link:
+    if (
+        os.readlink(proc_root / str(accepted.generation.pid) / "exe")
+        != accepted.running_link
+    ):
         fail("current proc executable link changed during attestation")
     if fd_identity(accepted.descriptor) != accepted.executable:
         fail("held executable changed during attestation")
-    if file_identity(candidate) != expected:
+    if candidate_authority is None:
+        fail("candidate executable authority is unavailable")
+    candidate_authority.verify()
+    if fd_identity(candidate_authority.descriptor) != expected:
         fail("candidate executable changed during attestation")
     if not service_link_matches(str(candidate)) or not same_object(
         os.stat(service_bin), expected
@@ -3350,7 +3766,9 @@ def rollback_wal(wal: dict[str, Any]) -> None:
         failed, failed_proc, prestate.generation, prestate.boot
     )
     health_check()
-    descriptor, running_link, identity = open_runtime_executable(restored_generation.pid)
+    descriptor, running_link, identity = open_runtime_executable(
+        restored_generation.pid
+    )
     try:
         if identity != expected_object:
             fail("rollback runtime did not execute the exact prior object")
@@ -3386,9 +3804,12 @@ def _verify_committed(wal: dict[str, Any], *, cancel_jobs: bool = True) -> None:
     candidate_record = cast(dict[str, Any], wal["candidate"])
     candidate = Path(cast(str, candidate_record["path"]))
     expected = cast(ExecutableIdentity, candidate_record["identity"])
+    if candidate_authority is not None:
+        candidate_authority.verify()
     if (
         not service_link_matches(str(candidate))
-        or file_identity(candidate) != expected
+        or candidate_authority is None
+        or fd_identity(candidate_authority.descriptor) != expected
         or boot_id() != committed["boot_id"]
         or query_generation() != generation
         or proc_starttime(generation.pid) != proc_value
@@ -3403,7 +3824,10 @@ def _verify_committed(wal: dict[str, Any], *, cancel_jobs: bool = True) -> None:
         ):
             fail("committed executable proof differs")
         health_check()
-        if query_generation() != generation or proc_starttime(generation.pid) != proc_value:
+        if (
+            query_generation() != generation
+            or proc_starttime(generation.pid) != proc_value
+        ):
             fail("committed generation drifted during recovery")
     finally:
         os.close(descriptor)
@@ -3513,9 +3937,10 @@ def final_commit_bracket(
     rustc_identity: bytes,
 ) -> None:
     source.verify()
+    _verify_fixed_authorities()
     if (
-        config_sha256 != sha256_file(guard_config)
-        or unit_sha256 != sha256_file(guard_unit)
+        config_sha256 != fixed_authorities["config"].sha256
+        or unit_sha256 != fixed_authorities["unit"].sha256
     ):
         fail("installed Guard config or unit changed before publication")
     if cargo_identity != capture_tool("cargo", "--version", "--verbose"):
@@ -3536,7 +3961,7 @@ for caught_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
 
 
 def run_transaction() -> int:
-    global operation_deadline, rollback_logging
+    global candidate_authority, operation_deadline, rollback_logging
 
     lock_descriptor: int | None = None
     snapshot_root: Path | None = None
@@ -3553,19 +3978,35 @@ def run_transaction() -> int:
         )
         stale = load_wal()
         if stale is not None:
-            _open_all_tools()
             operation_deadline = time.monotonic() + _test_deadline(
                 "LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS", RECOVERY_SECONDS
             )
+            authorities = cast(dict[str, Any], stale["authorities"])
+            if (
+                _runtime_python_authority_sha256()
+                != authorities["python_runtime_authority_sha256"]
+            ):
+                fail("Python runtime authority differs from stale transaction")
+            _open_fixed_authorities(authorities)
+            candidate_record = cast(dict[str, Any], stale["candidate"])
+            candidate_identity = cast(ExecutableIdentity, candidate_record["identity"])
+            candidate_authority = _open_file_authority(
+                "candidate executable",
+                Path(cast(str, candidate_record["path"])),
+                expected_mode=candidate_identity.mode,
+                max_bytes=MAX_EXECUTABLE_BYTES,
+            )
+            if candidate_authority.sha256 != candidate_identity.sha256:
+                fail("candidate executable authority differs from transaction")
+            _open_all_tools()
             recover_stale_transaction(stale)
             return 75
 
         sweep_orphan_backups()
+        _open_fixed_authorities()
         _open_all_tools()
-        require_secure_regular(guard_config)
-        require_secure_regular(guard_unit)
-        config_sha_initial = sha256_file(guard_config)
-        unit_sha_initial = sha256_file(guard_unit)
+        config_sha_initial = fixed_authorities["config"].sha256
+        unit_sha_initial = fixed_authorities["unit"].sha256
         cargo_identity_initial = capture_tool("cargo", "--version", "--verbose")
         rustc_identity_initial = capture_tool("rustc", "-vV")
         _validate_reviewed_tool_versions(cargo_identity_initial, rustc_identity_initial)
@@ -3579,20 +4020,23 @@ def run_transaction() -> int:
         snapshot_root.chmod(0o700)
         source_bundle = prepare_canonical_source(snapshot_root)
         build_bundle = build_sandboxed_candidate(source_bundle)
+        candidate_authority = build_bundle.authority
         candidate = build_bundle.candidate
         candidate_identity = build_bundle.identity
         source_bundle.verify()
         assert_prestate_unchanged(prestate)
         prove_no_manager_job()
         if (
-            config_sha_initial != sha256_file(guard_config)
-            or unit_sha_initial != sha256_file(guard_unit)
+            config_sha_initial != fixed_authorities["config"].sha256
+            or unit_sha_initial != fixed_authorities["unit"].sha256
         ):
             fail("installed Guard config or unit changed before cutover")
+        _verify_fixed_authorities()
         if cargo_identity_initial != capture_tool("cargo", "--version", "--verbose"):
             fail("Cargo toolchain identity changed before cutover")
         if rustc_identity_initial != capture_tool("rustc", "-vV"):
             fail("rustc toolchain identity changed before cutover")
+        candidate_authority.verify()
 
         backup, backup_identity = _make_backup(prestate)
         tool_receipts = {
@@ -3618,19 +4062,13 @@ def run_transaction() -> int:
                     allow_nan=False,
                 ).encode("ascii")
             ),
+            "build_inputs": build_bundle.inputs,
             "cargo_identity_sha256": cargo_identity_sha,
             "rustc_identity_sha256": rustc_identity_sha,
             "guard_config_sha256": config_sha_initial,
             "guard_unit_sha256": unit_sha_initial,
             "tool_authorities": tool_receipts,
-            "python_runtime_authority_sha256": sha256_bytes(
-                json.dumps(
-                    _runtime_python_authority(),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    allow_nan=False,
-                ).encode("ascii")
-            ),
+            "python_runtime_authority_sha256": _runtime_python_authority_sha256(),
         }
         wal = _build_wal(
             prestate,
@@ -3756,10 +4194,16 @@ def run_transaction() -> int:
             os.close(prestate.descriptor)
         if source_bundle is not None:
             source_bundle.close()
+        if candidate_authority is not None:
+            candidate_authority.close()
+            candidate_authority = None
         cleanup_snapshot(snapshot_root)
         for held in reversed(list(held_tools.values())):
             held.close()
         held_tools.clear()
+        for authority in fixed_authorities.values():
+            authority.close()
+        fixed_authorities.clear()
         operation_deadline = None
         if lock_descriptor is not None:
             os.close(lock_descriptor)

@@ -55,8 +55,6 @@ class GuardProductionFeatureContractTests(unittest.TestCase):
                 self.assertIn(required, normalized)
 
 
-
-
 class GuardRebuildProvenanceTests(unittest.TestCase):
     def test_launcher_hash_pins_real_module_without_embedded_python(self) -> None:
         launcher = REBUILD_SCRIPT.read_text()
@@ -138,7 +136,8 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
             self.assertIsNotNone(completion)
             assert completion is not None
             self.assertEqual(
-                completion.group(1), hashlib.sha256(receipts[0].read_bytes()).hexdigest()
+                completion.group(1),
+                hashlib.sha256(receipts[0].read_bytes()).hexdigest(),
             )
             receipt = json.loads(receipts[0].read_text())
             self.assertEqual(receipt["schema"], 1)
@@ -152,12 +151,28 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
             self.assertRegex(authorities["metadata_closure_sha256"], r"^[0-9a-f]{64}$")
             self.assertRegex(authorities["sandbox_contract_sha256"], r"^[0-9a-f]{64}$")
             self.assertRegex(authorities["build_inputs_sha256"], r"^[0-9a-f]{64}$")
-            self.assertEqual(set(authorities["tool_authorities"]), {
-                "ar", "bwrap", "cargo", "cc", "curl", "git",
-                "git_remote_https", "ionice", "ld", "nice", "readelf",
-                "rustc", "systemctl",
-            })
-            self.assertEqual(receipt["candidate"]["identity"]["sha256"], fixture.binary_sha256)
+            self.assertEqual(
+                set(authorities["tool_authorities"]),
+                {
+                    "ar",
+                    "as",
+                    "bwrap",
+                    "cargo",
+                    "cc",
+                    "curl",
+                    "git",
+                    "git_remote_https",
+                    "ionice",
+                    "ld",
+                    "nice",
+                    "readelf",
+                    "rustc",
+                    "systemctl",
+                },
+            )
+            self.assertEqual(
+                receipt["candidate"]["identity"]["sha256"], fixture.binary_sha256
+            )
             serialized = receipts[0].read_text()
             for forbidden in (
                 "private_config_payload",
@@ -223,7 +238,9 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
             self.assertEqual(fixture.reload_state()["restart_calls"], 0)
             fixture.assert_no_backend_lifecycle(self)
 
-    def test_inactive_and_unsupported_service_prestates_fail_before_mutation(self) -> None:
+    def test_inactive_and_unsupported_service_prestates_fail_before_mutation(
+        self,
+    ) -> None:
         with self.subTest(prestate="inactive"), RebuildFixture() as fixture:
             fixture.set_state(active=False, sub="dead")
             self.assert_failed_without_completion(fixture.run())
@@ -271,11 +288,15 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
                 fixture.assert_transaction_clean(self)
                 fixture.assert_no_backend_lifecycle(self)
 
-    def test_source_mutation_and_restore_during_cargo_is_rejected_pre_cutover(self) -> None:
+    def test_source_mutation_and_restore_during_cargo_is_rejected_pre_cutover(
+        self,
+    ) -> None:
         with RebuildFixture() as fixture:
             fixture.set_state(mutate_source_during_cargo=True)
             output = self.assert_failed_without_completion(fixture.run())
-            self.assertIn("directory authority ledger changed: canonical source", output)
+            self.assertIn(
+                "directory authority ledger changed: canonical source", output
+            )
             fixture.assert_prior_restored(self)
             self.assertEqual(fixture.reload_state()["restart_calls"], 0)
             self.assertFalse(fixture.source_dir.exists())
@@ -357,7 +378,9 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
             fixture.assert_prior_restored(self)
             fixture.assert_no_backend_lifecycle(self)
 
-    def test_prior_absence_is_restored_on_receipt_failure_without_runtime_restart(self) -> None:
+    def test_prior_absence_is_restored_on_receipt_failure_without_runtime_restart(
+        self,
+    ) -> None:
         with RebuildFixture() as fixture:
             fixture.set_prior_absent_with_candidate_runtime()
             result = fixture.run(
