@@ -166,18 +166,31 @@ class _ProcessTree:
             and table.get(pid, (0, -1))[1] == owned.starttime
         ]
 
-    def signal(self, number: int) -> None:
-        table = self.scan()
-        leader_row = table.get(self.leader.pid)
+    def _signal_group(self, number: int) -> None:
+        leader = self.owned.get(self.leader.pid)
         if (
             self.leader.returncode is None
-            and leader_row is not None
-            and leader_row[1] == self.root_starttime
+            and leader is not None
+            and leader.starttime == self.root_starttime
         ):
+            if leader.pidfd is not None and hasattr(signal, "pidfd_send_signal"):
+                try:
+                    signal.pidfd_send_signal(leader.pidfd, 0, None, 0)
+                except ProcessLookupError:
+                    return
+                except OSError:
+                    pass
+            leader_row = _proc_row(self.leader.pid)
+            if leader_row is None or leader_row[1] != self.root_starttime:
+                return
             try:
                 os.killpg(self.leader.pid, number)
             except ProcessLookupError:
                 pass
+
+    def signal(self, number: int) -> None:
+        self._signal_group(number)
+        table = self.scan()
         for owned in self.descendants(table):
             if owned.pidfd is not None and hasattr(signal, "pidfd_send_signal"):
                 try:
@@ -288,20 +301,38 @@ def _bounded_reap(
 ) -> None:
     now = time.monotonic()
     term_deadline = min(hard_deadline, now + min(2.0, max(0.0, (hard_deadline - now) / 2)))
-    tree.signal(signal.SIGTERM)
+    delayed_scan_error: BoundedProcessError | None = None
+    cleanup_complete = False
+    try:
+        tree.signal(signal.SIGTERM)
+    except BoundedProcessError as error:
+        delayed_scan_error = error
     while time.monotonic() < term_deadline:
         _drain_once(selector, streams, captures, min(_POLL_SECONDS, term_deadline - time.monotonic()))
         process.poll()
-        tree.reap_adopted()
-        if not tree.survivors() and not streams:
+        try:
+            tree.reap_adopted()
+            cleanup_complete = not tree.survivors() and not streams
+        except BoundedProcessError as error:
+            delayed_scan_error = delayed_scan_error or error
+            cleanup_complete = False
+        if cleanup_complete:
             break
-    if tree.survivors():
-        tree.signal(signal.SIGKILL)
+    if not cleanup_complete:
+        try:
+            tree.signal(signal.SIGKILL)
+        except BoundedProcessError as error:
+            delayed_scan_error = delayed_scan_error or error
     while time.monotonic() < hard_deadline:
         _drain_once(selector, streams, captures, min(_POLL_SECONDS, hard_deadline - time.monotonic()))
         process.poll()
-        tree.reap_adopted()
-        if not tree.survivors() and not streams:
+        try:
+            tree.reap_adopted()
+            cleanup_complete = not tree.survivors() and not streams
+        except BoundedProcessError as error:
+            delayed_scan_error = delayed_scan_error or error
+            cleanup_complete = False
+        if cleanup_complete:
             break
     for descriptor in list(streams):
         _close_stream(selector, streams, descriptor)
@@ -310,13 +341,25 @@ def _bounded_reap(
             process.wait(timeout=max(0.001, hard_deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             pass
-    tree.reap_adopted()
-    survivors = tree.survivors()
+    try:
+        tree.reap_adopted()
+    except BoundedProcessError as error:
+        delayed_scan_error = delayed_scan_error or error
+    try:
+        survivors = tree.survivors()
+    except BoundedProcessError as error:
+        delayed_scan_error = delayed_scan_error or error
+        survivors = []
+    if process.returncode is None and process.pid not in survivors:
+        survivors.append(process.pid)
+        survivors.sort()
     if survivors:
         raise BoundedProcessError(
             "subprocess cleanup deadline exhausted; survivors="
             + ",".join(str(pid) for pid in survivors)
         )
+    if delayed_scan_error is not None:
+        raise delayed_scan_error
 
 
 def command(

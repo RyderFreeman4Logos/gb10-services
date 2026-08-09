@@ -924,6 +924,114 @@ class SharedBoundedProcessRecoveryTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def _exercise_child_scan_order(self, *, overflow: bool) -> None:
+        bounded = self._load_bounded()
+        events: list[tuple[str, int | None]] = []
+        real_killpg = os.killpg
+        with tempfile.TemporaryDirectory() as temporary:
+            ready = Path(temporary) / "ready"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import pathlib,signal,sys,time;"
+                    "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                    "pathlib.Path(sys.argv[1]).touch();time.sleep(30)",
+                    str(ready),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            selector = bounded.selectors.DefaultSelector()
+            streams: dict[int, tuple[str, object]] = {}
+            tree = None
+            try:
+                ready_deadline = time.monotonic() + 2
+                while not ready.exists() and time.monotonic() < ready_deadline:
+                    self.assertIsNone(process.poll(), "fixture exited before readiness")
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists(), "fixture did not become ready")
+                tree = bounded._ProcessTree(process, set())
+                captures = {
+                    "stdout": bounded._Capture(bytearray()),
+                    "stderr": bounded._Capture(bytearray()),
+                }
+                assert process.stdout is not None and process.stderr is not None
+                for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+                    descriptor = stream.fileno()
+                    os.set_blocking(descriptor, False)
+                    selector.register(descriptor, bounded.selectors.EVENT_READ)
+                    streams[descriptor] = (name, stream)
+
+                def child_pids(_pid: int) -> list[int]:
+                    events.append(("scan", None))
+                    if overflow:
+                        raise bounded.BoundedProcessError(
+                            "subprocess child list exceeded its bound"
+                        )
+                    return []
+
+                def killpg(pid: int, number: int) -> None:
+                    events.append(("group", number))
+                    real_killpg(pid, number)
+
+                with (
+                    patch.object(bounded, "_child_pids", side_effect=child_pids),
+                    patch.object(bounded.os, "killpg", side_effect=killpg),
+                ):
+                    if overflow:
+                        with self.assertRaisesRegex(
+                            bounded.BoundedProcessError,
+                            "subprocess child list exceeded its bound",
+                        ):
+                            bounded._bounded_reap(
+                                process,
+                                tree,
+                                selector,
+                                streams,
+                                captures,
+                                time.monotonic() + 1,
+                            )
+                    else:
+                        bounded._bounded_reap(
+                            process,
+                            tree,
+                            selector,
+                            streams,
+                            captures,
+                            time.monotonic() + 1,
+                        )
+
+                self.assertIn(("group", signal.SIGTERM), events)
+                self.assertIn(("group", signal.SIGKILL), events)
+                self.assertEqual(events[0], ("group", signal.SIGTERM))
+                term = events.index(("group", signal.SIGTERM))
+                kill = events.index(("group", signal.SIGKILL))
+                self.assertLess(term, kill)
+                self.assertEqual(events[term + 1], ("scan", None))
+                self.assertEqual(events[kill + 1], ("scan", None))
+                self.assertEqual(process.returncode, -signal.SIGKILL)
+                self.assertFalse(Path(f"/proc/{process.pid}").exists())
+            finally:
+                if process.poll() is None:
+                    try:
+                        real_killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                process.wait(timeout=3)
+                for descriptor in list(streams):
+                    bounded._close_stream(selector, streams, descriptor)
+                selector.close()
+                if tree is not None:
+                    tree.close()
+
+    def test_child_scan_overflow_is_delayed_until_group_term_kill_and_reap(self) -> None:
+        self._exercise_child_scan_order(overflow=True)
+
+    def test_normal_child_scan_follows_group_term_and_kill_before_reap(self) -> None:
+        self._exercise_child_scan_order(overflow=False)
+
     def test_escaped_term_ignoring_flooders_are_killed_and_reaped(self) -> None:
         bounded = self._load_bounded()
         with tempfile.TemporaryDirectory() as temporary:

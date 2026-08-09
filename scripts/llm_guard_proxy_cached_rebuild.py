@@ -24,7 +24,7 @@ from typing import Any, NoReturn, cast
 __all__: list[str] = []
 
 EXPECTED_BOUNDED_PROCESS_SHA256 = (
-    "8787dba9c1545e146f08db3e5d395ffeea60c7bd2ea05f687270cf65ad401264"
+    "a61e09c71f55152cd15308c25f0bec84f3907b8513db582e853b25b97155f09d"
 )
 _SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 _BOUNDED_PROCESS_PATH = _SCRIPT_DIRECTORY / "gb10_bounded_process.py"
