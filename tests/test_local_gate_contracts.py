@@ -153,6 +153,29 @@ class LocalGateContractTests(unittest.TestCase):
         ):
             self.assertNotIn(stale_claim, active_text)
 
+    def test_active_guard_docs_require_restart_after_config_edits(self) -> None:
+        restart_instruction = (
+            "edit `/home/obj/.config/llm-guard-proxy/config.toml`, then run "
+            "`systemctl --user restart llm-guard-proxy`"
+        )
+        for path in ACTIVE_GUARD_DOCS:
+            text = path.read_text()
+            with self.subTest(path=path):
+                self.assertIn(restart_instruction, text)
+                self.assertIn("activation-time credential copy", text)
+
+        active_text = "\n".join(path.read_text() for path in ACTIVE_GUARD_DOCS).lower()
+        for stale_claim in (
+            "hot-reload",
+            "hot reload",
+            "without restart",
+            "live reload",
+            "edits take effect automatically",
+            "edits automatically take effect",
+        ):
+            with self.subTest(stale_claim=stale_claim):
+                self.assertNotIn(stale_claim, active_text)
+
     def test_systemd_gate_uses_unprivileged_user_manager_semantics(self) -> None:
         helper = SYSTEMD_VERIFY.read_text()
         self.assertIn('"--user"', helper)

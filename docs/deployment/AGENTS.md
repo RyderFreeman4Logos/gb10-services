@@ -31,7 +31,7 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 * `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
 * `llm-guard-proxy` routes by request `model` to AEON chat (`aeon-ultimate`, `qwen3.6-27b-decensor-by-aeon`, `qwen3.6-27b-decensored`), embedding (`qwen3-embedding-8b`, `Qwen/Qwen3-Embedding-8B`), or reranker (`qwen3-reranker-8b`, `Qwen/Qwen3-Reranker-8B`).
 * `llm-guard-proxy` default chat (`:18009`) is force_disable with a single no-thinking rung. Opt-in legacy bounded chat (`:18014`) keeps its multi-rung ladder and `bounded_answer_from_cot`; guarded max-thinking (`:18011`) uses `truncate_cot_then_answer` for one retry-local no-thinking synthesis. The legacy 18002/18003 ports are guard-owned downstream listeners, not raw vLLM publishes.
-* `llm-guard-proxy` also hot-reloads `config.toml`. Use `[server]` to change default/chat request parallelism and per-`[[upstreams]]` `max_in_flight_requests` / `max_queued_generation_requests` to tune embedding/reranker independently without restarting vLLM, trading total throughput against single-stream latency.
+* To change `[server]` default/chat request parallelism, per-`[[upstreams]]` `max_in_flight_requests` / `max_queued_generation_requests`, or `[guardian]` policy, edit `/home/obj/.config/llm-guard-proxy/config.toml`, then run `systemctl --user restart llm-guard-proxy`. The running service continues using its activation-time credential copy until restart; this restarts only the proxy, so vLLM backends keep running.
 
 ### llm-guard-proxy Enabled Features
 
@@ -475,18 +475,20 @@ curl -s -X POST http://100.105.4.92:18009/v1/rerank \
   -d '{"model":"qwen3-reranker-8b","query":"hello","documents":["hello world","goodbye"]}'
 ```
 
-### Hot-reload Chat Parallelism
+### Restart Guard for Chat Parallelism
 
-To tune throughput versus single-stream latency without restarting the slow AEON
-vLLM backend, edit `/home/obj/.config/llm-guard-proxy/config.toml` and adjust:
+To tune throughput versus single-stream latency, edit
+`/home/obj/.config/llm-guard-proxy/config.toml`, then run
+`systemctl --user restart llm-guard-proxy` after adjusting:
 
 ```toml
 max_in_flight_requests = 8
 max_queued_generation_requests = 8
 ```
 
-The running Rust proxy hot-reloads the config file. Restarting vLLM is not
-required for these proxy-only queue/concurrency changes.
+The running proxy continues using its activation-time credential copy until
+restart. This command restarts only `llm-guard-proxy`; vLLM backends keep
+running.
 
 ---
 
