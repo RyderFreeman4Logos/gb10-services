@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import select
 import stat
 import subprocess
 import tempfile
@@ -64,6 +65,8 @@ if [[ " $* " == *" clone "* ]]; then
     : > "$destination/Cargo.toml"
 elif [[ " $* " == *" fetch "* ]]; then
     exit "${FAKE_GIT_FETCH_STATUS:-0}"
+elif [[ " $* " == *" status "* ]]; then
+    printf '%s' "${FAKE_GIT_STATUS:-}"
 elif [[ " $* " == *" rev-parse "* ]]; then
     printf '%s\\n' "$FAKE_GIT_SHA"
 fi
@@ -76,6 +79,10 @@ printf 'cargo %s\\n' "$*" >> "$FAKE_COMMAND_LOG"
 if [[ "${1:-}" == "--version" ]]; then
     printf 'cargo 1.0.0 (fake)\\n'
     exit 0
+fi
+if [[ -n "${FAKE_BUILD_ENTERED:-}" ]]; then
+    printf 'entered\\n' > "$FAKE_BUILD_ENTERED"
+    IFS= read -r _ < "$FAKE_BUILD_RELEASE"
 fi
 mkdir -p "$CARGO_TARGET_DIR/release"
 printf '#!/bin/sh\\nexit 0\\n' > "$CARGO_TARGET_DIR/release/llm-guard-proxy"
@@ -91,6 +98,13 @@ case "$*" in
     '--user show -p MainPID --value llm-guard-proxy.service') printf '4242\\n' ;;
     *) exit 0 ;;
 esac
+""",
+        )
+        self._write_executable(
+            "file",
+            """#!/usr/bin/env bash
+printf 'file %s\\n' "$*" >> "$FAKE_COMMAND_LOG"
+exit "${FAKE_FILE_STATUS:-0}"
 """,
         )
         self._write_executable(
@@ -111,10 +125,35 @@ esac
     def run(
         self,
         *arguments: str,
+        fail_after_receipt_replace: bool = False,
         fetch_status: int = 0,
+        file_status: int = 0,
+        git_status: str = "",
     ) -> subprocess.CompletedProcess[str]:
         environment = self.environment.copy()
         environment["FAKE_GIT_FETCH_STATUS"] = str(fetch_status)
+        environment["FAKE_FILE_STATUS"] = str(file_status)
+        environment["FAKE_GIT_STATUS"] = git_status
+        if fail_after_receipt_replace:
+            (self.root / "sitecustomize.py").write_text(
+                """import os
+import stat
+
+_real_fsync = os.fsync
+
+def _fail_directory_fsync(descriptor):
+    if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        open(os.environ["FAKE_RECEIPT_REPLACED_MARKER"], "w").close()
+        raise OSError("injected directory fsync failure")
+    return _real_fsync(descriptor)
+
+os.fsync = _fail_directory_fsync
+"""
+            )
+            environment["PYTHONPATH"] = str(self.root)
+            environment["FAKE_RECEIPT_REPLACED_MARKER"] = str(
+                self.root / "receipt-replaced"
+            )
         return subprocess.run(
             ["/usr/bin/bash", str(REBUILD_SCRIPT), *arguments],
             cwd=ROOT,
@@ -200,6 +239,91 @@ class GuardProductionFeatureContractTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(fixture.service_bin.resolve(), fixture.prior_bin)
             self.assertFalse(fixture.systemctl_log.exists())
+            self.assertEqual(fixture.receipts(), [])
+
+    def test_pinned_deferred_mode_rejects_dirty_source_before_build(self) -> None:
+        with CachedRebuildFixture() as fixture:
+            result = fixture.run(
+                "--install-pinned-deferred",
+                FULL_SHA,
+                git_status=" M src/main.rs\n",
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("cargo build", fixture.command_log.read_text())
+            self.assertEqual(fixture.service_bin.resolve(), fixture.prior_bin)
+            self.assertEqual(fixture.receipts(), [])
+
+    def test_rebuild_rejects_overlapping_invocation(self) -> None:
+        with CachedRebuildFixture() as fixture:
+            entered = fixture.root / "build-entered.fifo"
+            release = fixture.root / "build-release.fifo"
+            os.mkfifo(entered)
+            os.mkfifo(release)
+            entered_fd = os.open(entered, os.O_RDWR | os.O_NONBLOCK)
+            release_fd = os.open(release, os.O_RDWR | os.O_NONBLOCK)
+            environment = fixture.environment.copy()
+            environment.update(
+                {
+                    "FAKE_BUILD_ENTERED": str(entered),
+                    "FAKE_BUILD_RELEASE": str(release),
+                    "FAKE_GIT_FETCH_STATUS": "0",
+                    "FAKE_GIT_STATUS": "",
+                }
+            )
+            first = subprocess.Popen(
+                [
+                    "/usr/bin/bash",
+                    str(REBUILD_SCRIPT),
+                    "--install-pinned-deferred",
+                    FULL_SHA,
+                ],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                ready, _, _ = select.select([entered_fd], [], [], 5)
+                self.assertEqual(ready, [entered_fd], "first build did not reach marker")
+                self.assertEqual(os.read(entered_fd, 8), b"entered\n")
+                overlapping = fixture.run("--install-pinned-deferred", FULL_SHA)
+
+                self.assertNotEqual(overlapping.returncode, 0)
+                self.assertEqual(fixture.service_bin.resolve(), fixture.prior_bin)
+                self.assertEqual(fixture.receipts(), [])
+            finally:
+                os.write(release_fd, b"release\n")
+                stdout, stderr = first.communicate(timeout=10)
+                os.close(entered_fd)
+                os.close(release_fd)
+                self.assertEqual(first.returncode, 0, stdout + stderr)
+
+    def test_pinned_deferred_mode_rolls_back_post_publication_failure(self) -> None:
+        with CachedRebuildFixture() as fixture:
+            result = fixture.run(
+                "--install-pinned-deferred",
+                FULL_SHA,
+                file_status=42,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("file ", fixture.command_log.read_text())
+            self.assertEqual(fixture.service_bin.resolve(), fixture.prior_bin)
+            self.assertEqual(fixture.receipts(), [])
+
+    def test_pinned_deferred_mode_removes_receipt_when_commit_fails(self) -> None:
+        with CachedRebuildFixture() as fixture:
+            result = fixture.run(
+                "--install-pinned-deferred",
+                FULL_SHA,
+                fail_after_receipt_replace=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((fixture.root / "receipt-replaced").exists())
+            self.assertEqual(fixture.service_bin.resolve(), fixture.prior_bin)
             self.assertEqual(fixture.receipts(), [])
 
     def test_no_argument_mode_keeps_deleted_guard_restart_contract(self) -> None:

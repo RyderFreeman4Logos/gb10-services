@@ -45,6 +45,12 @@ run() { log "+ $*"; "$@"; }
 
 mkdir -p "$CACHE_ROOT" "$LOG_DIR" "$(dirname "$SOURCE_DIR")"
 chmod 700 "$CACHE_ROOT"
+# ponytail: one user-wide writer; split locks only for independent runtime paths.
+exec 9>"$HOME/.cache/source/llm-guard-proxy-rebuild.lock"
+if ! /usr/bin/flock -n 9; then
+  log "another llm-guard-proxy rebuild is already running"
+  exit 75
+fi
 if [[ "$MODE" == "pinned-deferred" ]]; then
   mkdir -p "$RECEIPT_DIR"
   chmod 700 "$RECEIPT_DIR"
@@ -79,6 +85,14 @@ fi
       log "checked-out source does not match requested SHA"
       exit 65
     }
+    SOURCE_STATUS="$(git -C "$SOURCE_DIR" status --porcelain=v1 --untracked-files=all --ignored)" || {
+      log "could not verify pinned source state"
+      exit 65
+    }
+    [[ -z "$SOURCE_STATUS" ]] || {
+      log "pinned source checkout is dirty"
+      exit 65
+    }
   else
     run git -C "$SOURCE_DIR" fetch --prune origin "$SOURCE_BRANCH"
     run git -C "$SOURCE_DIR" checkout --detach "origin/$SOURCE_BRANCH"
@@ -90,6 +104,7 @@ fi
   run test -x "$BUILD_BIN"
   PREVIOUS_SERVICE_TARGET=""
   PREVIOUS_SERVICE_PRESENT=0
+  RECEIPT_FILE=""
   if [[ "$MODE" == "pinned-deferred" ]]; then
     if [[ -L "$SERVICE_BIN" ]]; then
       PREVIOUS_SERVICE_TARGET="$(readlink "$SERVICE_BIN")"
@@ -98,6 +113,7 @@ fi
       log "deferred publication requires the managed runtime path to be a symlink"
       exit 65
     fi
+    RECEIPT_FILE="$RECEIPT_DIR/completion-${TS}-$$-${SOURCE_COMMIT}.json"
   fi
   restore_previous_publication() {
     if (( PREVIOUS_SERVICE_PRESENT )); then
@@ -107,8 +123,19 @@ fi
       rm -f "$SERVICE_BIN"
     fi
   }
+  rollback_pinned_publication() {
+    local status="$1"
+    trap - ERR
+    set +e
+    rm -f -- "$RECEIPT_FILE" "${RECEIPT_FILE}.tmp."*
+    restore_previous_publication
+    exit "$status"
+  }
   ln -sfn "$BUILD_BIN" "${SERVICE_BIN}.tmp"
   mv -Tf "${SERVICE_BIN}.tmp" "$SERVICE_BIN"
+  if [[ "$MODE" == "pinned-deferred" ]]; then
+    trap 'rollback_pinned_publication $?' ERR
+  fi
   log "build_bin=$BUILD_BIN"
   RUNTIME_RESOLVED="$(readlink -f "$SERVICE_BIN")"
   log "service_bin_resolved=$RUNTIME_RESOLVED"
@@ -121,10 +148,8 @@ fi
     read -r RUNTIME_SHA256 _ < <(sha256sum "$SERVICE_BIN")
     if [[ "$BUILD_SHA256" != "$RUNTIME_SHA256" ]]; then
       log "published runtime artifact does not match the candidate"
-      restore_previous_publication
-      exit 65
+      rollback_pinned_publication 65
     fi
-    RECEIPT_FILE="$RECEIPT_DIR/completion-${TS}-$$-${SOURCE_COMMIT}.json"
     if ! /usr/bin/python3 - "$RECEIPT_FILE" "$SOURCE_REPO" \
       "$REQUESTED_SOURCE_SHA" "$SOURCE_COMMIT" "$BUILD_BIN" "$BUILD_SHA256" \
       "$SERVICE_BIN" "$RUNTIME_RESOLVED" "$RUNTIME_SHA256" <<'PY'
@@ -180,9 +205,9 @@ finally:
 PY
     then
       log "completion receipt failed; restoring prior runtime publication"
-      restore_previous_publication
-      exit 65
+      rollback_pinned_publication 65
     fi
+    trap - ERR
     log "activation=deferred"
     log "completion_receipt=$RECEIPT_FILE"
   elif systemctl --user is-active --quiet llm-guard-proxy.service; then
