@@ -2,21 +2,18 @@
 # Safe restart of the AEON 27B text service without crashing embedding.
 #
 # Problem: on GB10's unified memory architecture, the 27B text service's
-# torch.compile / cudagraph capture peak can exceed available headroom when
-# both embedding and reranker are resident, causing the text container to be
-# OOM-killed (exit 137) mid-start.  This script orchestrates the restart in
-# the only order proven to work:
+# concurrent model startup can exceed available headroom.  This script starts
+# the fixed-KV reranker first so text AUTO-sizes from the remaining memory:
 #
 #   1. Stop text (if running)
-#   2. Stop reranker (temporarily; embedding NEVER touched)
+#   2. Start reranker and wait for /v1/models to respond
 #   3. Start text and wait for /v1/models to respond
-#   4. Start reranker back
 #
 # Embedding (:18012) is the reliability-critical service and is never stopped.
 #
 # Usage:
-#   gb10_restart_text_safe.sh                # restart text + cycle rr
-#   gb10_restart_text_safe.sh --start-only   # start text only (rr already down)
+#   gb10_restart_text_safe.sh                # ensure rr ready, then restart text
+#   gb10_restart_text_safe.sh --start-only   # start text only (rr already ready)
 #   gb10_restart_text_safe.sh --rr-only      # start reranker only
 #
 # Exit codes:
@@ -107,9 +104,12 @@ fi
 stop_unit "$TEXT_UNIT"
 
 if [[ "$MODE" == "full" ]]; then
-  # Step 2: stop reranker to free UMA peak headroom
-  stop_unit "$RR_UNIT"
-  sleep 3
+  # Step 2: establish fixed-KV reranker readiness before text AUTO-sizing.
+  start_unit "$RR_UNIT"
+  if ! wait_for_url "$RR_URL" "$RR_DEADLINE" "reranker"; then
+    log "FAILED: reranker did not become ready"
+    exit 2
+  fi
 fi
 
 # Step 3: start text and wait
@@ -117,16 +117,6 @@ start_unit "$TEXT_UNIT"
 if ! wait_for_url "$TEXT_URL" "$TEXT_DEADLINE" "text"; then
   log "FAILED: text did not become ready"
   exit 1
-fi
-
-if [[ "$MODE" == "full" ]]; then
-  # Step 4: bring reranker back
-  sleep 5
-  start_unit "$RR_UNIT"
-  if ! wait_for_url "$RR_URL" "$RR_DEADLINE" "reranker"; then
-    log "WARNING: reranker did not become ready — text is up, reranker needs manual fix"
-    exit 2
-  fi
 fi
 
 log "Done. Final state:"

@@ -234,6 +234,21 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertEqual(int(timeout.group(1)), 1800)
         self.assertEqual(readiness_deadline, 1800)
 
+    def test_text_waits_for_embedding_and_reranker_without_lifecycle_coupling(
+        self,
+    ) -> None:
+        unit_section = AEON_UNIT.read_text().split("[Service]", 1)[0]
+        self.assertIn(
+            "After=network.target vllm-embedding.service "
+            "vllm-querit-4b-reranker.service",
+            unit_section,
+        )
+        for dependency in ("Wants", "Requires", "BindsTo", "PartOf"):
+            self.assertNotRegex(
+                unit_section,
+                rf"(?m)^{dependency}=.*(?:vllm-embedding|vllm-querit-4b-reranker)",
+            )
+
     def test_guard_starts_independently_to_protect_backend_startup(self) -> None:
         unit = GUARD_UNIT.read_text()
         unit_section = unit.split("[Service]", 1)[0]

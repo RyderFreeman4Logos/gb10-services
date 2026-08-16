@@ -2,8 +2,8 @@
 [Unit]
 # AEON image release: 2026-07-27-v0.26.0; immutable digest: sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7
 Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (profile-selected, v0.26.0)
-# Independent of embedding/reranker so text can restart alone (no HTTP poll).
-After=network.target
+# Wait for embedding/reranker readiness without coupling their lifecycles.
+After=network.target vllm-embedding.service vllm-querit-4b-reranker.service
 Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
 StartLimitIntervalSec=600
 StartLimitBurst=3

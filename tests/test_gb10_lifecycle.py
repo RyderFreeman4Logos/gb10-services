@@ -644,7 +644,11 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
 
                     fake_bin = root / "bin"
                     fake_bin.mkdir()
-                    self.make_executable(fake_bin / "curl", "#!/bin/sh\nexit 0\n")
+                    self.make_executable(
+                        fake_bin / "curl",
+                        "#!/bin/sh\n"
+                        'printf "curl %s\\n" "$*" >> "$GB10_HELPER_SYSTEMCTL_LOG"\n',
+                    )
                     self.make_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
                     systemctl = root / "systemctl"
                     self.make_executable(
@@ -715,6 +719,28 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                         self.assertEqual(commands.count(start), 1)
                         self.assertLess(commands.index(reset), commands.index(start))
                         self.assertFalse((rate_limits / unit).exists())
+                    if mode is None:
+                        reranker_start = commands.index(
+                            "--user start --no-block vllm-querit-4b-reranker.service"
+                        )
+                        reranker_ready = next(
+                            index
+                            for index, command in enumerate(commands)
+                            if command.startswith("curl ")
+                            and "http://100.105.4.92:18013/v1/models" in command
+                        )
+                        text_start = commands.index(
+                            "--user start --no-block vllm-aeon-27b-dflash.service"
+                        )
+                        text_ready = next(
+                            index
+                            for index, command in enumerate(commands)
+                            if command.startswith("curl ")
+                            and "http://100.105.4.92:18010/v1/models" in command
+                        )
+                        self.assertLess(reranker_start, reranker_ready)
+                        self.assertLess(reranker_ready, text_start)
+                        self.assertLess(text_start, text_ready)
 
     def test_guard_helper_preserves_start_rate_limit_circuit_breaker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
