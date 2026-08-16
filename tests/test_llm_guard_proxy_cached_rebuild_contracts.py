@@ -2,6 +2,7 @@ import json
 import os
 import re
 import select
+import signal
 import stat
 import subprocess
 import tempfile
@@ -67,6 +68,8 @@ elif [[ " $* " == *" fetch "* ]]; then
     exit "${FAKE_GIT_FETCH_STATUS:-0}"
 elif [[ " $* " == *" status "* ]]; then
     printf '%s' "${FAKE_GIT_STATUS:-}"
+elif [[ " $* " == *" archive "* ]]; then
+    /usr/bin/tar -C "$2" --exclude=.git -cf - .
 elif [[ " $* " == *" rev-parse "* ]]; then
     printf '%s\\n' "$FAKE_GIT_SHA"
 fi
@@ -85,7 +88,19 @@ if [[ -n "${FAKE_BUILD_ENTERED:-}" ]]; then
     IFS= read -r _ < "$FAKE_BUILD_RELEASE"
 fi
 mkdir -p "$CARGO_TARGET_DIR/release"
-printf '#!/bin/sh\\nexit 0\\n' > "$CARGO_TARGET_DIR/release/llm-guard-proxy"
+if [[ -n "${FAKE_BUILD_RELATIVE_FILE:-}" ]]; then
+    manifest_path=""
+    while (( $# )); do
+        if [[ "$1" == "--manifest-path" ]]; then
+            manifest_path="$2"
+            break
+        fi
+        shift
+    done
+    cat "$(dirname "$manifest_path")/$FAKE_BUILD_RELATIVE_FILE" > "$CARGO_TARGET_DIR/release/llm-guard-proxy"
+else
+    printf '#!/bin/sh\\nexit 0\\n' > "$CARGO_TARGET_DIR/release/llm-guard-proxy"
+fi
 chmod 0755 "$CARGO_TARGET_DIR/release/llm-guard-proxy"
 """,
         )
@@ -104,6 +119,10 @@ esac
             "file",
             """#!/usr/bin/env bash
 printf 'file %s\\n' "$*" >> "$FAKE_COMMAND_LOG"
+if [[ -n "${FAKE_POST_SWAP_ENTERED:-}" ]]; then
+    printf 'entered\\n' > "$FAKE_POST_SWAP_ENTERED"
+    IFS= read -r _ < "$FAKE_POST_SWAP_RELEASE"
+fi
 exit "${FAKE_FILE_STATUS:-0}"
 """,
         )
@@ -254,6 +273,83 @@ class GuardProductionFeatureContractTests(unittest.TestCase):
             self.assertEqual(fixture.service_bin.resolve(), fixture.prior_bin)
             self.assertEqual(fixture.receipts(), [])
 
+    def test_pinned_build_uses_requested_commit_bytes_with_hidden_tracked_edit(self) -> None:
+        with CachedRebuildFixture() as fixture:
+            upstream = fixture.root / "upstream"
+            source = fixture.root / "source"
+            upstream.mkdir()
+            git_environment = os.environ.copy()
+            git_environment.update(
+                {
+                    "GIT_AUTHOR_NAME": "Fixture",
+                    "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+                    "GIT_COMMITTER_NAME": "Fixture",
+                    "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+                }
+            )
+            subprocess.run(["/usr/bin/git", "init", "-q", str(upstream)], check=True)
+            (upstream / "Cargo.toml").write_text("[workspace]\n")
+            (upstream / "source-marker").write_text("committed bytes\n")
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(upstream), "add", "Cargo.toml", "source-marker"],
+                check=True,
+            )
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(upstream), "commit", "-qm", "fixture"],
+                check=True,
+                env=git_environment,
+            )
+            source_sha = subprocess.run(
+                ["/usr/bin/git", "-C", str(upstream), "rev-parse", "HEAD"],
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["/usr/bin/git", "clone", "-q", str(upstream), str(source)], check=True
+            )
+            subprocess.run(
+                [
+                    "/usr/bin/git",
+                    "-C",
+                    str(source),
+                    "update-index",
+                    "--assume-unchanged",
+                    "source-marker",
+                ],
+                check=True,
+            )
+            (source / "source-marker").write_text("hidden dirty bytes\n")
+            fixture._write_executable(
+                "git",
+                """#!/usr/bin/env bash
+printf 'git %s\\n' "$*" >> "$FAKE_COMMAND_LOG"
+arguments=()
+for argument in "$@"; do
+    if [[ "$argument" == "https://github.com/RyderFreeman4Logos/llm-guard-proxy" ]]; then
+        arguments+=("$FAKE_SOURCE_REPO")
+    else
+        arguments+=("$argument")
+    fi
+done
+exec /usr/bin/git "${arguments[@]}"
+""",
+            )
+            fixture.environment.update(
+                {
+                    "SOURCE_DIR": str(source),
+                    "FAKE_SOURCE_REPO": str(upstream),
+                    "FAKE_BUILD_RELATIVE_FILE": "source-marker",
+                }
+            )
+
+            result = fixture.run("--install-pinned-deferred", source_sha)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            [receipt_path] = fixture.receipts()
+            candidate = Path(json.loads(receipt_path.read_text())["candidate_artifact"]["path"])
+            self.assertEqual(candidate.read_text(), "committed bytes\n")
+
     def test_rebuild_rejects_overlapping_invocation(self) -> None:
         with CachedRebuildFixture() as fixture:
             entered = fixture.root / "build-entered.fifo"
@@ -300,6 +396,15 @@ class GuardProductionFeatureContractTests(unittest.TestCase):
                 os.close(release_fd)
                 self.assertEqual(first.returncode, 0, stdout + stderr)
 
+    def test_custom_source_dir_reaches_legacy_build_on_fresh_home(self) -> None:
+        with CachedRebuildFixture() as fixture:
+            fixture.environment["SOURCE_DIR"] = str(fixture.root / "source" / "guard")
+
+            result = fixture.run()
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("cargo build", fixture.command_log.read_text())
+
     def test_pinned_deferred_mode_rolls_back_post_publication_failure(self) -> None:
         with CachedRebuildFixture() as fixture:
             result = fixture.run(
@@ -312,6 +417,84 @@ class GuardProductionFeatureContractTests(unittest.TestCase):
             self.assertIn("file ", fixture.command_log.read_text())
             self.assertEqual(fixture.service_bin.resolve(), fixture.prior_bin)
             self.assertEqual(fixture.receipts(), [])
+
+    def test_same_target_rebuild_restores_previous_artifact_bytes(self) -> None:
+        with CachedRebuildFixture() as fixture:
+            build_bin = (
+                fixture.home
+                / ".cache"
+                / "cargo-target"
+                / f"llm-guard-proxy-{FULL_SHA}"
+                / "release"
+                / "llm-guard-proxy"
+            )
+            build_bin.parent.mkdir(parents=True)
+            build_bin.write_text("previous artifact bytes\n")
+            build_bin.chmod(0o755)
+            fixture.service_bin.unlink()
+            fixture.service_bin.symlink_to(build_bin)
+
+            result = fixture.run(
+                "--install-pinned-deferred",
+                FULL_SHA,
+                file_status=42,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(fixture.service_bin.resolve(), build_bin)
+            self.assertEqual(build_bin.read_text(), "previous artifact bytes\n")
+            self.assertEqual(fixture.receipts(), [])
+
+    def test_term_after_publication_restores_previous_link(self) -> None:
+        with CachedRebuildFixture() as fixture:
+            entered = fixture.root / "post-swap-entered.fifo"
+            release = fixture.root / "post-swap-release.fifo"
+            os.mkfifo(entered)
+            os.mkfifo(release)
+            entered_fd = os.open(entered, os.O_RDWR | os.O_NONBLOCK)
+            release_fd = os.open(release, os.O_RDWR | os.O_NONBLOCK)
+            environment = fixture.environment.copy()
+            environment.update(
+                {
+                    "FAKE_GIT_FETCH_STATUS": "0",
+                    "FAKE_GIT_STATUS": "",
+                    "FAKE_POST_SWAP_ENTERED": str(entered),
+                    "FAKE_POST_SWAP_RELEASE": str(release),
+                }
+            )
+            process = subprocess.Popen(
+                [
+                    "/usr/bin/bash",
+                    str(REBUILD_SCRIPT),
+                    "--install-pinned-deferred",
+                    FULL_SHA,
+                ],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                ready, _, _ = select.select([entered_fd], [], [], 5)
+                self.assertEqual(ready, [entered_fd], "build did not reach post-swap marker")
+                self.assertEqual(os.read(entered_fd, 8), b"entered\n")
+                self.assertNotEqual(fixture.service_bin.resolve(), fixture.prior_bin)
+                process.send_signal(signal.SIGTERM)
+                os.write(release_fd, b"release\n")
+                stdout, stderr = process.communicate(timeout=10)
+                self.assertNotEqual(process.returncode, 0, stdout + stderr)
+                self.assertEqual(
+                    fixture.service_bin.resolve(), fixture.prior_bin, stdout + stderr
+                )
+                self.assertEqual(fixture.receipts(), [])
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.communicate(timeout=10)
+                os.close(entered_fd)
+                os.close(release_fd)
 
     def test_pinned_deferred_mode_removes_receipt_when_commit_fails(self) -> None:
         with CachedRebuildFixture() as fixture:

@@ -37,13 +37,12 @@ TS="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/llm_guard_proxy_cached_rebuild_${TS}.log}"
 
 export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
-export CARGO_TARGET_DIR="$CACHE_ROOT"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
 
 log() { printf '[%s] %s\n' "$(date -Is)" "$*"; }
 run() { log "+ $*"; "$@"; }
 
-mkdir -p "$CACHE_ROOT" "$LOG_DIR" "$(dirname "$SOURCE_DIR")"
+mkdir -p "$CACHE_ROOT" "$LOG_DIR" "$(dirname "$SOURCE_DIR")" "$HOME/.cache/source"
 chmod 700 "$CACHE_ROOT"
 # ponytail: one user-wide writer; split locks only for independent runtime paths.
 exec 9>"$HOME/.cache/source/llm-guard-proxy-rebuild.lock"
@@ -52,11 +51,15 @@ if ! /usr/bin/flock -n 9; then
   exit 75
 fi
 if [[ "$MODE" == "pinned-deferred" ]]; then
+  CARGO_TARGET_DIR="$(mktemp -d "$CACHE_ROOT/build.XXXXXX")"
   mkdir -p "$RECEIPT_DIR"
   chmod 700 "$RECEIPT_DIR"
+else
+  CARGO_TARGET_DIR="$CACHE_ROOT"
 fi
+export CARGO_TARGET_DIR
 
-{
+exec > >(tee "$LOG_FILE") 2>&1
   log "cached llm-guard-proxy workspace rebuild starting"
   log "mode=$MODE"
   log "SOURCE_REPO=$SOURCE_REPO"
@@ -93,18 +96,23 @@ fi
       log "pinned source checkout is dirty"
       exit 65
     }
+    BUILD_SOURCE_DIR="$(mktemp -d "$CACHE_ROOT/source.XXXXXX")"
+    log "+ git -C $SOURCE_DIR archive $SOURCE_COMMIT | tar -x -C $BUILD_SOURCE_DIR"
+    git -C "$SOURCE_DIR" archive "$SOURCE_COMMIT" | tar -x -C "$BUILD_SOURCE_DIR"
   else
     run git -C "$SOURCE_DIR" fetch --prune origin "$SOURCE_BRANCH"
     run git -C "$SOURCE_DIR" checkout --detach "origin/$SOURCE_BRANCH"
     SOURCE_COMMIT="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+    BUILD_SOURCE_DIR="$SOURCE_DIR"
   fi
   log "source_commit=$SOURCE_COMMIT"
-  run nice -n 10 ionice -c3 cargo build --release -p llm-guard-proxy --features guard --manifest-path "$SOURCE_DIR/Cargo.toml"
+  run nice -n 10 ionice -c3 cargo build --release -p llm-guard-proxy --features guard --manifest-path "$BUILD_SOURCE_DIR/Cargo.toml"
   BUILD_BIN="$CARGO_TARGET_DIR/release/llm-guard-proxy"
   run test -x "$BUILD_BIN"
   PREVIOUS_SERVICE_TARGET=""
   PREVIOUS_SERVICE_PRESENT=0
   RECEIPT_FILE=""
+  PINNED_PUBLICATION_COMMITTED=0
   if [[ "$MODE" == "pinned-deferred" ]]; then
     if [[ -L "$SERVICE_BIN" ]]; then
       PREVIOUS_SERVICE_TARGET="$(readlink "$SERVICE_BIN")"
@@ -125,17 +133,22 @@ fi
   }
   rollback_pinned_publication() {
     local status="$1"
-    trap - ERR
+    trap - ERR EXIT HUP INT TERM
     set +e
-    rm -f -- "$RECEIPT_FILE" "${RECEIPT_FILE}.tmp."*
-    restore_previous_publication
+    if (( ! PINNED_PUBLICATION_COMMITTED )); then
+      rm -f -- "$RECEIPT_FILE" "${RECEIPT_FILE}.tmp."*
+      restore_previous_publication
+    fi
     exit "$status"
   }
+  if [[ "$MODE" == "pinned-deferred" ]]; then
+    trap 'rollback_pinned_publication $?' ERR EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+  fi
   ln -sfn "$BUILD_BIN" "${SERVICE_BIN}.tmp"
   mv -Tf "${SERVICE_BIN}.tmp" "$SERVICE_BIN"
-  if [[ "$MODE" == "pinned-deferred" ]]; then
-    trap 'rollback_pinned_publication $?' ERR
-  fi
   log "build_bin=$BUILD_BIN"
   RUNTIME_RESOLVED="$(readlink -f "$SERVICE_BIN")"
   log "service_bin_resolved=$RUNTIME_RESOLVED"
@@ -207,7 +220,8 @@ PY
       log "completion receipt failed; restoring prior runtime publication"
       rollback_pinned_publication 65
     fi
-    trap - ERR
+    PINNED_PUBLICATION_COMMITTED=1
+    trap - ERR EXIT HUP INT TERM
     log "activation=deferred"
     log "completion_receipt=$RECEIPT_FILE"
   elif systemctl --user is-active --quiet llm-guard-proxy.service; then
@@ -228,6 +242,4 @@ PY
   fi
 
   log "cached llm-guard-proxy workspace rebuild complete"
-} 2>&1 | tee "$LOG_FILE"
-
 printf 'log=%s\n' "$LOG_FILE"
