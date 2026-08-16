@@ -51,17 +51,33 @@ done
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
+monotonic_ticks() {
+  awk '{printf "%.0f\n", $1 * 100}' /proc/uptime
+}
 
 wait_for_url() {
   local url="$1" deadline="$2" name="$3"
-  local elapsed=0
-  while (( elapsed < deadline )); do
-    if curl -fsS --max-time 5 "$url" >/dev/null 2>&1; then
-      log "$name ready (after ${elapsed}s)"
-      return 0
+  local start_ticks deadline_ticks now_ticks remaining_ticks curl_ticks sleep_ticks completed_ticks
+  start_ticks="$(monotonic_ticks)"
+  deadline_ticks=$((start_ticks + deadline * 100))
+  while :; do
+    now_ticks="$(monotonic_ticks)"
+    remaining_ticks=$((deadline_ticks - now_ticks))
+    (( remaining_ticks > 0 )) || break
+    curl_ticks=$((remaining_ticks < 500 ? remaining_ticks : 500))
+    if curl -fsS --max-time "$(awk -v ticks="$curl_ticks" 'BEGIN {printf "%.2f", ticks / 100}')" "$url" >/dev/null 2>&1; then
+      completed_ticks="$(monotonic_ticks)"
+      if (( completed_ticks <= deadline_ticks )); then
+        log "$name ready (after $(((completed_ticks - start_ticks) / 100))s)"
+        return 0
+      fi
+      break
     fi
-    sleep "$POLL_INTERVAL"
-    elapsed=$((elapsed + POLL_INTERVAL))
+    now_ticks="$(monotonic_ticks)"
+    remaining_ticks=$((deadline_ticks - now_ticks))
+    (( remaining_ticks > 0 )) || break
+    sleep_ticks=$((remaining_ticks < POLL_INTERVAL * 100 ? remaining_ticks : POLL_INTERVAL * 100))
+    sleep "$(awk -v ticks="$sleep_ticks" 'BEGIN {printf "%.2f", ticks / 100}')"
   done
   log "TIMEOUT: $name not ready after ${deadline}s ($url)"
   return 1

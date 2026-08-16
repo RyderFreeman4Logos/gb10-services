@@ -507,6 +507,8 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
         destinations = (
             "install -m 0755 scripts/gb10_lifecycle.sh "
             "/home/obj/.local/bin/gb10_lifecycle.sh",
+            "install -m 0755 scripts/gb10_service_ready.sh "
+            "/home/obj/.local/bin/gb10_service_ready.sh",
             "install -m 0755 scripts/aeon_text_stop_start.sh "
             "/home/obj/scripts/aeon_text_stop_start.sh",
             "install -m 0755 scripts/gb10_restart_text_safe.sh "
@@ -514,8 +516,10 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
         )
 
         for destination in destinations:
-            self.assertIn(destination, runbook)
-            self.assertIn(destination, readme.replace("~/.local", "/home/obj/.local"))
+            with self.subTest(document="runbook", destination=destination):
+                self.assertIn(destination, runbook)
+            with self.subTest(document="readme", destination=destination):
+                self.assertIn(destination, readme.replace("~/.local", "/home/obj/.local"))
 
         guard_config = GUARD_CONFIG.read_text()
         # The primary profile plus guarded, default-no-think, and legacy-bounded
@@ -963,6 +967,88 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                 and "vllm-aeon-27b-dflash.service" in line
             )
             self.assertLess(third_reranker_probe, text_start)
+
+    def test_restart_helper_accepts_final_budget_readiness_without_overrunning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            events = root / "events.log"
+            clock = root / "monotonic-ticks"
+            clock.write_text("0 179900 180000 180000 180000 180001\n")
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            lifecycle = root / "lifecycle"
+            systemctl = root / "systemctl"
+            self.make_executable(
+                lifecycle,
+                "#!/bin/sh\n"
+                'printf "lifecycle %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n',
+            )
+            self.make_executable(
+                systemctl,
+                "#!/bin/sh\n"
+                'if [ "${2:-}" = "show" ]; then printf "inactive\\n"; fi\n',
+            )
+            self.make_executable(
+                fake_bin / "curl",
+                "#!/bin/sh\n"
+                'printf "curl duration=100ticks %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n',
+            )
+            source = RESTART_HELPER.read_text()
+            self.assertIn("RR_DEADLINE=1800", source)
+            production_clock = """monotonic_ticks() {
+  awk '{printf \"%.0f\\n\", $1 * 100}' /proc/uptime
+}
+"""
+            test_clock = """monotonic_ticks() {
+  local now rest
+  read -r now rest < \"$GB10_HELPER_CLOCK\"
+  printf '%s\\n' \"$rest\" > \"$GB10_HELPER_CLOCK\"
+  printf '%s\\n' \"$now\"
+}
+"""
+            self.assertIn(production_clock, source)
+            helper = root / "gb10_restart_text_safe.sh"
+            helper.write_text(
+                source.replace(production_clock, test_clock).replace(
+                    "systemctl", str(systemctl)
+                )
+            )
+            helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "GB10_HELPER_CLOCK": str(clock),
+                    "GB10_HELPER_EVENT_LOG": str(events),
+                    "GB10_LIFECYCLE_BIN": str(lifecycle),
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                }
+            )
+
+            result = subprocess.run(
+                ["/usr/bin/bash", str(helper)],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            event_lines = events.read_text().splitlines()
+            reranker_probe = next(
+                line for line in event_lines if "18013/v1/models" in line
+            )
+            self.assertIn("duration=100ticks", reranker_probe)
+            self.assertIn("--max-time 1.00", reranker_probe)
+            reranker_ready = event_lines.index(reranker_probe)
+            text_start = next(
+                index
+                for index, line in enumerate(event_lines)
+                if line.startswith("lifecycle start ")
+                and "vllm-aeon-27b-dflash.service" in line
+            )
+            self.assertLess(reranker_ready, text_start)
 
     def run_guard_helper(
         self,

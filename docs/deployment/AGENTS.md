@@ -116,6 +116,7 @@ cp scripts/llm_guard_proxy_publish_cgroup_registration.sh /home/obj/.local/bin/
 install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py /home/obj/.local/bin/gb10_verify_vllm_no_swap_core.py
 install -m 0755 scripts/gb10_verify_vllm_no_swap.sh /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh
 install -m 0755 scripts/gb10_lifecycle.sh /home/obj/.local/bin/gb10_lifecycle.sh
+install -m 0755 scripts/gb10_service_ready.sh /home/obj/.local/bin/gb10_service_ready.sh
 install -m 0755 scripts/gb10_restart_text_safe.sh /home/obj/.local/bin/gb10_restart_text_safe.sh
 cp scripts/sysmon.sh /home/obj/.local/bin/
 
