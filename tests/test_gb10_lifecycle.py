@@ -656,6 +656,11 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                         "#!/bin/sh\n"
                         'printf "%s\\n" "$*" >> "$GB10_HELPER_SYSTEMCTL_LOG"\n'
                         'if [ "${1:-}" = "--user" ] && '
+                        '[ "${2:-}" = "show" ]; then\n'
+                        '    printf "inactive\\n"\n'
+                        "    exit 0\n"
+                        "fi\n"
+                        'if [ "${1:-}" = "--user" ] && '
                         '[ "${2:-}" = "is-active" ]; then\n'
                         "    exit 1\n"
                         "fi\n"
@@ -819,6 +824,70 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                 audit,
             )
             self.assertNotIn("event=reset-failed", audit)
+
+    def test_restart_helper_cancels_activating_text_before_starting_reranker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            events = root / "events.log"
+            state = root / "text-state"
+            state.write_text("activating\n")
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            lifecycle = root / "lifecycle"
+            systemctl = root / "systemctl"
+            self.make_executable(
+                lifecycle,
+                "#!/bin/sh\n"
+                'printf "lifecycle %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
+                'if [ "${1:-}" = "stop" ]; then printf "inactive\\n" > "$GB10_HELPER_TEXT_STATE"; fi\n',
+            )
+            self.make_executable(
+                systemctl,
+                "#!/bin/sh\n"
+                'printf "systemctl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
+                'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then cat "$GB10_HELPER_TEXT_STATE"; fi\n',
+            )
+            self.make_executable(
+                fake_bin / "curl",
+                "#!/bin/sh\n"
+                'printf "curl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n',
+            )
+            self.make_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
+            helper = root / "gb10_restart_text_safe.sh"
+            helper.write_text(RESTART_HELPER.read_text().replace("systemctl", str(systemctl)))
+            helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "GB10_HELPER_EVENT_LOG": str(events),
+                    "GB10_HELPER_TEXT_STATE": str(state),
+                    "GB10_LIFECYCLE_BIN": str(lifecycle),
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                }
+            )
+
+            result = subprocess.run(
+                ["/usr/bin/bash", str(helper)],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            event_lines = events.read_text().splitlines()
+            stop = next(index for index, line in enumerate(event_lines) if line.startswith("lifecycle stop "))
+            stopped = next(index for index, line in enumerate(event_lines) if line.startswith("systemctl --user show "))
+            reranker = next(
+                index
+                for index, line in enumerate(event_lines)
+                if line.startswith("lifecycle start ") and "vllm-querit-4b-reranker.service" in line
+            )
+            self.assertEqual(state.read_text(), "inactive\n")
+            self.assertLess(stop, stopped)
+            self.assertLess(stopped, reranker)
 
     def run_guard_helper(
         self,

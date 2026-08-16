@@ -5,7 +5,7 @@
 # concurrent model startup can exceed available headroom.  This script starts
 # the fixed-KV reranker first so text AUTO-sizes from the remaining memory:
 #
-#   1. Stop text (if running)
+#   1. Stop/cancel text and verify it is inactive
 #   2. Start reranker and wait for /v1/models to respond
 #   3. Start text and wait for /v1/models to respond
 #
@@ -68,16 +68,25 @@ wait_for_url() {
 }
 
 stop_unit() {
-  local unit="$1"
-  if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
-    log "Stopping $unit ..."
-    "$LIFECYCLE" stop --unit "${unit}.service" \
-      --actor "$LIFECYCLE_ACTOR" --reason "$LIFECYCLE_REASON"
-    # Kill any orphaned readiness scripts
-    pkill -f "${unit}.*ready" 2>/dev/null || true
-  else
-    log "$unit already stopped"
-  fi
+  local unit="$1" state deadline
+  log "Stopping $unit ..."
+  "$LIFECYCLE" stop --unit "${unit}.service" \
+    --actor "$LIFECYCLE_ACTOR" --reason "$LIFECYCLE_REASON"
+  # Kill any orphaned readiness scripts.
+  pkill -f "${unit}.*ready" 2>/dev/null || true
+  deadline=$((SECONDS + 60))
+  while (( SECONDS < deadline )); do
+    state="$(systemctl --user show --property=ActiveState --value "$unit" 2>/dev/null || true)"
+    case "$state" in
+      inactive|failed)
+        log "$unit stopped"
+        return 0
+        ;;
+    esac
+    sleep "$POLL_INTERVAL"
+  done
+  log "TIMEOUT: $unit did not stop (ActiveState=${state:-unknown})"
+  return 1
 }
 
 start_unit() {

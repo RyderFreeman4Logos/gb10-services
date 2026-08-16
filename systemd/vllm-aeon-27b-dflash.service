@@ -36,6 +36,9 @@ ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-memory-guardian
 ExecStartPre=/usr/bin/install -d -m 0700 /home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473
 ExecStartPre=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-aeon-27b-dflash-n12 --container vllm-aeon-27b-dflash-hikv --container vllm-aeon-27b-dflash --cidfile %t/gb10-memory-guardian/aeon-text.cid
 ExecStartPre=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1
+# Every text activation—including Restart=always recovery—must reserve fixed-KV backends first.
+ExecStartPre=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C /home/obj/.local/bin/gb10_service_ready.sh embedding http://100.105.4.92:18012 Qwen/Qwen3-Embedding-8B --deadline 300
+ExecStartPre=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C /home/obj/.local/bin/gb10_service_ready.sh rerank http://100.105.4.92:18013 Querit/Querit-4B --deadline 300
 ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.cid --name vllm-aeon-27b-dflash \
   --cgroup-parent app.slice \
   --gpus all --ipc host \
