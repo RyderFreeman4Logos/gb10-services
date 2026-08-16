@@ -76,7 +76,7 @@ wait_for_url() {
     now_ticks="$(monotonic_ticks)"
     remaining_ticks=$((deadline_ticks - now_ticks))
     (( remaining_ticks > 0 )) || break
-    sleep_ticks=$((remaining_ticks < POLL_INTERVAL * 100 ? remaining_ticks - 1 : POLL_INTERVAL * 100))
+    sleep_ticks=$((remaining_ticks <= POLL_INTERVAL * 100 ? remaining_ticks - 1 : POLL_INTERVAL * 100))
     (( sleep_ticks > 0 )) && sleep "$(awk -v ticks="$sleep_ticks" 'BEGIN {printf "%.2f", ticks / 100}')"
   done
   log "TIMEOUT: $name not ready after ${deadline}s ($url)"
