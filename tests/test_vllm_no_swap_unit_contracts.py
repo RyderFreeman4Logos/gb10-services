@@ -92,6 +92,52 @@ def _logical_argv(unit: str, directive: str) -> list[list[str]]:
 
 
 class VllmNoSwapUnitContractTests(unittest.TestCase):
+    def test_dflash_start_pre_fails_closed_until_fixed_kv_backends_are_ready(self) -> None:
+        unit = (ROOT / "systemd" / "vllm-aeon-27b-dflash.service").read_text()
+        prerequisites = [
+            [
+                "/usr/bin/env",
+                "-i",
+                "HOME=/home/obj",
+                "PATH=/usr/bin:/bin",
+                "LC_ALL=C",
+                "/home/obj/.local/bin/gb10_service_ready.sh",
+                "embedding",
+                "http://100.105.4.92:18012",
+                "Qwen/Qwen3-Embedding-8B",
+                "--deadline",
+                "300",
+            ],
+            [
+                "/usr/bin/env",
+                "-i",
+                "HOME=/home/obj",
+                "PATH=/usr/bin:/bin",
+                "LC_ALL=C",
+                "/home/obj/.local/bin/gb10_service_ready.sh",
+                "rerank",
+                "http://100.105.4.92:18013",
+                "Querit/Querit-4B",
+                "--deadline",
+                "300",
+            ],
+        ]
+
+        pre = _logical_argv(unit, "ExecStartPre")
+        readiness_pre = [
+            argv
+            for argv in pre
+            if "/home/obj/.local/bin/gb10_service_ready.sh" in argv
+        ]
+        self.assertEqual(readiness_pre, prerequisites)
+        unit_section = unit.split("[Service]", 1)[0]
+        self.assertIn("Restart=always", unit)
+        for dependency in ("Wants", "Requires"):
+            self.assertNotRegex(
+                unit_section,
+                rf"(?m)^{dependency}=.*(?:vllm-embedding|vllm-querit-4b-reranker)",
+            )
+
     def test_wrapper_has_one_fixed_digest_bound_non_executable_core(self) -> None:
         core = VERIFIER_CORE.read_bytes()
         source = VERIFIER.read_text()
