@@ -251,9 +251,9 @@ systemctl --user enable --now sysmon.service
 
 # Model services remain independent from the proxy lifecycle.
 systemctl --user enable --now vllm-embedding.service
-systemctl --user enable --now vllm-aeon-27b-dflash.service
 systemctl --user disable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now vllm-querit-4b-reranker.service
+systemctl --user enable --now vllm-aeon-27b-dflash.service
 systemctl --user enable --now llm-guard-proxy.service
 
 ```

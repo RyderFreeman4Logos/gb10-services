@@ -889,6 +889,81 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             self.assertLess(stop, stopped)
             self.assertLess(stopped, reranker)
 
+    def test_restart_helper_keeps_text_closure_for_supported_slow_reranker(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            events = root / "events.log"
+            attempts = root / "reranker-attempts"
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            lifecycle = root / "lifecycle"
+            systemctl = root / "systemctl"
+            self.make_executable(
+                lifecycle,
+                "#!/bin/sh\n"
+                'printf "lifecycle %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n',
+            )
+            self.make_executable(
+                systemctl,
+                "#!/bin/sh\n"
+                'printf "systemctl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
+                'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then\n'
+                '    printf "inactive\\n"\n'
+                "fi\n",
+            )
+            self.make_executable(
+                fake_bin / "curl",
+                "#!/bin/sh\n"
+                'printf "curl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
+                'case "$*" in\n'
+                '  *18013*) count=$(cat "$GB10_HELPER_RERANKER_ATTEMPTS" 2>/dev/null || printf 0); '
+                'count=$((count + 1)); printf "%s\\n" "$count" > "$GB10_HELPER_RERANKER_ATTEMPTS"; '
+                'if [ "$count" -lt 3 ]; then exit 1; fi ;;\n'
+                "esac\n",
+            )
+            self.make_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
+            helper = root / "gb10_restart_text_safe.sh"
+            helper.write_text(RESTART_HELPER.read_text().replace("systemctl", str(systemctl)))
+            helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "GB10_HELPER_EVENT_LOG": str(events),
+                    "GB10_HELPER_RERANKER_ATTEMPTS": str(attempts),
+                    "GB10_LIFECYCLE_BIN": str(lifecycle),
+                    "POLL_INTERVAL": "600",
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                }
+            )
+
+            result = subprocess.run(
+                ["/usr/bin/bash", str(helper)],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(attempts.read_text(), "3\n")
+            event_lines = events.read_text().splitlines()
+            third_reranker_probe = [
+                index
+                for index, line in enumerate(event_lines)
+                if line.startswith("curl ") and "18013/v1/models" in line
+            ][2]
+            text_start = next(
+                index
+                for index, line in enumerate(event_lines)
+                if line.startswith("lifecycle start ")
+                and "vllm-aeon-27b-dflash.service" in line
+            )
+            self.assertLess(third_reranker_probe, text_start)
+
     def run_guard_helper(
         self,
         *,

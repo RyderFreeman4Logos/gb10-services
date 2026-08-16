@@ -190,11 +190,11 @@ systemctl --user enable --now sysmon.service
 
 # Start model services and the proxy independently.
 systemctl --user enable --now vllm-embedding.service
-systemctl --user enable --now vllm-aeon-27b-dflash.service
 # To select baseline for a future authorized stop/start, atomically repoint
 # active.env to baseline.env; keep the canonical systemd unit enabled.
 systemctl --user disable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now vllm-querit-4b-reranker.service
+systemctl --user enable --now vllm-aeon-27b-dflash.service
 systemctl --user enable --now llm-guard-proxy.service
 ```
 

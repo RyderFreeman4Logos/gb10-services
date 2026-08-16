@@ -25,6 +25,7 @@ LEGACY_UNIT = ROOT / "systemd" / "vllm-qwen3-reranker-8b.service"
 MEMORY_GATE = ROOT / "scripts" / "gb10_check_mem_available.sh"
 CONFIG = ROOT / "config" / "llm-guard-proxy" / "config.toml"
 README = ROOT / "README.md"
+RUNBOOK = ROOT / "docs" / "deployment" / "AGENTS.md"
 
 LIVE_RECEIPT = ROOT / "docs" / "evidence" / "2026-07-14-aeon-15g-live-receipt.json"
 
@@ -586,6 +587,22 @@ class QueritServiceContractTests(unittest.TestCase):
         )
         enable = readme.index("systemctl --user enable --now vllm-querit-4b-reranker.service")
         self.assertLess(disable, enable)
+
+    def test_fresh_stack_runbooks_ready_querit_before_text(self) -> None:
+        for runbook in (README, RUNBOOK):
+            with self.subTest(runbook=runbook):
+                text = runbook.read_text()
+                embedding = text.index(
+                    "systemctl --user enable --now vllm-embedding.service"
+                )
+                querit = text.index(
+                    "systemctl --user enable --now vllm-querit-4b-reranker.service"
+                )
+                aeon = text.index(
+                    "systemctl --user enable --now vllm-aeon-27b-dflash.service"
+                )
+                self.assertLess(embedding, querit)
+                self.assertLess(querit, aeon)
 
 
 if __name__ == "__main__":
