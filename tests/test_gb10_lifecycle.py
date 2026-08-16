@@ -968,6 +968,104 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             )
             self.assertLess(third_reranker_probe, text_start)
 
+    def test_restart_helper_probes_again_during_final_poll_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            events = root / "events.log"
+            attempts = root / "reranker-attempts"
+            clock = root / "monotonic-ticks"
+            clock.write_text("0 179900 179900 179999 180000\n")
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            lifecycle = root / "lifecycle"
+            systemctl = root / "systemctl"
+            self.make_executable(
+                lifecycle,
+                "#!/bin/sh\n"
+                'printf "lifecycle %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n',
+            )
+            self.make_executable(
+                systemctl,
+                "#!/bin/sh\n"
+                'if [ "${2:-}" = "show" ]; then printf "inactive\\n"; fi\n',
+            )
+            self.make_executable(
+                fake_bin / "curl",
+                "#!/bin/sh\n"
+                'printf "curl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
+                'count=$(cat "$GB10_HELPER_RERANKER_ATTEMPTS" 2>/dev/null || printf 0)\n'
+                'count=$((count + 1)); printf "%s\\n" "$count" > "$GB10_HELPER_RERANKER_ATTEMPTS"\n'
+                '[ "$count" -gt 1 ]\n',
+            )
+            self.make_executable(
+                fake_bin / "sleep",
+                "#!/bin/sh\n"
+                'printf "sleep %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
+                'if [ "$1" = "1.00" ]; then printf "180000\\n" > "$GB10_HELPER_CLOCK"; fi\n',
+            )
+            source = RESTART_HELPER.read_text()
+            production_clock = """monotonic_ticks() {
+  awk '{printf \"%.0f\\n\", $1 * 100}' /proc/uptime
+}
+"""
+            test_clock = """monotonic_ticks() {
+  local now rest
+  read -r now rest < \"$GB10_HELPER_CLOCK\"
+  printf '%s\\n' \"$rest\" > \"$GB10_HELPER_CLOCK\"
+  printf '%s\\n' \"$now\"
+}
+"""
+            self.assertIn(production_clock, source)
+            helper = root / "gb10_restart_text_safe.sh"
+            helper.write_text(
+                source.replace(production_clock, test_clock).replace(
+                    "systemctl", str(systemctl)
+                )
+            )
+            helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "GB10_HELPER_CLOCK": str(clock),
+                    "GB10_HELPER_EVENT_LOG": str(events),
+                    "GB10_HELPER_RERANKER_ATTEMPTS": str(attempts),
+                    "GB10_LIFECYCLE_BIN": str(lifecycle),
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                }
+            )
+
+            result = subprocess.run(
+                ["/usr/bin/bash", str(helper)],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            event_lines = events.read_text().splitlines()
+            reranker_probes = [
+                line for line in event_lines if "18013/v1/models" in line
+            ]
+            self.assertEqual(len(reranker_probes), 2)
+            self.assertIn("--max-time 0.01", reranker_probes[-1])
+            self.assertFalse(any(line == "sleep 1.00" for line in event_lines))
+            self.assertIn("sleep 0.99", event_lines)
+            reranker_ready = next(
+                index
+                for index, line in enumerate(event_lines)
+                if line.startswith("curl ") and "18013/v1/models" in line
+            )
+            text_start = next(
+                index
+                for index, line in enumerate(event_lines)
+                if line.startswith("lifecycle start ")
+                and "vllm-aeon-27b-dflash.service" in line
+            )
+            self.assertLess(reranker_ready, text_start)
+
     def test_restart_helper_accepts_final_budget_readiness_without_overrunning(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
