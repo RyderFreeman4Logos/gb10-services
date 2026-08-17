@@ -28,6 +28,11 @@ class ImageRelease:
 
 
 CURRENT_RELEASE = ImageRelease(
+    date="2026-08-16",
+    version="v0.27.1",
+    digest="sha256:13c0df6a321ade60507a9026b0d2963ad51f0499a228de430eeba3bb74ad7954",
+)
+ROLLBACK_RELEASE = ImageRelease(
     date="2026-07-27",
     version="v0.26.0",
     digest="sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7",
@@ -42,6 +47,11 @@ SUPERSEDED_MARKERS = (
     "18c09e6b",
     "0.25.0+aeon.sm121a.dflash",
     "v0.25.0",
+)
+SUPERSEDED_OPERATIONAL_MARKERS = (
+    ROLLBACK_RELEASE.tag,
+    ROLLBACK_RELEASE.digest,
+    *SUPERSEDED_MARKERS,
 )
 CURRENT_DOCS = (
     ROOT / "README.md",
@@ -84,7 +94,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
     def test_operational_tree_cannot_use_superseded_image_identity(self) -> None:
         for path in _operational_files():
             text = path.read_text()
-            for marker in SUPERSEDED_MARKERS:
+            for marker in SUPERSEDED_OPERATIONAL_MARKERS:
                 with self.subTest(path=path.relative_to(ROOT), marker=marker):
                     self.assertNotIn(marker, text)
 
@@ -152,8 +162,8 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                 self.assertNotRegex(text, r"aeon-vllm-ultimate:[^\s\\]+")
 
     def test_aeon_compile_cache_namespace_rotates_with_the_release(self) -> None:
-        host_cache = "/home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473"
-        container_cache = "/var/cache/vllm/aeon-qwen36-v0260"
+        host_cache = "/home/obj/.cache/vllm-compile/aeon-qwen36-v0271-13c0df"
+        container_cache = "/var/cache/vllm/aeon-qwen36-v0271"
         for unit_name in ("vllm-aeon-27b-dflash.service",):
             text = (ROOT / "systemd" / unit_name).read_text()
             with self.subTest(unit=unit_name):
@@ -165,10 +175,12 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                 )
                 self.assertNotIn("aeon-qwen36-v0251-c15e2c", text)
                 self.assertNotIn("/var/cache/vllm/aeon-qwen36-v0251", text)
+                self.assertNotIn("aeon-qwen36-v0260-1aa473", text)
+                self.assertNotIn("/var/cache/vllm/aeon-qwen36-v0260", text)
 
     def test_current_docs_publish_one_coherent_release_identity(self) -> None:
         readme = (ROOT / "README.md").read_text()
-        self.assertIn("pinned AEON v0.26.0 GB10 Docker image", readme)
+        self.assertIn("pinned AEON v0.27.1 GB10 Docker image", readme)
         self.assertNotIn("pinned AEON v0.25 GB10 Docker image", readme)
         self.assertRegex(
             readme,
@@ -176,6 +188,9 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                 rf"friendly tag: {re.escape(IMAGE_REPOSITORY)}:"
                 rf"{re.escape(CURRENT_RELEASE.tag)}\n"
                 rf"repository digest: {re.escape(CURRENT_RELEASE.digest)}\n"
+                rf"rollback: {re.escape(IMAGE_REPOSITORY)}:"
+                rf"{re.escape(ROLLBACK_RELEASE.tag)} @ "
+                rf"{re.escape(ROLLBACK_RELEASE.digest)}\n"
                 r"rollback/superseded: .*\n"
                 rf"runtime version: {re.escape(CURRENT_RELEASE.version)}\b"
             ),
