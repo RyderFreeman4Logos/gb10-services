@@ -220,10 +220,6 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertIn("MemorySwapMax=0", unit)
         self.assertIn("--max-num-batched-tokens 16384", unit)
         self.assertIn("--max-num-seqs 32", unit)
-        self.assertIn("--max-num-partial-prefills 1", unit)
-        self.assertIn("--max-long-partial-prefills 1", unit)
-        self.assertNotIn("--max-num-partial-prefills 64", unit)
-        self.assertNotIn("--max-long-partial-prefills 64", unit)
         self.assertIn("gb10_service_ready.sh rerank", unit)
         timeout = re.search(r"^TimeoutStartSec=(\d+)$", unit, re.MULTILINE)
         if timeout is None:
@@ -291,6 +287,13 @@ class QueritServiceContractTests(unittest.TestCase):
         # Equal Docker caps retain the source request. 69g is the old cap.
         self.assertNotIn("--dns", unit)
         self.assertNotRegex(unit, r"aeon-vllm-ultimate:[^\s\\]+(?:\s|\\)")
+
+    def test_current_v0271_units_forbid_removed_partial_prefill_flags(self) -> None:
+        for unit_path in (QUERIT_UNIT, AEON_UNIT):
+            with self.subTest(unit=unit_path.name):
+                unit = unit_path.read_text()
+                self.assertNotIn("--max-num-partial-prefills", unit)
+                self.assertNotIn("--max-long-partial-prefills", unit)
 
     def test_aeon_text_uma_safe_profile(self) -> None:
         contract = _aeon_contract(AEON_UNIT.read_text())

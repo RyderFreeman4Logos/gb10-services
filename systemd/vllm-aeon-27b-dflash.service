@@ -71,8 +71,6 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
     --max-model-len 262144 \
     --max-num-seqs 16 \
     --max-num-batched-tokens 4096 \
-    --max-num-partial-prefills 1 \
-    --max-long-partial-prefills 1 \
     --enable-prefix-caching \
     --gpu-memory-utilization ${AEON_GPU_MEMORY_UTILIZATION} \
     --enable-chunked-prefill \
