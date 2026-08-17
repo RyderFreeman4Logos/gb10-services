@@ -54,6 +54,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   -e PYTHONPATH=/opt/hang_guard \
   -e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768 \
   -e AEON_THINKING_BUDGET_GUARD=0 \
+  -e VLLM_USE_V2_MODEL_RUNNER=0 \
   --memory-swappiness 0 \
   --memory 128g \
   --memory-swap 128g \
