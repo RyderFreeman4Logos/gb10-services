@@ -178,6 +178,28 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                 self.assertNotIn("aeon-qwen36-v0260-1aa473", text)
                 self.assertNotIn("/var/cache/vllm/aeon-qwen36-v0260", text)
 
+    def test_aeon_uses_the_v1_runner_for_native_thinking_budgets(self) -> None:
+        unit = (ROOT / "systemd" / "vllm-aeon-27b-dflash.service").read_text()
+        self.assertRegex(
+            unit,
+            re.compile(
+                r"(?m)^  -e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768 \\\n"
+                r"  -e AEON_THINKING_BUDGET_GUARD=0 \\\n"
+                r"  -e VLLM_USE_V2_MODEL_RUNNER=0 \\\n"
+                r"  --memory-swappiness 0"
+            ),
+        )
+        self.assertEqual(
+            re.findall(
+                r"(?m)^\s*-e (VLLM_USE_V2_MODEL_RUNNER=[^\s\\]+)\s*\\$", unit
+            ),
+            ["VLLM_USE_V2_MODEL_RUNNER=0"],
+        )
+
+        guide = (ROOT / "docs" / "deployment" / "AGENTS.md").read_text()
+        self.assertIn("`VLLM_USE_V2_MODEL_RUNNER=0`", guide)
+        self.assertIn("`thinking_token_budget`", guide)
+
     def test_current_docs_publish_one_coherent_release_identity(self) -> None:
         readme = (ROOT / "README.md").read_text()
         self.assertIn("pinned AEON v0.27.1 GB10 Docker image", readme)
