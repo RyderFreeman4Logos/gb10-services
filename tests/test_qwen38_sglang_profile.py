@@ -21,9 +21,18 @@ GUARD = PROFILE_DIR / "llm-guard-proxy" / "config.toml"
 
 # Exact immutable arm64 image digest inspected for this box (brief / cookbook).
 SGLANG_DIGEST = "lmsysorg/sglang@sha256:3c0abdf41ef22de9d7a859dc16ed71eae69452e36c91f071a25e60c85a6d1fc6"
+# Host source of the read-only draft mount (docker -v source, always stays).
 DSPARK_DRAFT_PATH = "/home/obj/models/RadixArk/Qwen3.8-27B-DSpark"
 # The stable public alias every caller uses; must survive model swaps.
 SERVED_ALIAS = "abliterated-qwen-latest-27b-nvfp4"
+# Flat hf --local-dir docker mount targets the server paths must resolve to
+# (the snapshots/<sha> subdirs do NOT exist under a --local-dir install).
+MODEL_MOUNT = "/models/qwen38-nvfp4"
+DRAFT_MOUNT = "/models/qwen38-dspark"
+# Revision-locked hub SHA pins, documented in the unit comments (kept when the
+# server path is the flat mount, not the hub snapshots/<sha> path).
+NVFP4_SHA = "554ebba9b5f1b79dc11246341960360e6ef05ef4"
+DSPARK_SHA = "85ef153be924f17ce4bf62726954eeaa4a73e854"
 
 
 class Qwen38ProfileLayoutTests(unittest.TestCase):
@@ -63,15 +72,27 @@ class Qwen38UnitContractTests(unittest.TestCase):
         self.assertNotIn("lmsysorg/sglang:spark", self.text)
 
     def test_unit_pins_nvfp4_revision_pinned_model_path(self):
+        # Server path is the flat --local-dir mount target (no snapshots/<sha>).
+        self.assertIn(f"--model-path {MODEL_MOUNT}", self.text)
         self.assertIn("/home/obj/models/RadixArk/Qwen3.8-27B-NVFP4", self.text)
-        self.assertIn("554ebba9b5f1b79dc11246341960360e6ef05ef4", self.text)
+        # Hub SHA pin kept as a documented comment, not a snapshots path.
+        self.assertIn(NVFP4_SHA, self.text)
 
     def test_unit_uses_dspark_speculative_decoding(self):
         self.assertIn("--speculative-algorithm DSPARK", self.text)
         self.assertNotIn("--speculative-algorithm EAGLE", self.text)
         self.assertIn("--speculative-dspark-block-size 7", self.text)
         self.assertIn("--speculative-draft-model-quantization unquant", self.text)
+        # Draft server path is the flat --local-dir mount target.
+        self.assertIn(f"--speculative-draft-model-path {DRAFT_MOUNT}", self.text)
         self.assertIn(DSPARK_DRAFT_PATH, self.text)
+        # Hub SHA pin kept as a documented comment, not a snapshots path.
+        self.assertIn(DSPARK_SHA, self.text)
+
+    def test_unit_has_no_hub_snapshots_paths(self):
+        # hf --local-dir never creates snapshots/<sha>; the server must use the
+        # flat mount root, not a raw hub cache layout path.
+        self.assertNotIn("/snapshots/", self.text)
 
     def test_unit_pins_kv_cache_dtype_auto(self):
         # NVFP4 declares FP8 kv calibration; auto honors fp8_e4m3 scales.

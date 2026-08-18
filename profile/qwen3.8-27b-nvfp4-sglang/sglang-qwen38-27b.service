@@ -36,6 +36,9 @@ TimeoutStopSec=60
 ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-memory-guardian
 # Host-pinned NVFP4 weights + DSpark draft, mounted read-only. Both are
 # revision-locked destinations (download/prepare may still be running).
+# Server paths are the flat hf --local-dir mounts (no snapshots/<sha> subdirs).
+# Pinned hub revisions: NVFP4 @554ebba9b5f1b79dc11246341960360e6ef05ef4,
+# DSpark @85ef153be924f17ce4bf62726954eeaa4a73e854.
 ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/sglang-text.cid --name qwen3.8-27b-sglang \
   --cgroup-parent app.slice \
   --gpus all --ipc host \
@@ -51,27 +54,27 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --oom-score-adj 800 \
   lmsysorg/sglang@sha256:3c0abdf41ef22de9d7a859dc16ed71eae69452e36c91f071a25e60c85a6d1fc6 \
   python3 -m sglang.launch_server \
-    /models/qwen38-nvfp4/snapshots/554ebba9b5f1b79dc11246341960360e6ef05ef4 \
-    --host 0.0.0.0 --port 30000 \
-    --served-model-name "abliterated-qwen-latest-27b-nvfp4" "qwen3.8-27b-sglang" \
-    --trust-remote-code \
-    --mem-fraction-static 0.53 \
-    --attention-backend flashinfer \
-    --chunked-prefill-size 8192 \
-    --disable-prefill-cuda-graph \
-    --kv-cache-dtype auto \
-    --mamba-ssm-dtype float32 \
-    --mamba-radix-cache-strategy extra_buffer_lazy \
-    --max-mamba-cache-size 32 \
-    --max-running-requests 8 \
-    --context-length 262144 \
-    --speculative-algorithm DSPARK \
-    --speculative-draft-model-path /models/qwen38-dspark/snapshots/85ef153be924f17ce4bf62726954eeaa4a73e854 \
-    --speculative-dspark-block-size 7 \
-    --speculative-draft-model-quantization unquant \
-    --reasoning-parser qwen3 \
-    --tool-call-parser qwen3_coder \
-    --sampling-defaults model
+  --model-path /models/qwen38-nvfp4 \
+  --host 0.0.0.0 --port 30000 \
+  --served-model-name "abliterated-qwen-latest-27b-nvfp4" "qwen3.8-27b-sglang" \
+  --trust-remote-code \
+  --mem-fraction-static 0.53 \
+  --attention-backend flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-prefill-cuda-graph \
+  --kv-cache-dtype auto \
+  --mamba-ssm-dtype float32 \
+  --mamba-radix-cache-strategy extra_buffer_lazy \
+  --max-mamba-cache-size 32 \
+  --max-running-requests 8 \
+  --context-length 262144 \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path /models/qwen38-dspark \
+  --speculative-dspark-block-size 7 \
+  --speculative-draft-model-quantization unquant \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --sampling-defaults model
 # NVFP4 declares kv_cache_quant_algo FP8; --kv-cache-dtype auto honors the
 # fp8_e4m3 calibration scales. Do NOT raise KV quantization aggressiveness.
 # DSpark verify window D=8 sizes a SEPARATE GDN buffer, so the max-mamba-cache-size

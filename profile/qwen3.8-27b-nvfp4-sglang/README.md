@@ -25,8 +25,11 @@ uses that alias gets the Qwen3.8 generation after a later authorized cutover.
   (`lmsysorg/sglang:qwen38-27b` tag). Not the deleted `:spark` image.
 - Model: `/home/obj/models/RadixArk/Qwen3.8-27B-NVFP4` @ `554ebba9…`
   (NVFP4 W4A4; FP8 KV calibration scales honored via `--kv-cache-dtype auto`).
+  Server path is the flat `hf --local-dir` mount `--model-path /models/qwen38-nvfp4`
+  (no `snapshots/<sha>` subdir exists under a `--local-dir` install).
 - Draft: DSPARK `/home/obj/models/RadixArk/Qwen3.8-27B-DSpark` @ `85ef153b…`,
-  mounted read-only, `--speculative-dspark-block-size 7`,
+  mounted read-only as the flat mount `--speculative-draft-model-path /models/qwen38-dspark`,
+  `--speculative-dspark-block-size 7`,
   `--speculative-draft-model-quantization unquant`.
 - `--mem-fraction-static 0.53` (operator contract, not MIAI's 0.95) on a
   121.63 GiB box: ~64.73 GiB reservation. Do **not** copy MIAI's
