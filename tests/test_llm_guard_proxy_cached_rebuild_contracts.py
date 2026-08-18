@@ -17,6 +17,8 @@ from guard_rebuild_fixtures import RebuildFixture
 ROOT = Path(__file__).resolve().parents[1]
 REBUILD_SCRIPT = ROOT / "scripts" / "llm_guard_proxy_cached_rebuild.sh"
 REBUILD_ENGINE = ROOT / "scripts" / "llm_guard_proxy_cached_rebuild.py"
+BOUNDED_PROCESS = ROOT / "scripts" / "gb10_bounded_process.py"
+SCOPED_WORKER = ROOT / "scripts" / "llm_guard_proxy_scoped_worker.py"
 GUARD_CONFIG = ROOT / "config" / "llm-guard-proxy" / "config.toml"
 README = ROOT / "README.md"
 DEPLOYMENT_GUIDE = ROOT / "docs" / "deployment" / "AGENTS.md"
@@ -59,6 +61,7 @@ class GuardProductionFeatureContractTests(unittest.TestCase):
 class GuardRebuildProvenanceTests(unittest.TestCase):
     def test_launcher_hash_pins_real_module_without_embedded_python(self) -> None:
         launcher = REBUILD_SCRIPT.read_text()
+        engine = REBUILD_ENGINE.read_text()
         self.assertTrue(REBUILD_ENGINE.is_file(), "real rebuild engine is missing")
         self.assertTrue(launcher.startswith("#!/usr/bin/bash -p\n"))
         self.assertLessEqual(len(launcher.splitlines()), 64)
@@ -73,7 +76,27 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
         self.assertEqual(
             hashlib.sha256(REBUILD_ENGINE.read_bytes()).hexdigest(), match.group(1)
         )
-        self.assertIn("class RebuildError", REBUILD_ENGINE.read_text())
+        helper_match = re.search(
+            r'EXPECTED_BOUNDED_PROCESS_SHA256\s*=\s*\(\s*"([0-9a-f]{64})"\s*\)',
+            engine,
+        )
+        worker_match = re.search(
+            r'"scoped_worker": ToolSpec\(.*?\n\s*"([0-9a-f]{64})",\n\s*\)',
+            engine,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(helper_match, "bounded helper authority is missing")
+        self.assertIsNotNone(worker_match, "scoped worker authority is missing")
+        assert helper_match is not None and worker_match is not None
+        self.assertEqual(
+            hashlib.sha256(BOUNDED_PROCESS.read_bytes()).hexdigest(),
+            helper_match.group(1),
+        )
+        self.assertEqual(
+            hashlib.sha256(SCOPED_WORKER.read_bytes()).hexdigest(),
+            worker_match.group(1),
+        )
+        self.assertIn("class RebuildError", engine)
 
     def test_launcher_rejects_invalid_argv_before_engine_execution(self) -> None:
         usage = "usage: llm_guard_proxy_cached_rebuild.sh [--test-only]\n"
@@ -225,6 +248,7 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
                     "ar",
                     "as",
                     "bwrap",
+                    "ca_cert",
                     "cargo",
                     "cc",
                     "curl",
@@ -232,9 +256,16 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
                     "git_remote_https",
                     "ionice",
                     "ld",
+                    "hosts",
                     "nice",
+                    "nsswitch",
+                    "prlimit",
+                    "python",
                     "readelf",
+                    "resolv_conf",
                     "rustc",
+                    "scoped_worker",
+                    "systemd_run",
                     "systemctl",
                 },
             )
@@ -263,14 +294,10 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
                 for line in calls.splitlines()
                 if line.startswith("bwrap ") and " build " in f" {line} "
             )
-            metadata_arguments = shlex.split(metadata_line)
-            build_arguments = shlex.split(build_line)
-            metadata_target = metadata_arguments[
-                metadata_arguments.index("/target") - 1
-            ]
-            build_target = build_arguments[build_arguments.index("/target") - 1]
-            self.assertEqual(metadata_target, build_target)
-            self.assertIn("--chdir /src", build_line)
+            self.assertIn("--size 6442450944 --tmpfs /target", metadata_line)
+            self.assertIn("--size 6442450944 --tmpfs /target", build_line)
+            self.assertNotIn("--bind", build_line)
+            self.assertIn("--chdir /", build_line)
             self.assertRegex(
                 build_line,
                 r"--ro-bind /proc/self/fd/[0-9]+ /toolchain/bin/cargo",
@@ -279,9 +306,15 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
                 build_line,
                 r"--ro-bind /proc/self/fd/[0-9]+ /toolchain/bin/rustc",
             )
-            self.assertIn("-- /toolchain/bin/cargo build", build_line)
-            self.assertIn("--release --frozen --locked --offline", build_line)
-            self.assertIn("-p llm-guard-proxy --features guard", build_line)
+            self.assertIn("/worker.py build", build_line)
+            scope_lines = [
+                line for line in calls.splitlines() if line.startswith("systemd_run ")
+            ]
+            self.assertEqual(len(scope_lines), 3)
+            for line in scope_lines:
+                self.assertIn("--scope", line)
+                self.assertIn("--property=MemorySwapMax=0", line)
+                self.assertIn("--property=KillMode=control-group", line)
             self.assertNotIn(str(fixture.source_dir), build_line)
             self.assertFalse(fixture.source_dir.exists())
             fixture.assert_no_backend_lifecycle(self)
@@ -461,6 +494,303 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
             self.assertEqual(state["running_target"], str(fixture.candidate))
             self.assertEqual(state["restart_calls"], 0)
             fixture.assert_no_backend_lifecycle(self)
+
+    def test_proc_mount_follows_pid_isolation_and_preserves_network_policy(self) -> None:
+        with RebuildFixture() as fixture:
+            result = fixture.run()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            commands = {
+                operation: shlex.split(
+                    next(
+                        line
+                        for line in fixture.calls().splitlines()
+                        if line.startswith("bwrap ")
+                        and f" {operation} " in f" {line} "
+                    )
+                )
+                for operation in ("fetch", "metadata", "build")
+            }
+            for operation, arguments in commands.items():
+                self.assertIn("--unshare-user", arguments)
+                self.assertIn("--unshare-all", arguments)
+                proc = arguments.index("--proc")
+                self.assertLess(arguments.index("--unshare-all"), proc)
+                self.assertEqual(arguments[proc + 1], "/proc")
+                for weaker in (
+                    "--unshare-cgroup",
+                    "--unshare-ipc",
+                    "--unshare-net",
+                    "--unshare-pid",
+                    "--unshare-uts",
+                ):
+                    self.assertNotIn(weaker, arguments)
+                self.assertEqual("--share-net" in arguments, operation == "fetch")
+
+
+class GuardRebuildFixtureScopeAuthorityTests(unittest.TestCase):
+    @staticmethod
+    def _write_scope(fixture: RebuildFixture, unit: str, worker_pid: int) -> Path:
+        scope = fixture.cgroup_root / "fixture.slice" / unit
+        scope.mkdir(parents=True)
+        (scope / "cgroup.procs").write_text(f"{worker_pid}\n")
+        (scope / "cgroup.events").write_text("populated 1\nfrozen 0\n")
+        return scope
+
+    def _register_scope(
+        self, fixture: RebuildFixture, unit: str, worker_pid: int
+    ) -> Path:
+        scope = self._write_scope(fixture, unit, worker_pid)
+        proc = fixture.proc_root / str(worker_pid)
+        proc.mkdir(parents=True)
+        (proc / "cgroup").write_text(f"0::/fixture.slice/{unit}\n")
+        fixture.set_state(
+            scope_unit=unit,
+            scope_worker=worker_pid,
+            scope_registration={
+                "cgroup_path": str(scope),
+                "unit": unit,
+                "worker_pid": worker_pid,
+            },
+        )
+        return scope
+
+    @staticmethod
+    def _scope_bytes(scope: Path) -> dict[str, bytes]:
+        return {path.name: path.read_bytes() for path in scope.iterdir()}
+
+    @staticmethod
+    def _systemctl(
+        fixture: RebuildFixture, *arguments: str
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(fixture.fake_bin / "systemctl"), *arguments],
+            cwd=fixture.root,
+            env=fixture.env,
+            text=True,
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+
+    def test_fake_systemctl_rejects_malformed_or_unregistered_scope_kills(self) -> None:
+        cases = ("foreign", "signal", "kill", "argv")
+        for case in cases:
+            with self.subTest(case=case), RebuildFixture() as fixture:
+                worker = subprocess.Popen(["/usr/bin/sleep", "30"])
+                try:
+                    owned = "llm-guard-rebuild-build-" + "a" * 32 + ".scope"
+                    owned_scope = self._register_scope(fixture, owned, worker.pid)
+                    foreign = "llm-guard-rebuild-build-" + "b" * 32 + ".scope"
+                    foreign_scope = self._write_scope(fixture, foreign, 999999)
+                    before = {
+                        owned: self._scope_bytes(owned_scope),
+                        foreign: self._scope_bytes(foreign_scope),
+                    }
+                    if case == "foreign":
+                        arguments = (
+                            "--user",
+                            "kill",
+                            "--kill-whom=all",
+                            "--signal=SIGTERM",
+                            foreign,
+                        )
+                    elif case == "signal":
+                        arguments = (
+                            "--user",
+                            "kill",
+                            "--kill-whom=all",
+                            "--signal=SIGBOGUS",
+                            owned,
+                        )
+                    elif case == "kill":
+                        arguments = (
+                            "--user",
+                            "kill",
+                            "--kill-whom=all",
+                            "--signal=SIGKILL",
+                            owned,
+                        )
+                    else:
+                        arguments = (
+                            "--user",
+                            "kill",
+                            "--kill-whom=all",
+                            "--signal=SIGTERM",
+                            "--",
+                            owned,
+                        )
+                    result = self._systemctl(fixture, *arguments)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIsNone(worker.poll())
+                    self.assertEqual(self._scope_bytes(owned_scope), before[owned])
+                    self.assertEqual(self._scope_bytes(foreign_scope), before[foreign])
+                finally:
+                    if worker.poll() is None:
+                        worker.kill()
+                    worker.wait(timeout=2)
+
+    def test_fake_systemctl_signals_only_the_exact_registered_owned_scope(self) -> None:
+        with RebuildFixture() as fixture:
+            worker = subprocess.Popen(["/usr/bin/sleep", "30"])
+            unit = "llm-guard-rebuild-build-" + "a" * 32 + ".scope"
+            scope = self._register_scope(fixture, unit, worker.pid)
+            try:
+                result = self._systemctl(
+                    fixture,
+                    "--user",
+                    "kill",
+                    "--kill-whom=all",
+                    "--signal=SIGTERM",
+                    unit,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(worker.wait(timeout=2), -15)
+                self.assertFalse(scope.exists())
+                state = fixture.reload_state()
+                self.assertEqual(state["scope_registration"], {})
+                self.assertEqual(state["scope_unit"], "")
+                self.assertEqual(state["scope_worker"], 0)
+            finally:
+                if worker.poll() is None:
+                    worker.kill()
+                worker.wait(timeout=2)
+
+
+class GuardRebuildHardContainmentContractTests(unittest.TestCase):
+    def assert_contained_failure(
+        self, fixture: RebuildFixture, *, payload_released: bool = False
+    ) -> str:
+        result = fixture.run()
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertNotIn(PRODUCTION_COMPLETE, output)
+        self.assertNotIn(TEST_COMPLETE, output)
+        if payload_released:
+            self.assertIn("payload ", fixture.calls())
+        else:
+            self.assertNotIn("payload ", fixture.calls())
+        fixture.assert_prior_restored(self)
+        fixture.assert_no_scopes_or_scratch(self)
+        return output
+
+    def test_rebuild_payload_has_one_fail_closed_hard_containment_boundary(self) -> None:
+        engine = REBUILD_ENGINE.read_text()
+        bounded = BOUNDED_PROCESS.read_text()
+        self.assertTrue(SCOPED_WORKER.is_file())
+        for required in (
+            "def scoped_command(",
+            "--scope",
+            "MemoryHigh",
+            "MemoryMax",
+            "MemorySwapMax",
+            "TasksMax",
+            "CPUQuota",
+            "--json-status-fd",
+            "--block-fd",
+            "cgroup.procs",
+            "memory.events",
+            "pids.events",
+        ):
+            self.assertIn(required, bounded)
+        for required in (
+            "FETCH_TMPFS_BYTES",
+            "BUILD_TARGET_TMPFS_BYTES",
+            "HOST_WRITE_BUDGET_BYTES",
+            "HOST_FREE_FLOOR_BYTES",
+            "GB10ART1",
+            "scoped_worker",
+        ):
+            self.assertIn(required, engine)
+        self.assertNotRegex(engine, r'"--bind",\s*target\.exec_path')
+
+    def test_scope_setup_failures_never_release_payload(self) -> None:
+        for mode in (
+            "manager",
+            "property",
+            "status",
+            "worker-wrapper",
+            "cgroup",
+            "controller",
+            "property-readback",
+        ):
+            with self.subTest(mode=mode), RebuildFixture() as fixture:
+                fixture.set_state(scope_failure=mode)
+                self.assert_contained_failure(fixture)
+        for mode, diagnostic in (
+            ("array", "scope status"),
+            ("duplicate-key", "scope status"),
+            ("duplicate-record", "scope status"),
+            ("unknown-member", "scope status"),
+            ("unknown-record", "scope status"),
+            ("boolean", "scope status"),
+            ("zero", "scope status"),
+            ("negative", "scope status"),
+            ("oversized", "scope status"),
+            ("trailing-bytes", "scope status"),
+            ("exit-array", "scope status"),
+            ("exit-duplicate-key", "scope status"),
+            ("exit-unknown-member", "scope exit status"),
+            ("exit-boolean", "scope exit status"),
+        ):
+            with self.subTest(status_mode=mode), RebuildFixture() as fixture:
+                fixture.set_state(scope_status_mode=mode)
+                output = self.assert_contained_failure(
+                    fixture, payload_released=mode.startswith("exit-")
+                )
+                self.assertIn(diagnostic, output)
+                self.assertEqual(fixture.receipt_paths(), [])
+
+    def test_frames_and_resource_limit_events_fail_without_artifacts(self) -> None:
+        cases = (
+            ("scope_frame_mode", "partial"),
+            ("scope_frame_mode", "trailing"),
+            ("scope_frame_mode", "oversized"),
+            ("scope_frame_mode", "malformed"),
+            ("scope_resource_event", "memory"),
+            ("scope_resource_event", "pids"),
+            ("scope_failure", "payload"),
+        )
+        for key, value in cases:
+            with self.subTest(key=key, value=value), RebuildFixture() as fixture:
+                fixture.set_state(**{key: value})
+                output = self.assert_contained_failure(fixture, payload_released=True)
+                if key == "scope_resource_event":
+                    self.assertIn("scope resource limit was reached", output)
+                self.assertEqual(fixture.receipt_paths(), [])
+
+    def test_immediate_scope_collection_still_requires_worker_exit(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(scope_worker_live_after_collect=True)
+            self.assert_contained_failure(fixture, payload_released=True)
+
+    def test_memory_and_free_space_admission_happen_before_payload(self) -> None:
+        with RebuildFixture() as fixture:
+            (fixture.proc_root / "meminfo").write_text(
+                "MemTotal: 134217728 kB\nMemAvailable: 1024 kB\n"
+            )
+            self.assert_contained_failure(fixture)
+        with RebuildFixture() as fixture:
+            fixture.test_free_bytes = 8 * 1024 * 1024 * 1024 - 1
+            self.assert_contained_failure(fixture)
+
+    def test_success_leaves_no_scope_name_in_wal_or_receipt(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(scope_status_mode="canonical")
+            result = fixture.run()
+            self.assertEqual(
+                result.returncode,
+                0,
+                result.stdout + result.stderr + "\nCALLS\n" + fixture.calls(),
+            )
+            serialized = fixture.receipt_paths()[0].read_text()
+            self.assertNotIn("llm-guard-rebuild-", serialized)
+            state = fixture.reload_state()
+            self.assertEqual(fixture.calls().count("payload "), 3)
+            self.assertEqual(state["scope_registration"], {})
+            self.assertEqual(state["scope_unit"], "")
+            self.assertEqual(state["scope_worker"], 0)
+            fixture.assert_transaction_clean(self)
+            fixture.assert_no_scopes_or_scratch(self)
 
 
 if __name__ == "__main__":

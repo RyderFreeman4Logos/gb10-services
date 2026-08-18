@@ -1,23 +1,36 @@
 from __future__ import annotations
 
+import errno
 import os
+import json
 import selectors
+import secrets
 import signal
+import socket
+import stat
 import subprocess
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["command", "remaining"]
+__all__ = ["ScopePolicy", "command", "remaining", "scoped_command"]
 
 _MAX_STREAM_BYTES = 4 * 1024 * 1024
 _READ_BYTES = 64 * 1024
 _POLL_SECONDS = 0.02
+_SCOPE_STATUS_BYTES = 64 * 1024
+_SCOPE_UNIT_TOKEN = "@GB10_SCOPE_UNIT@"
+_LINUX_PID_LIMIT = 1 << 22
+_LINUX_NAMESPACE_INODE_LIMIT = 1 << 64
 
 
 class BoundedProcessError(RuntimeError):
     """A command failed or its complete process tree could not be contained."""
+
+    def __init__(self, message: str, *, error_number: int | None = None) -> None:
+        super().__init__(message)
+        self.errno = error_number
 
 
 def remaining(deadline: float, cap: float | None = None) -> float:
@@ -188,24 +201,32 @@ class _ProcessTree:
             except ProcessLookupError:
                 pass
 
-    def signal(self, number: int) -> None:
+    def signal_group(self, number: int) -> None:
         self._signal_group(number)
+
+    def signal_descendants(self, number: int) -> None:
         table = self.scan()
+        first_error: BoundedProcessError | None = None
         for owned in self.descendants(table):
-            if owned.pidfd is not None and hasattr(signal, "pidfd_send_signal"):
-                try:
-                    signal.pidfd_send_signal(owned.pidfd, number, None, 0)
-                    continue
-                except ProcessLookupError:
-                    continue
-                except OSError:
-                    pass
-            row = _proc_row(owned.pid)
-            if row is not None and row[1] == owned.starttime:
-                try:
-                    os.kill(owned.pid, number)
-                except ProcessLookupError:
-                    pass
+            if owned.pidfd is None or not hasattr(signal, "pidfd_send_signal"):
+                first_error = first_error or BoundedProcessError(
+                    "subprocess descendant pidfd signal is unavailable"
+                )
+                continue
+            try:
+                signal.pidfd_send_signal(owned.pidfd, number, None, 0)
+            except ProcessLookupError:
+                continue
+            except OSError:
+                first_error = first_error or BoundedProcessError(
+                    "subprocess descendant pidfd signal failed"
+                )
+        if first_error is not None:
+            raise first_error
+
+    def signal(self, number: int) -> None:
+        self.signal_group(number)
+        self.signal_descendants(number)
 
     def reap_adopted(self) -> None:
         table = self.scan()
@@ -239,12 +260,13 @@ class _ProcessTree:
 @dataclass
 class _Capture:
     retained: bytearray
+    limit: int = _MAX_STREAM_BYTES
     total: int = 0
     truncated: bool = False
 
     def append(self, payload: bytes) -> None:
         self.total += len(payload)
-        available = max(0, _MAX_STREAM_BYTES - len(self.retained))
+        available = max(0, self.limit - len(self.retained))
         if available:
             self.retained.extend(payload[:available])
         if len(payload) > available:
@@ -291,6 +313,38 @@ def _render(capture: _Capture) -> str:
     return text
 
 
+def _bounded_error_summary(error: BaseException) -> str:
+    if isinstance(error, BoundedProcessError):
+        summary = str(error).splitlines()[0].strip()
+    else:
+        summary = type(error).__name__
+    return (summary or "cleanup failure")[:256]
+
+
+def _signal_cleanup(
+    tree: _ProcessTree,
+    scope_signal: Callable[[int], None] | None,
+    number: int,
+) -> None:
+    first_error: BaseException | None = None
+    actions: list[Callable[[], None]] = []
+    if scope_signal is not None and number == signal.SIGKILL:
+        actions.extend((lambda: scope_signal(number), lambda: tree.signal_group(number)))
+    else:
+        actions.append(lambda: tree.signal_group(number))
+        if scope_signal is not None:
+            actions.append(lambda: scope_signal(number))
+    if scope_signal is None:
+        actions.append(lambda: tree.signal_descendants(number))
+    for action in actions:
+        try:
+            action()
+        except BaseException as error:
+            first_error = first_error or error
+    if first_error is not None:
+        raise first_error
+
+
 def _bounded_reap(
     process: subprocess.Popen[bytes],
     tree: _ProcessTree,
@@ -298,68 +352,1057 @@ def _bounded_reap(
     streams: dict[int, tuple[str, object]],
     captures: dict[str, _Capture],
     hard_deadline: float,
+    scope_signal: Callable[[int], None] | None = None,
 ) -> None:
-    now = time.monotonic()
-    term_deadline = min(hard_deadline, now + min(2.0, max(0.0, (hard_deadline - now) / 2)))
-    delayed_scan_error: BoundedProcessError | None = None
+    first_error: BaseException | None = None
     cleanup_complete = False
+
+    def remember(error: BaseException) -> None:
+        nonlocal first_error
+        first_error = first_error or error
+
     try:
-        tree.signal(signal.SIGTERM)
-    except BoundedProcessError as error:
-        delayed_scan_error = error
-    while time.monotonic() < term_deadline:
-        _drain_once(selector, streams, captures, min(_POLL_SECONDS, term_deadline - time.monotonic()))
-        process.poll()
+        now = time.monotonic()
+        term_deadline = min(
+            hard_deadline,
+            now + min(2.0, max(0.0, (hard_deadline - now) / 2)),
+        )
         try:
-            tree.reap_adopted()
-            cleanup_complete = not tree.survivors() and not streams
-        except BoundedProcessError as error:
-            delayed_scan_error = delayed_scan_error or error
-            cleanup_complete = False
-        if cleanup_complete:
-            break
-    if not cleanup_complete:
-        try:
-            tree.signal(signal.SIGKILL)
-        except BoundedProcessError as error:
-            delayed_scan_error = delayed_scan_error or error
-    while time.monotonic() < hard_deadline:
-        _drain_once(selector, streams, captures, min(_POLL_SECONDS, hard_deadline - time.monotonic()))
-        process.poll()
-        try:
-            tree.reap_adopted()
-            cleanup_complete = not tree.survivors() and not streams
-        except BoundedProcessError as error:
-            delayed_scan_error = delayed_scan_error or error
-            cleanup_complete = False
-        if cleanup_complete:
-            break
+            _signal_cleanup(tree, scope_signal, signal.SIGTERM)
+        except BaseException as error:
+            remember(error)
+        while time.monotonic() < term_deadline:
+            try:
+                _drain_once(
+                    selector,
+                    streams,
+                    captures,
+                    min(_POLL_SECONDS, term_deadline - time.monotonic()),
+                )
+                process.poll()
+            except BaseException as error:
+                remember(error)
+                break
+            try:
+                tree.reap_adopted()
+                cleanup_complete = not tree.survivors() and not streams
+            except BaseException as error:
+                remember(error)
+                cleanup_complete = False
+            if cleanup_complete:
+                break
+    except BaseException as error:
+        remember(error)
+    finally:
+        if scope_signal is not None or not cleanup_complete:
+            try:
+                _signal_cleanup(tree, scope_signal, signal.SIGKILL)
+            except BaseException as error:
+                remember(error)
+    try:
+        while time.monotonic() < hard_deadline:
+            try:
+                _drain_once(
+                    selector,
+                    streams,
+                    captures,
+                    min(_POLL_SECONDS, hard_deadline - time.monotonic()),
+                )
+                process.poll()
+            except BaseException as error:
+                remember(error)
+                break
+            try:
+                tree.reap_adopted()
+                cleanup_complete = not tree.survivors() and not streams
+            except BaseException as error:
+                remember(error)
+                cleanup_complete = False
+            if cleanup_complete:
+                break
+    except BaseException as error:
+        remember(error)
     for descriptor in list(streams):
-        _close_stream(selector, streams, descriptor)
+        try:
+            _close_stream(selector, streams, descriptor)
+        except BaseException as error:
+            remember(error)
     if process.returncode is None:
         try:
             process.wait(timeout=max(0.001, hard_deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             pass
+        except BaseException as error:
+            remember(error)
     try:
         tree.reap_adopted()
-    except BoundedProcessError as error:
-        delayed_scan_error = delayed_scan_error or error
+    except BaseException as error:
+        remember(error)
     try:
         survivors = tree.survivors()
-    except BoundedProcessError as error:
-        delayed_scan_error = delayed_scan_error or error
+    except BaseException as error:
+        remember(error)
         survivors = []
     if process.returncode is None and process.pid not in survivors:
         survivors.append(process.pid)
         survivors.sort()
     if survivors:
+        diagnostic = "" if first_error is None else f"; cleanup={_bounded_error_summary(first_error)}"
         raise BoundedProcessError(
-            "subprocess cleanup deadline exhausted; survivors="
-            + ",".join(str(pid) for pid in survivors)
+            f"subprocess cleanup deadline exhausted; survivor_count={len(survivors)}"
+            + diagnostic
         )
-    if delayed_scan_error is not None:
-        raise delayed_scan_error
+    if first_error is not None:
+        raise first_error
+
+
+@dataclass(frozen=True)
+class ScopePolicy:
+    phase: str
+    memory_high: int
+    memory_max: int
+    tasks_max: int
+    cpu_percent: int
+    fsize_bytes: int
+    min_mem_available: int
+    runtime_seconds: int
+    proc_root: Path = Path("/proc")
+    cgroup_root: Path = Path("/sys/fs/cgroup")
+
+    def __post_init__(self) -> None:
+        if (
+            not self.phase
+            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-" for character in self.phase)
+            or self.memory_high <= 0
+            or self.memory_max < self.memory_high
+            or self.tasks_max <= 0
+            or self.cpu_percent not in {100, 200}
+            or self.fsize_bytes <= 0
+            or self.min_mem_available <= 0
+            or self.runtime_seconds <= 0
+            or not self.proc_root.is_absolute()
+            or not self.cgroup_root.is_absolute()
+        ):
+            raise BoundedProcessError("invalid scope policy")
+
+    def contract(self) -> dict[str, int | str]:
+        return {
+            "cpu_percent": self.cpu_percent,
+            "fsize_bytes": self.fsize_bytes,
+            "memory_high": self.memory_high,
+            "memory_max": self.memory_max,
+            "min_mem_available": self.min_mem_available,
+            "phase": self.phase,
+            "runtime_seconds": self.runtime_seconds,
+            "tasks_max": self.tasks_max,
+        }
+
+
+@dataclass
+class _ScopeCgroup:
+    relative_path: str
+    descriptors: dict[str, int]
+
+    def read(self, name: str, maximum: int = _SCOPE_STATUS_BYTES) -> bytes:
+        descriptor = self.descriptors[name]
+        try:
+            if os.fstat(self.descriptors["directory"]).st_nlink == 0:
+                raise OSError(errno.ENODEV, "held scope was removed")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            payload = os.read(descriptor, maximum + 1)
+        except OSError as error:
+            raise BoundedProcessError(
+                "scope controller read failed", error_number=error.errno
+            ) from error
+        if len(payload) > maximum:
+            raise BoundedProcessError("scope controller value exceeded its bound")
+        return payload
+
+    def close(self) -> None:
+        for descriptor in self.descriptors.values():
+            os.close(descriptor)
+        self.descriptors.clear()
+
+
+def _read_small_file(path: Path, maximum: int = _SCOPE_STATUS_BYTES) -> bytes:
+    try:
+        with path.open("rb", buffering=0) as stream:
+            payload = stream.read(maximum + 1)
+    except OSError as error:
+        raise BoundedProcessError("scope authority read failed") from error
+    if len(payload) > maximum:
+        raise BoundedProcessError("scope authority value exceeded its bound")
+    return payload
+
+
+def _proc_row_under(root: Path, pid: int) -> tuple[int, int] | None:
+    try:
+        payload = _read_small_file(root / str(pid) / "stat").decode(
+            "utf-8", errors="strict"
+        )
+    except (BoundedProcessError, UnicodeDecodeError):
+        return None
+    closing = payload.rfind(")")
+    if closing <= 1:
+        return None
+    fields = payload[closing + 2 :].split()
+    if len(fields) < 20:
+        return None
+    try:
+        return int(fields[1]), int(fields[19])
+    except ValueError:
+        return None
+
+
+def _memory_available(policy: ScopePolicy) -> int:
+    payload = _read_small_file(policy.proc_root / "meminfo").decode(
+        "ascii", errors="strict"
+    )
+    values = [line.split() for line in payload.splitlines() if line.startswith("MemAvailable:")]
+    if len(values) != 1 or len(values[0]) != 3 or values[0][2] != "kB":
+        raise BoundedProcessError("MemAvailable authority is malformed")
+    try:
+        available = int(values[0][1]) * 1024
+    except ValueError as error:
+        raise BoundedProcessError("MemAvailable authority is malformed") from error
+    if available < policy.min_mem_available:
+        raise BoundedProcessError("scope memory admission failed")
+    return available
+
+
+def _json_object(payload: bytes) -> dict[str, object]:
+    def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        if len({key for key, _ in pairs}) != len(pairs):
+            raise ValueError("duplicate key")
+        return dict(pairs)
+
+    try:
+        value = json.loads(payload, object_pairs_hook=strict_object)
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+        raise BoundedProcessError("scope status is malformed") from error
+    if type(value) is not dict:
+        raise BoundedProcessError("scope status is malformed")
+    return value
+
+
+def _status_rows(capture: _Capture, *, complete: bool) -> list[dict[str, object]]:
+    payload = bytes(capture.retained)
+    if not complete and not payload.endswith(b"\n"):
+        payload = payload[: payload.rfind(b"\n") + 1]
+    if complete and payload and not payload.endswith(b"\n"):
+        raise BoundedProcessError("scope status is incomplete")
+    rows = [_json_object(line) for line in payload[:-1].split(b"\n")] if payload else []
+    if len(rows) > 2:
+        raise BoundedProcessError("scope status has unexpected records")
+    return rows
+
+
+def _ready_status(
+    capture: _Capture, namespace_keys: set[str]
+) -> tuple[int, dict[str, object]] | None:
+    payload = bytes(capture.retained)
+    if capture.truncated:
+        raise BoundedProcessError("scope status exceeded its bound")
+    if b"\n" not in payload:
+        return None
+    if not payload.endswith(b"\n"):
+        raise BoundedProcessError("scope status has trailing bytes")
+    rows = _status_rows(capture, complete=False)
+    expected_keys = {"child-pid", *namespace_keys}
+    if len(rows) != 1 or set(rows[0]) != expected_keys:
+        raise BoundedProcessError("scope status ready record is invalid")
+    row = rows[0]
+    value = row["child-pid"]
+    if type(value) is not int or not 1 < value < _LINUX_PID_LIMIT:
+        raise BoundedProcessError("scope status worker identity is invalid")
+    for key in namespace_keys:
+        namespace_inode = row[key]
+        if (
+            type(namespace_inode) is not int
+            or not 0 < namespace_inode < _LINUX_NAMESPACE_INODE_LIMIT
+        ):
+            raise BoundedProcessError("scope status namespace identity is invalid")
+    return value, row
+
+
+def _open_scope_cgroup(policy: ScopePolicy, relative_path: str) -> _ScopeCgroup:
+    parts = relative_path.lstrip("/").split("/")
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise BoundedProcessError("scope cgroup path is malformed")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    current = -1
+    descriptors: dict[str, int] = {}
+    try:
+        current = os.open(policy.cgroup_root, flags)
+        for part in parts:
+            child = os.open(part, flags, dir_fd=current)
+            os.close(current)
+            current = child
+        descriptors = {"directory": current}
+        for name in (
+            "cgroup.events",
+            "cgroup.procs",
+            "cpu.max",
+            "memory.events",
+            "memory.high",
+            "memory.max",
+            "memory.oom.group",
+            "memory.swap.max",
+            "pids.events",
+            "pids.max",
+        ):
+            descriptors[name] = os.open(
+                name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=current
+            )
+        descriptors["cgroup.kill"] = os.open(
+            "cgroup.kill", os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=current
+        )
+    except OSError as error:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+        if current >= 0 and current not in descriptors.values():
+            os.close(current)
+        raise BoundedProcessError("scope controllers are incomplete") from error
+    return _ScopeCgroup(relative_path, descriptors)
+
+
+def _integer_map(payload: bytes) -> dict[str, int]:
+    result: dict[str, int] = {}
+    try:
+        for line in payload.decode("ascii", errors="strict").splitlines():
+            key, raw = line.split()
+            if key in result:
+                raise ValueError("duplicate")
+            result[key] = int(raw)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise BoundedProcessError("scope event counters are malformed") from error
+    if any(value < 0 for value in result.values()):
+        raise BoundedProcessError("scope event counters are malformed")
+    return result
+
+
+def _scope_worker_exact(
+    policy: ScopePolicy,
+    unit: str,
+    worker_pid: int,
+    worker_starttime: int,
+    cgroup: _ScopeCgroup,
+) -> bool:
+    row = _proc_row_under(policy.proc_root, worker_pid)
+    if row is None or row[1] != worker_starttime:
+        return False
+    try:
+        membership = _read_small_file(
+            policy.proc_root / str(worker_pid) / "cgroup"
+        ).decode("ascii", errors="strict")
+        pinned = os.fstat(cgroup.descriptors["directory"])
+        current = os.stat(
+            policy.cgroup_root / cgroup.relative_path.lstrip("/"),
+            follow_symlinks=False,
+        )
+        procs = cgroup.read("cgroup.procs").split()
+    except (BoundedProcessError, UnicodeDecodeError, OSError):
+        return False
+    return (
+        membership.splitlines() == [f"0::{cgroup.relative_path}"]
+        and Path(cgroup.relative_path).name == unit
+        and stat.S_ISDIR(pinned.st_mode)
+        and stat.S_ISDIR(current.st_mode)
+        and (pinned.st_dev, pinned.st_ino) == (current.st_dev, current.st_ino)
+        and str(worker_pid).encode("ascii") in procs
+    )
+
+
+def _verify_scope(
+    policy: ScopePolicy,
+    unit: str,
+    wrapper_pid: int,
+    worker_pid: int,
+) -> tuple[int, int, _ScopeCgroup, dict[str, int], dict[str, int]]:
+    if worker_pid <= 1 or worker_pid == wrapper_pid:
+        raise BoundedProcessError("scope worker identity is invalid")
+    row = _proc_row_under(policy.proc_root, worker_pid)
+    if row is None or row[1] <= 0:
+        raise BoundedProcessError("scope worker identity is unavailable")
+    try:
+        cgroup_payload = _read_small_file(
+            policy.proc_root / str(worker_pid) / "cgroup"
+        ).decode("ascii", errors="strict")
+    except UnicodeDecodeError as error:
+        raise BoundedProcessError("scope cgroup membership is malformed") from error
+    lines = cgroup_payload.splitlines()
+    if len(lines) != 1 or not lines[0].startswith("0::/"):
+        raise BoundedProcessError("scope cgroup membership is malformed")
+    relative_path = lines[0][3:]
+    if Path(relative_path).name != unit:
+        raise BoundedProcessError("scope cgroup membership is not exact")
+    cgroup = _open_scope_cgroup(policy, relative_path)
+    worker_pidfd = -1
+    try:
+        expected = {
+            "memory.high": str(policy.memory_high),
+            "memory.max": str(policy.memory_max),
+            "memory.oom.group": "1",
+            "memory.swap.max": "0",
+            "pids.max": str(policy.tasks_max),
+            "cpu.max": f"{policy.cpu_percent * 1000} 100000",
+        }
+        for name, value in expected.items():
+            if cgroup.read(name).decode("ascii", errors="strict").strip() != value:
+                raise BoundedProcessError("scope controller value is not exact")
+        procs = cgroup.read("cgroup.procs").split()
+        if str(worker_pid).encode("ascii") not in procs:
+            raise BoundedProcessError("scope worker is outside exact cgroup")
+        events = _integer_map(cgroup.read("cgroup.events"))
+        if events.get("populated") != 1:
+            raise BoundedProcessError("scope cgroup is not populated")
+        memory_events = _integer_map(cgroup.read("memory.events"))
+        pids_events = _integer_map(cgroup.read("pids.events"))
+        for key in ("oom", "oom_kill", "max"):
+            if key not in memory_events:
+                raise BoundedProcessError("scope memory events are incomplete")
+        if "max" not in pids_events:
+            raise BoundedProcessError("scope PID events are incomplete")
+        if (
+            any(memory_events[key] != 0 for key in ("oom", "oom_kill", "max"))
+            or pids_events["max"] != 0
+        ):
+            raise BoundedProcessError("scope pre-GO resource event is nonzero")
+        if not _scope_worker_exact(policy, unit, worker_pid, row[1], cgroup):
+            raise BoundedProcessError("scope worker identity changed before GO")
+        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+            raise BoundedProcessError("scope worker pidfd authority is unavailable")
+        try:
+            worker_pidfd = os.pidfd_open(worker_pid, 0)
+            signal.pidfd_send_signal(worker_pidfd, 0, None, 0)
+        except (AttributeError, ProcessLookupError, OSError) as error:
+            raise BoundedProcessError(
+                "scope worker pidfd authority is unavailable"
+            ) from error
+        if not _scope_worker_exact(policy, unit, worker_pid, row[1], cgroup):
+            raise BoundedProcessError("scope worker identity changed before GO")
+    except BaseException:
+        if worker_pidfd >= 0:
+            os.close(worker_pidfd)
+        cgroup.close()
+        raise
+    return row[1], worker_pidfd, cgroup, memory_events, pids_events
+
+
+def _scope_manager_command(
+    systemctl: str,
+    pass_fds: Sequence[int],
+    arguments: Sequence[str],
+    label: str,
+    *,
+    capture: bool = False,
+) -> bytes:
+    try:
+        process = subprocess.Popen(
+            [systemctl, *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            pass_fds=tuple(pass_fds),
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise BoundedProcessError(f"scope manager {label} failed") from error
+    try:
+        output, _ = process.communicate(timeout=2)
+    except BaseException as error:
+        cleanup_error: BaseException | None = None
+        try:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+        except BaseException as failure:
+            cleanup_error = failure
+        try:
+            process.wait(timeout=1)
+        except BaseException as failure:
+            cleanup_error = cleanup_error or failure
+        if process.returncode is None:
+            containment = BoundedProcessError(
+                f"scope manager {label} cancellation cleanup failed"
+            )
+            if cleanup_error is not None:
+                containment.add_note(f"cleanup diagnostic: {cleanup_error}")
+            raise containment from error
+        if cleanup_error is not None:
+            error.add_note(f"scope manager cleanup diagnostic: {cleanup_error}")
+        if isinstance(error, subprocess.TimeoutExpired):
+            raise BoundedProcessError(f"scope manager {label} timed out") from error
+        if isinstance(error, (OSError, subprocess.SubprocessError)):
+            raise BoundedProcessError(f"scope manager {label} failed") from error
+        raise
+    if process.returncode != 0 or len(output) > _SCOPE_STATUS_BYTES:
+        raise BoundedProcessError(f"scope manager {label} failed")
+    return output
+
+
+def _scope_signal(
+    policy: ScopePolicy,
+    unit: str,
+    worker_pid: int,
+    worker_starttime: int,
+    cgroup: _ScopeCgroup,
+    worker_pidfd: int,
+    number: int,
+    deadline: float,
+) -> None:
+    del unit
+    if number not in {signal.SIGTERM, signal.SIGKILL}:
+        raise BoundedProcessError("scope cleanup signal is invalid")
+    errors: list[str] = []
+    first_error: BaseException | None = None
+    try:
+        if _scope_quiescent(
+            policy, worker_pid, worker_starttime, worker_pidfd, cgroup
+        ):
+            return
+    except BaseException as error:
+        first_error = error
+        errors.append("scope quiescence check failed")
+    if number == signal.SIGKILL:
+        try:
+            if os.write(cgroup.descriptors["cgroup.kill"], b"1\n") != 2:
+                raise OSError("short cgroup.kill write")
+        except BaseException as error:
+            first_error = first_error or error
+            errors.append("scope cgroup KILL failed")
+    try:
+        signal.pidfd_send_signal(worker_pidfd, number, None, 0)
+    except ProcessLookupError:
+        pass
+    except BaseException as error:
+        first_error = first_error or error
+        errors.append(
+            "scope worker pidfd KILL failed"
+            if number == signal.SIGKILL
+            else "scope worker pidfd TERM failed"
+        )
+    if number != signal.SIGKILL:
+        if errors:
+            raise BoundedProcessError("; ".join(dict.fromkeys(errors))) from first_error
+        return
+    poll_deadline = min(deadline, time.monotonic() + 1.0)
+    quiescent = False
+    while time.monotonic() < poll_deadline:
+        try:
+            quiescent = _scope_quiescent(
+                policy, worker_pid, worker_starttime, worker_pidfd, cgroup
+            )
+        except BaseException as error:
+            first_error = first_error or error
+            errors.append("scope quiescence check failed")
+            break
+        if quiescent:
+            break
+        try:
+            time.sleep(min(_POLL_SECONDS, max(0.0, poll_deadline - time.monotonic())))
+        except BaseException as error:
+            first_error = first_error or error
+            errors.append("scope quiescence wait failed")
+            break
+    if not quiescent:
+        try:
+            quiescent = _scope_quiescent(
+                policy, worker_pid, worker_starttime, worker_pidfd, cgroup
+            )
+        except BaseException as error:
+            first_error = first_error or error
+            errors.append("scope quiescence check failed")
+    if not quiescent:
+        errors.append("scope cgroup KILL did not quiesce")
+    if errors:
+        raise BoundedProcessError("; ".join(dict.fromkeys(errors))) from first_error
+
+
+def _scope_resource_events(
+    cgroup: _ScopeCgroup,
+    memory_before: Mapping[str, int],
+    pids_before: Mapping[str, int],
+) -> tuple[str, ...]:
+    memory_after = _integer_map(cgroup.read("memory.events"))
+    pids_after = _integer_map(cgroup.read("pids.events"))
+    events = [
+        f"memory.{key}"
+        for key in ("oom", "oom_kill", "max")
+        if memory_after.get(key, 0) > memory_before.get(key, 0)
+    ]
+    if pids_after.get("max", 0) > pids_before.get("max", 0):
+        events.append("pids.max")
+    return tuple(events)
+
+
+def _scope_quiescent(
+    policy: ScopePolicy,
+    worker_pid: int,
+    worker_starttime: int,
+    worker_pidfd: int,
+    cgroup: _ScopeCgroup,
+) -> bool:
+    row = _proc_row_under(policy.proc_root, worker_pid)
+    if row is not None and row[1] == worker_starttime:
+        return False
+    try:
+        signal.pidfd_send_signal(worker_pidfd, 0, None, 0)
+    except ProcessLookupError:
+        pass
+    except (AttributeError, OSError):
+        return False
+    else:
+        return False
+    try:
+        events = _integer_map(cgroup.read("cgroup.events"))
+        procs = cgroup.read("cgroup.procs").split()
+    except BoundedProcessError as error:
+        return error.errno == errno.ENODEV
+    return events.get("populated") == 0 and not procs
+
+
+def scoped_command(
+    sandbox_arguments: Sequence[str],
+    policy: ScopePolicy,
+    *,
+    systemd_run: str,
+    systemctl: str,
+    nice: str,
+    ionice: str,
+    prlimit: str,
+    timeout: float,
+    deadline: float,
+    env: Mapping[str, str],
+    pass_fds: Sequence[int],
+    max_output_bytes: int,
+    cleanup_reserve: float = 4.0,
+) -> bytes:
+    """Run one bwrap payload only after its exact user scope is proven."""
+
+    if (
+        not sandbox_arguments
+        or timeout <= 0
+        or cleanup_reserve <= 0
+        or max_output_bytes <= 0
+        or max_output_bytes > 192 * 1024 * 1024
+    ):
+        raise BoundedProcessError("invalid scoped command")
+    try:
+        unshare_all = sandbox_arguments.index("--unshare-all")
+        proc_mount = sandbox_arguments.index("--proc")
+    except ValueError as error:
+        raise BoundedProcessError("invalid scoped namespace policy") from error
+    weaker_unshares = {
+        "--unshare-cgroup",
+        "--unshare-ipc",
+        "--unshare-net",
+        "--unshare-pid",
+        "--unshare-uts",
+    }
+    resource_fences = [
+        index
+        for index in range(len(sandbox_arguments) - 2)
+        if list(sandbox_arguments[index : index + 3])
+        == ["--setenv", "GB10_RESOURCE_FENCE", "1"]
+    ]
+    if (
+        sandbox_arguments.count("--unshare-user") != 1
+        or sandbox_arguments.count("--unshare-all") != 1
+        or sandbox_arguments.count("--proc") != 1
+        or len(resource_fences) != 1
+        or sandbox_arguments.count("GB10_RESOURCE_FENCE") != 1
+        or proc_mount + 1 >= len(sandbox_arguments)
+        or sandbox_arguments[proc_mount + 1] != "/proc"
+        or unshare_all > proc_mount
+        or any(option in sandbox_arguments for option in weaker_unshares)
+        or sandbox_arguments.count("--share-net") != (policy.phase == "fetch")
+        or (
+            "--share-net" in sandbox_arguments
+            and unshare_all > sandbox_arguments.index("--share-net")
+        )
+    ):
+        raise BoundedProcessError("invalid scoped namespace policy")
+    _memory_available(policy)
+    started = time.monotonic()
+    hard_deadline = min(deadline, started + timeout)
+    reserve = min(cleanup_reserve, max(0.0, (hard_deadline - started) / 2))
+    work_deadline = hard_deadline - reserve
+    if work_deadline <= started:
+        raise BoundedProcessError("insufficient scoped command budget")
+
+    namespace_keys = {
+        "cgroup-namespace",
+        "ipc-namespace",
+        "mnt-namespace",
+        "net-namespace",
+        "pid-namespace",
+        "uts-namespace",
+    }
+    if policy.phase == "fetch":
+        namespace_keys.discard("net-namespace")
+
+    unit = f"llm-guard-rebuild-{policy.phase}-{secrets.token_hex(16)}.scope"
+    sandbox = [unit if value == _SCOPE_UNIT_TOKEN else value for value in sandbox_arguments]
+    status_read, status_write = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+    block_read, block_write = os.pipe2(os.O_CLOEXEC)
+    fence_parent, fence_child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    fence_parent.setblocking(False)
+    sandbox = [
+        sandbox[0],
+        "--json-status-fd",
+        str(status_write),
+        "--block-fd",
+        str(block_read),
+        *sandbox[1:],
+    ]
+    arguments = [
+        systemd_run,
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        f"--unit={unit}",
+        f"--property=MemoryHigh={policy.memory_high}",
+        f"--property=MemoryMax={policy.memory_max}",
+        "--property=MemorySwapMax=0",
+        f"--property=TasksMax={policy.tasks_max}",
+        f"--property=CPUQuota={policy.cpu_percent}%",
+        "--property=CPUQuotaPeriodSec=100ms",
+        "--property=KillMode=control-group",
+        "--property=SendSIGKILL=yes",
+        "--property=OOMPolicy=kill",
+        f"--property=RuntimeMaxSec={policy.runtime_seconds}",
+        "--",
+        nice,
+        "-n",
+        "10",
+        ionice,
+        "-c",
+        "3",
+        prlimit,
+        f"--fsize={policy.fsize_bytes}:{policy.fsize_bytes}",
+        "--",
+        *sandbox,
+    ]
+    inherited = tuple(sorted(set((*pass_fds, status_write, block_read))))
+    _enable_subreaper()
+    baseline = _direct_child_identities(os.getpid())
+    process: subprocess.Popen[bytes] | None = None
+    tree: _ProcessTree | None = None
+    selector = selectors.DefaultSelector()
+    streams: dict[int, tuple[str, object]] = {}
+    captures = {
+        "stdout": _Capture(bytearray(), max_output_bytes),
+        "stderr": _Capture(bytearray(), _SCOPE_STATUS_BYTES),
+        "status": _Capture(bytearray(), _SCOPE_STATUS_BYTES),
+        "fence": _Capture(bytearray(), 1),
+    }
+    cgroup: _ScopeCgroup | None = None
+    worker_pid = 0
+    ready_row: dict[str, object] = {}
+    worker_starttime = 0
+    worker_pidfd = -1
+    memory_before: dict[str, int] = {}
+    pids_before: dict[str, int] = {}
+    resource_events: tuple[str, ...] = ()
+    resource_snapshot = False
+    fence_released = False
+    failure: str | None = None
+    identity_lost_at: float | None = None
+    try:
+        try:
+            process = subprocess.Popen(
+                arguments,
+                env=dict(env),
+                stdin=fence_child.fileno(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                close_fds=True,
+                pass_fds=inherited,
+            )
+        except (OSError, ValueError) as error:
+            raise BoundedProcessError("scoped command spawn failed") from error
+        finally:
+            fence_child.close()
+            os.close(status_write)
+            os.close(block_read)
+        tree = _ProcessTree(process, baseline)
+        assert process.stdout is not None and process.stderr is not None
+        status_stream = os.fdopen(status_read, "rb", buffering=0)
+        status_read = -1
+        for name, stream in (
+            ("stdout", process.stdout),
+            ("stderr", process.stderr),
+            ("status", status_stream),
+            ("fence", fence_parent),
+        ):
+            descriptor = stream.fileno()
+            os.set_blocking(descriptor, False)
+            selector.register(descriptor, selectors.EVENT_READ)
+            streams[descriptor] = (name, stream)
+
+        setup_deadline = min(work_deadline, time.monotonic() + 8.0)
+        while time.monotonic() < setup_deadline:
+            tree.scan()
+            _drain_once(selector, streams, captures, _POLL_SECONDS)
+            ready = _ready_status(captures["status"], namespace_keys)
+            if ready is not None:
+                _drain_once(selector, streams, captures, 0.0)
+                ready = _ready_status(captures["status"], namespace_keys)
+                if ready is None:
+                    raise BoundedProcessError("scope status ready record disappeared")
+                worker_pid, ready_row = ready
+                break
+            if process.poll() is not None or captures["status"].truncated:
+                break
+        if worker_pid == 0:
+            raise BoundedProcessError("scope did not report a worker")
+        (
+            worker_starttime,
+            worker_pidfd,
+            cgroup,
+            memory_before,
+            pids_before,
+        ) = _verify_scope(policy, unit, process.pid, worker_pid)
+        if not _scope_worker_exact(
+            policy, unit, worker_pid, worker_starttime, cgroup
+        ):
+            raise BoundedProcessError("scope worker identity changed before GO")
+        os.write(block_write, b"G")
+        os.close(block_write)
+        block_write = -1
+
+        while True:
+            tree.scan()
+            _drain_once(
+                selector,
+                streams,
+                captures,
+                min(_POLL_SECONDS, max(0.0, work_deadline - time.monotonic())),
+            )
+            if not resource_snapshot:
+                try:
+                    observed_events = _scope_resource_events(
+                        cgroup, memory_before, pids_before
+                    )
+                except BoundedProcessError as error:
+                    if error.errno == errno.ENODEV and resource_events:
+                        resource_snapshot = True
+                    elif error.errno != errno.ENODEV:
+                        raise
+                else:
+                    resource_events = tuple(
+                        dict.fromkeys((*resource_events, *observed_events))
+                    )
+            fence_payload = bytes(captures["fence"].retained)
+            if captures["fence"].truncated or fence_payload not in {b"", b"R"}:
+                failure = "scope resource snapshot fence is malformed"
+                break
+            if fence_payload == b"R" and not fence_released:
+                try:
+                    observed_events = _scope_resource_events(
+                        cgroup, memory_before, pids_before
+                    )
+                except BoundedProcessError as error:
+                    if error.errno == errno.ENODEV:
+                        raise BoundedProcessError(
+                            "scope resource receipt unavailable before collection"
+                        ) from error
+                    raise
+                resource_events = tuple(
+                    dict.fromkeys((*resource_events, *observed_events))
+                )
+                resource_snapshot = True
+                if fence_parent.send(b"G") != 1:
+                    raise BoundedProcessError("scope resource snapshot fence release failed")
+                fence_parent.shutdown(socket.SHUT_WR)
+                fence_released = True
+            status = process.poll()
+            tree.reap_adopted()
+            descendants = tree.descendants(tree.scan())
+            if any(capture.truncated for capture in captures.values()):
+                failure = "scoped output exceeded bound"
+                break
+            terminal_status = len(
+                _status_rows(captures["status"], complete=False)
+            ) == 2
+            worker_exact = _scope_worker_exact(
+                policy, unit, worker_pid, worker_starttime, cgroup
+            )
+            if worker_exact or terminal_status:
+                identity_lost_at = None
+            elif identity_lost_at is None:
+                identity_lost_at = time.monotonic()
+            elif time.monotonic() - identity_lost_at >= 0.1:
+                failure = "scope worker identity changed during execution"
+                break
+            if status is not None and not streams:
+                if descendants:
+                    failure = "scoped command left descendants"
+                break
+            if time.monotonic() >= work_deadline:
+                failure = "scoped command deadline exhausted"
+                break
+        if not resource_snapshot:
+            try:
+                observed_events = _scope_resource_events(
+                    cgroup, memory_before, pids_before
+                )
+            except BoundedProcessError as error:
+                if error.errno != errno.ENODEV:
+                    raise
+                if resource_events:
+                    resource_snapshot = True
+                elif failure is None:
+                    raise BoundedProcessError(
+                        "scope resource receipt unavailable after collection"
+                    ) from error
+                else:
+                    failure += "; scope resource receipt unavailable after collection"
+            else:
+                resource_events = tuple(
+                    dict.fromkeys((*resource_events, *observed_events))
+                )
+                resource_snapshot = True
+        if failure is None and process.returncode not in {None, 0}:
+            failure = "scoped payload failed"
+        if resource_events:
+            resource_failure = (
+                "scope resource limit was reached: " + ",".join(resource_events)
+            )
+            if failure is not None:
+                raise BoundedProcessError(f"{failure}; {resource_failure}")
+            raise BoundedProcessError(resource_failure)
+        if failure is not None:
+            raise BoundedProcessError(failure)
+        if process.returncode != 0:
+            raise BoundedProcessError("scoped payload failed")
+        rows = _status_rows(captures["status"], complete=True)
+        if len(rows) != 2:
+            raise BoundedProcessError("scope exit status is invalid")
+        exit_code = rows[1].get("exit-code")
+        if (
+            rows[0] != ready_row
+            or set(rows[1]) != {"exit-code"}
+            or type(exit_code) is not int
+            or exit_code != 0
+        ):
+            raise BoundedProcessError("scope exit status is invalid")
+        if not _scope_quiescent(
+            policy, worker_pid, worker_starttime, worker_pidfd, cgroup
+        ):
+            raise BoundedProcessError("scope worker survived collection")
+        return bytes(captures["stdout"].retained)
+    except BaseException as error:
+        resource_diagnostics: list[str] = []
+        if cgroup is not None and not resource_snapshot:
+            try:
+                observed_events = _scope_resource_events(
+                    cgroup, memory_before, pids_before
+                )
+            except BoundedProcessError as snapshot_error:
+                if snapshot_error.errno == errno.ENODEV and resource_events:
+                    resource_snapshot = True
+                else:
+                    resource_diagnostics.append(
+                        "scope resource receipt unavailable before cleanup"
+                        if snapshot_error.errno == errno.ENODEV
+                        else _bounded_error_summary(snapshot_error)
+                    )
+            else:
+                resource_events = tuple(
+                    dict.fromkeys((*resource_events, *observed_events))
+                )
+                resource_snapshot = True
+        if resource_events:
+            resource_diagnostics.append(
+                "scope resource limit was reached: " + ",".join(resource_events)
+            )
+        if process is not None and tree is not None:
+            scope_signal = (
+                None
+                if cgroup is None
+                else lambda number: _scope_signal(
+                    policy,
+                    unit,
+                    worker_pid,
+                    worker_starttime,
+                    cgroup,
+                    worker_pidfd,
+                    number,
+                    hard_deadline,
+                )
+            )
+            cleanup_error: BaseException | None = None
+            try:
+                _bounded_reap(
+                    process,
+                    tree,
+                    selector,
+                    streams,
+                    captures,
+                    hard_deadline,
+                    scope_signal,
+                )
+            except BaseException as cleanup_failure:
+                cleanup_error = cleanup_failure
+            cleanup_diagnostics: list[str] = []
+            scope_quiescent = False
+            if cgroup is not None:
+                try:
+                    scope_quiescent = _scope_quiescent(
+                        policy,
+                        worker_pid,
+                        worker_starttime,
+                        worker_pidfd,
+                        cgroup,
+                    )
+                except BaseException as diagnostic_failure:
+                    cleanup_error = cleanup_error or diagnostic_failure
+            if cgroup is not None and not scope_quiescent:
+                cleanup_diagnostics.append("hard-contained scope survived cleanup")
+            if process.returncode is None:
+                cleanup_diagnostics.append("scope wrapper survived cleanup")
+            if cleanup_error is not None:
+                cleanup_diagnostics.append(_bounded_error_summary(cleanup_error))
+            if cleanup_diagnostics or resource_diagnostics:
+                diagnostics = [
+                    _bounded_error_summary(error),
+                    *resource_diagnostics,
+                ]
+                if cleanup_diagnostics:
+                    diagnostics.append(
+                        "cleanup=" + "; ".join(dict.fromkeys(cleanup_diagnostics))
+                    )
+                raise BoundedProcessError(
+                    "; ".join(dict.fromkeys(diagnostics))
+                ) from error
+        elif resource_diagnostics:
+            raise BoundedProcessError(
+                "; ".join(
+                    dict.fromkeys(
+                        (_bounded_error_summary(error), *resource_diagnostics)
+                    )
+                )
+            ) from error
+        raise
+    finally:
+        if block_write >= 0:
+            os.close(block_write)
+        if status_read >= 0:
+            os.close(status_read)
+        for descriptor in list(streams):
+            _close_stream(selector, streams, descriptor)
+        fence_parent.close()
+        selector.close()
+        if tree is not None:
+            tree.close()
+        if worker_pidfd >= 0:
+            os.close(worker_pidfd)
+        if cgroup is not None:
+            cgroup.close()
 
 
 def command(

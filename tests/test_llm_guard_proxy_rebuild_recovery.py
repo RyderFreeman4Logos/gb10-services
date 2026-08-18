@@ -285,6 +285,29 @@ class GuardRebuildRecoveryTests(unittest.TestCase):
             self.assertFalse(state.exists())
             fixture.assert_prior_restored(self)
 
+    def test_unsafe_snapshot_name_blocks_before_tools_or_recovery_mutation(self) -> None:
+        with RebuildFixture() as fixture:
+            state = fixture.write_wal("mutated")
+            payload = json.loads(state.read_text())
+            snapshot = Path(payload["snapshot_root"])
+            unsafe = snapshot.with_name(".rebuild-input-unsafe")
+            snapshot.rename(unsafe)
+            payload["snapshot_root"] = str(unsafe)
+            state.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+            )
+            fixture.tool_log.unlink(missing_ok=True)
+            before_link = os.readlink(fixture.service_bin)
+
+            result = fixture.run(timeout=10)
+            output = self.output(result)
+
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("transaction snapshot name is unsafe", output)
+            self.assertEqual(fixture.calls(), "")
+            self.assertEqual(os.readlink(fixture.service_bin), before_link)
+            self.assertTrue(state.exists())
+
     def test_committed_executable_one_field_mismatch_matrix_is_rejected(self) -> None:
         mutations: dict[str, object] = {
             "device": 1,
@@ -1032,6 +1055,184 @@ class SharedBoundedProcessRecoveryTests(unittest.TestCase):
     def test_normal_child_scan_follows_group_term_and_kill_before_reap(self) -> None:
         self._exercise_child_scan_order(overflow=False)
 
+    def test_scope_cleanup_orders_group_then_scope_then_descendant_scan(self) -> None:
+        bounded = self._load_bounded()
+        events: list[tuple[str, int]] = []
+
+        class Tree:
+            def signal_group(self, number: int) -> None:
+                events.append(("group", number))
+
+            def signal_descendants(self, number: int) -> None:
+                events.append(("scan", number))
+
+        bounded._signal_cleanup(
+            Tree(), lambda number: events.append(("scope", number)), signal.SIGTERM
+        )
+        self.assertEqual(
+            events,
+            [
+                ("group", signal.SIGTERM),
+                ("scope", signal.SIGTERM),
+            ],
+        )
+
+        class CompleteTree(Tree):
+            def reap_adopted(self) -> None:
+                pass
+
+            def survivors(self) -> list[int]:
+                return []
+
+        class CompleteProcess:
+            pid = 424242
+            returncode = 0
+
+            def poll(self) -> int:
+                return 0
+
+            def wait(self, timeout: float) -> int:
+                del timeout
+                return 0
+
+        completed_scope: list[int] = []
+        completed_selector = bounded.selectors.DefaultSelector()
+        try:
+            bounded._bounded_reap(
+                CompleteProcess(),
+                CompleteTree(),
+                completed_selector,
+                {},
+                {},
+                time.monotonic() + 1,
+                completed_scope.append,
+            )
+        finally:
+            completed_selector.close()
+        self.assertEqual(completed_scope, [signal.SIGTERM, signal.SIGKILL])
+
+        baseline = bounded._direct_child_identities(os.getpid())
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os,signal,time;"
+                "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                "os.write(1,b'R');"
+                "time.sleep(30)",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        assert process.stdout is not None
+        self.assertEqual(process.stdout.read(1), b"R")
+        process.stdout.close()
+        tree = bounded._ProcessTree(process, baseline)
+        selector = bounded.selectors.DefaultSelector()
+        scope_events: list[int] = []
+        real_signal_group = tree.signal_group
+        interrupted = False
+
+        def signal_group(number: int) -> None:
+            nonlocal interrupted
+            real_signal_group(number)
+            if number == signal.SIGTERM and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+
+        tree.signal_group = signal_group
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                bounded._bounded_reap(
+                    process,
+                    tree,
+                    selector,
+                    {},
+                    {},
+                    time.monotonic() + 2,
+                    scope_events.append,
+                )
+            self.assertIn(signal.SIGKILL, scope_events)
+            self.assertEqual(process.returncode, -signal.SIGKILL)
+            self.assertFalse(Path(f"/proc/{process.pid}").exists())
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=3)
+            selector.close()
+            tree.close()
+
+        class InjectedRebuildError(RuntimeError):
+            pass
+
+        cleanup_events: list[tuple[str, int | None]] = []
+
+        class InterruptedProcess:
+            pid = 424243
+            returncode: int | None = None
+
+            def poll(self) -> int | None:
+                cleanup_events.append(("poll", None))
+                if any(
+                    event == ("group", signal.SIGKILL) for event in cleanup_events
+                ):
+                    self.returncode = -signal.SIGKILL
+                return self.returncode
+
+            def wait(self, timeout: float) -> int:
+                del timeout
+                cleanup_events.append(("wait", None))
+                self.returncode = -signal.SIGKILL
+                return self.returncode
+
+        interrupted_process = InterruptedProcess()
+
+        class InterruptedTree(Tree):
+            def signal_group(self, number: int) -> None:
+                cleanup_events.append(("group", number))
+
+            def reap_adopted(self) -> None:
+                cleanup_events.append(("reap", None))
+
+            def survivors(self) -> list[int]:
+                return [] if interrupted_process.returncode is not None else [interrupted_process.pid]
+
+        real_monotonic = bounded.time.monotonic
+        clock_calls = 0
+
+        def interrupted_clock() -> float:
+            nonlocal clock_calls
+            clock_calls += 1
+            cleanup_events.append(("clock", None))
+            if clock_calls == 2:
+                raise InjectedRebuildError("TERM grace interrupted")
+            return real_monotonic()
+
+        interrupted_selector = bounded.selectors.DefaultSelector()
+        interrupted_deadline = time.monotonic() + 1
+        try:
+            with (
+                patch.object(bounded.time, "monotonic", side_effect=interrupted_clock),
+                self.assertRaises(InjectedRebuildError),
+            ):
+                bounded._bounded_reap(
+                    interrupted_process,
+                    InterruptedTree(),
+                    interrupted_selector,
+                    {},
+                    {},
+                    interrupted_deadline,
+                    lambda number: cleanup_events.append(("scope", number)),
+                )
+        finally:
+            interrupted_selector.close()
+        self.assertIn(("scope", signal.SIGKILL), cleanup_events)
+        self.assertIn(("group", signal.SIGKILL), cleanup_events)
+        self.assertIn(("reap", None), cleanup_events)
+        self.assertEqual(interrupted_process.returncode, -signal.SIGKILL)
+        self.assertEqual(InterruptedTree().survivors(), [])
+
     def test_escaped_term_ignoring_flooders_are_killed_and_reaped(self) -> None:
         bounded = self._load_bounded()
         with tempfile.TemporaryDirectory() as temporary:
@@ -1087,6 +1288,22 @@ class SharedBoundedProcessRecoveryTests(unittest.TestCase):
 
     def test_pidfd_failure_still_contains_escaped_descendant_only(self) -> None:
         bounded = self._load_bounded()
+        modeled = bounded._OwnedProcess(424242, 11, None)
+        modeled_tree = object.__new__(bounded._ProcessTree)
+        modeled_tree.scan = lambda: {modeled.pid: (os.getpid(), modeled.starttime)}
+        modeled_tree.descendants = lambda _table: [modeled]
+        raw_pid_signals: list[tuple[int, int]] = []
+        with patch.object(
+            bounded.os,
+            "kill",
+            side_effect=lambda pid, number: raw_pid_signals.append((pid, number)),
+        ):
+            with self.assertRaisesRegex(
+                bounded.BoundedProcessError, "descendant pidfd"
+            ):
+                modeled_tree.signal_descendants(signal.SIGKILL)
+        self.assertEqual(raw_pid_signals, [])
+
         unrelated = subprocess.Popen(["/usr/bin/sleep", "30"])
         escaped_pid = 0
         with tempfile.TemporaryDirectory() as temporary:
@@ -1108,30 +1325,29 @@ class SharedBoundedProcessRecoveryTests(unittest.TestCase):
                         "pidfd_open",
                         side_effect=OSError(errno.EMFILE, "forced pidfd exhaustion"),
                     ),
-                    self.assertRaises(RuntimeError),
+                    self.assertRaisesRegex(RuntimeError, "pidfd"),
                 ):
-                    bounded.command(
-                        [sys.executable, str(hostile), str(pid_path)], timeout=1
-                    )
+                    bounded.command([sys.executable, str(hostile), str(pid_path)], timeout=1)
                 deadline = time.monotonic() + 2
                 while time.monotonic() < deadline and not pid_path.exists():
                     time.sleep(0.01)
                 self.assertTrue(pid_path.exists(), "escaped child did not publish PID")
                 escaped_pid = int(pid_path.read_text())
-                with self.assertRaises(ProcessLookupError):
-                    os.kill(escaped_pid, 0)
+                os.kill(escaped_pid, 0)
                 self.assertIsNone(unrelated.poll(), "unrelated process was disturbed")
             finally:
-                for pid in (escaped_pid, unrelated.pid):
-                    if pid:
-                        try:
-                            os.kill(pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                        try:
-                            os.waitpid(pid, 0)
-                        except (ChildProcessError, ProcessLookupError):
-                            pass
+                if escaped_pid:
+                    try:
+                        os.kill(escaped_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        os.waitpid(escaped_pid, 0)
+                    except (ChildProcessError, ProcessLookupError):
+                        pass
+                if unrelated.poll() is None:
+                    unrelated.kill()
+                unrelated.wait(timeout=3)
 
 
 if __name__ == "__main__":

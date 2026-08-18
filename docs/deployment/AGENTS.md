@@ -112,7 +112,8 @@ install -m 0755 scripts/aeon_text_stop_start.sh /home/obj/scripts/aeon_text_stop
 cp scripts/aeon_chat_ready.py /home/obj/.local/bin/
 cp scripts/gb10_check_mem_available.sh /home/obj/.local/bin/
 install -m 0755 scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/llm_guard_proxy_cached_rebuild.sh
-install -m 0644 scripts/llm_guard_proxy_cached_rebuild.py scripts/gb10_bounded_process.py /home/obj/.local/bin/
+install -m 0644 scripts/llm_guard_proxy_cached_rebuild.py scripts/llm_guard_proxy_scoped_worker.py \
+  scripts/gb10_bounded_process.py /home/obj/.local/bin/
 cp scripts/llm_guard_proxy_publish_cgroup_registration.sh /home/obj/.local/bin/
 install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py /home/obj/.local/bin/gb10_verify_vllm_no_swap_core.py
 install -m 0755 scripts/gb10_verify_vllm_no_swap.sh /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh
@@ -138,8 +139,8 @@ cp config/llm-guard-proxy/config.toml /home/obj/.config/llm-guard-proxy/config.t
 
 ### 3. Build llm-guard-proxy
 ```bash
-# Build/update the reviewed main branch from a private immutable snapshot while
-# reusing the Cargo target cache. Production accepts no environment overrides.
+# Build/update the reviewed main branch through verified hard-contained scopes.
+# Production accepts no environment overrides.
 /home/obj/.local/bin/llm_guard_proxy_cached_rebuild.sh
 ```
 
@@ -149,11 +150,19 @@ source/cache paths, installed config/unit, service symlink, owner-only recovery
 state, real `/proc`, and fixed tool path. `--test-only` is exclusively for
 hermetic tests and cannot emit the production completion contract.
 
-The script verifies a commit-bearing immutable Git archive, extracts a private
-read-only snapshot, and builds package `llm-guard-proxy` with feature `guard`
-only from that snapshot. The metadata-only receipt binds commit/tree, archive
-and snapshot-content SHA-256, Cargo/rustc identities, installed config/unit
-hashes, and candidate ELF SHA-256/build-ID/device:inode.
+The script gates each fetch, Cargo-metadata, and Cargo-build payload behind a
+random transient user scope whose exact cgroup membership and effective hard
+memory/swap/PID/CPU limits are verified before GO. Bubblewrap keeps Git objects,
+Cargo target output, and temporary files in bounded tmpfs mounts; no writable
+host target or external Git worktree is mounted. The parent accepts bounded
+canonical frames, revalidates the immutable Git archive or candidate, applies one
+576 MiB host-write budget with 8 GiB free-space headroom, and cleans the exact
+process group, scope, and verified descendants on failure. Metadata-only
+receipts bind the complete containment policy and reviewed worker/tool authorities,
+but never persist transient scope names.
+The parent keeps opened memory/pids event descriptors through the worker's final
+resource fence and reads them before a failed scope is collected, preserving
+exact limit evidence for nonzero status, signal/OOM, and early post-GO failure.
 
 Before any link mutation it snapshots and validates exact prior symlink or
 absence plus `MainPID`, `InvocationID`, monotonic start, boot ID, and
@@ -180,6 +189,15 @@ or leaf is preserved and the WAL remains. If the prior service link was absent,
 the original runtime pathname must be a held no-follow exact executable before
 forward mutation, remains the rollback restart pathname, and is re-proved after
 link absence and cleanup are restored.
+Scratch cleanup exchanges the exact target with a held placeholder, parks the
+placeholder in a durable reusable slot, and retains the target as its durable
+deletion record; it never removes a validated replacement leaf by name. Cleanup
+and recovery reuse the active write budget and held destination parent, with a
+zero-byte free-space admission before any host mutation.
+All other exact-leaf retirements use one held, identity-named park under the
+cache root. Receipt, rollback, WAL, candidate, backup, temporary, and service-link
+namespaces never retain hidden parks; malformed or cross-device park state fails
+closed before the source leaf moves.
 
 Cutover and every external command share one 1,800-second forward deadline.
 Failure or stale-WAL recovery gets a fresh 180 seconds shared by direct

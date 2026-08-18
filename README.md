@@ -178,14 +178,19 @@ config/unit, service symlink, owner-only recovery state, real `/proc`, and a
 fixed tool path. Hermetic tests alone use `--test-only`; their marker cannot
 equal the production completion contract.
 
-The rebuild fetches the reviewed commit, creates a verified immutable Git
-archive, extracts it into a private read-only snapshot, and runs Cargo only from
-that snapshot. The receipt binds the source commit/tree, archive SHA-256, and
-snapshot-content SHA-256 in addition to Cargo/rustc identities, installed
-config/unit hashes, and the candidate ELF identity. A content-addressed release
-under `~/.cache/cargo-target/llm-guard-proxy-main/releases/` is linked into
-`~/.local/bin/llm-guard-proxy`; Cargo intermediates remain cached under the same
-cache root.
+The rebuild releases each fetch, Cargo-metadata, and Cargo-build payload only
+after its random transient user scope is proven in the exact cgroup with hard
+memory/swap/PID/CPU/file-size limits. Fetch and build intermediates live only in
+bounded bubblewrap tmpfs mounts; no writable host Cargo target or external Git
+worktree is mounted. The parent accepts one bounded canonical frame, revalidates
+the immutable Git archive or candidate, enforces a 576 MiB host-write budget with
+8 GiB free-space headroom, and publishes a content-addressed release under
+`~/.cache/cargo-target/llm-guard-proxy-main/releases/`. Receipts bind the complete
+containment policy and reviewed worker/tool authorities without persisting
+transient scope names.
+The parent retains opened memory/pids event descriptors through the worker's
+final resource fence and reads them before a failed scope can be collected, so
+nonzero status, signal/OOM, and early post-GO failures keep exact limit evidence.
 
 Before Git or build work, the script takes nonblocking `flock` authority at
 `~/.local/state/llm-guard-proxy-rebuild/lock.v1` and resolves any durable
@@ -208,6 +213,15 @@ quarantines it by atomic rename, and uses symlink-resistant FD-relative removal;
 replacement entries are preserved and keep the WAL. For an absent prior service
 link, the unchanged original runtime pathname must remain an exact, held,
 no-follow restart authority before mutation and after cleanup.
+Scratch-root deletion exchanges the exact target with a held placeholder, parks
+that placeholder in a durable reusable slot, and retains the target as its
+durable deletion record; it never resolves a validated replacement leaf through
+`rmdir`. Cleanup and recovery reuse the active write budget and held destination
+parent, including a zero-byte free-space admission before host mutation.
+All other exact-leaf retirements use one held, identity-named park under the
+cache root. Receipt, rollback, WAL, candidate, backup, temporary, and service-link
+namespaces never retain hidden parks; malformed or cross-device park state fails
+closed before the source leaf moves.
 
 Restart intent and the user-manager generation are durable before dispatch.
 Recovery cancels only a recorded job ID under that unchanged generation after
@@ -252,7 +266,8 @@ cp scripts/aeon_chat_ready.py ~/.local/bin/
 cp scripts/gb10_apply_aeon_querit_profile.sh ~/.local/bin/
 cp scripts/gb10_check_mem_available.sh ~/.local/bin/
 install -m 0755 scripts/llm_guard_proxy_cached_rebuild.sh ~/.local/bin/llm_guard_proxy_cached_rebuild.sh
-install -m 0644 scripts/llm_guard_proxy_cached_rebuild.py scripts/gb10_bounded_process.py ~/.local/bin/
+install -m 0644 scripts/llm_guard_proxy_cached_rebuild.py scripts/llm_guard_proxy_scoped_worker.py \
+  scripts/gb10_bounded_process.py ~/.local/bin/
 cp scripts/llm_guard_proxy_publish_cgroup_registration.sh ~/.local/bin/
 install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py ~/.local/bin/gb10_verify_vllm_no_swap_core.py
 install -m 0755 scripts/gb10_verify_vllm_no_swap.sh ~/.local/bin/gb10_verify_vllm_no_swap.sh

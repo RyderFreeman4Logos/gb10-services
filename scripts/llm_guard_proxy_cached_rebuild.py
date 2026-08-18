@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -10,13 +11,13 @@ import secrets
 import shlex
 import signal
 import stat
+import struct
 import sys
 import tarfile
-import tempfile
 import time
 import types
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn, cast
@@ -24,7 +25,7 @@ from typing import Any, NoReturn, cast
 __all__: list[str] = []
 
 EXPECTED_BOUNDED_PROCESS_SHA256 = (
-    "a61e09c71f55152cd15308c25f0bec84f3907b8513db582e853b25b97155f09d"
+    "248762c2fdc73fdf54914fc5a20c2292bcc90430e59523c5767409ebf0f4c230"
 )
 _SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 _BOUNDED_PROCESS_PATH = _SCRIPT_DIRECTORY / "gb10_bounded_process.py"
@@ -63,6 +64,8 @@ exec(
     _bounded_module.__dict__,
 )
 run_bounded = _bounded_module.command
+run_scoped = _bounded_module.scoped_command
+ScopePolicy = _bounded_module.ScopePolicy
 
 UNIT = "llm-guard-proxy.service"
 HEALTH_URL = "http://100.105.4.92:18009/health"
@@ -74,6 +77,45 @@ RECOVERY_SECONDS = 180.0
 STATE_MAX_BYTES = 64 * 1024
 PHASES = {"prestate", "mutated", "committed"}
 MAX_EXECUTABLE_BYTES = 128 * 1024 * 1024
+FRAME_MAGIC = b"GB10ART1"
+FRAME_HEADER_BYTES = 16 * 1024 * 1024
+FETCH_TMPFS_BYTES = 384 * 1024 * 1024
+FETCH_TMP_BYTES = 64 * 1024 * 1024
+BUILD_TARGET_TMPFS_BYTES = 6 * 1024 * 1024 * 1024
+BUILD_TMP_BYTES = 512 * 1024 * 1024
+HOST_WRITE_BUDGET_BYTES = 576 * 1024 * 1024
+HOST_FREE_FLOOR_BYTES = 8 * 1024 * 1024 * 1024
+FETCH_MEMORY_MIN_BYTES = 7 * 1024 * 1024 * 1024
+BUILD_MEMORY_MIN_BYTES = 16 * 1024 * 1024 * 1024
+SCOPE_UNIT_TOKEN = "@GB10_SCOPE_UNIT@"
+SCRATCH_MARKER = ".gb10-rebuild-scratch.v1"
+SCRATCH_DELETE_PREFIX = ".gb10-rebuild-scratch-delete.v1."
+SCRATCH_DELETE_SLOT = ".gb10-rebuild-scratch-delete-slot.v1"
+LEAF_PARK_DIRECTORY = ".gb10-host-write-leaf-park.v1"
+LEAF_PARK_SLOT = ".gb10-host-write-leaf-park-slot.v1"
+SCRATCH_DIRECT_PATTERN = re.compile(r"\.rebuild-input-([0-9a-f]{32})")
+SCRATCH_PREPUBLICATION_PATTERN = re.compile(
+    r"\.(\.rebuild-input-[0-9a-f]{32})\.publish\.[1-9][0-9]*\.[0-9a-f]{8}"
+)
+SCRATCH_TOMBSTONE_PATTERN = re.compile(
+    r"\.\.(rebuild-input-[0-9a-f]{32})\.cleanup\.[1-9][0-9]*\.[0-9a-f]{8}"
+)
+SCRATCH_DELETE_PATTERN = re.compile(
+    re.escape(SCRATCH_DELETE_PREFIX)
+    + r"([0-9a-f]{64})\.([0-9a-f]+)\.([0-9a-f]+)\.([0-9a-f]+)\.([0-9a-f]+)\.([0-9a-f]{16})"
+)
+_RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
+_LIBC_RENAMEAT2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+if _LIBC_RENAMEAT2 is not None:
+    _LIBC_RENAMEAT2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    _LIBC_RENAMEAT2.restype = ctypes.c_int
 GENERATION_FIELDS = (
     "LoadState",
     "ActiveState",
@@ -236,100 +278,17 @@ def require_secure_regular(path: Path, *, executable: bool = False) -> os.stat_r
         os.close(descriptor)
 
 
-def ensure_private_directory(path: Path) -> None:
-    existed = path.exists()
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    metadata = path.lstat()
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or stat.S_ISLNK(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-    ):
-        fail(f"unsafe private directory: {path}")
-    if stat.S_IMODE(metadata.st_mode) != 0o700:
-        path.chmod(0o700)
-        if stat.S_IMODE(path.lstat().st_mode) != 0o700:
-            fail(f"could not make directory private: {path}")
-    if not existed:
-        fsync_directory(path.parent)
-
-
-def atomic_copy(source: Path, destination: Path, mode: int) -> None:
-    ensure_private_directory(destination.parent)
-    temporary = destination.with_name(
-        f".{destination.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
-    )
-    source_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC)
-    target_fd = os.open(
-        temporary,
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | os.O_CLOEXEC
-        | getattr(os, "O_NOFOLLOW", 0),
-        mode,
-    )
-    try:
-        while True:
-            chunk = os.read(source_fd, 1024 * 1024)
-            if not chunk:
-                break
-            view = memoryview(chunk)
-            while view:
-                written = os.write(target_fd, view)
-                view = view[written:]
-        os.fchmod(target_fd, mode)
-        os.fsync(target_fd)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-    finally:
-        os.close(source_fd)
-        os.close(target_fd)
-    os.replace(temporary, destination)
-    fsync_directory(destination.parent)
-
-
-def atomic_copy_fd(source_fd: int, destination: Path, mode: int) -> None:
-    ensure_private_directory(destination.parent)
-    temporary = destination.with_name(
-        f".{destination.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
-    )
-    target_fd = os.open(
-        temporary,
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | os.O_CLOEXEC
-        | getattr(os, "O_NOFOLLOW", 0),
-        mode,
-    )
-    try:
-        offset = 0
-        while True:
-            chunk = os.pread(source_fd, 1024 * 1024, offset)
-            if not chunk:
-                break
-            offset += len(chunk)
-            view = memoryview(chunk)
-            while view:
-                written = os.write(target_fd, view)
-                view = view[written:]
-        os.fchmod(target_fd, mode)
-        os.fsync(target_fd)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-    finally:
-        os.close(target_fd)
-    os.replace(temporary, destination)
-    fsync_directory(destination.parent)
+def atomic_copy_fd(
+    source_fd: int, destination: Path, mode: int, budget: HostWriteBudget
+) -> None:
+    budget.copy_fd(source_fd, destination, mode)
 
 
 TOOL_NAMES = {
     "ar",
     "as",
     "bwrap",
+    "ca_cert",
     "cargo",
     "cc",
     "curl",
@@ -338,8 +297,15 @@ TOOL_NAMES = {
     "ionice",
     "ld",
     "nice",
+    "nsswitch",
+    "hosts",
+    "prlimit",
+    "python",
     "readelf",
+    "resolv_conf",
     "rustc",
+    "scoped_worker",
+    "systemd_run",
     "systemctl",
 }
 
@@ -518,10 +484,16 @@ def _open_file_authority(
     expected_mode: int,
     max_bytes: int,
 ) -> FileAuthority:
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
-    )
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | os.O_NONBLOCK
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as error:
+        raise RebuildError(f"unsafe {label} authority") from error
     try:
         info = os.fstat(descriptor)
         if (
@@ -677,6 +649,46 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
         "stable-x86_64-unknown-linux-gnu"
     )
     return {
+        "systemd_run": root(
+            "/usr/bin/systemd-run",
+            "20886766c7aec37baf11daba7974cba999eedec181d15ac1e269cbd122d0a2f8",
+        ),
+        "prlimit": root(
+            "/usr/bin/prlimit",
+            "663634070079386b7401ccc9fb92522ec3ece10f07f84a83fe96ec3ecb0bc74b",
+        ),
+        "python": root(
+            "/usr/bin/python3.11",
+            "6d972cf21be56fe3c947ab6ba257ff8d08c342dd2714442986791bd9a6dfabfe",
+        ),
+        "scoped_worker": ToolSpec(
+            "/home/obj/.local/bin/llm_guard_proxy_scoped_worker.py",
+            "/home/obj/.local/bin/llm_guard_proxy_scoped_worker.py",
+            1001,
+            1001,
+            0o644,
+            "a1538f69cdb2fe334fe3d8fe1bb5e67e2dcbed86da751ddb7707f8a844a0b50b",
+        ),
+        "ca_cert": root(
+            "/etc/ssl/certs/ca-certificates.crt",
+            "b543499f6fde79f360c7c9da22b74d33230563dad47cd287d8bbb50e2132418b",
+            mode=0o644,
+        ),
+        "resolv_conf": root(
+            "/etc/resolv.conf",
+            "ccc451bf09f40aa94d6ff7bc68d662473c6d5c8d815d111f9a02a12e65a814ce",
+            mode=0o644,
+        ),
+        "nsswitch": root(
+            "/etc/nsswitch.conf",
+            "cf4b86500454b477d4a15e93f28d3cda0ec4bd3649967cf5c2678a18f521993c",
+            mode=0o644,
+        ),
+        "hosts": root(
+            "/etc/hosts",
+            "ac9b3caaa1e5d78e40bef1be61989425d9aa57869ba6005472ff9c9b4ef50fc3",
+            mode=0o644,
+        ),
         "git": root(
             "/usr/bin/git",
             "2540879925a6881e3877ff7e3330746ba3027b04edf16a3a12dccd1644c4f32d",
@@ -776,11 +788,14 @@ def _load_test_authority_config(path: Path) -> dict[str, Any]:
         raise RebuildError("malformed test-only rebuild authority config") from error
     keys = {
         "schema",
+        "cgroup_root",
         "registry_cache",
         "registry_index",
         "gcc_root",
         "sysroot_lib",
         "sysroot_include",
+        "python_stdlib",
+        "test_free_bytes",
         "test_env",
         "toolchain_root",
         "tools",
@@ -799,9 +814,17 @@ def _load_test_authority_config(path: Path) -> dict[str, Any]:
         "gcc_root",
         "sysroot_lib",
         "sysroot_include",
+        "python_stdlib",
+        "cgroup_root",
     ):
         if not isinstance(parsed[key], str) or not Path(parsed[key]).is_absolute():
             fail(f"test-only authority path is invalid: {key}")
+    if (
+        not isinstance(parsed["test_free_bytes"], int)
+        or isinstance(parsed["test_free_bytes"], bool)
+        or parsed["test_free_bytes"] < 0
+    ):
+        fail("test-only free-space authority is invalid")
     if not isinstance(parsed["test_env"], dict) or any(
         not isinstance(key, str)
         or not isinstance(value, str)
@@ -841,6 +864,7 @@ if not test_only:
     guard_config = home / ".config/llm-guard-proxy/config.toml"
     guard_unit = home / ".config/systemd/user/llm-guard-proxy.service"
     proc_root = Path("/proc")
+    cgroup_root = Path("/sys/fs/cgroup")
     receipt_dir = home / ".local/state/llm-guard-proxy-rebuild"
     toolchain_root = Path(
         "/usr/local/share/mise/installs/rust/stable/toolchains/"
@@ -855,6 +879,8 @@ if not test_only:
     gcc_root = Path("/usr/lib/gcc/x86_64-linux-gnu/12")
     sysroot_lib = Path("/usr/lib/x86_64-linux-gnu")
     sysroot_include = Path("/usr/include")
+    python_stdlib = Path("/usr/lib/python3.11")
+    test_free_bytes: int | None = None
     tool_specs = _production_tool_specs()
     child_env = {
         "HOME": str(home),
@@ -896,6 +922,9 @@ else:
     gcc_root = Path(authority_config["gcc_root"])
     sysroot_lib = Path(authority_config["sysroot_lib"])
     sysroot_include = Path(authority_config["sysroot_include"])
+    python_stdlib = Path(authority_config["python_stdlib"])
+    cgroup_root = Path(authority_config["cgroup_root"])
+    test_free_bytes = cast(int, authority_config["test_free_bytes"])
     tool_specs = authority_config["tools"]
     child_env = dict(authority_config["test_env"])
     child_env.update(
@@ -1017,54 +1046,103 @@ def execute(
             tool.verify()
 
 
+def _scope_policy(phase: str) -> Any:
+    if phase == "fetch":
+        return ScopePolicy(
+            phase=phase,
+            memory_high=768 * 1024 * 1024,
+            memory_max=1024 * 1024 * 1024,
+            tasks_max=32,
+            cpu_percent=100,
+            fsize_bytes=160 * 1024 * 1024,
+            min_mem_available=FETCH_MEMORY_MIN_BYTES,
+            runtime_seconds=300,
+            proc_root=proc_root,
+            cgroup_root=cgroup_root,
+        )
+    if phase not in {"metadata", "build"}:
+        fail("unknown scoped phase")
+    return ScopePolicy(
+        phase=phase,
+        memory_high=8 * 1024 * 1024 * 1024,
+        memory_max=10 * 1024 * 1024 * 1024,
+        tasks_max=768,
+        cpu_percent=200,
+        fsize_bytes=128 * 1024 * 1024,
+        min_mem_available=BUILD_MEMORY_MIN_BYTES,
+        runtime_seconds=300 if phase == "metadata" else 1800,
+        proc_root=proc_root,
+        cgroup_root=cgroup_root,
+    )
+
+
+def _bounded_primary_error(error: BaseException) -> str:
+    line = str(error).splitlines()[0] if str(error) else type(error).__name__
+    return "".join(character if character.isprintable() else "?" for character in line)[:512]
+
+
+def execute_scoped(
+    phase: str,
+    sandbox_arguments: list[str],
+    *,
+    max_output_bytes: int,
+    pass_fds: tuple[int, ...] = (),
+) -> bytes:
+    deadline = operation_deadline
+    if deadline is None:
+        fail("scoped command invoked without a transaction deadline")
+    budget = deadline - time.monotonic()
+    if budget <= 0:
+        fail("transaction scoped-command deadline exhausted")
+    policy = _scope_policy(phase)
+    log(f"+ verified hard-containment scope phase={phase}")
+    output: bytes | None = None
+    primary_error: BaseException | None = None
+    try:
+        output = run_scoped(
+            sandbox_arguments,
+            policy,
+            systemd_run=require_tool("systemd_run"),
+            systemctl=require_tool("systemctl"),
+            nice=require_tool("nice"),
+            ionice=require_tool("ionice"),
+            prlimit=require_tool("prlimit"),
+            timeout=budget,
+            deadline=deadline,
+            env=child_env,
+            pass_fds=tuple(sorted(set(_tool_fds() + pass_fds))),
+            max_output_bytes=max_output_bytes,
+            cleanup_reserve=min(8.0, max(2.0, budget / 2)),
+        )
+    except BaseException as error:
+        primary_error = error
+    tool_error: BaseException | None = None
+    try:
+        _verify_all_tools()
+    except BaseException as error:
+        tool_error = error
+    if primary_error is not None:
+        primary_reason = (
+            f"hard-contained phase failed: {phase}; "
+            f"reason={_bounded_primary_error(primary_error)}"
+        )
+        if tool_error is not None:
+            raise RebuildError(
+                f"{primary_reason}; tool verification="
+                f"{_bounded_primary_error(tool_error)}"
+            ) from primary_error
+        if isinstance(primary_error, RuntimeError):
+            raise RebuildError(primary_reason) from primary_error
+        raise primary_error
+    if tool_error is not None:
+        raise tool_error
+    if output is None:
+        fail("hard-contained phase returned no output")
+    return output
+
+
 def capture_tool(name: str, *arguments: str) -> bytes:
     return execute([require_tool(name), *arguments], capture=True)
-
-
-def _git_environment(exec_directory_fd: int | None = None) -> dict[str, str]:
-    environment = {
-        "HOME": "/nonexistent",
-        "XDG_CONFIG_HOME": "/nonexistent",
-        "PATH": "/usr/bin:/bin",
-        "LC_ALL": "C",
-        "LANG": "C",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_CONFIG_SYSTEM": "/dev/null",
-        "GIT_CONFIG_COUNT": "0",
-        "GIT_ALLOW_PROTOCOL": fetch_protocol,
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_ASKPASS": "/bin/false",
-        "SSH_ASKPASS": "/bin/false",
-        "GIT_NO_LAZY_FETCH": "1",
-    }
-    if exec_directory_fd is not None:
-        environment["GIT_EXEC_PATH"] = f"/proc/self/fd/{exec_directory_fd}"
-    return environment
-
-
-def _git_options() -> list[str]:
-    options = [
-        "-c",
-        "include.path=/dev/null",
-        "-c",
-        "credential.helper=",
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "protocol.allow=never",
-        "-c",
-        f"protocol.{fetch_protocol}.allow=always",
-        "-c",
-        "fetch.fsckObjects=true",
-        "-c",
-        "transfer.fsckObjects=true",
-        "-c",
-        "receive.fsckObjects=true",
-        "-c",
-        "fetch.writeCommitGraph=false",
-    ]
-    return options
 
 
 @dataclass(frozen=True)
@@ -1176,7 +1254,18 @@ def _directory_ledger(root_fd: int, label: str) -> DirectoryLedger:
             if stat.S_ISLNK(info.st_mode):
                 target = os.readlink(name, dir_fd=directory_fd)
                 parts = PurePosixPath(target).parts
-                if target.startswith("/") or ".." in parts:
+                authorized_external = label == "sandbox Python standard library" and (
+                    (
+                        relative == "sitecustomize.py"
+                        and target == "/etc/python3.11/sitecustomize.py"
+                    )
+                    or (
+                        relative
+                        == "config-3.11-x86_64-linux-gnu/libpython3.11.so"
+                        and target == "../../x86_64-linux-gnu/libpython3.11.so.1"
+                    )
+                )
+                if (target.startswith("/") or ".." in parts) and not authorized_external:
                     fail(f"unsafe symlink in directory authority: {label}")
                 content.update(f"L\0{relative}\0{mode:o}\0{target}\n".encode())
                 continue
@@ -1277,145 +1366,956 @@ def _read_fd_limited(descriptor: int, limit: int, label: str) -> bytes:
             fail(f"{label} exceeded byte bound")
 
 
-def _validate_raw_git_config(repo_fd: int) -> tuple[int, tuple[int, ...], str]:
-    config_fd = os.open(
-        "config",
-        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-        dir_fd=repo_fd,
-    )
-    info = os.fstat(config_fd)
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o022:
-        os.close(config_fd)
-        fail("private Git config metadata is unsafe")
-    payload = _read_fd_limited(config_fd, 64 * 1024, "private Git config")
-    try:
-        lines = payload.decode("utf-8", errors="strict").splitlines()
-    except UnicodeDecodeError as error:
-        os.close(config_fd)
-        raise RebuildError("private Git config is not UTF-8") from error
-    section = ""
-    values: dict[tuple[str, str], str] = {}
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith(("#", ";")):
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            section = line[1:-1].strip().lower()
-            if section != "core":
-                os.close(config_fd)
-                fail("private Git config section differs")
-            continue
-        if "=" not in line or section != "core":
-            os.close(config_fd)
-            fail("private Git config syntax differs")
-        key, value = (part.strip().lower() for part in line.split("=", 1))
-        pair = (section, key)
-        if pair in values:
-            os.close(config_fd)
-            fail("private Git config has duplicate keys")
-        values[pair] = value
-    expected = {
-        ("core", "repositoryformatversion"): "0",
-        ("core", "filemode"): "true",
-        ("core", "bare"): "true",
-    }
-    if values != expected:
-        os.close(config_fd)
-        fail("private Git config allowlist differs")
-    fields = (
-        info.st_dev,
-        info.st_ino,
-        info.st_size,
-        info.st_mtime_ns,
-        info.st_ctime_ns,
-    )
-    return config_fd, fields, sha256_bytes(payload)
+@dataclass(frozen=True)
+class _LeafAuthority:
+    device: int
+    inode: int
+    kind: int
+    uid: int
+    nlink: int
+    mode: int
 
 
-def _verify_git_config(
-    repo_fd: int, config_fd: int, fields: tuple[int, ...], digest: str
+def _leaf_authority(metadata: os.stat_result) -> _LeafAuthority:
+    return _LeafAuthority(
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_nlink,
+        stat.S_IMODE(metadata.st_mode),
+    )
+
+
+def _leaf_matches(
+    authority: _LeafAuthority, expected: _LeafAuthority | tuple[int, int]
+) -> bool:
+    return authority == expected if isinstance(expected, _LeafAuthority) else (
+        authority.device,
+        authority.inode,
+    ) == expected
+
+
+def _open_leaf_at(parent_fd: int, name: str) -> tuple[int, os.stat_result]:
+    if not name or Path(name).name != name:
+        fail("host write leaf name is unsafe")
+    descriptor = os.open(
+        name,
+        os.O_PATH | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    return descriptor, os.fstat(descriptor)
+
+
+def _renameat2_between(
+    source_parent_fd: int,
+    source: str,
+    destination_parent_fd: int,
+    destination: str,
+    flags: int,
 ) -> None:
-    held = os.fstat(config_fd)
-    current = os.stat("config", dir_fd=repo_fd, follow_symlinks=False)
-    held_fields = (
-        held.st_dev,
-        held.st_ino,
-        held.st_size,
-        held.st_mtime_ns,
-        held.st_ctime_ns,
+    if _LIBC_RENAMEAT2 is None:
+        fail("scratch exact-leaf rename is unavailable")
+    result = _LIBC_RENAMEAT2(
+        source_parent_fd,
+        os.fsencode(source),
+        destination_parent_fd,
+        os.fsencode(destination),
+        flags,
     )
-    current_fields = (
-        current.st_dev,
-        current.st_ino,
-        current.st_size,
-        current.st_mtime_ns,
-        current.st_ctime_ns,
-    )
-    if (
-        held_fields != fields
-        or current_fields != fields
-        or _sha256_fd(config_fd) != digest
-    ):
-        fail("private Git config changed")
+    if result == 0:
+        return
+    number = ctypes.get_errno()
+    error = OSError(number, os.strerror(number))
+    if number in {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP}:
+        raise RebuildError("scratch exact-leaf rename is unavailable") from error
+    raise RebuildError(
+        f"scratch exact-leaf rename failed: {source!r} -> {destination!r}"
+    ) from error
 
 
-def _parse_tree(payload: bytes) -> list[TreeEntry]:
-    records = payload.split(b"\0")
-    if records and records[-1] == b"":
-        records.pop()
-    if not records or len(records) > 8192:
-        fail("canonical source file-count bound differs")
-    entries: list[TreeEntry] = []
-    total = 0
-    seen: set[str] = set()
-    for record in records:
-        try:
-            header, raw_path = record.split(b"\t", 1)
-            mode_text, kind, oid, size_text = header.split(b" ", 3)
-            size_text = size_text.strip()
-            path = raw_path.decode("utf-8", errors="strict")
-        except (ValueError, UnicodeDecodeError) as error:
-            raise RebuildError("canonical Git tree record is malformed") from error
-        if kind != b"blob" or mode_text not in {b"100644", b"100755"}:
-            fail("canonical Git tree contains symlink, gitlink, or special entry")
-        relative = PurePosixPath(path)
-        if (
-            not path
-            or path.startswith("/")
-            or ".." in relative.parts
-            or "." in relative.parts
-            or path in seen
-            or not re.fullmatch(rb"[0-9a-f]{40}", oid)
-            or not size_text.isdigit()
-        ):
-            fail("canonical Git tree path or identity is unsafe")
-        seen.add(path)
-        forbidden = (
-            path in {".gitmodules", ".gitattributes"}
-            or path.endswith(
-                (
-                    "/.gitmodules",
-                    "/.gitattributes",
-                    "/.cargo/config",
-                    "/.cargo/config.toml",
-                )
+def _renameat2(parent_fd: int, source: str, destination: str, flags: int) -> None:
+    _renameat2_between(parent_fd, source, parent_fd, destination, flags)
+
+
+def _rename_exchange_between(
+    source_parent_fd: int,
+    source: str,
+    destination_parent_fd: int,
+    destination: str,
+) -> None:
+    _renameat2_between(
+        source_parent_fd,
+        source,
+        destination_parent_fd,
+        destination,
+        _RENAME_EXCHANGE,
+    )
+
+
+def _rename_noreplace_between(
+    source_parent_fd: int,
+    source: str,
+    destination_parent_fd: int,
+    destination: str,
+) -> None:
+    _renameat2_between(
+        source_parent_fd,
+        source,
+        destination_parent_fd,
+        destination,
+        _RENAME_NOREPLACE,
+    )
+
+
+def _rename_exchange(parent_fd: int, source: str, destination: str) -> None:
+    _rename_exchange_between(parent_fd, source, parent_fd, destination)
+
+
+def _rename_noreplace(parent_fd: int, source: str, destination: str) -> None:
+    _rename_noreplace_between(parent_fd, source, parent_fd, destination)
+
+
+@dataclass
+class HostWriteBudget:
+    root: Path
+    used: int = 0
+    used_by_device: dict[int, int] = field(default_factory=dict)
+    _directories: dict[Path, int] = field(default_factory=dict, init=False, repr=False)
+
+    @staticmethod
+    def _absolute(path: Path) -> Path:
+        normalized = Path(os.path.normpath(path))
+        if not normalized.is_absolute() or ".." in normalized.parts:
+            fail("host write destination is not an exact absolute path")
+        return normalized
+
+    def _admit_fd(self, directory_fd: int, amount: int) -> None:
+        if amount < 0 or self.used + amount > HOST_WRITE_BUDGET_BYTES:
+            fail("host write budget exceeded")
+        metadata = os.fstat(directory_fd)
+        if not stat.S_ISDIR(metadata.st_mode):
+            fail("host write destination is not a directory")
+        device_used = self.used_by_device.get(metadata.st_dev, 0)
+        if test_free_bytes is None:
+            filesystem = os.fstatvfs(directory_fd)
+            available = filesystem.f_bavail * filesystem.f_frsize
+        else:
+            available = max(0, test_free_bytes - device_used)
+        if available - amount < HOST_FREE_FLOOR_BYTES:
+            fail("host free-space admission failed")
+        self.used += amount
+        self.used_by_device[metadata.st_dev] = device_used + amount
+
+    def _open_directory(self, path: Path, *, create: bool) -> int:
+        path = self._absolute(path)
+        cached = self._directories.get(path)
+        if cached is not None:
+            if not stat.S_ISDIR(os.fstat(cached).st_mode):
+                fail("held host write directory changed type")
+            return cached
+        ancestors = [
+            candidate
+            for candidate in self._directories
+            if candidate == path or candidate in path.parents
+        ]
+        if ancestors:
+            current_path = max(ancestors, key=lambda candidate: len(candidate.parts))
+            current_fd = self._directories[current_path]
+        else:
+            current_path = Path("/")
+            current_fd = os.open(
+                "/",
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_CLOEXEC
+                | getattr(os, "O_NOFOLLOW", 0),
             )
-            or path in {".cargo/config", ".cargo/config.toml"}
+            self._directories[current_path] = current_fd
+        for part in path.relative_to(current_path).parts:
+            try:
+                child_fd = os.open(
+                    part,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_CLOEXEC
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=current_fd,
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise
+                self._admit_fd(current_fd, 0)
+                os.mkdir(part, 0o700, dir_fd=current_fd)
+                os.fsync(current_fd)
+                child_fd = os.open(
+                    part,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_CLOEXEC
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=current_fd,
+                )
+            metadata = os.fstat(child_fd)
+            if not stat.S_ISDIR(metadata.st_mode):
+                os.close(child_fd)
+                fail("host write path crossed a non-directory")
+            current_path /= part
+            self._directories[current_path] = child_fd
+            current_fd = child_fd
+        return current_fd
+
+    def _safe_parent(self, path: Path, *, create: bool) -> int:
+        directory_fd = self._open_directory(path, create=create)
+        metadata = os.fstat(directory_fd)
+        if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022:
+            fail("host write parent authority is unsafe")
+        return directory_fd
+
+    def reserve(self, path: Path, amount: int) -> int:
+        path = self._absolute(path)
+        try:
+            metadata = os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            directory = path.parent
+        else:
+            directory = path if stat.S_ISDIR(metadata.st_mode) else path.parent
+        try:
+            directory_fd = self._safe_parent(directory, create=False)
+        except FileNotFoundError:
+            ancestor = directory
+            while True:
+                ancestor = ancestor.parent
+                try:
+                    directory_fd = self._safe_parent(ancestor, create=False)
+                    break
+                except FileNotFoundError:
+                    if ancestor == ancestor.parent:
+                        raise
+        self._admit_fd(directory_fd, amount)
+        return directory_fd
+
+    def _parent_for_write(self, path: Path, amount: int) -> int:
+        path = self._absolute(path)
+        try:
+            directory_fd = self._safe_parent(path.parent, create=False)
+        except FileNotFoundError:
+            self.reserve(path, amount)
+            return self._safe_parent(path.parent, create=True)
+        self._admit_fd(directory_fd, amount)
+        return directory_fd
+
+    def ensure_private_directory(self, path: Path) -> int:
+        directory_fd = self._open_directory(path, create=True)
+        metadata = os.fstat(directory_fd)
+        if metadata.st_uid != os.geteuid():
+            fail("private host write directory has unsafe owner")
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
+            self._admit_fd(directory_fd, 0)
+            os.fchmod(directory_fd, 0o700)
+            os.fsync(directory_fd)
+        return directory_fd
+
+    def ensure_write_directory(self, path: Path) -> int:
+        return self._safe_parent(path, create=True)
+
+    def held_directory(self, path: Path) -> int:
+        directory_fd = self._safe_parent(path, create=False)
+        self._admit_fd(directory_fd, 0)
+        return directory_fd
+
+    def move_leaf(
+        self,
+        source_parent_fd: int,
+        source_name: str,
+        destination_parent_fd: int,
+        destination_name: str,
+        *,
+        expected: _LeafAuthority | tuple[int, int] | None = None,
+    ) -> _LeafAuthority:
+        source_fd, source = _open_leaf_at(source_parent_fd, source_name)
+        try:
+            authority = _leaf_authority(source)
+            if expected is not None and not _leaf_matches(authority, expected):
+                fail("host write source leaf authority differs")
+            _test_boundary("host-leaf-move-validated")
+            self._admit_fd(source_parent_fd, 0)
+            self._admit_fd(destination_parent_fd, 0)
+            if source_parent_fd == destination_parent_fd:
+                _rename_noreplace(
+                    source_parent_fd, source_name, destination_name
+                )
+            else:
+                _rename_noreplace_between(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                )
+            moved = True
+            try:
+                destination_fd, destination = _open_leaf_at(
+                    destination_parent_fd, destination_name
+                )
+                try:
+                    if _leaf_authority(destination) != authority:
+                        fail("host write source replacement was preserved")
+                finally:
+                    os.close(destination_fd)
+                try:
+                    os.stat(
+                        source_name,
+                        dir_fd=source_parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    fail("host write source name was repopulated during move")
+            except BaseException as error:
+                if moved:
+                    try:
+                        self._admit_fd(destination_parent_fd, 0)
+                        self._admit_fd(source_parent_fd, 0)
+                        if source_parent_fd == destination_parent_fd:
+                            _rename_noreplace(
+                                source_parent_fd, destination_name, source_name
+                            )
+                        else:
+                            _rename_noreplace_between(
+                                destination_parent_fd,
+                                destination_name,
+                                source_parent_fd,
+                                source_name,
+                            )
+                        os.fsync(destination_parent_fd)
+                        if source_parent_fd != destination_parent_fd:
+                            os.fsync(source_parent_fd)
+                    except BaseException as restore_error:
+                        raise RebuildError(
+                            "host write source replacement retained both leaves"
+                        ) from restore_error
+                raise RebuildError(
+                    "host write source replacement was preserved"
+                ) from error
+            os.fsync(source_parent_fd)
+            if destination_parent_fd != source_parent_fd:
+                os.fsync(destination_parent_fd)
+            return authority
+        finally:
+            os.close(source_fd)
+
+    def exchange_leaves(
+        self,
+        left_parent_fd: int,
+        left_name: str,
+        right_parent_fd: int,
+        right_name: str,
+        *,
+        expected_left: _LeafAuthority | tuple[int, int] | None = None,
+        expected_right: _LeafAuthority | tuple[int, int] | None = None,
+    ) -> tuple[_LeafAuthority, _LeafAuthority]:
+        left_fd, left = _open_leaf_at(left_parent_fd, left_name)
+        right_fd = -1
+        try:
+            right_fd, right = _open_leaf_at(right_parent_fd, right_name)
+            left_authority = _leaf_authority(left)
+            right_authority = _leaf_authority(right)
+            if expected_left is not None and not _leaf_matches(
+                left_authority, expected_left
+            ):
+                fail("host write exchange left authority differs")
+            if expected_right is not None and not _leaf_matches(
+                right_authority, expected_right
+            ):
+                fail("host write exchange right authority differs")
+            _test_boundary("host-leaf-exchange-validated")
+            self._admit_fd(left_parent_fd, 0)
+            self._admit_fd(right_parent_fd, 0)
+            if left_parent_fd == right_parent_fd:
+                _rename_exchange(left_parent_fd, left_name, right_name)
+            else:
+                _rename_exchange_between(
+                    left_parent_fd, left_name, right_parent_fd, right_name
+                )
+            post_left_fd = -1
+            post_right_fd = -1
+            try:
+                post_left_fd, post_left = _open_leaf_at(left_parent_fd, left_name)
+                post_right_fd, post_right = _open_leaf_at(right_parent_fd, right_name)
+                if (
+                    _leaf_authority(post_left) != right_authority
+                    or _leaf_authority(post_right) != left_authority
+                ):
+                    fail("host write exchange replacement was preserved")
+            except BaseException as error:
+                try:
+                    self._admit_fd(left_parent_fd, 0)
+                    self._admit_fd(right_parent_fd, 0)
+                    if left_parent_fd == right_parent_fd:
+                        _rename_exchange(left_parent_fd, left_name, right_name)
+                    else:
+                        _rename_exchange_between(
+                            left_parent_fd, left_name, right_parent_fd, right_name
+                        )
+                    os.fsync(left_parent_fd)
+                    if right_parent_fd != left_parent_fd:
+                        os.fsync(right_parent_fd)
+                except BaseException as restore_error:
+                    raise RebuildError(
+                        "host write exchange replacement retained both leaves"
+                    ) from restore_error
+                raise RebuildError(
+                    "host write exchange replacement was preserved"
+                ) from error
+            finally:
+                if post_right_fd >= 0:
+                    os.close(post_right_fd)
+                if post_left_fd >= 0:
+                    os.close(post_left_fd)
+            os.fsync(left_parent_fd)
+            if right_parent_fd != left_parent_fd:
+                os.fsync(right_parent_fd)
+            return left_authority, right_authority
+        finally:
+            if right_fd >= 0:
+                os.close(right_fd)
+            os.close(left_fd)
+
+    def park_leaf(
+        self,
+        source_parent_fd: int,
+        source_name: str,
+        *,
+        expected: _LeafAuthority | tuple[int, int] | None = None,
+    ) -> str:
+        source_fd, metadata = _open_leaf_at(source_parent_fd, source_name)
+        try:
+            authority = _leaf_authority(metadata)
+            if expected is not None and not _leaf_matches(authority, expected):
+                fail("host write parked leaf authority differs")
+        finally:
+            os.close(source_fd)
+        self._admit_fd(source_parent_fd, 0)
+        park_parent_fd = self.ensure_private_directory(self.root)
+        park_fd, park_name, park_authority = self._leaf_park_fd(park_parent_fd)
+        parent = os.fstat(source_parent_fd)
+        token = sha256_bytes(
+            (
+                f"{parent.st_dev:x}:{parent.st_ino:x}:{source_name}:"
+                f"{authority.device:x}:{authority.inode:x}"
+            ).encode("utf-8", errors="strict")
         )
-        if forbidden:
-            fail(f"canonical Git tree contains forbidden build control: {path}")
-        size = int(size_text)
+        parked_name = (
+            f"leaf.{token}.{authority.device:x}.{authority.inode:x}."
+            f"{secrets.token_hex(8)}"
+        )
+        try:
+            if os.fstat(park_fd).st_dev != authority.device:
+                fail("host write leaf park crosses filesystem authority")
+            self.move_leaf(
+                source_parent_fd,
+                source_name,
+                park_fd,
+                parked_name,
+                expected=authority,
+            )
+            try:
+                current = os.stat(
+                    park_name, dir_fd=park_parent_fd, follow_symlinks=False
+                )
+                if _leaf_authority(current) != park_authority:
+                    fail("host write leaf park identity changed")
+            except BaseException as error:
+                try:
+                    self.move_leaf(
+                        park_fd,
+                        parked_name,
+                        source_parent_fd,
+                        source_name,
+                        expected=authority,
+                    )
+                except BaseException as restore_error:
+                    raise RebuildError(
+                        "host write leaf retained its identity-bound park"
+                    ) from restore_error
+                raise RebuildError("host write leaf park was rolled back") from error
+        finally:
+            os.close(park_fd)
+        return parked_name
+
+    def _leaf_park_fd(
+        self, parent_fd: int
+    ) -> tuple[int, str, _LeafAuthority]:
+        entries = _directory_entries(parent_fd)
+        final_names = [
+            entry.name
+            for entry in entries
+            if entry.name.startswith(f"{LEAF_PARK_DIRECTORY}.")
+        ]
+        slot_names = [entry.name for entry in entries if entry.name == LEAF_PARK_SLOT]
+        if len(final_names) > 1 or len(slot_names) > 1 or final_names and slot_names:
+            fail("host write leaf park inventory is ambiguous")
+        if not final_names:
+            if slot_names:
+                slot_fd = os.open(
+                    LEAF_PARK_SLOT,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_CLOEXEC
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_fd,
+                )
+                try:
+                    slot = os.fstat(slot_fd)
+                    if (
+                        slot.st_uid != os.geteuid()
+                        or stat.S_IMODE(slot.st_mode) != 0o700
+                        or _directory_entries(slot_fd)
+                    ):
+                        fail("host write leaf park slot authority differs")
+                    identity = (slot.st_dev, slot.st_ino)
+                finally:
+                    os.close(slot_fd)
+            else:
+                identity = self.mkdir_at(parent_fd, LEAF_PARK_SLOT)
+            final_name = (
+                f"{LEAF_PARK_DIRECTORY}.{identity[0]:x}.{identity[1]:x}"
+            )
+            self.move_leaf(
+                parent_fd,
+                LEAF_PARK_SLOT,
+                parent_fd,
+                final_name,
+                expected=identity,
+            )
+        else:
+            final_name = final_names[0]
+        match = re.fullmatch(
+            rf"{re.escape(LEAF_PARK_DIRECTORY)}\.([0-9a-f]+)\.([0-9a-f]+)",
+            final_name,
+        )
+        if match is None:
+            fail("host write leaf park name is malformed")
+        park_fd = os.open(
+            final_name,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            metadata = os.fstat(park_fd)
+            authority = _leaf_authority(metadata)
+            if (
+                metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+                or authority.device != int(match.group(1), 16)
+                or authority.inode != int(match.group(2), 16)
+            ):
+                fail("host write leaf park authority differs")
+            parked_pattern = re.compile(
+                r"leaf\.[0-9a-f]{64}\.([0-9a-f]+)\.([0-9a-f]+)\."
+                r"[0-9a-f]{16}"
+            )
+            for entry in _directory_entries(park_fd):
+                parked = parked_pattern.fullmatch(entry.name)
+                if parked is None:
+                    fail("host write leaf park contains an unknown entry")
+                leaf = entry.stat(follow_symlinks=False)
+                if (leaf.st_dev, leaf.st_ino) != (
+                    int(parked.group(1), 16),
+                    int(parked.group(2), 16),
+                ):
+                    fail("host write parked leaf identity differs")
+            return park_fd, final_name, authority
+        except BaseException:
+            os.close(park_fd)
+            raise
+
+    def mkdir_at(self, parent_fd: int, name: str) -> tuple[int, int]:
+        if not name or Path(name).name != name:
+            fail("host write directory name is unsafe")
+        self._admit_fd(parent_fd, 0)
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+        directory_fd = os.open(
+            name,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            metadata = os.fstat(directory_fd)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                fail("created host write directory authority differs")
+            os.fsync(directory_fd)
+            os.fsync(parent_fd)
+            return metadata.st_dev, metadata.st_ino
+        finally:
+            os.close(directory_fd)
+
+    def mkdir(self, path: Path) -> tuple[int, int]:
+        path = self._absolute(path)
+        parent_fd = self._parent_for_write(path, 0)
+        os.mkdir(path.name, 0o700, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        directory_fd = os.open(
+            path.name,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        self._directories[path] = directory_fd
+        metadata = os.fstat(directory_fd)
+        return metadata.st_dev, metadata.st_ino
+
+    def write_new(self, path: Path, payload: bytes, mode: int) -> None:
+        path = self._absolute(path)
+        parent_fd = self._parent_for_write(path, len(payload))
+        self._admit_fd(parent_fd, 0)
+        descriptor = os.open(
+            path.name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+            mode,
+            dir_fd=parent_fd,
+        )
+        try:
+            view = memoryview(payload)
+            while view:
+                view = view[os.write(descriptor, view) :]
+            os.fchmod(descriptor, mode)
+            os.fsync(descriptor)
+        except BaseException:
+            try:
+                self.park_leaf(
+                    parent_fd,
+                    path.name,
+                    expected=_leaf_authority(os.fstat(descriptor)),
+                )
+            except FileNotFoundError:
+                pass
+            raise
+        finally:
+            os.close(descriptor)
+
+    def copy_fd(self, source_fd: int, destination: Path, mode: int) -> None:
+        destination = self._absolute(destination)
+        parent_fd = self._parent_for_write(destination, os.fstat(source_fd).st_size)
+        temporary = f".{destination.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+        self._admit_fd(parent_fd, 0)
+        target_fd = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+            mode,
+            dir_fd=parent_fd,
+        )
+        try:
+            offset = 0
+            while True:
+                chunk = os.pread(source_fd, 1024 * 1024, offset)
+                if not chunk:
+                    break
+                offset += len(chunk)
+                view = memoryview(chunk)
+                while view:
+                    view = view[os.write(target_fd, view) :]
+            os.fchmod(target_fd, mode)
+            os.fsync(target_fd)
+            self.rename(
+                destination.parent / temporary,
+                destination,
+            )
+        except BaseException:
+            try:
+                self.park_leaf(
+                    parent_fd,
+                    temporary,
+                    expected=_leaf_authority(os.fstat(target_fd)),
+                )
+            except FileNotFoundError:
+                pass
+            raise
+        finally:
+            os.close(target_fd)
+
+    def rename(self, source: Path, destination: Path, *, replace: bool = False) -> None:
+        source = self._absolute(source)
+        destination = self._absolute(destination)
+        source_parent = self._safe_parent(source.parent, create=False)
+        destination_parent = self._parent_for_write(destination, 0)
+        source_fd, source_metadata = _open_leaf_at(source_parent, source.name)
+        try:
+            source_authority = _leaf_authority(source_metadata)
+        finally:
+            os.close(source_fd)
+        try:
+            destination_fd, destination_metadata = _open_leaf_at(
+                destination_parent, destination.name
+            )
+        except FileNotFoundError:
+            self.move_leaf(
+                source_parent,
+                source.name,
+                destination_parent,
+                destination.name,
+                expected=source_authority,
+            )
+        else:
+            try:
+                destination_authority = _leaf_authority(destination_metadata)
+            finally:
+                os.close(destination_fd)
+            if not replace:
+                fail("host write destination already exists")
+            self.exchange_leaves(
+                source_parent,
+                source.name,
+                destination_parent,
+                destination.name,
+                expected_left=source_authority,
+                expected_right=destination_authority,
+            )
+            try:
+                self.park_leaf(
+                    source_parent,
+                    source.name,
+                    expected=destination_authority,
+                )
+            except BaseException as error:
+                try:
+                    self.exchange_leaves(
+                        source_parent,
+                        source.name,
+                        destination_parent,
+                        destination.name,
+                        expected_left=destination_authority,
+                        expected_right=source_authority,
+                    )
+                except BaseException as restore_error:
+                    raise RebuildError(
+                        "host write replacement retained its durable park"
+                    ) from restore_error
+                raise RebuildError("host write replacement was rolled back") from error
+        for key in list(self._directories):
+            if key in {source, destination} or source in key.parents or destination in key.parents:
+                os.close(self._directories.pop(key))
+
+    def replace_symlink(self, destination: Path, target: str) -> None:
+        destination = self._absolute(destination)
+        parent_fd = self._parent_for_write(destination, len(target.encode()))
+        temporary = f".{destination.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+        self._admit_fd(parent_fd, 0)
+        os.symlink(target, temporary, dir_fd=parent_fd)
+        try:
+            self.rename(
+                destination.parent / temporary,
+                destination,
+                replace=True,
+            )
+        finally:
+            try:
+                self.unlink(
+                    destination.parent / temporary,
+                    missing_ok=True,
+                    symlink_only=True,
+                )
+            except FileNotFoundError:
+                pass
+
+    def unlink(
+        self,
+        path: Path,
+        *,
+        missing_ok: bool = False,
+        symlink_only: bool = False,
+        regular_mode: int | None = None,
+    ) -> None:
+        path = self._absolute(path)
+        parent_fd = self._parent_for_write(path, 0)
+        try:
+            descriptor, metadata = _open_leaf_at(parent_fd, path.name)
+        except FileNotFoundError:
+            if not missing_ok:
+                raise
+            return
+        try:
+            if symlink_only and not stat.S_ISLNK(metadata.st_mode):
+                fail("host write unlink authority changed type")
+            if regular_mode is not None and (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != regular_mode
+            ):
+                fail("host write unlink regular-file authority changed")
+            authority = _leaf_authority(metadata)
+        finally:
+            os.close(descriptor)
+        self.park_leaf(parent_fd, path.name, expected=authority)
+
+    def chmod(self, path: Path, mode: int, *, directory: bool = False) -> None:
+        path = self._absolute(path)
+        if directory:
+            descriptor = self._open_directory(path, create=False)
+            parent_fd = self._safe_parent(path.parent, create=False)
+            close_descriptor = False
+        else:
+            parent_fd = self._safe_parent(path.parent, create=False)
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            close_descriptor = True
+        self._admit_fd(parent_fd, 0)
+        try:
+            metadata = os.fstat(descriptor)
+            if metadata.st_uid != os.geteuid() or (
+                directory != stat.S_ISDIR(metadata.st_mode)
+            ):
+                fail("host write chmod authority is unsafe")
+            os.fchmod(descriptor, mode)
+            os.fsync(descriptor)
+            os.fsync(parent_fd)
+        finally:
+            if close_descriptor:
+                os.close(descriptor)
+
+    def close(self) -> None:
+        for descriptor in set(self._directories.values()):
+            os.close(descriptor)
+        self._directories.clear()
+
+
+def _decode_frame(
+    frame: bytes,
+    kind: str,
+    maximum_payload: int,
+) -> tuple[dict[str, Any], bytes]:
+    if len(frame) < 12 or frame[:8] != FRAME_MAGIC:
+        fail("scoped artifact frame is malformed")
+    header_size = struct.unpack(">I", frame[8:12])[0]
+    if header_size <= 0 or header_size > FRAME_HEADER_BYTES or len(frame) < 12 + header_size:
+        fail("scoped artifact frame header is malformed")
+    encoded = frame[12 : 12 + header_size]
+    try:
+        header = json.loads(encoded, object_pairs_hook=_reject_duplicate_json)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RebuildError("scoped artifact frame header is malformed") from error
+    if (
+        not isinstance(header, dict)
+        or json.dumps(
+            header, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("ascii")
+        != encoded
+        or header.get("schema") != 1
+        or header.get("kind") != kind
+        or not isinstance(header.get("payload_size"), int)
+        or isinstance(header.get("payload_size"), bool)
+        or not 0 <= header["payload_size"] <= maximum_payload
+    ):
+        fail("scoped artifact frame header differs")
+    payload = frame[12 + header_size :]
+    if len(payload) != header["payload_size"]:
+        fail("scoped artifact frame length differs")
+    return cast(dict[str, Any], header), payload
+
+
+def _entries_from_header(header: dict[str, Any]) -> list[TreeEntry]:
+    expected_keys = {
+        "archive_sha256",
+        "byte_count",
+        "commit",
+        "entries",
+        "file_count",
+        "git_config_sha256",
+        "kind",
+        "payload_size",
+        "schema",
+        "tree",
+    }
+    if set(header) != expected_keys:
+        fail("fetch frame authority set differs")
+    for name, width in (
+        ("commit", 40),
+        ("tree", 40),
+        ("archive_sha256", 64),
+        ("git_config_sha256", 64),
+    ):
+        if not isinstance(header[name], str) or re.fullmatch(
+            rf"[0-9a-f]{{{width}}}", header[name]
+        ) is None:
+            fail("fetch frame identity is malformed")
+    raw_entries = header["entries"]
+    if not isinstance(raw_entries, list) or not 0 < len(raw_entries) <= 8192:
+        fail("fetch frame inventory is malformed")
+    entries: list[TreeEntry] = []
+    seen: set[str] = set()
+    total = 0
+    for raw in raw_entries:
+        if not isinstance(raw, dict) or set(raw) != {"mode", "oid", "path", "size"}:
+            fail("fetch frame entry is malformed")
+        path = raw["path"]
+        mode = raw["mode"]
+        oid = raw["oid"]
+        size = raw["size"]
+        if (
+            not isinstance(path, str)
+            or not path
+            or path.startswith("/")
+            or path in seen
+            or ".." in PurePosixPath(path).parts
+            or "." in PurePosixPath(path).parts
+            or mode not in {0o100644, 0o100755}
+            or not isinstance(oid, str)
+            or re.fullmatch(r"[0-9a-f]{40}", oid) is None
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or not 0 <= size <= 16 * 1024 * 1024
+        ):
+            fail("fetch frame entry authority differs")
+        if path in {".gitmodules", ".gitattributes", ".cargo/config", ".cargo/config.toml"} or path.endswith(
+            ("/.gitmodules", "/.gitattributes", "/.cargo/config", "/.cargo/config.toml")
+        ):
+            fail("fetch frame contains forbidden build control")
+        seen.add(path)
         total += size
-        if size > 16 * 1024 * 1024 or total > 128 * 1024 * 1024:
-            fail("canonical source byte bound exceeded")
-        entries.append(TreeEntry(path, int(mode_text, 8), oid.decode(), size))
-    if "Cargo.toml" not in seen or "Cargo.lock" not in seen:
-        fail("canonical source lacks Cargo.toml or Cargo.lock")
+        if total > 128 * 1024 * 1024:
+            fail("fetch frame source byte bound exceeded")
+        entries.append(TreeEntry(path, mode, oid, size))
+    if (
+        "Cargo.toml" not in seen
+        or "Cargo.lock" not in seen
+        or header["file_count"] != len(entries)
+        or header["byte_count"] != total
+    ):
+        fail("fetch frame inventory differs")
     return entries
 
 
 def _extract_archive(
-    archive_path: Path, source_path: Path, commit: str, entries: list[TreeEntry]
+    archive_path: Path,
+    source_path: Path,
+    commit: str,
+    entries: list[TreeEntry],
+    budget: HostWriteBudget,
 ) -> str:
     expected = {entry.path: entry for entry in entries}
     seen: set[str] = set()
@@ -1431,7 +2331,7 @@ def _extract_archive(
                 relative = PurePosixPath(name)
                 if name.startswith("/") or ".." in relative.parts:
                     fail("source archive directory is unsafe")
-                (source_path / relative).mkdir(parents=True, exist_ok=True, mode=0o700)
+                budget.ensure_private_directory(source_path / relative)
                 continue
             if not member.isfile() or name not in expected or name in seen:
                 fail("source archive object differs from exact tree")
@@ -1450,23 +2350,10 @@ def _extract_archive(
             if git_oid != entry.oid:
                 fail("source archive blob identity differs")
             destination = source_path / PurePosixPath(name)
-            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            descriptor = os.open(
-                destination,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | os.O_CLOEXEC
-                | getattr(os, "O_NOFOLLOW", 0),
-                0o500 if entry.mode == 0o100755 else 0o400,
+            budget.ensure_private_directory(destination.parent)
+            budget.write_new(
+                destination, data, 0o500 if entry.mode == 0o100755 else 0o400
             )
-            try:
-                written = 0
-                while written < len(data):
-                    written += os.write(descriptor, data[written:])
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
             seen.add(name)
             content.update(
                 f"{name}\0{entry.mode:o}\0{entry.oid}\0{sha256_bytes(data)}\n".encode()
@@ -1475,11 +2362,11 @@ def _extract_archive(
         fail("source archive inventory differs from exact tree")
     for directory, directories, files in os.walk(source_path, topdown=False):
         for name in directories:
-            os.chmod(Path(directory) / name, 0o500, follow_symlinks=False)
+            budget.chmod(Path(directory) / name, 0o500, directory=True)
         for name in files:
             if str((Path(directory) / name).relative_to(source_path)) not in expected:
                 fail("source extraction produced an extra file")
-    source_path.chmod(0o500)
+    budget.chmod(source_path, 0o500, directory=True)
     return content.hexdigest()
 
 
@@ -1488,9 +2375,8 @@ class SourceBundle:
     root: Path
     source: Path
     source_authority: DirectoryAuthority
-    repo_fd: int
-    config_fd: int
-    config_fields: tuple[int, ...]
+    runtime_lib_authority: DirectoryAuthority
+    python_stdlib_authority: DirectoryAuthority
     config_sha256: str
     commit: str
     tree: str
@@ -1501,222 +2387,21 @@ class SourceBundle:
 
     def verify(self) -> None:
         self.source_authority.verify()
-        _verify_git_config(
-            self.repo_fd, self.config_fd, self.config_fields, self.config_sha256
-        )
-        held_tools["git"].verify()
-        held_tools["git_remote_https"].verify()
+        self.runtime_lib_authority.verify()
+        self.python_stdlib_authority.verify()
+        _verify_all_tools()
 
     def close(self) -> None:
         self.source_authority.close()
-        os.close(self.config_fd)
-        os.close(self.repo_fd)
+        self.runtime_lib_authority.close()
+        self.python_stdlib_authority.close()
 
 
-def prepare_canonical_source(snapshot_root: Path) -> SourceBundle:
-    template = snapshot_root / "empty-template"
-    bare = snapshot_root / "objects.git"
-    source = snapshot_root / "source"
-    git_exec = snapshot_root / "git-exec"
-    template.mkdir(mode=0o700)
-    git_exec.mkdir(mode=0o700)
-    source.mkdir(mode=0o700)
-    execute(
-        [
-            require_tool("git"),
-            *_git_options(),
-            "init",
-            "--bare",
-            "--initial-branch=_unused",
-            f"--template={template}",
-            str(bare),
-        ],
-        env=_git_environment(),
-    )
-    repo_fd = os.open(
-        bare,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-    )
-    exec_fd = os.open(
-        git_exec,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-    )
-    config_fd = -1
-    try:
-        os.symlink(
-            held_tools["git_remote_https"].exec_path,
-            git_exec / "git-remote-https",
-        )
-        config_fd, config_fields, config_sha = _validate_raw_git_config(repo_fd)
-        git_env = _git_environment(exec_fd)
-        git_dir = f"--git-dir=/proc/self/fd/{repo_fd}"
-        execute(
-            [
-                require_tool("git"),
-                *_git_options(),
-                git_dir,
-                "fetch",
-                "--no-tags",
-                "--no-recurse-submodules",
-                "--no-filter",
-                "--depth=1",
-                "--refmap=",
-                source_repo,
-                f"+{source_ref}:refs/gb10/rebuild",
-            ],
-            env=git_env,
-            pass_fds=(repo_fd, exec_fd),
-        )
-        held_tools["git_remote_https"].verify()
-        _verify_git_config(repo_fd, config_fd, config_fields, config_sha)
-        commit = (
-            execute(
-                [
-                    require_tool("git"),
-                    *_git_options(),
-                    git_dir,
-                    "rev-parse",
-                    "refs/gb10/rebuild^{commit}",
-                ],
-                capture=True,
-                env=git_env,
-                pass_fds=(repo_fd, exec_fd),
-            )
-            .decode("ascii")
-            .strip()
-        )
-        tree = (
-            execute(
-                [
-                    require_tool("git"),
-                    *_git_options(),
-                    git_dir,
-                    "rev-parse",
-                    f"{commit}^{{tree}}",
-                ],
-                capture=True,
-                env=git_env,
-                pass_fds=(repo_fd, exec_fd),
-            )
-            .decode("ascii")
-            .strip()
-        )
-        if not re.fullmatch(r"[0-9a-f]{40}", commit) or not re.fullmatch(
-            r"[0-9a-f]{40}", tree
-        ):
-            fail("canonical Git commit or tree identity is malformed")
-        execute(
-            [
-                require_tool("git"),
-                *_git_options(),
-                git_dir,
-                "fsck",
-                "--strict",
-                "--full",
-                "--no-dangling",
-                commit,
-            ],
-            env=git_env,
-            pass_fds=(repo_fd, exec_fd),
-        )
-        reachable = execute(
-            [
-                require_tool("git"),
-                *_git_options(),
-                git_dir,
-                "rev-list",
-                "--objects",
-                "--missing=print",
-                commit,
-            ],
-            capture=True,
-            env=git_env,
-            pass_fds=(repo_fd, exec_fd),
-        )
-        if any(line.startswith(b"?") for line in reachable.splitlines()):
-            fail("canonical Git object graph is incomplete")
-        tree_payload = execute(
-            [
-                require_tool("git"),
-                *_git_options(),
-                git_dir,
-                "ls-tree",
-                "-lrz",
-                "--full-tree",
-                commit,
-            ],
-            capture=True,
-            env=git_env,
-            pass_fds=(repo_fd, exec_fd),
-        )
-        entries = _parse_tree(tree_payload)
-        archive_path = snapshot_root / "source.tar"
-        execute(
-            [
-                require_tool("git"),
-                *_git_options(),
-                git_dir,
-                "archive",
-                "--format=tar",
-                f"--output={archive_path}",
-                commit,
-            ],
-            env=git_env,
-            pass_fds=(repo_fd, exec_fd),
-        )
-        require_secure_regular(archive_path)
-        if archive_path.stat().st_size > 160 * 1024 * 1024:
-            fail("canonical source archive exceeded bound")
-        archive_sha = sha256_file(archive_path)
-        tree_ledger = _extract_archive(archive_path, source, commit, entries)
-        source_authority = _open_directory_authority("canonical source", source)
-        os.close(exec_fd)
-        bundle = SourceBundle(
-            snapshot_root,
-            source,
-            source_authority,
-            repo_fd,
-            config_fd,
-            config_fields,
-            config_sha,
-            commit,
-            tree,
-            archive_sha,
-            tree_ledger,
-            len(entries),
-            sum(entry.size for entry in entries),
-        )
-        bundle.verify()
-        return bundle
-    except BaseException:
-        os.close(exec_fd)
-        if config_fd >= 0:
-            os.close(config_fd)
-        os.close(repo_fd)
-        raise
-
-
-def _sandbox_command(
-    source_fd: int,
-    target_fd: int,
-    toolchain_fd: int,
-    cache_fd: int,
-    index_fd: int,
-    gcc_fd: int,
-    sysroot_lib_fd: int,
-    sysroot_include_fd: int,
-    cargo_arguments: list[str],
+def _sandbox_runtime_prefix(
+    runtime_lib: DirectoryAuthority,
+    python_lib: DirectoryAuthority,
 ) -> list[str]:
-    cargo = "/toolchain/bin/cargo"
-    rustc = "/toolchain/bin/rustc"
-    cc = "/usr/bin/x86_64-linux-gnu-gcc-12"
-    ar = "/usr/bin/x86_64-linux-gnu-ar"
     return [
-        require_tool("nice"),
-        "-n",
-        "10",
-        require_tool("ionice"),
-        "-c3",
         require_tool("bwrap"),
         "--unshare-user",
         "--unshare-all",
@@ -1736,21 +2421,207 @@ def _sandbox_command(
         "--dir",
         "/usr/lib",
         "--dir",
+        "/usr/lib/python3.11",
+        "--dir",
+        "/usr/lib/x86_64-linux-gnu",
+        "--dir",
+        "/sys",
+        "--dir",
+        "/sys/fs",
+        "--dir",
+        "/sys/fs/cgroup",
+        "--dir",
+        "/tools",
+        "--ro-bind",
+        f"/proc/self/fd/{runtime_lib.descriptor}",
+        "/usr/lib/x86_64-linux-gnu",
+        "--ro-bind",
+        f"/proc/self/fd/{python_lib.descriptor}",
+        "/usr/lib/python3.11",
+        "--ro-bind",
+        held_tools["python"].exec_path,
+        "/tools/python",
+        "--ro-bind",
+        held_tools["scoped_worker"].exec_path,
+        "/worker.py",
+        "--ro-bind",
+        str(cgroup_root),
+        "/sys/fs/cgroup",
+        "--symlink",
+        "usr/lib",
+        "/lib",
+        "--symlink",
+        "usr/lib/x86_64-linux-gnu",
+        "/lib64",
+        "--tmpfs",
+        "/home",
+        "--clearenv",
+        "--setenv",
+        "GB10_RESOURCE_FENCE",
+        "1",
+        "--setenv",
+        "LANG",
+        "C",
+        "--setenv",
+        "LC_ALL",
+        "C",
+        "--setenv",
+        "PATH",
+        "/tools",
+    ]
+
+
+def _worker_payload(operation: str, config: dict[str, object]) -> list[str]:
+    # The digest-pinned worker keeps Cargo --frozen, --locked, and --offline.
+    return [
+        "--chdir",
+        "/",
+        "--",
+        "/tools/python",
+        "-I",
+        "-B",
+        "-S",
+        "/worker.py",
+        operation,
+        json.dumps(config, sort_keys=True, separators=(",", ":"), allow_nan=False),
+        SCOPE_UNIT_TOKEN,
+    ]
+
+
+def _fetch_sandbox(
+    runtime_lib: DirectoryAuthority,
+    python_lib: DirectoryAuthority,
+) -> list[str]:
+    policy = _scope_policy("fetch")
+    config: dict[str, object] = {
+        "policy": policy.contract(),
+        "source_protocol": fetch_protocol,
+        "source_ref": source_ref,
+        "source_repo": source_repo,
+    }
+    return [
+        *_sandbox_runtime_prefix(runtime_lib, python_lib),
+        "--share-net",
+        "--dir",
+        "/etc",
+        "--dir",
+        "/etc/ssl",
+        "--dir",
+        "/etc/ssl/certs",
+        "--ro-bind",
+        held_tools["ca_cert"].exec_path,
+        "/etc/ssl/certs/ca-certificates.crt",
+        "--ro-bind",
+        held_tools["resolv_conf"].exec_path,
+        "/etc/resolv.conf",
+        "--ro-bind",
+        held_tools["nsswitch"].exec_path,
+        "/etc/nsswitch.conf",
+        "--ro-bind",
+        held_tools["hosts"].exec_path,
+        "/etc/hosts",
+        "--ro-bind",
+        held_tools["git"].exec_path,
+        "/tools/git",
+        "--ro-bind",
+        held_tools["git_remote_https"].exec_path,
+        "/tools/git-remote-https",
+        "--size",
+        str(FETCH_TMPFS_BYTES),
+        "--tmpfs",
+        "/fetch",
+        "--size",
+        str(FETCH_TMP_BYTES),
+        "--tmpfs",
+        "/tmp",
+        *_worker_payload("fetch", config),
+    ]
+
+
+def prepare_canonical_source(
+    snapshot_root: Path,
+    budget: HostWriteBudget,
+) -> SourceBundle:
+    source = snapshot_root / "source"
+    budget.mkdir(source)
+    runtime_lib = _open_directory_authority("sandbox runtime libraries", sysroot_lib)
+    try:
+        python_lib = _open_directory_authority("sandbox Python standard library", python_stdlib)
+    except BaseException:
+        runtime_lib.close()
+        raise
+    try:
+        frame = execute_scoped(
+            "fetch",
+            _fetch_sandbox(runtime_lib, python_lib),
+            max_output_bytes=FRAME_HEADER_BYTES + 160 * 1024 * 1024 + 12,
+            pass_fds=(runtime_lib.descriptor, python_lib.descriptor),
+        )
+        header, archive = _decode_frame(frame, "fetch", 160 * 1024 * 1024)
+        entries = _entries_from_header(header)
+        if sha256_bytes(archive) != header["archive_sha256"]:
+            fail("fetch frame archive digest differs")
+        archive_path = snapshot_root / "source.tar"
+        budget.write_new(archive_path, archive, 0o400)
+        tree_ledger = _extract_archive(
+            archive_path,
+            source,
+            cast(str, header["commit"]),
+            entries,
+            budget,
+        )
+        source_authority = _open_directory_authority("canonical source", source)
+        bundle = SourceBundle(
+            snapshot_root,
+            source,
+            source_authority,
+            runtime_lib,
+            python_lib,
+            cast(str, header["git_config_sha256"]),
+            cast(str, header["commit"]),
+            cast(str, header["tree"]),
+            cast(str, header["archive_sha256"]),
+            tree_ledger,
+            len(entries),
+            sum(entry.size for entry in entries),
+        )
+        bundle.verify()
+        return bundle
+    except BaseException:
+        python_lib.close()
+        runtime_lib.close()
+        raise
+
+
+def _cargo_sandbox(
+    source: SourceBundle,
+    toolchain: DirectoryAuthority,
+    cache: DirectoryAuthority,
+    index: DirectoryAuthority,
+    gcc: DirectoryAuthority,
+    sysroot_include_authority: DirectoryAuthority,
+    phase: str,
+) -> tuple[list[str], tuple[int, ...]]:
+    policy = _scope_policy(phase)
+    config: dict[str, object] = {"policy": policy.contract()}
+    arguments = [
+        *_sandbox_runtime_prefix(
+            source.runtime_lib_authority,
+            source.python_stdlib_authority,
+        ),
+        "--dir",
         "/usr/lib/gcc",
         "--dir",
         "/usr/lib/gcc/x86_64-linux-gnu",
         "--ro-bind",
-        f"/proc/self/fd/{gcc_fd}",
+        f"/proc/self/fd/{gcc.descriptor}",
         "/usr/lib/gcc/x86_64-linux-gnu/12",
         "--ro-bind",
-        f"/proc/self/fd/{sysroot_lib_fd}",
-        "/usr/lib/x86_64-linux-gnu",
-        "--ro-bind",
-        f"/proc/self/fd/{sysroot_include_fd}",
+        f"/proc/self/fd/{sysroot_include_authority.descriptor}",
         "/usr/include",
         "--ro-bind",
         held_tools["cc"].exec_path,
-        cc,
+        "/usr/bin/cc",
         "--ro-bind",
         held_tools["as"].exec_path,
         "/usr/bin/as",
@@ -1759,142 +2630,50 @@ def _sandbox_command(
         "/usr/bin/ld",
         "--ro-bind",
         held_tools["ar"].exec_path,
-        ar,
-        "--tmpfs",
-        "/usr/local",
-        "--tmpfs",
-        "/home",
-        "--symlink",
-        "usr/lib",
-        "/lib",
-        "--symlink",
-        "usr/lib/x86_64-linux-gnu",
-        "/lib64",
+        "/usr/bin/ar",
         "--ro-bind",
-        f"/proc/self/fd/{source_fd}",
+        f"/proc/self/fd/{source.source_authority.descriptor}",
         "/src",
         "--ro-bind",
-        f"/proc/self/fd/{toolchain_fd}",
+        f"/proc/self/fd/{toolchain.descriptor}",
         "/toolchain",
         "--ro-bind",
         held_tools["cargo"].exec_path,
-        cargo,
+        "/toolchain/bin/cargo",
         "--ro-bind",
         held_tools["rustc"].exec_path,
-        rustc,
+        "/toolchain/bin/rustc",
         "--dir",
         "/cargo-home",
         "--dir",
         "/cargo-home/registry",
         "--ro-bind",
-        f"/proc/self/fd/{cache_fd}",
+        f"/proc/self/fd/{cache.descriptor}",
         "/cargo-home/registry/cache",
         "--ro-bind",
-        f"/proc/self/fd/{index_fd}",
+        f"/proc/self/fd/{index.descriptor}",
         "/cargo-home/registry/index",
-        "--bind",
-        f"/proc/self/fd/{target_fd}",
+        "--size",
+        str(BUILD_TARGET_TMPFS_BYTES),
+        "--tmpfs",
         "/target",
+        "--size",
+        str(BUILD_TMP_BYTES),
         "--tmpfs",
         "/tmp",
-        "--clearenv",
-        "--setenv",
-        "HOME",
-        "/nonexistent",
-        "--setenv",
-        "PATH",
-        "/toolchain/bin:/usr/bin",
-        "--setenv",
-        "LC_ALL",
-        "C",
-        "--setenv",
-        "LANG",
-        "C",
-        "--setenv",
-        "CARGO_HOME",
-        "/cargo-home",
-        "--setenv",
-        "CARGO_TARGET_DIR",
-        "/target",
-        "--setenv",
-        "CARGO_NET_OFFLINE",
-        "true",
-        "--setenv",
-        "CARGO_INCREMENTAL",
-        "0",
-        "--setenv",
-        "CARGO_BUILD_JOBS",
-        "1",
-        "--setenv",
-        "RUSTC",
-        rustc,
-        "--setenv",
-        "CC",
-        cc,
-        "--setenv",
-        "AR",
-        ar,
-        "--setenv",
-        "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
-        cc,
-        "--chdir",
-        "/src",
-        "--",
-        cargo,
-        *cargo_arguments,
+        *_worker_payload(phase, config),
     ]
-
-
-def _run_sandbox(
-    source: SourceBundle,
-    target: DirectoryAuthority,
-    toolchain: DirectoryAuthority,
-    cache: DirectoryAuthority,
-    index: DirectoryAuthority,
-    gcc: DirectoryAuthority,
-    sysroot_lib_authority: DirectoryAuthority,
-    sysroot_include_authority: DirectoryAuthority,
-    arguments: list[str],
-) -> str:
-    pass_fds = tuple(
-        sorted(
-            set(
-                _tool_fds()
-                + (
-                    source.source_authority.descriptor,
-                    target.descriptor,
-                    toolchain.descriptor,
-                    cache.descriptor,
-                    index.descriptor,
-                    gcc.descriptor,
-                    sysroot_lib_authority.descriptor,
-                    sysroot_include_authority.descriptor,
-                )
-            )
-        )
-    )
-    command = _sandbox_command(
+    descriptors = (
         source.source_authority.descriptor,
-        target.descriptor,
+        source.runtime_lib_authority.descriptor,
+        source.python_stdlib_authority.descriptor,
         toolchain.descriptor,
         cache.descriptor,
         index.descriptor,
         gcc.descriptor,
-        sysroot_lib_authority.descriptor,
         sysroot_include_authority.descriptor,
-        arguments,
     )
-    try:
-        return execute(
-            command,
-            capture=True,
-            cwd=Path("/"),
-            env=child_env,
-            pass_fds=pass_fds,
-        ).decode("utf-8")
-    finally:
-        for name in ("nice", "ionice", "bwrap", "cargo", "rustc", "cc", "ld", "ar"):
-            held_tools[name].verify()
+    return arguments, descriptors
 
 
 def _validate_metadata(payload: str) -> str:
@@ -1966,113 +2745,6 @@ def _validate_metadata(payload: str) -> str:
     return closure.hexdigest()
 
 
-def _open_target_artifact(target_fd: int) -> int:
-    descriptor = os.dup(target_fd)
-    try:
-        for part in ("x86_64-unknown-linux-gnu", "release"):
-            child = os.open(
-                part,
-                os.O_RDONLY
-                | os.O_DIRECTORY
-                | os.O_CLOEXEC
-                | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=descriptor,
-            )
-            os.close(descriptor)
-            descriptor = child
-        artifact = os.open(
-            "llm-guard-proxy",
-            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=descriptor,
-        )
-        return artifact
-    except OSError as error:
-        raise RebuildError("built artifact path is unavailable or unsafe") from error
-    finally:
-        os.close(descriptor)
-
-
-def _normalize_target_artifact_link(target_fd: int, artifact_fd: int) -> None:
-    before = os.fstat(artifact_fd)
-    if (
-        not stat.S_ISREG(before.st_mode)
-        or before.st_uid != os.geteuid()
-        or before.st_mode & 0o022
-        or not before.st_mode & stat.S_IXUSR
-        or before.st_size <= 0
-        or before.st_size > MAX_EXECUTABLE_BYTES
-        or before.st_nlink not in {1, 2}
-    ):
-        fail("built artifact object metadata is unsafe")
-    release_fd = os.dup(target_fd)
-    try:
-        for part in ("x86_64-unknown-linux-gnu", "release"):
-            child = os.open(
-                part,
-                os.O_RDONLY
-                | os.O_DIRECTORY
-                | os.O_CLOEXEC
-                | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=release_fd,
-            )
-            os.close(release_fd)
-            release_fd = child
-        current = os.stat("llm-guard-proxy", dir_fd=release_fd, follow_symlinks=False)
-        if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
-            fail("built artifact path changed after same-FD open")
-        if before.st_nlink == 2:
-            deps_fd = os.open(
-                "deps",
-                os.O_RDONLY
-                | os.O_DIRECTORY
-                | os.O_CLOEXEC
-                | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=release_fd,
-            )
-            try:
-                names = sorted(os.listdir(deps_fd))
-                if len(names) > 100_000:
-                    fail("built artifact dependency directory exceeded bound")
-                linked = []
-                for name in names:
-                    if not re.fullmatch(r"llm_guard_proxy-[0-9a-f]{16}", name):
-                        continue
-                    info = os.stat(name, dir_fd=deps_fd, follow_symlinks=False)
-                    if (info.st_dev, info.st_ino) == (before.st_dev, before.st_ino):
-                        linked.append(name)
-                if len(linked) != 1:
-                    fail("built artifact has unrecognized hardlink authority")
-                os.unlink(linked[0], dir_fd=deps_fd)
-                os.fsync(deps_fd)
-            finally:
-                os.close(deps_fd)
-        after = os.fstat(artifact_fd)
-        current = os.stat("llm-guard-proxy", dir_fd=release_fd, follow_symlinks=False)
-
-        def stable(info: os.stat_result) -> tuple[int, ...]:
-            return (
-                info.st_dev,
-                info.st_ino,
-                info.st_uid,
-                info.st_gid,
-                info.st_mode,
-                info.st_size,
-                info.st_mtime_ns,
-            )
-
-        if (
-            after.st_nlink != 1
-            or current.st_nlink != 1
-            or stable(after) != stable(before)
-            or stable(current) != stable(before)
-        ):
-            fail("built artifact same-FD hardlink normalization failed")
-    except OSError as error:
-        raise RebuildError("built artifact hardlink authority is unsafe") from error
-    finally:
-        os.close(release_fd)
-
-
 @dataclass
 class BuildBundle:
     candidate: Path
@@ -2083,183 +2755,186 @@ class BuildBundle:
     authority: FileAuthority
 
 
-def build_sandboxed_candidate(source: SourceBundle) -> BuildBundle:
+def _containment_contract_sha256() -> str:
+    contract = {
+        "schema": 1,
+        "frame": {
+            "header_bytes": FRAME_HEADER_BYTES,
+            "magic": FRAME_MAGIC.decode("ascii"),
+            "source_bytes": 160 * 1024 * 1024,
+            "candidate_bytes": MAX_EXECUTABLE_BYTES,
+        },
+        "host": {
+            "free_floor_bytes": HOST_FREE_FLOOR_BYTES,
+            "write_budget_bytes": HOST_WRITE_BUDGET_BYTES,
+        },
+        "scope": {
+            phase: _scope_policy(phase).contract()
+            for phase in ("fetch", "metadata", "build")
+        },
+        "sandbox": {
+            "build_target_tmpfs_bytes": BUILD_TARGET_TMPFS_BYTES,
+            "build_tmp_bytes": BUILD_TMP_BYTES,
+            "fetch_tmpfs_bytes": FETCH_TMPFS_BYTES,
+            "fetch_tmp_bytes": FETCH_TMP_BYTES,
+            "network": {"fetch": "shared", "metadata": "isolated", "build": "isolated"},
+            "writable_host_mounts": [],
+        },
+        "tool_sha256": {
+            name: held.identity.sha256 for name, held in sorted(held_tools.items())
+        },
+    }
+    return sha256_bytes(
+        json.dumps(
+            contract, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("ascii")
+    )
+
+
+def _publish_candidate(
+    source: SourceBundle,
+    header: dict[str, Any],
+    payload: bytes,
+    budget: HostWriteBudget,
+) -> tuple[Path, ExecutableIdentity, FileAuthority]:
+    if set(header) != {
+        "kind",
+        "payload_sha256",
+        "payload_size",
+        "schema",
+    } or not isinstance(header.get("payload_sha256"), str) or re.fullmatch(
+        r"[0-9a-f]{64}", header["payload_sha256"]
+    ) is None:
+        fail("build frame authority set differs")
+    digest = sha256_bytes(payload)
+    if digest != header["payload_sha256"] or not payload:
+        fail("build frame candidate digest differs")
+    candidate = (
+        cache_root
+        / "releases"
+        / f"{source.commit}-{digest}"
+        / "llm-guard-proxy"
+    )
+    candidate_preexists = candidate.exists()
+    if not candidate_preexists:
+        scratch = os.fstat(budget.ensure_private_directory(source.root))
+        destination = os.fstat(budget.ensure_private_directory(candidate.parent))
+        if scratch.st_dev != destination.st_dev:
+            fail("candidate publication scratch crosses filesystem authority")
+        temporary = source.root / (
+            f".candidate.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+        )
+        try:
+            budget.write_new(temporary, payload, 0o755)
+            _test_boundary("candidate-written")
+            descriptor = os.open(
+                temporary,
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                built_identity = fd_identity(descriptor)
+            finally:
+                os.close(descriptor)
+            if built_identity.sha256 != digest:
+                fail("candidate publication identity differs")
+            _test_boundary("candidate-validated")
+            budget.rename(temporary, candidate)
+        except BaseException:
+            budget.unlink(temporary, missing_ok=True)
+            raise
+    candidate_file = _open_file_authority(
+        "built artifact" if candidate_preexists else "candidate executable",
+        candidate,
+        expected_mode=0o755,
+        max_bytes=MAX_EXECUTABLE_BYTES,
+    )
+    identity = fd_identity(candidate_file.descriptor)
+    if identity.sha256 != digest or identity.size != len(payload):
+        candidate_file.close()
+        fail("adopted candidate differs from build frame")
+    return candidate, identity, candidate_file
+
+
+def build_sandboxed_candidate(
+    source: SourceBundle,
+    budget: HostWriteBudget,
+) -> BuildBundle:
     authorities = [
         _open_directory_authority("toolchain", toolchain_root),
         _open_directory_authority("registry cache", registry_cache),
         _open_directory_authority("registry index", registry_index),
         _open_directory_authority("gcc closure", gcc_root),
-        _open_directory_authority("sysroot lib", sysroot_lib),
         _open_directory_authority("sysroot include", sysroot_include),
     ]
-    target_root = Path(tempfile.mkdtemp(prefix=".build-target-", dir=cache_root))
-    target = _open_directory_authority("build target", target_root)
-    target_identity = (target.metadata[0], target.metadata[1])
     try:
-        metadata_output = _run_sandbox(
+        metadata_command, metadata_fds = _cargo_sandbox(
             source,
-            target,
             authorities[0],
             authorities[1],
             authorities[2],
             authorities[3],
             authorities[4],
-            authorities[5],
-            [
-                "metadata",
-                "--format-version=1",
-                "--frozen",
-                "--locked",
-                "--offline",
-                "--filter-platform",
-                "x86_64-unknown-linux-gnu",
-            ],
+            "metadata",
         )
-        metadata_closure = _validate_metadata(metadata_output)
-        inventory_fd = os.open(
-            ".",
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=target.descriptor,
+        metadata_frame = execute_scoped(
+            "metadata",
+            metadata_command,
+            max_output_bytes=FRAME_HEADER_BYTES + 16 * 1024 * 1024 + 12,
+            pass_fds=metadata_fds,
         )
+        metadata_header, metadata_payload = _decode_frame(
+            metadata_frame, "metadata", 16 * 1024 * 1024
+        )
+        if set(metadata_header) != {"kind", "payload_size", "schema"}:
+            fail("metadata frame authority set differs")
         try:
-            metadata_target_names = sorted(os.listdir(inventory_fd))
-        finally:
-            os.close(inventory_fd)
-        try:
-            metadata_target_info = os.stat(
-                ".rustc_info.json",
-                dir_fd=target.descriptor,
-                follow_symlinks=False,
-            )
-        except OSError as error:
-            raise RebuildError("Cargo metadata target state differs") from error
-        metadata_target_ledger = _directory_ledger(target.descriptor, "metadata target")
-        if (
-            metadata_target_names != [".rustc_info.json"]
-            or not stat.S_ISREG(metadata_target_info.st_mode)
-            or metadata_target_info.st_uid != os.geteuid()
-            or metadata_target_info.st_nlink != 1
-            or metadata_target_info.st_mode & 0o022
-            or not 0 < metadata_target_info.st_size <= 1024 * 1024
-            or metadata_target_ledger.files != 1
-        ):
-            fail(
-                "Cargo metadata target state differs: "
-                f"names={metadata_target_names!r} uid={metadata_target_info.st_uid} "
-                f"mode={stat.S_IMODE(metadata_target_info.st_mode):o} "
-                f"nlink={metadata_target_info.st_nlink} "
-                f"size={metadata_target_info.st_size} "
-                f"files={metadata_target_ledger.files}"
-            )
-        build_arguments = [
+            metadata_text = metadata_payload.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise RebuildError("Cargo metadata frame is not UTF-8") from error
+        metadata_closure = _validate_metadata(metadata_text)
+
+        build_command, build_fds = _cargo_sandbox(
+            source,
+            authorities[0],
+            authorities[1],
+            authorities[2],
+            authorities[3],
+            authorities[4],
             "build",
-            "--release",
-            "--frozen",
-            "--locked",
-            "--offline",
-            "--target",
-            "x86_64-unknown-linux-gnu",
-            "-p",
-            "llm-guard-proxy",
-            "--features",
-            "guard",
-        ]
-        sandbox_contract = sha256_bytes(
-            "\0".join(
-                _sandbox_command(
-                    source.source_authority.descriptor,
-                    target.descriptor,
-                    authorities[0].descriptor,
-                    authorities[1].descriptor,
-                    authorities[2].descriptor,
-                    authorities[3].descriptor,
-                    authorities[4].descriptor,
-                    authorities[5].descriptor,
-                    build_arguments,
-                )
-            ).encode()
         )
-        _run_sandbox(
-            source,
-            target,
-            authorities[0],
-            authorities[1],
-            authorities[2],
-            authorities[3],
-            authorities[4],
-            authorities[5],
-            build_arguments,
+        build_frame = execute_scoped(
+            "build",
+            build_command,
+            max_output_bytes=FRAME_HEADER_BYTES + MAX_EXECUTABLE_BYTES + 12,
+            pass_fds=build_fds,
         )
-        artifact_fd = _open_target_artifact(target.descriptor)
-        try:
-            _normalize_target_artifact_link(target.descriptor, artifact_fd)
-            raw_identity = fd_identity(artifact_fd)
-            candidate = (
-                cache_root
-                / "releases"
-                / f"{source.commit}-{raw_identity.sha256}"
-                / "llm-guard-proxy"
-            )
-            if candidate.exists():
-                require_secure_regular(candidate, executable=True)
-                existing = os.open(
-                    candidate,
-                    os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-                )
-                try:
-                    existing_identity = fd_identity(existing)
-                finally:
-                    os.close(existing)
-                if (
-                    existing_identity.sha256 != raw_identity.sha256
-                    or existing_identity.build_id != raw_identity.build_id
-                ):
-                    fail("existing content-addressed candidate identity differs")
-            else:
-                atomic_copy_fd(artifact_fd, candidate, 0o755)
-        finally:
-            os.close(artifact_fd)
-        candidate_file = _open_file_authority(
-            "candidate executable",
-            candidate,
-            expected_mode=0o755,
-            max_bytes=MAX_EXECUTABLE_BYTES,
+        build_header, candidate_payload = _decode_frame(
+            build_frame, "build", MAX_EXECUTABLE_BYTES
         )
-        candidate_identity = fd_identity(candidate_file.descriptor)
-        if (
-            candidate_identity.size,
-            candidate_identity.sha256,
-            candidate_identity.build_id,
-        ) != (raw_identity.size, raw_identity.sha256, raw_identity.build_id):
-            fail("adopted candidate differs from built artifact")
+        candidate, candidate_identity, candidate_file = _publish_candidate(
+            source, build_header, candidate_payload, budget
+        )
         source.verify()
         for authority in authorities:
             authority.verify()
         _verify_all_tools()
-        inputs = {
+        inputs: dict[str, object] = {
             authority.name.replace(" ", "_"): authority.receipt()
             for authority in authorities
         }
-        inputs["metadata_target"] = {
-            "files": metadata_target_names,
-            "content_sha256": metadata_target_ledger.content_sha256,
-            "metadata_sha256": metadata_target_ledger.metadata_sha256,
-            "file_count": metadata_target_ledger.files,
-            "byte_count": metadata_target_ledger.bytes,
-        }
+        inputs["sysroot_lib"] = source.runtime_lib_authority.receipt()
+        inputs["python_stdlib"] = source.python_stdlib_authority.receipt()
         return BuildBundle(
             candidate,
             candidate_identity,
             metadata_closure,
-            sandbox_contract,
+            _containment_contract_sha256(),
             inputs,
             candidate_file,
         )
     finally:
-        target.close()
         for authority in reversed(authorities):
             authority.close()
-        cleanup_snapshot(target_root, target_identity)
 
 
 def _validate_reviewed_tool_versions(cargo: bytes, rustc: bytes) -> None:
@@ -2279,6 +2954,150 @@ def _validate_reviewed_tool_versions(cargo: bytes, rustc: bytes) -> None:
         fail("reviewed Cargo/rustc version contract differs")
 
 
+@dataclass(frozen=True)
+class _ScratchDeleteRecord:
+    name: str
+    target_hash: str
+    target_identity: tuple[int, int]
+    placeholder_identity: tuple[int, int]
+
+
+def _scratch_original_name(name: str) -> str | None:
+    if SCRATCH_DIRECT_PATTERN.fullmatch(name) is not None:
+        return name
+    match = SCRATCH_PREPUBLICATION_PATTERN.fullmatch(name)
+    if match is not None:
+        return match.group(1)
+    match = SCRATCH_TOMBSTONE_PATTERN.fullmatch(name)
+    if match is not None:
+        return f".{match.group(1)}"
+    return None
+
+
+def _scratch_name_hash(name: str) -> str:
+    try:
+        payload = name.encode("ascii", errors="strict")
+    except UnicodeEncodeError as error:
+        raise RebuildError("scratch exact-leaf name is malformed") from error
+    return sha256_bytes(payload)
+
+
+def _directory_entries(directory_fd: int) -> list[os.DirEntry[str]]:
+    try:
+        os.lseek(directory_fd, 0, os.SEEK_SET)
+        with os.scandir(directory_fd) as entries:
+            return list(entries)
+    except OSError as error:
+        raise RebuildError("held directory scan failed") from error
+
+
+def _parse_scratch_delete_record(name: str) -> _ScratchDeleteRecord:
+    match = SCRATCH_DELETE_PATTERN.fullmatch(name)
+    if match is None:
+        fail("scratch deletion record name is malformed")
+    target_identity = (int(match.group(2), 16), int(match.group(3), 16))
+    placeholder_identity = (int(match.group(4), 16), int(match.group(5), 16))
+    if target_identity[1] == 0 or placeholder_identity[1] == 0:
+        fail("scratch deletion record identity is malformed")
+    return _ScratchDeleteRecord(
+        name, match.group(1), target_identity, placeholder_identity
+    )
+
+
+def _scratch_delete_records(parent_fd: int) -> list[_ScratchDeleteRecord]:
+    records = [
+        _parse_scratch_delete_record(entry.name)
+        for entry in _directory_entries(parent_fd)
+        if entry.name.startswith(SCRATCH_DELETE_PREFIX)
+    ]
+    if len(records) > 8:
+        fail("scratch deletion record inventory exceeded bound")
+    return sorted(records, key=lambda record: record.name)
+
+
+def _open_scratch_leaf(
+    parent_fd: int,
+    name: str,
+    *,
+    expected_identity: tuple[int, int] | None,
+    allow_marker: bool,
+    require_empty: bool = True,
+) -> tuple[int, os.stat_result]:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+    except OSError as error:
+        raise RebuildError("scratch exact leaf is unavailable") from error
+    try:
+        parent = os.fstat(parent_fd)
+        metadata = os.fstat(descriptor)
+        entries = _directory_entries(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or (require_empty and not 0 < metadata.st_nlink <= 2)
+            or metadata.st_dev != parent.st_dev
+            or (
+                expected_identity is not None
+                and (metadata.st_dev, metadata.st_ino) != expected_identity
+            )
+            or (
+                require_empty
+                and entries
+                and (
+                    not allow_marker
+                    or len(entries) != 1
+                    or entries[0].name != SCRATCH_MARKER
+                )
+            )
+        ):
+            fail("scratch exact leaf authority differs")
+        return descriptor, metadata
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _scratch_marker_present(
+    descriptor: int, target_name: str
+) -> _LeafAuthority | None:
+    entries = _directory_entries(descriptor)
+    if not entries:
+        return None
+    if not any(entry.name == SCRATCH_MARKER for entry in entries):
+        return None
+    marker_fd = os.open(
+        SCRATCH_MARKER,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=descriptor,
+    )
+    try:
+        marker = os.fstat(marker_fd)
+        if (
+            not stat.S_ISREG(marker.st_mode)
+            or marker.st_uid != os.geteuid()
+            or marker.st_nlink != 1
+            or stat.S_IMODE(marker.st_mode) != 0o600
+            or not 0 < marker.st_size <= 512
+        ):
+            fail("scratch marker authority differs")
+        authority = _leaf_authority(marker)
+        payload = _read_fd_limited(marker_fd, 512, "scratch marker")
+    finally:
+        os.close(marker_fd)
+    original_name = _scratch_original_name(target_name)
+    if original_name is None or payload != _scratch_payload(original_name):
+        fail("scratch marker identity differs")
+    return authority
+
+
 def _directory_identity(path: Path) -> tuple[int, int]:
     _deadline_checkpoint("filesystem-read")
     metadata = os.stat(path, follow_symlinks=False)
@@ -2291,45 +3110,811 @@ def _directory_identity(path: Path) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
 
 
-def _remove_tree_contents(directory_fd: int, expected_device: int) -> None:
+def _remove_tree_contents(
+    budget: HostWriteBudget,
+    directory_fd: int,
+    expected_device: int,
+    *,
+    scratch_root: bool = False,
+) -> None:
     _deadline_checkpoint("snapshot-cleanup")
     metadata = os.fstat(directory_fd)
     if metadata.st_uid != os.geteuid() or metadata.st_dev != expected_device:
         fail("owned cleanup tree crossed its filesystem authority")
+    budget._admit_fd(directory_fd, 0)
     os.fchmod(directory_fd, 0o700)
-    for entry in os.scandir(directory_fd):
+    entries = _directory_entries(directory_fd)
+    entries.sort(key=lambda entry: entry.name)
+    for entry in entries:
         _deadline_checkpoint("snapshot-cleanup")
-        if not entry.is_dir(follow_symlinks=False):
-            os.unlink(entry.name, dir_fd=directory_fd)
+        if scratch_root and entry.name == SCRATCH_MARKER:
             continue
-        child_fd = os.open(
-            entry.name,
-            os.O_RDONLY
-            | os.O_DIRECTORY
-            | os.O_CLOEXEC
-            | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=directory_fd,
+        scanned_inode = entry.inode()
+        scanned = entry.stat(follow_symlinks=False)
+        if scanned.st_ino != scanned_inode or scanned.st_dev != metadata.st_dev:
+            fail("owned cleanup leaf changed after scan")
+        authority = _leaf_authority(scanned)
+        _test_boundary("cleanup-leaf-scanned")
+        budget._admit_fd(directory_fd, 0)
+        current_fd, current = _open_leaf_at(directory_fd, entry.name)
+        try:
+            if _leaf_authority(current) != authority:
+                fail("owned cleanup replacement leaf was preserved")
+        finally:
+            os.close(current_fd)
+
+
+def _scratch_payload(name: str) -> bytes:
+    token = name.removeprefix(".rebuild-input-")
+    return json.dumps(
+        {
+            "kind": "llm-guard-rebuild-scratch",
+            "name": name,
+            "schema": 1,
+            "token": token,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("ascii")
+
+
+def create_snapshot_root(budget: HostWriteBudget) -> tuple[Path, tuple[int, int]]:
+    name = f".rebuild-input-{secrets.token_hex(16)}"
+    root = cache_root / name
+    prepublication = cache_root / (
+        f".{name}.publish.{os.getpid()}.{secrets.token_hex(4)}"
+    )
+    parent_fd = budget.held_directory(cache_root)
+    identity = _reuse_completed_scratch(budget, parent_fd, prepublication)
+    if identity is None:
+        identity = budget.mkdir(prepublication)
+    published = False
+    try:
+        _test_boundary("scratch-prepublication")
+        budget.write_new(
+            prepublication / SCRATCH_MARKER, _scratch_payload(name), 0o600
+        )
+        os.fsync(budget.ensure_write_directory(prepublication))
+        _test_boundary("scratch-marker-directory-fsynced")
+        budget.rename(prepublication, root)
+        published = True
+        _test_boundary("scratch-published")
+        if _directory_identity(root) != identity:
+            fail("scratch identity changed during publication")
+        return root, identity
+    except BaseException:
+        if published:
+            cleanup_snapshot(root, identity, budget=budget)
+        else:
+            _remove_quarantined_scratch(budget, prepublication, identity)
+        raise
+
+
+def _verify_scratch_marker(root: Path, name: str) -> tuple[int, int]:
+    metadata = os.stat(root, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        fail("orphan scratch directory authority differs")
+    descriptor = os.open(
+        root / SCRATCH_MARKER,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        marker = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(marker.st_mode)
+            or marker.st_uid != os.geteuid()
+            or marker.st_nlink != 1
+            or stat.S_IMODE(marker.st_mode) != 0o600
+            or not 0 < marker.st_size <= 512
+        ):
+            fail("orphan scratch marker authority differs")
+        payload = _read_fd_limited(descriptor, 512, "scratch marker")
+    finally:
+        os.close(descriptor)
+    if payload != _scratch_payload(name):
+        fail("orphan scratch marker identity differs")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _verify_prepublication_scratch(root: Path) -> tuple[int, int]:
+    identity = _directory_identity(root)
+    entries = list(os.scandir(root))
+    if len(entries) > 1 or any(entry.name != SCRATCH_MARKER for entry in entries):
+        fail("prepublication scratch contains an unknown artifact")
+    if entries:
+        marker = entries[0].stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(marker.st_mode)
+            or marker.st_uid != os.geteuid()
+            or marker.st_nlink != 1
+            or stat.S_IMODE(marker.st_mode) != 0o600
+            or marker.st_size > 512
+        ):
+            fail("prepublication scratch marker authority differs")
+    return identity
+
+
+def _target_name_for_record(
+    parent_fd: int, record: _ScratchDeleteRecord
+) -> str | None:
+    matches = [
+        entry.name
+        for entry in _directory_entries(parent_fd)
+        if _scratch_original_name(entry.name) is not None
+        and _scratch_name_hash(entry.name) == record.target_hash
+    ]
+    if len(matches) > 1:
+        fail("scratch deletion target inventory is ambiguous")
+    return matches[0] if matches else None
+
+
+def _ensure_scratch_delete_slot(
+    budget: HostWriteBudget, parent_fd: int
+) -> tuple[int, int]:
+    try:
+        descriptor, metadata = _open_scratch_leaf(
+            parent_fd,
+            SCRATCH_DELETE_SLOT,
+            expected_identity=None,
+            allow_marker=False,
+        )
+    except RebuildError as error:
+        try:
+            os.stat(SCRATCH_DELETE_SLOT, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return budget.mkdir_at(parent_fd, SCRATCH_DELETE_SLOT)
+        raise error
+    try:
+        return metadata.st_dev, metadata.st_ino
+    finally:
+        os.close(descriptor)
+
+
+def _prepare_scratch_delete(
+    budget: HostWriteBudget,
+    parent_fd: int,
+    target_name: str,
+    target_identity: tuple[int, int],
+    *,
+    require_empty: bool = False,
+) -> _ScratchDeleteRecord:
+    if _scratch_original_name(target_name) is None:
+        fail("scratch deletion target name is malformed")
+    target_hash = _scratch_name_hash(target_name)
+    if any(
+        record.target_hash == target_hash for record in _scratch_delete_records(parent_fd)
+    ):
+        fail("scratch deletion record already exists")
+    target_fd, _ = _open_scratch_leaf(
+        parent_fd,
+        target_name,
+        expected_identity=target_identity,
+        allow_marker=True,
+        require_empty=require_empty,
+    )
+    try:
+        if require_empty and _directory_entries(target_fd):
+            fail("scratch deletion target gained an artifact before ownership record")
+    finally:
+        os.close(target_fd)
+    placeholder_identity = _ensure_scratch_delete_slot(budget, parent_fd)
+    record = _ScratchDeleteRecord(
+        (
+            f"{SCRATCH_DELETE_PREFIX}{target_hash}."
+            f"{target_identity[0]:x}.{target_identity[1]:x}."
+            f"{placeholder_identity[0]:x}.{placeholder_identity[1]:x}."
+            f"{secrets.token_hex(8)}"
+        ),
+        target_hash,
+        target_identity,
+        placeholder_identity,
+    )
+    try:
+        budget.move_leaf(
+            parent_fd,
+            SCRATCH_DELETE_SLOT,
+            parent_fd,
+            record.name,
+            expected=placeholder_identity,
+        )
+        record_fd, _ = _open_scratch_leaf(
+            parent_fd,
+            record.name,
+            expected_identity=placeholder_identity,
+            allow_marker=False,
         )
         try:
-            _remove_tree_contents(child_fd, expected_device)
+            budget._admit_fd(record_fd, 0)
+            os.fchmod(record_fd, 0o700)
+            os.fsync(record_fd)
         finally:
-            os.close(child_fd)
-        os.rmdir(entry.name, dir_fd=directory_fd)
+            os.close(record_fd)
+        os.fsync(parent_fd)
+    except OSError as error:
+        raise RebuildError("scratch deletion record could not be made durable") from error
+    _test_boundary("scratch-delete-record-created")
+    return record
+
+
+def _park_exact_leaf(
+    budget: HostWriteBudget,
+    parent_fd: int,
+    name: str,
+    descriptor: int,
+    identity: tuple[int, int],
+    destination: str,
+) -> None:
+    held = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(held.st_mode)
+        or (held.st_dev, held.st_ino) != identity
+        or _directory_entries(descriptor)
+    ):
+        fail("scratch exact-leaf identity changed before parking")
+    _test_boundary("scratch-delete-placeholder-validated")
+    budget.move_leaf(
+        parent_fd,
+        name,
+        parent_fd,
+        destination,
+        expected=identity,
+    )
+
+
+def _exchange_and_remove_scratch(
+    budget: HostWriteBudget,
+    parent_fd: int,
+    target_name: str,
+    target_fd: int,
+    target_identity: tuple[int, int],
+    record: _ScratchDeleteRecord,
+) -> None:
+    if (
+        record.target_identity != target_identity
+        or record.target_hash != _scratch_name_hash(target_name)
+    ):
+        fail("scratch deletion record does not bind the target")
+    placeholder_fd, placeholder = _open_scratch_leaf(
+        parent_fd,
+        record.name,
+        expected_identity=None,
+        allow_marker=False,
+    )
+    placeholder_identity = (placeholder.st_dev, placeholder.st_ino)
+    if placeholder_identity != record.placeholder_identity:
+        os.close(placeholder_fd)
+        fail("scratch deletion placeholder identity differs")
+    try:
+        budget.exchange_leaves(
+            parent_fd,
+            target_name,
+            parent_fd,
+            record.name,
+            expected_left=target_identity,
+            expected_right=placeholder_identity,
+        )
+        _test_boundary("scratch-delete-exchanged")
+
+        post_target_fd = -1
+        try:
+            post_target_fd, _ = _open_scratch_leaf(
+                parent_fd,
+                target_name,
+                expected_identity=placeholder_identity,
+                allow_marker=False,
+            )
+            _park_exact_leaf(
+                budget,
+                parent_fd,
+                target_name,
+                post_target_fd,
+                placeholder_identity,
+                SCRATCH_DELETE_SLOT,
+            )
+            _test_boundary("scratch-delete-placeholder-removed")
+            _recover_scratch_delete(budget, parent_fd, record)
+            _test_boundary("scratch-delete-target-removed")
+        except BaseException as error:
+            try:
+                current_target = os.stat(
+                    target_name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                restorable = (
+                    current_target.st_dev,
+                    current_target.st_ino,
+                ) == placeholder_identity
+            except OSError:
+                restorable = False
+            if restorable:
+                try:
+                    budget.exchange_leaves(
+                        parent_fd,
+                        target_name,
+                        parent_fd,
+                        record.name,
+                        expected_left=placeholder_identity,
+                        expected_right=target_identity,
+                    )
+                except BaseException as restore_error:
+                    raise RebuildError(
+                        "scratch exact-leaf exchange could not be restored"
+                    ) from restore_error
+            raise RebuildError("scratch exact-leaf exchange validation failed") from error
+        finally:
+            if post_target_fd >= 0:
+                os.close(post_target_fd)
+    finally:
+        os.close(placeholder_fd)
+
+
+def _finish_scratch_delete(
+    budget: HostWriteBudget,
+    parent_fd: int,
+    target_name: str,
+    target_fd: int,
+    target_identity: tuple[int, int],
+    record: _ScratchDeleteRecord | None = None,
+) -> None:
+    metadata = os.fstat(target_fd)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or (metadata.st_dev, metadata.st_ino) != target_identity
+    ):
+        fail("scratch target identity differs before deletion")
+    matching = [
+        candidate
+        for candidate in _scratch_delete_records(parent_fd)
+        if candidate.target_hash == _scratch_name_hash(target_name)
+    ]
+    if record is None:
+        if len(matching) > 1:
+            fail("scratch deletion record inventory is ambiguous")
+        record = (
+            matching[0]
+            if matching
+            else _prepare_scratch_delete(
+                budget, parent_fd, target_name, target_identity
+            )
+        )
+    elif matching != [record]:
+        fail("scratch deletion record authority differs")
+    if record.target_identity != target_identity:
+        fail("scratch deletion record identity differs")
+    current = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+    if (current.st_dev, current.st_ino) != target_identity:
+        fail("scratch target changed before marker removal")
+    marker = _scratch_marker_present(target_fd, target_name)
+    if marker is not None:
+        budget.park_leaf(
+            target_fd,
+            SCRATCH_MARKER,
+            expected=marker,
+        )
+        _test_boundary("scratch-marker-removed")
+    _exchange_and_remove_scratch(
+        budget, parent_fd, target_name, target_fd, target_identity, record
+    )
+
+
+def _recover_scratch_delete(
+    budget: HostWriteBudget, parent_fd: int, record: _ScratchDeleteRecord
+) -> None:
+    try:
+        record_fd, record_metadata = _open_leaf_at(parent_fd, record.name)
+    except OSError as error:
+        raise RebuildError("scratch deletion record is unavailable") from error
+    try:
+        record_identity = (record_metadata.st_dev, record_metadata.st_ino)
+    finally:
+        os.close(record_fd)
+    if record_metadata.st_dev != os.fstat(parent_fd).st_dev:
+        fail("scratch deletion record crossed filesystem authority")
+    if record_identity not in {
+        record.target_identity,
+        record.placeholder_identity,
+    }:
+        fail("foreign scratch entry preserved after record replacement")
+    target_name = _target_name_for_record(parent_fd, record)
+    if record_identity == record.target_identity:
+        record_fd, _ = _open_scratch_leaf(
+            parent_fd,
+            record.name,
+            expected_identity=record.target_identity,
+            allow_marker=False,
+            require_empty=False,
+        )
+        try:
+            if target_name is not None:
+                placeholder_fd, _ = _open_scratch_leaf(
+                    parent_fd,
+                    target_name,
+                    expected_identity=record.placeholder_identity,
+                    allow_marker=False,
+                )
+                try:
+                    _park_exact_leaf(
+                        budget,
+                        parent_fd,
+                        target_name,
+                        placeholder_fd,
+                        record.placeholder_identity,
+                        SCRATCH_DELETE_SLOT,
+                    )
+                finally:
+                    os.close(placeholder_fd)
+                _test_boundary("scratch-delete-placeholder-removed")
+            try:
+                slot_fd, _ = _open_scratch_leaf(
+                    parent_fd,
+                    SCRATCH_DELETE_SLOT,
+                    expected_identity=record.placeholder_identity,
+                    allow_marker=False,
+                )
+            except RebuildError as error:
+                try:
+                    os.stat(
+                        SCRATCH_DELETE_SLOT,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    _ensure_scratch_delete_slot(budget, parent_fd)
+                    budget.park_leaf(
+                        parent_fd,
+                        record.name,
+                        expected=record.target_identity,
+                    )
+                    return
+                raise RebuildError("foreign scratch slot preserved") from error
+            try:
+                _test_boundary("scratch-delete-record-validated")
+                current_record = os.stat(
+                    record.name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                current_slot = os.stat(
+                    SCRATCH_DELETE_SLOT,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    (current_record.st_dev, current_record.st_ino)
+                    != record.target_identity
+                    or (current_slot.st_dev, current_slot.st_ino)
+                    != record.placeholder_identity
+                ):
+                    fail("scratch parked deletion record identity differs")
+            finally:
+                os.close(slot_fd)
+        finally:
+            os.close(record_fd)
+        return
+    if target_name is None:
+        record_fd, _ = _open_scratch_leaf(
+            parent_fd,
+            record.name,
+            expected_identity=record.placeholder_identity,
+            allow_marker=False,
+        )
+        try:
+            slot_fd, _ = _open_scratch_leaf(
+                parent_fd,
+                SCRATCH_DELETE_SLOT,
+                expected_identity=record.target_identity,
+                allow_marker=False,
+                require_empty=False,
+            )
+            os.close(slot_fd)
+        finally:
+            os.close(record_fd)
+        budget.exchange_leaves(
+            parent_fd,
+            record.name,
+            parent_fd,
+            SCRATCH_DELETE_SLOT,
+            expected_left=record.placeholder_identity,
+            expected_right=record.target_identity,
+        )
+        _test_boundary("scratch-reuse-rollback")
+        _recover_scratch_delete(budget, parent_fd, record)
+        return
+    target_fd, _ = _open_scratch_leaf(
+        parent_fd,
+        target_name,
+        expected_identity=record.target_identity,
+        allow_marker=True,
+        require_empty=False,
+    )
+    try:
+        _finish_scratch_delete(
+            budget,
+            parent_fd,
+            target_name,
+            target_fd,
+            record.target_identity,
+            record,
+        )
+    finally:
+        os.close(target_fd)
+
+
+def _reuse_completed_scratch(
+    budget: HostWriteBudget, parent_fd: int, destination: Path
+) -> tuple[int, int] | None:
+    records = _scratch_delete_records(parent_fd)
+    if not records:
+        return None
+    if len(records) != 1:
+        fail("reusable scratch record inventory is ambiguous")
+    record = records[0]
+    _recover_scratch_delete(budget, parent_fd, record)
+    try:
+        os.stat(record.name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if _target_name_for_record(parent_fd, record) is not None:
+        fail("reusable scratch target name still exists")
+    record_fd, _ = _open_scratch_leaf(
+        parent_fd,
+        record.name,
+        expected_identity=record.target_identity,
+        allow_marker=False,
+        require_empty=False,
+    )
+    slot_fd = -1
+    try:
+        slot_fd, _ = _open_scratch_leaf(
+            parent_fd,
+            SCRATCH_DELETE_SLOT,
+            expected_identity=record.placeholder_identity,
+            allow_marker=False,
+        )
+        budget.move_leaf(
+            parent_fd,
+            SCRATCH_DELETE_SLOT,
+            parent_fd,
+            destination.name,
+            expected=record.placeholder_identity,
+        )
+        _test_boundary("scratch-reuse-published")
+        reused_fd, _ = _open_scratch_leaf(
+            parent_fd,
+            destination.name,
+            expected_identity=record.placeholder_identity,
+            allow_marker=False,
+        )
+        os.close(reused_fd)
+        budget.park_leaf(
+            parent_fd,
+            record.name,
+            expected=record.target_identity,
+        )
+        return record.placeholder_identity
+    finally:
+        if slot_fd >= 0:
+            os.close(slot_fd)
+        os.close(record_fd)
+
+
+def _remove_quarantined_scratch(
+    budget: HostWriteBudget,
+    root: Path,
+    identity: tuple[int, int],
+    parent_fd: int | None = None,
+) -> None:
+    if parent_fd is None:
+        parent_fd = budget.held_directory(root.parent)
+    root_fd = os.open(
+        root.name,
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    try:
+        metadata = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o022
+            or (metadata.st_dev, metadata.st_ino) != identity
+        ):
+            fail("quarantined scratch identity differs")
+        _remove_tree_contents(
+            budget,
+            root_fd,
+            identity[0],
+            scratch_root=True,
+        )
+        _finish_scratch_delete(
+            budget, parent_fd, root.name, root_fd, identity
+        )
+    finally:
+        os.close(root_fd)
+
+
+def _remove_prepublication_scratch(
+    budget: HostWriteBudget,
+    parent_fd: int,
+    target_name: str,
+    target_identity: tuple[int, int],
+) -> None:
+    target_fd, _ = _open_scratch_leaf(
+        parent_fd,
+        target_name,
+        expected_identity=target_identity,
+        allow_marker=False,
+    )
+    try:
+        if _directory_entries(target_fd):
+            fail("markerless prepublication scratch is not empty")
+    finally:
+        os.close(target_fd)
+    record = _prepare_scratch_delete(
+        budget,
+        parent_fd,
+        target_name,
+        target_identity,
+        require_empty=True,
+    )
+    target_fd, _ = _open_scratch_leaf(
+        parent_fd,
+        target_name,
+        expected_identity=target_identity,
+        allow_marker=False,
+    )
+    try:
+        _finish_scratch_delete(
+            budget,
+            parent_fd,
+            target_name,
+            target_fd,
+            target_identity,
+            record,
+        )
+    finally:
+        os.close(target_fd)
+
+
+def _remove_empty_markerless_tombstone(
+    root: Path,
+    budget: HostWriteBudget,
+    parent_fd: int | None = None,
+) -> None:
+    if parent_fd is None:
+        parent_fd = budget.held_directory(root.parent)
+    parent = os.fstat(parent_fd)
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.geteuid()
+        or parent.st_mode & 0o022
+    ):
+        fail("markerless scratch parent authority differs")
+    root_fd, metadata = _open_scratch_leaf(
+        parent_fd,
+        root.name,
+        expected_identity=None,
+        allow_marker=False,
+    )
+    try:
+        identity = (metadata.st_dev, metadata.st_ino)
+    finally:
+        os.close(root_fd)
+    matching = [
+        record
+        for record in _scratch_delete_records(parent_fd)
+        if record.target_hash == _scratch_name_hash(root.name)
+        and record.target_identity == identity
+    ]
+    if len(matching) != 1:
+        fail("markerless scratch lacks a durable external ownership record")
+    _recover_scratch_delete(budget, parent_fd, matching[0])
+
+
+def sweep_orphan_scratch(budget: HostWriteBudget) -> None:
+    parent_fd = budget.held_directory(cache_root)
+    parent = os.fstat(parent_fd)
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.geteuid()
+        or parent.st_mode & 0o022
+    ):
+        fail("scratch recovery parent authority differs")
+    for record in _scratch_delete_records(parent_fd):
+        _recover_scratch_delete(budget, parent_fd, record)
+    candidates = [
+        entry
+        for entry in _directory_entries(parent_fd)
+        if entry.name.startswith((".rebuild-input-", "..rebuild-input-"))
+    ]
+    if len(candidates) > 8:
+        fail("orphan scratch inventory exceeded bound")
+    for entry in candidates:
+        direct_match = SCRATCH_DIRECT_PATTERN.fullmatch(entry.name)
+        prepublication_match = SCRATCH_PREPUBLICATION_PATTERN.fullmatch(entry.name)
+        tombstone_match = SCRATCH_TOMBSTONE_PATTERN.fullmatch(entry.name)
+        root = cache_root / entry.name
+        if direct_match is not None:
+            identity = _verify_scratch_marker(root, entry.name)
+            cleanup_snapshot(
+                root,
+                identity,
+                budget=budget,
+                parent_fd=parent_fd,
+            )
+            continue
+        if prepublication_match is not None:
+            identity = _verify_prepublication_scratch(root)
+            root_fd, _ = _open_scratch_leaf(
+                parent_fd,
+                entry.name,
+                expected_identity=identity,
+                allow_marker=True,
+            )
+            try:
+                marker_present = bool(_directory_entries(root_fd))
+            finally:
+                os.close(root_fd)
+            if marker_present:
+                _remove_quarantined_scratch(
+                    budget, root, identity, parent_fd
+                )
+            else:
+                _remove_prepublication_scratch(
+                    budget, parent_fd, entry.name, identity
+                )
+            continue
+        if tombstone_match is not None:
+            original_name = f".{tombstone_match.group(1)}"
+            root_fd, metadata = _open_scratch_leaf(
+                parent_fd,
+                entry.name,
+                expected_identity=None,
+                allow_marker=True,
+            )
+            try:
+                marker_present = bool(_directory_entries(root_fd))
+                identity = (metadata.st_dev, metadata.st_ino)
+            finally:
+                os.close(root_fd)
+            if not marker_present:
+                _remove_empty_markerless_tombstone(root, budget, parent_fd)
+            else:
+                verified_identity = _verify_scratch_marker(root, original_name)
+                if verified_identity != identity:
+                    fail("orphan scratch marker identity changed")
+                _remove_quarantined_scratch(
+                    budget, root, identity, parent_fd
+                )
+            continue
+        fail("orphan scratch name is malformed")
 
 
 def cleanup_snapshot(
-    root: Path | None, expected_identity: tuple[int, int] | None = None
+    root: Path | None,
+    expected_identity: tuple[int, int] | None = None,
+    *,
+    budget: HostWriteBudget | None = None,
+    parent_fd: int | None = None,
 ) -> None:
     if root is None:
         return
     if expected_identity is None:
         fail("owned directory cleanup lacks exact identity")
+    if budget is None:
+        fail("owned directory cleanup lacks its active host write budget")
+    scratch_root = root.name.startswith(".rebuild-input-")
     _deadline_checkpoint("snapshot-cleanup")
-    parent_fd = os.open(
-        root.parent,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-    )
-    try:
+    if parent_fd is None:
+        parent_fd = budget.held_directory(root.parent)
+    if parent_fd is not None:
         parent = os.fstat(parent_fd)
         if (
             not stat.S_ISDIR(parent.st_mode)
@@ -2337,11 +3922,12 @@ def cleanup_snapshot(
             or parent.st_mode & 0o022
         ):
             fail(f"unsafe owned cleanup parent: {root.parent}")
+        budget._admit_fd(parent_fd, 0)
         cleanup_pattern = re.compile(
             rf"\.{re.escape(root.name)}\.cleanup\.[1-9][0-9]*\.[0-9a-f]{{8}}"
         )
         tombstones: list[str] = []
-        for entry in os.scandir(parent_fd):
+        for entry in _directory_entries(parent_fd):
             _deadline_checkpoint("snapshot-cleanup")
             if cleanup_pattern.fullmatch(entry.name):
                 tombstones.append(entry.name)
@@ -2357,7 +3943,23 @@ def cleanup_snapshot(
                 dir_fd=parent_fd,
             )
         except FileNotFoundError:
-            if expected_identity is None or not tombstones:
+            records = (
+                [
+                    record
+                    for record in _scratch_delete_records(parent_fd)
+                    if record.target_identity == expected_identity
+                ]
+                if scratch_root
+                else []
+            )
+            if len(records) > 1:
+                fail("owned scratch deletion record inventory is ambiguous")
+            if records:
+                if budget is None:
+                    fail("scratch recovery lacks a host write budget")
+                _recover_scratch_delete(budget, parent_fd, records[0])
+                return
+            if not tombstones:
                 return
             owned_name = tombstones[0]
         else:
@@ -2387,16 +3989,21 @@ def cleanup_snapshot(
         finally:
             os.close(root_fd)
         tombstone = owned_name
-        if owned_name == root.name:
+        renamed = owned_name == root.name
+        if renamed:
+            if budget is None:
+                fail("owned cleanup quarantine lacks a host write budget")
             tombstone = f".{root.name}.cleanup.{os.getpid()}.{secrets.token_hex(4)}"
             _deadline_checkpoint("snapshot-cleanup")
-            os.rename(
-                root.name, tombstone, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
+            budget.move_leaf(
+                parent_fd,
+                root.name,
+                parent_fd,
+                tombstone,
+                expected=actual,
             )
-        moved = os.stat(tombstone, dir_fd=parent_fd, follow_symlinks=False)
-        if (moved.st_dev, moved.st_ino) != actual or not stat.S_ISDIR(moved.st_mode):
-            fail(f"owned directory changed during quarantine: {root}")
-        os.fsync(parent_fd)
+        if renamed and scratch_root:
+            _test_boundary("scratch-tombstone-renamed")
         tombstone_fd = os.open(
             tombstone,
             os.O_RDONLY
@@ -2414,15 +4021,30 @@ def cleanup_snapshot(
                 or (quarantined.st_dev, quarantined.st_ino) != actual
             ):
                 fail(f"owned directory changed after quarantine: {root}")
-            _remove_tree_contents(tombstone_fd, actual[0])
+            _remove_tree_contents(
+                budget,
+                tombstone_fd,
+                actual[0],
+                scratch_root=scratch_root,
+            )
+            if scratch_root:
+                if budget is None:
+                    fail("scratch cleanup lacks a host write budget")
+                _finish_scratch_delete(
+                    budget, parent_fd, tombstone, tombstone_fd, actual
+                )
+            else:
+                if budget is None:
+                    fail("owned cleanup leaf park lacks a host write budget")
+                budget.park_leaf(
+                    parent_fd,
+                    tombstone,
+                    expected=_leaf_authority(quarantined),
+                )
         finally:
             os.close(tombstone_fd)
         _deadline_checkpoint("snapshot-cleanup")
-        os.rmdir(tombstone, dir_fd=parent_fd)
-        os.fsync(parent_fd)
         _deadline_checkpoint("snapshot-cleanup")
-    finally:
-        os.close(parent_fd)
 
 
 @dataclass(frozen=True)
@@ -2840,7 +4462,6 @@ def _safe_absolute(value: str) -> bool:
 
 
 def snapshot_prestate() -> Prestate:
-    service_bin.parent.mkdir(parents=True, exist_ok=True)
     try:
         metadata = service_bin.lstat()
     except FileNotFoundError:
@@ -2940,42 +4561,20 @@ def assert_prestate_unchanged(prestate: Prestate) -> None:
         fail("prior absent-link stable pathname changed before cutover")
 
 
-def set_service_link(target: str) -> None:
+def set_service_link(target: str, budget: HostWriteBudget) -> None:
     _deadline_checkpoint("rollback")
     if not _safe_absolute(target):
         fail("refusing unsafe service link target")
-    temporary = service_bin.with_name(
-        f".{service_bin.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
-    )
-    os.symlink(target, temporary)
-    try:
-        os.replace(temporary, service_bin)
-        fsync_directory(service_bin.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
+    budget.replace_symlink(service_bin, target)
 
 
-def remove_service_link() -> None:
+def remove_service_link(budget: HostWriteBudget) -> None:
     _deadline_checkpoint("rollback")
-    try:
-        metadata = service_bin.lstat()
-    except FileNotFoundError:
-        fsync_directory(service_bin.parent)
-        return
-    if not stat.S_ISLNK(metadata.st_mode):
-        fail("service binary changed to unsupported type during transaction")
-    service_bin.unlink()
-    fsync_directory(service_bin.parent)
+    budget.unlink(service_bin, missing_ok=True, symlink_only=True)
 
 
-def _secure_directory(path: Path, *, create: bool = False) -> None:
+def _secure_directory(path: Path) -> None:
     _deadline_checkpoint("filesystem-read")
-    if create:
-        try:
-            path.mkdir(mode=0o700, parents=True)
-            fsync_directory(path.parent)
-        except FileExistsError:
-            pass
     metadata = path.lstat()
     if (
         not stat.S_ISDIR(metadata.st_mode)
@@ -3001,6 +4600,31 @@ def _secure_state_file(path: Path) -> os.stat_result:
     return metadata
 
 
+def _secure_directory_fd(descriptor: int, label: Path) -> None:
+    _deadline_checkpoint("filesystem-read")
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        fail(f"unsafe rebuild state directory: {label}")
+
+
+def _secure_state_file_at(directory_fd: int, name: str, label: Path) -> os.stat_result:
+    _deadline_checkpoint("filesystem-read")
+    metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size > STATE_MAX_BYTES
+    ):
+        fail(f"unsafe rebuild state file: {label}")
+    return metadata
+
+
 def _secure_backup_file(path: Path) -> os.stat_result:
     _deadline_checkpoint("filesystem-read")
     metadata = path.lstat()
@@ -3016,14 +4640,24 @@ def _secure_backup_file(path: Path) -> os.stat_result:
     return metadata
 
 
-def acquire_rebuild_lock() -> int:
-    _secure_directory(receipt_dir, create=True)
+def acquire_rebuild_lock(budget: HostWriteBudget) -> int:
+    budget.ensure_private_directory(receipt_dir)
     lock_path = receipt_dir / "lock.v1"
-    existed = lock_path.exists() or lock_path.is_symlink()
+    parent_fd = budget.reserve(lock_path, 0)
+    try:
+        os.stat(lock_path.name, dir_fd=parent_fd, follow_symlinks=False)
+        existed = True
+    except FileNotFoundError:
+        existed = False
+    budget._admit_fd(parent_fd, 0)
+    flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    if not existed:
+        flags |= os.O_CREAT | os.O_EXCL
     descriptor = os.open(
-        lock_path,
-        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        lock_path.name,
+        flags,
         0o600,
+        dir_fd=parent_fd,
     )
     try:
         metadata = os.fstat(descriptor)
@@ -3036,14 +4670,19 @@ def acquire_rebuild_lock() -> int:
             fail("unsafe rebuild lock authority")
         if not existed:
             os.fsync(descriptor)
-            fsync_directory(receipt_dir)
+            os.fsync(parent_fd)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RebuildError("rebuild lock is already held") from error
+        current = os.stat(
+            lock_path.name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        if _leaf_authority(current) != _leaf_authority(metadata):
+            fail("rebuild lock leaf changed during acquisition")
         for name in ("rollback", "receipts"):
-            _secure_directory(receipt_dir / name, create=True)
-        fsync_directory(receipt_dir)
+            budget.ensure_private_directory(receipt_dir / name)
+        os.fsync(parent_fd)
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -3058,25 +4697,28 @@ def _state_path() -> Path:
     return _transaction_dir() / "state.json"
 
 
-def _transaction_artifacts() -> list[Path]:
+def _transaction_artifacts(
+    budget: HostWriteBudget, parent_fd: int
+) -> list[Path]:
     _deadline_checkpoint("filesystem-read")
     patterns = (
         r"\.transaction\.v1\.tmp\.[1-9][0-9]*\.[0-9a-f]{8}",
         r"\.transaction\.v1\.cleanup\.[1-9][0-9]*\.[0-9a-f]{8}",
     )
     artifacts: list[Path] = []
-    for entry in receipt_dir.iterdir():
+    for entry in _directory_entries(parent_fd):
         _deadline_checkpoint("filesystem-read")
         if entry.name == "transaction.v1" or any(
             re.fullmatch(pattern, entry.name) for pattern in patterns
         ):
-            artifacts.append(entry)
+            artifacts.append(receipt_dir / entry.name)
     return sorted(artifacts, key=lambda path: path.name)
 
 
-def _prepare_transaction_namespace() -> bool:
+def _prepare_transaction_namespace(budget: HostWriteBudget) -> bool:
     _deadline_checkpoint("filesystem-read")
-    artifacts = _transaction_artifacts()
+    parent_fd = budget.held_directory(receipt_dir)
+    artifacts = _transaction_artifacts(budget, parent_fd)
     if len(artifacts) > 2:
         fail("transaction recovery artifact inventory exceeded its bound")
     canonical = _transaction_dir()
@@ -3098,16 +4740,21 @@ def _prepare_transaction_namespace() -> bool:
     if len(cleanups) > 1 or len(temporaries) > 1:
         fail("transaction recovery artifact inventory is ambiguous")
     for cleanup in cleanups:
-        cleanup_snapshot(cleanup, _directory_identity(cleanup))
-    if canonical.exists() or canonical.is_symlink():
+        metadata = os.stat(
+            cleanup.name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        cleanup_snapshot(
+            cleanup,
+            (metadata.st_dev, metadata.st_ino),
+            budget=budget,
+            parent_fd=parent_fd,
+        )
+    if any(path.name == canonical.name for path in artifacts):
         if temporaries:
             fail("canonical transaction conflicts with prepublication temp")
-        _secure_directory(canonical)
-        entries = []
-        for path in canonical.iterdir():
-            _deadline_checkpoint("filesystem-read")
-            entries.append(path.name)
-        entries.sort()
+        canonical_fd = budget.held_directory(canonical)
+        _secure_directory_fd(canonical_fd, canonical)
+        entries = sorted(entry.name for entry in _directory_entries(canonical_fd))
         if "state.json" not in entries or any(
             name != "state.json"
             and re.fullmatch(r"\.state\.tmp\.[1-9][0-9]*\.[0-9a-f]{8}", name)
@@ -3117,28 +4764,24 @@ def _prepare_transaction_namespace() -> bool:
             fail("transaction contains an unknown publication artifact")
         for name in entries:
             if name != "state.json":
-                _secure_state_file(canonical / name)
+                _secure_state_file_at(canonical_fd, name, canonical / name)
         return bool(artifacts)
     if not temporaries:
         return bool(artifacts)
     temporary = temporaries[0]
-    _secure_directory(temporary)
-    entries = []
-    for path in temporary.iterdir():
-        _deadline_checkpoint("filesystem-read")
-        entries.append(path.name)
-    entries.sort()
+    temporary_fd = budget.held_directory(temporary)
+    _secure_directory_fd(temporary_fd, temporary)
+    entries = sorted(entry.name for entry in _directory_entries(temporary_fd))
     if not entries:
         fail("empty prepublication transaction retained")
     if entries == ["state.json"]:
-        _secure_state_file(temporary / "state.json")
-        os.rename(temporary, canonical)
-        fsync_directory(receipt_dir)
+        _secure_state_file_at(temporary_fd, "state.json", temporary / "state.json")
+        budget.rename(temporary, canonical)
         return True
     if len(entries) == 1 and re.fullmatch(
         r"\.state\.tmp\.[1-9][0-9]*\.[0-9a-f]{8}", entries[0]
     ):
-        _secure_state_file(temporary / entries[0])
+        _secure_state_file_at(temporary_fd, entries[0], temporary / entries[0])
         fail("incomplete prepublication transaction retained")
     fail("prepublication transaction contains an unknown artifact")
 
@@ -3371,7 +5014,7 @@ def _validate_authorities(value: object) -> dict[str, Any]:
             "gcc_closure",
             "sysroot_lib",
             "sysroot_include",
-            "metadata_target",
+            "python_stdlib",
         }
         or sha256_bytes(
             json.dumps(
@@ -3445,7 +5088,7 @@ def validate_wal(value: object) -> dict[str, Any]:
         Path(snapshot).relative_to(cache_root)
     except ValueError:
         fail("transaction snapshot escaped cache root")
-    if not Path(snapshot).name.startswith(".rebuild-input-"):
+    if re.fullmatch(r"\.rebuild-input-[0-9a-f]{32}", Path(snapshot).name) is None:
         fail("transaction snapshot name is unsafe")
     snapshot_identity = _exact_keys(
         wal["snapshot_identity"], {"device", "inode"}, "snapshot identity"
@@ -3637,14 +5280,16 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         written += count
 
 
-def persist_wal(wal: dict[str, Any], *, initial: bool = False) -> None:
+def persist_wal(
+    wal: dict[str, Any], budget: HostWriteBudget, *, initial: bool = False
+) -> None:
     transaction = _transaction_dir()
     if initial:
         temporary_transaction = receipt_dir / (
             f".transaction.v1.tmp.{os.getpid()}.{secrets.token_hex(4)}"
         )
         try:
-            temporary_transaction.mkdir(mode=0o700)
+            budget.mkdir(temporary_transaction)
         except FileExistsError:
             fail("transaction publication temp already exists")
         transaction = temporary_transaction
@@ -3658,55 +5303,30 @@ def persist_wal(wal: dict[str, Any], *, initial: bool = False) -> None:
     if failure and failure != "completion-sink":
         raise RebuildError(f"test-only injected committed-state failure: {failure}")
     temporary = transaction / f".state.tmp.{os.getpid()}.{secrets.token_hex(4)}"
-    descriptor = os.open(
-        temporary,
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | os.O_CLOEXEC
-        | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-    )
-    try:
-        _write_all(descriptor, payload)
-        os.fchmod(descriptor, 0o600)
-        metadata = os.fstat(descriptor)
-        if (
-            metadata.st_uid != os.geteuid()
-            or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) != 0o600
-        ):
-            fail("temporary state file authority is unsafe")
-        os.fsync(descriptor)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-    finally:
-        os.close(descriptor)
+    budget.write_new(temporary, payload, 0o600)
+    _secure_state_file(temporary)
     if initial:
-        os.replace(temporary, transaction / "state.json")
-        fsync_directory(transaction)
-        os.rename(transaction, _transaction_dir())
+        budget.rename(temporary, transaction / "state.json", replace=True)
+        budget.rename(transaction, _transaction_dir())
         transaction = _transaction_dir()
-        fsync_directory(receipt_dir)
     else:
-        os.replace(temporary, _state_path())
+        budget.rename(temporary, _state_path(), replace=True)
     _secure_state_file(_state_path())
-    fsync_directory(transaction)
-    fsync_directory(receipt_dir / "rollback")
-    fsync_directory(receipt_dir / "receipts")
-    fsync_directory(receipt_dir)
 
 
 def persist_phase(
-    wal: dict[str, Any], phase: str, *, committed: dict[str, Any] | None = None
+    wal: dict[str, Any],
+    phase: str,
+    budget: HostWriteBudget,
+    *,
+    committed: dict[str, Any] | None = None,
 ) -> None:
     if phase not in PHASES:
         fail("invalid transaction phase")
     updated = dict(wal)
     updated["phase"] = phase
     updated["committed"] = committed
-    persist_wal(updated)
+    persist_wal(updated, budget)
     wal.clear()
     wal.update(updated)
 
@@ -3737,7 +5357,9 @@ def _test_boundary(name: str) -> None:
         signal.pause()
 
 
-def _make_backup(prestate: Prestate) -> tuple[Path, ExecutableIdentity]:
+def _make_backup(
+    prestate: Prestate, budget: HostWriteBudget
+) -> tuple[Path, ExecutableIdentity]:
     if prestate.descriptor is None:
         fail("prior executable descriptor is unavailable")
     rollback_dir = receipt_dir / "rollback"
@@ -3749,7 +5371,7 @@ def _make_backup(prestate: Prestate) -> tuple[Path, ExecutableIdentity]:
         before = fd_identity(prestate.descriptor)
         if before != prestate.executable:
             fail("prior held executable changed before backup")
-        atomic_copy_fd(prestate.descriptor, backup, 0o700)
+        atomic_copy_fd(prestate.descriptor, backup, 0o700, budget)
         identity = file_identity(backup)
         if fd_identity(prestate.descriptor) != before:
             fail("prior held executable changed during backup")
@@ -3837,22 +5459,24 @@ def _sleep_poll() -> None:
         fail("transaction deadline exhausted while polling")
 
 
-def _record_job(wal: dict[str, Any], job: int) -> None:
+def _record_job(wal: dict[str, Any], budget: HostWriteBudget, job: int) -> None:
     jobs = cast(list[int], wal["manager_job_ids"])
     if job not in jobs:
         updated = dict(wal)
         updated["manager_job_ids"] = [*jobs, job]
-        persist_wal(updated)
+        persist_wal(updated, budget)
         wal.clear()
         wal.update(updated)
 
 
-def _set_restart_intent(wal: dict[str, Any], value: bool) -> None:
+def _set_restart_intent(
+    wal: dict[str, Any], budget: HostWriteBudget, value: bool
+) -> None:
     if wal["restart_intent"] == value:
         return
     updated = dict(wal)
     updated["restart_intent"] = value
-    persist_wal(updated)
+    persist_wal(updated, budget)
     wal.clear()
     wal.update(updated)
 
@@ -3920,6 +5544,7 @@ def _prove_restarted_runtime(
 
 def restart_guard(
     wal: dict[str, Any],
+    budget: HostWriteBudget,
     *,
     service_link: str,
     running_link: str,
@@ -3932,7 +5557,7 @@ def restart_guard(
 ) -> tuple[Generation, int]:
     _require_same_manager(wal)
     prove_no_manager_job()
-    _set_restart_intent(wal, True)
+    _set_restart_intent(wal, budget, True)
     execute(
         [
             require_tool("systemctl"),
@@ -3959,7 +5584,7 @@ def restart_guard(
         }:
             fail("restart published an unsupported manager job")
         job = manager_job.job_id
-        _record_job(wal, job)
+        _record_job(wal, budget, job)
     if boundary is not None:
         _test_boundary(boundary)
     while job is not None:
@@ -3987,7 +5612,7 @@ def restart_guard(
         prior_generation=prior_generation,
         expected_boot=expected_boot,
     )
-    _set_restart_intent(wal, False)
+    _set_restart_intent(wal, budget, False)
     return restarted
 
 
@@ -4156,43 +5781,26 @@ def _exact_prior_running(wal: dict[str, Any]) -> bool:
     return service_link_matches(prestate.link_target) and _exact_prior_runtime(wal)
 
 
-def _remove_backup(wal: dict[str, Any]) -> None:
+def _remove_backup(wal: dict[str, Any], budget: HostWriteBudget) -> None:
     _deadline_checkpoint("rollback")
     backup = Path(cast(dict[str, Any], wal["prior"])["backup"]["path"])
-    try:
-        metadata = backup.lstat()
-    except FileNotFoundError:
-        return
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or stat.S_ISLNK(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or metadata.st_nlink != 1
-        or stat.S_IMODE(metadata.st_mode) != 0o700
-    ):
-        fail("rollback backup became unsafe")
-    backup.unlink()
-    fsync_directory(backup.parent)
-    fsync_directory(receipt_dir)
+    budget.unlink(backup, missing_ok=True, regular_mode=0o700)
 
 
-def sweep_orphan_backups() -> None:
+def sweep_orphan_backups(budget: HostWriteBudget) -> None:
     _deadline_checkpoint("filesystem-read")
     rollback = receipt_dir / "rollback"
-    entries = []
-    for entry in rollback.iterdir():
+    rollback_fd = budget.ensure_private_directory(rollback)
+    entries: list[str] = []
+    for entry in _directory_entries(rollback_fd):
         _deadline_checkpoint("filesystem-read")
-        entries.append(entry)
+        entries.append(entry.name)
     if len(entries) > 64:
         fail("rollback backup inventory exceeded its bound")
-    for entry in entries:
-        if re.fullmatch(r"[0-9a-f]{64}\.bin", entry.name) is None:
+    for name in entries:
+        if re.fullmatch(r"[0-9a-f]{64}\.bin", name) is None:
             fail("rollback directory contains an unknown entry")
-        _secure_backup_file(entry)
-        entry.unlink()
-    if entries:
-        fsync_directory(rollback)
-        fsync_directory(receipt_dir)
+        budget.unlink(rollback / name, regular_mode=0o700)
 
 
 def _snapshot_wal_identity(wal: dict[str, Any]) -> tuple[int, int]:
@@ -4203,17 +5811,27 @@ def _snapshot_wal_identity(wal: dict[str, Any]) -> tuple[int, int]:
     return payload["device"], payload["inode"]
 
 
-def cleanup_transaction(wal: dict[str, Any]) -> None:
+def cleanup_transaction(wal: dict[str, Any], budget: HostWriteBudget) -> None:
+    snapshot = Path(cast(str, wal["snapshot_root"]))
     cleanup_snapshot(
-        Path(cast(str, wal["snapshot_root"])),
+        snapshot,
         _snapshot_wal_identity(wal),
+        budget=budget,
+        parent_fd=budget.held_directory(snapshot.parent),
     )
-    _remove_backup(wal)
+    _remove_backup(wal, budget)
     transaction = _transaction_dir()
-    cleanup_snapshot(transaction, _directory_identity(transaction))
+    transaction_fd = budget.held_directory(transaction)
+    metadata = os.fstat(transaction_fd)
+    cleanup_snapshot(
+        transaction,
+        (metadata.st_dev, metadata.st_ino),
+        budget=budget,
+        parent_fd=budget.held_directory(transaction.parent),
+    )
 
 
-def rollback_wal(wal: dict[str, Any]) -> None:
+def rollback_wal(wal: dict[str, Any], budget: HostWriteBudget) -> None:
     log("ROLLBACK_BEGIN=1")
     _deadline_checkpoint("rollback")
     _assert_fixed_authorities(wal)
@@ -4223,7 +5841,7 @@ def rollback_wal(wal: dict[str, Any]) -> None:
         health_check()
         if not _exact_prior_running(wal):
             fail("exact prior generation drifted during rollback health check")
-        cleanup_transaction(wal)
+        cleanup_transaction(wal, budget)
         log("ROLLBACK_RESTORED=1")
         return
     stable_prior_fd: int | None = None
@@ -4238,13 +5856,13 @@ def rollback_wal(wal: dict[str, Any]) -> None:
     if _exact_prior_runtime(wal):
         try:
             if prestate.link_target is None:
-                remove_service_link()
+                remove_service_link(budget)
             else:
-                set_service_link(prestate.link_target)
+                set_service_link(prestate.link_target, budget)
             if not _exact_prior_running(wal):
                 fail("exact prior runtime or link drifted during rollback")
             health_check()
-            cleanup_transaction(wal)
+            cleanup_transaction(wal, budget)
             if stable_prior_fd is not None and (
                 fd_identity(stable_prior_fd) != prestate.executable
                 or file_identity(Path(prestate.running_link)) != prestate.executable
@@ -4258,17 +5876,17 @@ def rollback_wal(wal: dict[str, Any]) -> None:
     failed = query_generation(require_running=False)
     failed_proc = proc_starttime(failed.pid) if failed.pid else 0
     if prestate.link_target is None:
-        set_service_link(prestate.running_link)
+        set_service_link(prestate.running_link, budget)
     else:
         prior_target = Path(prestate.link_target)
         if file_identity(prior_target) != prestate.executable:
             fail("prior-present rollback target no longer names exact prior object")
-        set_service_link(prestate.link_target)
+        set_service_link(prestate.link_target, budget)
     if _exact_prior_running(wal):
         health_check()
         if not _exact_prior_running(wal):
             fail("exact prior generation drifted during rollback health check")
-        cleanup_transaction(wal)
+        cleanup_transaction(wal, budget)
         log("ROLLBACK_RESTORED=1")
         return
     backup_record = cast(dict[str, Any], cast(dict[str, Any], wal["prior"])["backup"])
@@ -4279,6 +5897,7 @@ def rollback_wal(wal: dict[str, Any]) -> None:
     try:
         restored_generation, restored_start = restart_guard(
             wal,
+            budget,
             service_link=(
                 prestate.running_link
                 if prestate.link_target is None
@@ -4315,10 +5934,10 @@ def rollback_wal(wal: dict[str, Any]) -> None:
         ):
             fail("prior absent-link stable pathname drifted during rollback")
         if prestate.link_target is None:
-            remove_service_link()
+            remove_service_link(budget)
         if not service_link_matches(prestate.link_target):
             fail("rollback did not restore exact prior service link state")
-        cleanup_transaction(wal)
+        cleanup_transaction(wal, budget)
         if stable_prior_fd is not None and (
             fd_identity(stable_prior_fd) != prestate.executable
             or file_identity(Path(prestate.running_link)) != prestate.executable
@@ -4373,21 +5992,32 @@ def _verify_committed(wal: dict[str, Any], *, cancel_jobs: bool = True) -> None:
         os.close(descriptor)
 
 
-def archive_committed(wal: dict[str, Any]) -> tuple[Path, str]:
+def archive_committed(
+    wal: dict[str, Any], budget: HostWriteBudget
+) -> tuple[Path, str]:
     _deadline_checkpoint("rollback")
     if wal["phase"] != "committed":
         fail("only committed state may be archived")
+    snapshot = Path(cast(str, wal["snapshot_root"]))
     cleanup_snapshot(
-        Path(cast(str, wal["snapshot_root"])),
+        snapshot,
         _snapshot_wal_identity(wal),
+        budget=budget,
+        parent_fd=budget.held_directory(snapshot.parent),
     )
-    _remove_backup(wal)
+    _remove_backup(wal, budget)
     receipts = receipt_dir / "receipts"
+    receipts_fd = budget.ensure_private_directory(receipts)
     destination = receipts / cast(str, wal["txid"])
-    if destination.exists() or destination.is_symlink():
+    try:
+        os.stat(destination.name, dir_fd=receipts_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
         fail("committed receipt destination already exists")
     transaction = _transaction_dir()
-    for entry in transaction.iterdir():
+    transaction_fd = budget.ensure_private_directory(transaction)
+    for entry in _directory_entries(transaction_fd):
         _deadline_checkpoint("filesystem-read")
         if entry.name == "state.json":
             continue
@@ -4395,33 +6025,30 @@ def archive_committed(wal: dict[str, Any]) -> tuple[Path, str]:
             r"\.state\.tmp\.[1-9][0-9]*\.[0-9a-f]{8}", entry.name
         ) is None:
             fail("transaction contains an unknown publication artifact")
-        _secure_state_file(entry)
         _deadline_checkpoint("filesystem-write")
-        entry.unlink()
-    fsync_directory(transaction)
-    os.rename(transaction, destination)
+        budget.unlink(transaction / entry.name, regular_mode=0o600)
+    budget.rename(transaction, destination)
     _secure_directory(destination)
     state_path = destination / "state.json"
     _secure_state_file(state_path)
-    fsync_directory(destination)
-    fsync_directory(receipts)
-    fsync_directory(receipt_dir)
     return state_path, sha256_file(state_path)
 
 
-def recover_stale_transaction(wal: dict[str, Any]) -> None:
+def recover_stale_transaction(
+    wal: dict[str, Any], budget: HostWriteBudget
+) -> None:
     phase = cast(str, wal["phase"])
     if phase == "committed":
         _verify_committed(wal)
-        archive_committed(wal)
+        archive_committed(wal, budget)
     elif phase == "prestate" and _exact_prior_running(wal):
         _assert_fixed_authorities(wal)
         prove_no_manager_job()
-        cleanup_transaction(wal)
+        cleanup_transaction(wal, budget)
     else:
         if phase == "prestate":
-            persist_phase(wal, "mutated")
-        rollback_wal(wal)
+            persist_phase(wal, "mutated", budget)
+        rollback_wal(wal, budget)
     print(
         f"{RECOVERY_COMPLETE} phase={phase} txid={wal['txid']}",
         flush=True,
@@ -4535,14 +6162,19 @@ def run_transaction() -> int:
     prestate: Prestate | None = None
     accepted: RuntimeAttestation | None = None
     wal: dict[str, Any] | None = None
+    write_budget: HostWriteBudget | None = None
     lock_acquired = False
     try:
-        lock_descriptor = acquire_rebuild_lock()
+        write_budget = HostWriteBudget(cache_root)
+        for destination in (receipt_dir, cache_root, service_bin):
+            write_budget.reserve(destination, 0)
+        write_budget.ensure_write_directory(service_bin.parent)
+        lock_descriptor = acquire_rebuild_lock(write_budget)
         lock_acquired = True
         operation_deadline = time.monotonic() + _test_deadline(
             "LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS", RECOVERY_SECONDS
         )
-        recovered_namespace = _prepare_transaction_namespace()
+        recovered_namespace = _prepare_transaction_namespace(write_budget)
         stale = load_wal()
         if stale is not None:
             authorities = cast(dict[str, Any], stale["authorities"])
@@ -4563,7 +6195,7 @@ def run_transaction() -> int:
             if candidate_authority.sha256 != candidate_identity.sha256:
                 fail("candidate executable authority differs from transaction")
             _open_all_tools()
-            recover_stale_transaction(stale)
+            recover_stale_transaction(stale, write_budget)
             return 75
         if recovered_namespace:
             print(f"{RECOVERY_COMPLETE} phase=cleanup txid=unknown", flush=True)
@@ -4572,7 +6204,9 @@ def run_transaction() -> int:
         operation_deadline = time.monotonic() + _test_deadline(
             "LLM_GUARD_REBUILD_TEST_FORWARD_SECONDS", FORWARD_SECONDS
         )
-        sweep_orphan_backups()
+        write_budget.ensure_private_directory(cache_root)
+        sweep_orphan_scratch(write_budget)
+        sweep_orphan_backups(write_budget)
         _open_fixed_authorities()
         _open_all_tools()
         config_sha_initial = fixed_authorities["config"].sha256
@@ -4586,12 +6220,9 @@ def run_transaction() -> int:
         prestate = snapshot_prestate()
         manager_generation = query_manager_generation()
         prove_no_manager_job()
-        ensure_private_directory(cache_root)
-        snapshot_root = Path(tempfile.mkdtemp(prefix=".rebuild-input-", dir=cache_root))
-        snapshot_root.chmod(0o700)
-        snapshot_root_identity = _directory_identity(snapshot_root)
-        source_bundle = prepare_canonical_source(snapshot_root)
-        build_bundle = build_sandboxed_candidate(source_bundle)
+        snapshot_root, snapshot_root_identity = create_snapshot_root(write_budget)
+        source_bundle = prepare_canonical_source(snapshot_root, write_budget)
+        build_bundle = build_sandboxed_candidate(source_bundle, write_budget)
         candidate_authority = build_bundle.authority
         candidate = build_bundle.candidate
         candidate_identity = build_bundle.identity
@@ -4612,7 +6243,7 @@ def run_transaction() -> int:
         if query_manager_generation() != manager_generation:
             fail("user manager generation changed before cutover")
 
-        backup, backup_identity = _make_backup(prestate)
+        backup, backup_identity = _make_backup(prestate, write_budget)
         tool_receipts = {
             name: held.receipt() for name, held in sorted(held_tools.items())
         }
@@ -4655,13 +6286,13 @@ def run_transaction() -> int:
             candidate_identity,
             authorities,
         )
-        persist_wal(wal, initial=True)
+        persist_wal(wal, write_budget, initial=True)
         _test_boundary("prestate-fsynced")
-        persist_phase(wal, "mutated")
+        persist_phase(wal, "mutated", write_budget)
         _test_boundary("mutated-fsynced")
 
         if not service_link_matches(str(candidate)):
-            set_service_link(str(candidate))
+            set_service_link(str(candidate), write_budget)
         _test_boundary("link-renamed")
         needs_restart = (
             prestate.executable.device,
@@ -4672,6 +6303,7 @@ def run_transaction() -> int:
         if needs_restart:
             restarted_generation, restarted_start = restart_guard(
                 wal,
+                write_budget,
                 service_link=str(candidate),
                 running_link=str(candidate),
                 expected=candidate_identity,
@@ -4723,9 +6355,9 @@ def run_transaction() -> int:
             "running_link": accepted.running_link,
             "executable": accepted.executable,
         }
-        persist_phase(wal, "committed", committed=committed)
+        persist_phase(wal, "committed", write_budget, committed=committed)
         _test_boundary("committed-fsynced")
-        _, receipt_digest = archive_committed(wal)
+        _, receipt_digest = archive_committed(wal, write_budget)
         snapshot_root = None
         snapshot_root_identity = None
         _verify_committed(wal, cancel_jobs=False)
@@ -4750,7 +6382,9 @@ def run_transaction() -> int:
                 for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
             }
             try:
-                rollback_wal(wal)
+                if write_budget is None:
+                    fail("host write budget is unavailable during rollback")
+                rollback_wal(wal, write_budget)
             except Exception as failure:  # noqa: BLE001 - retain WAL and report.
                 rollback_error = failure
             finally:
@@ -4772,7 +6406,16 @@ def run_transaction() -> int:
         if candidate_authority is not None:
             candidate_authority.close()
             candidate_authority = None
-        cleanup_snapshot(snapshot_root, snapshot_root_identity)
+        cleanup_snapshot(
+            snapshot_root,
+            snapshot_root_identity,
+            budget=write_budget,
+            parent_fd=(
+                None
+                if snapshot_root is None or write_budget is None
+                else write_budget.held_directory(snapshot_root.parent)
+            ),
+        )
         for held in reversed(list(held_tools.values())):
             held.close()
         held_tools.clear()
@@ -4782,6 +6425,8 @@ def run_transaction() -> int:
         operation_deadline = None
         if lock_descriptor is not None:
             os.close(lock_descriptor)
+        if write_budget is not None:
+            write_budget.close()
 
 
 raise SystemExit(run_transaction())
