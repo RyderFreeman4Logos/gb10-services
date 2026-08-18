@@ -78,6 +78,21 @@ class Qwen38UnitContractTests(unittest.TestCase):
         # Hub SHA pin kept as a documented comment, not a snapshots path.
         self.assertIn(NVFP4_SHA, self.text)
 
+    def test_unit_adds_dspark_speed_flags(self):
+        # MiaAI 2026-08-18 start-dspark.sh speed flags (code-decode ~51 tok/s).
+        for flag in (
+            "--speculative-num-draft-tokens 8",
+            "--enable-torch-compile",
+            "--torch-compile-max-bs 4",
+            "--cuda-graph-max-bs-decode 4",
+            "--num-continuous-decode-steps 2",
+        ):
+            self.assertIn(flag, self.text)
+        # Deprecated prefill CUDA-graph flag must NOT be used; only the decode
+        # variant above. Prefill CUDA graphs remain disabled (see unit test).
+        self.assertNotIn("--cuda-graph-max-bs \\", self.text)
+        self.assertNotIn("--cuda-graph-max-bs \n", self.text)
+
     def test_unit_uses_dspark_speculative_decoding(self):
         self.assertIn("--speculative-algorithm DSPARK", self.text)
         self.assertNotIn("--speculative-algorithm EAGLE", self.text)

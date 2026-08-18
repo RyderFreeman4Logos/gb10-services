@@ -31,6 +31,10 @@ uses that alias gets the Qwen3.8 generation after a later authorized cutover.
   mounted read-only as the flat mount `--speculative-draft-model-path /models/qwen38-dspark`,
   `--speculative-dspark-block-size 7`,
   `--speculative-draft-model-quantization unquant`.
+- MiaAI 2026-08-18 DSpark speed flags chase code-decode ~51 tok/s (chat ~23;
+  long essay still prefers MTP): `--speculative-num-draft-tokens 8`,
+  `--enable-torch-compile`, `--torch-compile-max-bs 4`,
+  `--cuda-graph-max-bs-decode 4`, `--num-continuous-decode-steps 2`.
 - `--mem-fraction-static 0.53` (operator contract, not MIAI's 0.95) on a
   121.63 GiB box: ~64.73 GiB reservation. Do **not** copy MIAI's
   `--mamba-full-memory-ratio 4.21` — it was tuned at 0.95 and is untrusted
