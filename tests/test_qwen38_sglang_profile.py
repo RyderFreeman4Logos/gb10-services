@@ -92,12 +92,14 @@ class Qwen38UnitContractTests(unittest.TestCase):
         self.assertIn("--kv-cache-dtype fp8_e4m3", argv)
         self.assertNotIn("--kv-cache-dtype auto", argv)
 
-    def test_unit_pins_max_total_tokens_to_full_window(self):
-        # Live `auto` sized KV to 234834 tokens with 15.81 GB left over, too
-        # small for a single full-window request. Pin to 262144 so the pool
-        # actually fits one window. Scope to launch_server argv, not comments.
+    def test_unit_omits_max_total_tokens_pool_cap(self):
+        # --max-total-tokens is a pool CAP, not an OOM guard; it blocks leftover
+        # envelope from becoming concurrent KV. Dropping it lets SGLang grow KV
+        # into the new 74g envelope within --mem-fraction-static 0.83.
+        # Scope to launch_server argv so comments cannot false-positive.
         argv = self.text.split("--sampling-defaults model", 1)[0]
-        self.assertIn("--max-total-tokens 262144", argv)
+        self.assertNotIn("--max-total-tokens", argv)
+        self.assertIn("--context-length 262144", argv)
 
     def test_unit_adds_dspark_speed_flags(self):
         # MiaAI 2026-08-18 start-dspark.sh speed flags (code-decode ~51 tok/s).
@@ -135,7 +137,6 @@ class Qwen38UnitContractTests(unittest.TestCase):
         # live 0.72 + --max-total-tokens 262144 still allocated 233344 fp8
         # tokens with 16.53 GB leftover (262144/233344*0.72 ~= 0.81, +buffer).
         self.assertIn("--context-length 262144", self.text)
-        self.assertIn("--max-total-tokens 262144", self.text)
         self.assertIn("--mem-fraction-static 0.83", self.text)
         self.assertIn("SGLANG_MEM_FRACTION=0.83", self.text)
         self.assertNotIn("--mem-fraction-static 0.72", self.text)
@@ -180,8 +181,8 @@ class Qwen38UnitContractTests(unittest.TestCase):
     def test_unit_swap_is_impossible(self):
         # Docker: memory == memory-swap (zero extra swap) + swappiness 0.
         self.assertIn("--memory-swappiness 0", self.text)
-        self.assertRegex(self.text, r"--memory\s+70g")
-        self.assertRegex(self.text, r"--memory-swap\s+70g")
+        self.assertRegex(self.text, r"--memory\s+74g")
+        self.assertRegex(self.text, r"--memory-swap\s+74g")
         # systemd: no swap escapes the unit.
         self.assertIn("MemorySwapMax=0", self.text)
 

@@ -26,8 +26,8 @@ EXPECTED_IMAGE = (
 )
 EXPECTED_CONTAINER = "vllm-embedding"
 EXPECTED_MODELS = ("qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B")
-EXPECTED_PROFILE = "qwen3-embedding-8b-32k-4800M-128GiB"
-EXPECTED_UNIT_SHA256 = "01f6bc2ab4e4460d3d4c3bf60b8174d9cc501d4636fd0d1be72d4670223a840c"
+EXPECTED_PROFILE = "qwen3-embedding-8b-32k-4800M-24GiB"
+EXPECTED_UNIT_SHA256 = "6ed616bfe2ef91073e5cf9ef158642d2036d5e4bb589e475a063827cdaae05f4"
 EXPECTED_NO_SWAP_PREFIX = [
     "/usr/bin/env",
     "-i",
@@ -61,9 +61,9 @@ EXPECTED_HOST_ARGV = [
     "--memory-swappiness",
     "0",
     "--memory",
-    "128g",
+    "24g",
     "--memory-swap",
-    "128g",
+    "24g",
     "--oom-score-adj",
     "0",
     "--entrypoint",

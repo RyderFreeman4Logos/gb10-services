@@ -181,7 +181,7 @@ class HostileAeonUnitMutationTests(unittest.TestCase):
         """--memory-swap != --memory allows swap and must be rejected."""
         unit = AEON_UNIT.read_text()
         unit = unit.replace(
-            "--memory-swap 128g",
+            "--memory-swap 74g",
             "--memory-swap 256g",
             1,
         )

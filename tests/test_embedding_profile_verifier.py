@@ -66,7 +66,7 @@ class StrictUnitParserTests(unittest.TestCase):
         canonical = UNIT.read_text()
         mutations = {
             "host short memory alias": canonical.replace(
-                "  --memory 128g \\\n", "  --memory 128g -m 24g \\\n", 1
+                "  --memory 24g \\\n", "  --memory 24g -m 24g \\\n", 1
             ),
             "host flag after image": canonical.replace(
                 "  /usr/local/bin/vllm serve",
@@ -262,7 +262,7 @@ class CurrentGenerationVerifierTests(unittest.TestCase):
                 self.assertEqual(receipt["verification"], "passed")
                 self.assertEqual(
                     receipt["profile"],
-                    "qwen3-embedding-8b-32k-4800M-128GiB",
+                    "qwen3-embedding-8b-32k-4800M-24GiB",
                 )
                 serialized = json.dumps(receipt, sort_keys=True)
                 self.assertNotIn(CURRENT_INVOCATION, serialized)

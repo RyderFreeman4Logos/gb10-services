@@ -8,7 +8,7 @@ if (( $# != 0 )); then
 fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 engine="$script_dir/gb10_embedding_activation.py"
-expected_engine_sha256="19115f0844c7d320cc317301a652959b9a3e33789e5513df68765d3b5a7cd1ec"
+expected_engine_sha256="bedcb0d2b469535a13f048cec45af6ce8a7a56484b79001bea6480b7640fe507"
 if [[ -L "$engine" || ! -f "$engine" ]]; then
   echo "embedding activation engine authority is unsafe" >&2
   exit 1

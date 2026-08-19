@@ -152,7 +152,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 self.assertEqual(receipt["verification"], "passed")
                 self.assertEqual(
                     receipt["profile"],
-                    "qwen3-embedding-8b-32k-4800M-128GiB",
+                    "qwen3-embedding-8b-32k-4800M-24GiB",
                 )
                 self.assertNotIn("transaction", receipt)
                 self.assertNotIn("rollback_available", receipt)

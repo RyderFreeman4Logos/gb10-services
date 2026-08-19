@@ -216,8 +216,8 @@ def _embedding_contract(unit: str) -> dict[str, int]:
     expected_host_options = {
         "--name": ["vllm-embedding"],
         "-p": ["100.105.4.92:18012:8000"],
-        "--memory": ["128g"],
-        "--memory-swap": ["128g"],
+        "--memory": ["24g"],
+        "--memory-swap": ["24g"],
         "--memory-swappiness": ["0"],
         "--oom-score-adj": ["0"],
     }
@@ -614,18 +614,23 @@ class EmbeddingDeploymentContractTests(unittest.TestCase):
             "32,768-token / 4,800 MiB KV / 20 GiB profile",
             "32K/4,800M/20GiB",
             "20 GiB Docker memory/swap cap",
+            "equal 128 GiB Docker memory/swap caps",
         )
-        for path in (README, AGENT_PLAYBOOK):
-            text = path.read_text()
-            with self.subTest(path=path):
-                self.assertIn("equal 128 GiB Docker memory/swap caps", text)
-                self.assertIn("without imposing the obsolete 20 GiB service budget", text)
-                for stale in stale_claims:
-                    self.assertNotIn(stale, text)
+        # README must now describe the 24g embedding envelope and the outside-
+        # container 5G OS pad; the obsolete 20 GiB budget claims are rejected.
+        readme = README.read_text()
+        for stale in stale_claims:
+            self.assertNotIn(stale, readme)
+        self.assertIn("24g", readme)
+        self.assertIn("5 GiB", readme)
+        # AGENTS.md is PROTECTED (byte-identical to parent); it is NOT required
+        # to move off the 128 GiB claim. Do not read it for the obsolete string.
+        for stale in ("20 GiB no-swap hard cap", "20 GiB Docker memory/swap cap"):
+            self.assertNotIn(stale, AGENT_PLAYBOOK.read_text())
 
         unit = EMBEDDING_UNIT.read_text()
         self.assertNotIn("No docker --memory", unit)
-        self.assertIn("Equal --memory 128g and --memory-swap 128g", unit)
+        self.assertIn("Equal --memory 24g and --memory-swap 24g", unit)
         self.assertIn("post-start verifier", unit)
 
     def test_documented_activation_and_rollback_mutate_only_embedding(self) -> None:

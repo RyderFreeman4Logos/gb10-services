@@ -52,8 +52,8 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   -e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768 \
   -e AEON_THINKING_BUDGET_GUARD=0 \
   --memory-swappiness 0 \
-  --memory 128g \
-  --memory-swap 128g \
+  --memory 74g \
+  --memory-swap 74g \
   --oom-score-adj 800 \
   --entrypoint python3 \
   ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7 \
