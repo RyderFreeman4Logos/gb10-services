@@ -31,7 +31,7 @@ MODEL_MOUNT = "/models/qwen38-nvfp4"
 DRAFT_MOUNT = "/models/qwen38-dspark"
 # Revision-locked hub SHA pins, documented in the unit comments (kept when the
 # server path is the flat mount, not the hub snapshots/<sha> path).
-NVFP4_SHA = "554ebba9b5f1b79dc11246341960360e6ef05ef4"
+NVFP4_SHA = "faf7945020c138c8ef864ab1644273f3158f85fa"
 DSPARK_SHA = "85ef153be924f17ce4bf62726954eeaa4a73e854"
 
 
@@ -74,7 +74,9 @@ class Qwen38UnitContractTests(unittest.TestCase):
     def test_unit_pins_nvfp4_revision_pinned_model_path(self):
         # Server path is the flat --local-dir mount target (no snapshots/<sha>).
         self.assertIn(f"--model-path {MODEL_MOUNT}", self.text)
-        self.assertIn("/home/obj/models/RadixArk/Qwen3.8-27B-NVFP4", self.text)
+        self.assertIn("/home/obj/models/Blackfrost-AI/Qwen3.8-27B-ABLITERATED-NVFP4", self.text)
+        # Reject the superseded RadixArk NVFP4 host bind.
+        self.assertNotIn("/home/obj/models/RadixArk/Qwen3.8-27B-NVFP4", self.text)
         # Hub SHA pin kept as a documented comment, not a snapshots path.
         self.assertIn(NVFP4_SHA, self.text)
 

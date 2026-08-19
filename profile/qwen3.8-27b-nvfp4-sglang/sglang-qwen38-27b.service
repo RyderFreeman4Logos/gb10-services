@@ -37,7 +37,7 @@ ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-memory-guardian
 # Host-pinned NVFP4 weights + DSpark draft, mounted read-only. Both are
 # revision-locked destinations (download/prepare may still be running).
 # Server paths are the flat hf --local-dir mounts (no snapshots/<sha> subdirs).
-# Pinned hub revisions: NVFP4 @554ebba9b5f1b79dc11246341960360e6ef05ef4,
+# Pinned hub revisions: NVFP4 @faf7945020c138c8ef864ab1644273f3158f85fa,
 # DSpark @85ef153be924f17ce4bf62726954eeaa4a73e854.
 # cpuset 5-8,15-18 are the MiaAI text acceleration set; leave cores 9 and 19
 # for embedding/reranker.
@@ -47,7 +47,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --cpuset-cpus 5-8,15-18 \
   --shm-size 32g \
   -p 100.105.4.92:18010:30000 \
-  -v /home/obj/models/RadixArk/Qwen3.8-27B-NVFP4:/models/qwen38-nvfp4:ro \
+  -v /home/obj/models/Blackfrost-AI/Qwen3.8-27B-ABLITERATED-NVFP4:/models/qwen38-nvfp4:ro \
   -v /home/obj/models/RadixArk/Qwen3.8-27B-DSpark:/models/qwen38-dspark:ro \
   -e HF_HUB_OFFLINE=1 \
   --memory-swappiness 0 \
