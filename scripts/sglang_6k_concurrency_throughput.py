@@ -23,14 +23,13 @@ DEFAULT_MIN_PROMPT_TOKENS = 6000
 DEFAULT_MAX_TOKENS = 256
 DEFAULT_CONCURRENCIES = [1, 2, 4, 6, 8]
 
-# Rough OpenAI-style estimate: ~4 chars per token for English.
-CHARS_PER_TOKEN = 4.0
-
 FILLER_WORD = "aluminium"
 
 
 def estimate_tokens(text: str) -> int:
-    return max(1, int(len(text) / CHARS_PER_TOKEN))
+    # Conservative local estimate: whitespace-separated words, capping at
+    # 1 token per word (Qwen counts ~1 token/word). Never 4-chars/token.
+    return max(1, len(text.split()))
 
 
 def make_nonce(wave: int, index: int) -> str:
@@ -78,7 +77,7 @@ def build_payload(
     }
 
 
-def _stream_chat(base_url: str, payload: dict) -> dict:
+def _stream_chat(base_url: str, payload: dict, min_tokens: int) -> dict:
     """POST a streaming chat request, return parsed SSE usage + throughput."""
     url = base_url.rstrip("/") + "/chat/completions"
     req = urllib.request.Request(
@@ -138,12 +137,12 @@ def _stream_chat(base_url: str, payload: dict) -> dict:
         "completion_tokens": completion_tokens,
         "decode_tok_s": decode_tok_s,
         "finish_reason": finish_reason,
-        "n_fail_short": 1 if (prompt_tokens and prompt_tokens < DEFAULT_MIN_PROMPT_TOKENS) else 0,
+        "n_fail_short": 1 if (prompt_tokens and prompt_tokens < min_tokens) else 0,
     }
 
 
-def run_request(base_url: str, payload: dict) -> dict:
-    metric = _stream_chat(base_url, payload)
+def run_request(base_url: str, payload: dict, min_tokens: int) -> dict:
+    metric = _stream_chat(base_url, payload, min_tokens)
     metric["ok"] = False if metric["n_fail_short"] else True
     return metric
 
@@ -155,7 +154,7 @@ def run_wave(base_url: str, model: str, wave: int, n: int, min_tokens: int, max_
     ]
     wave_start = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
-        results = list(ex.map(lambda p: run_request(base_url, p), payloads))
+        results = list(ex.map(lambda p: run_request(base_url, p, min_tokens), payloads))
     wave_wall = time.monotonic() - wave_start
     ok = [r for r in results if r["ok"]]
     n_ok = len(ok)

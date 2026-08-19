@@ -79,6 +79,15 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             )
             self.assertIn("-", prompt.splitlines()[0])
 
+    def test_built_prompt_word_count_at_least_6000(self):
+        nonce = self.mod.make_nonce(0, 0)
+        prompt = self.mod.build_prompt(nonce, MIN_PROMPT_TOKENS)
+        self.assertGreaterEqual(len(prompt.split()), MIN_PROMPT_TOKENS)
+
+    def test_estimate_tokens_never_more_than_word_count(self):
+        words = "aluminium " * 10
+        self.assertLessEqual(self.mod.estimate_tokens(words), 10)
+
     def test_request_payload_shape_and_thinking_off(self):
         nonce = self.mod.make_nonce(0, 0)
         payload = self.mod.build_payload(
