@@ -58,7 +58,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   python3 -m sglang.launch_server \
   --model-path /models/qwen38-nvfp4 \
   --host 0.0.0.0 --port 30000 \
-  --served-model-name "abliterated-qwen-latest-27b-nvfp4" "qwen3.8-27b-sglang" \
+  --served-model-name "abliterated-qwen-latest-27b-nvfp4" \
   --trust-remote-code \
   --mem-fraction-static 0.53 \
   --attention-backend flashinfer \

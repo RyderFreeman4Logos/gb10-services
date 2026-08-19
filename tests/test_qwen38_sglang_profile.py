@@ -128,7 +128,14 @@ class Qwen38UnitContractTests(unittest.TestCase):
         self.assertIn("--chunked-prefill-size 8192", self.text)
 
     def test_unit_serves_public_stable_alias(self):
+        # Image CLI accepts ONE SERVED_MODEL_NAME; only the stable public alias
+        # is passed on this line (no second argv token like the old two-token form).
         self.assertIn(SERVED_ALIAS, self.text)
+        self.assertIn(f'--served-model-name "{SERVED_ALIAS}" \\', self.text)
+        self.assertNotIn(
+            f'--served-model-name "{SERVED_ALIAS}" "qwen3.8-27b-sglang"',
+            self.text,
+        )
 
     def test_unit_cpuset_and_no_privileged(self):
         self.assertIn("--cpuset-cpus 5-8,15-18", self.text)
