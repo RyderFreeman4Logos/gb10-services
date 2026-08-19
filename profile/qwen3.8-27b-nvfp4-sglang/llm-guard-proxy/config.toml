@@ -45,11 +45,8 @@ port = 18005
 # Default multi-model chat entry :18009. Faithful forward of the caller's
 # temperature / top_p / top_k / reasoning_effort / enable_thinking: no
 # force_disable, no param_override, no loop salvage, no thinking_token_budget.
-[[listeners]]
-name = "chat-default"
-bind_host = "100.105.4.92"
-port = 18009
-allowed_upstreams = ["qwen3.8-sglang-default-chat"]
+# 18009 is served by the implicit default listener ([server].port); do not
+# bind a second [[listeners]] on it (live Guard rejects duplicate listener ports).
 
 [upstream]
 base_url = "http://100.105.4.92:18010/v1"

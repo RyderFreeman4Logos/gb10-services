@@ -178,6 +178,30 @@ class Qwen38GuardContractTests(unittest.TestCase):
         self.assertNotIn("mode = \"force_disable\"", self.text)
         self.assertNotIn("force_disable = true", self.text)
 
+    def test_default_chat_listener_port_is_unique(self):
+        # [server].port is the implicit default listener for 18009; a
+        # [[listeners]] on the same port is rejected by live Guard ("listener
+        # ports must be unique to avoid startup bind conflicts").
+        self.assertRegex(
+            self.text,
+            r"(?m)^port\s*=\s*18009\s*$",
+            "[server].port must keep the default chat entry on 18009",
+        )
+        # No explicit [[listeners]] block may bind 18009 or use the old
+        # chat-default name.
+        self.assertNotIn(
+            'name = "chat-default"',
+            self.text,
+            "chat-default [[listeners]] must be dropped (implicit default owns 18009)",
+        )
+        # Every explicit [[listeners]] port listed except 18009.
+        for line in self.text.splitlines():
+            self.assertFalse(
+                re.match(r"port\s*=\s*18009\s*$", line)
+                and "[[listeners]]" in self.text[: self.text.index(line)],
+                "no [[listeners]] block may bind 18009",
+            )
+
     def test_param_override_disabled(self):
         # TOML table form: [upstreams.param_override] with enabled = false.
         self.assertIn("[upstreams.param_override]", self.text)
