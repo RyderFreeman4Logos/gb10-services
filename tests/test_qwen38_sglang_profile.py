@@ -212,6 +212,39 @@ class Qwen38GuardContractTests(unittest.TestCase):
                 f"{header} must be disabled",
             )
 
+    def test_paired_comparison_variants_are_live_guard_parseable(self):
+        # Live Guard 8adcce30 rejects any non-allowlisted variants entry.
+        # Scope to the paired_comparison section: the retry.ladder name
+        # intentionally keeps the "same-policy" token (a section-local name,
+        # not a paired_comparison variant).
+        head = self.text.index("[evidence.shadow.paired_comparison]")
+        nxt = self.text.find("\n[", head + 1)
+        block = self.text[head:] if nxt < 0 else self.text[head:nxt]
+        variants_line = next(
+            line for line in block.splitlines() if line.startswith("variants")
+        )
+        self.assertNotIn(
+            "same-policy",
+            variants_line,
+            'paired_comparison variants must not contain "same-policy" '
+            "(live Guard enum rejects it)",
+        )
+        self.assertIn(
+            'variants = ["no-thinking"]',
+            block,
+            "variants must pin the live-Guard-parseable token no-thinking",
+        )
+
+    def test_paired_comparison_is_disabled(self):
+        # Faithful-forward profile must not spawn extra GPU thinking shadows.
+        head = self.text.index("[evidence.shadow.paired_comparison]")
+        nxt = self.text.find("\n[", head + 1)
+        block = self.text[head:] if nxt < 0 else self.text[head:nxt]
+        self.assertTrue(
+            re.search(r"(?m)^enabled\s*=\s*false\s*$", block),
+            "[evidence.shadow.paired_comparison] must be disabled",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

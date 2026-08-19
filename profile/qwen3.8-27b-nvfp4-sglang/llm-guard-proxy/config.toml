@@ -247,8 +247,8 @@ max_global_shadow_in_flight = 2
 shadow_attempt_timeout_ms = 7200000
 
 [evidence.shadow.paired_comparison]
-enabled = true
-variants = ["same-policy"]
+enabled = false
+variants = ["no-thinking"]
 include_raw_input = false
 include_raw_output = false
 include_raw_reasoning = false
