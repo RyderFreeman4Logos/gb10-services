@@ -92,6 +92,13 @@ class Qwen38UnitContractTests(unittest.TestCase):
         self.assertIn("--kv-cache-dtype fp8_e4m3", argv)
         self.assertNotIn("--kv-cache-dtype auto", argv)
 
+    def test_unit_pins_max_total_tokens_to_full_window(self):
+        # Live `auto` sized KV to 234834 tokens with 15.81 GB left over, too
+        # small for a single full-window request. Pin to 262144 so the pool
+        # actually fits one window. Scope to launch_server argv, not comments.
+        argv = self.text.split("--sampling-defaults model", 1)[0]
+        self.assertIn("--max-total-tokens 262144", argv)
+
     def test_unit_adds_dspark_speed_flags(self):
         # MiaAI 2026-08-18 start-dspark.sh speed flags (code-decode ~51 tok/s).
         for flag in (
