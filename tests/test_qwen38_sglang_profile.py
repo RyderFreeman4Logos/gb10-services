@@ -74,11 +74,23 @@ class Qwen38UnitContractTests(unittest.TestCase):
     def test_unit_pins_nvfp4_revision_pinned_model_path(self):
         # Server path is the flat --local-dir mount target (no snapshots/<sha>).
         self.assertIn(f"--model-path {MODEL_MOUNT}", self.text)
-        self.assertIn("/home/obj/models/Blackfrost-AI/Qwen3.8-27B-ABLITERATED-NVFP4", self.text)
-        # Reject the superseded RadixArk NVFP4 host bind.
-        self.assertNotIn("/home/obj/models/RadixArk/Qwen3.8-27B-NVFP4", self.text)
+        # Host bind must be the RadixArk NVFP4 weights (Blackfrost superseded).
+        self.assertIn("/home/obj/models/RadixArk/Qwen3.8-27B-NVFP4", self.text)
+        self.assertNotIn(
+            "/home/obj/models/Blackfrost-AI/Qwen3.8-27B-ABLITERATED-NVFP4",
+            self.text,
+        )
         # Hub SHA pin kept as a documented comment, not a snapshots path.
         self.assertIn(NVFP4_SHA, self.text)
+
+    def test_unit_pins_kv_cache_dtype_fp8(self):
+        # Live `auto` allocated torch.bfloat16 / 41028 tokens and did NOT honor
+        # NVFP4's FP8 calibration; fp8_e4m3 is pinned so KV really reaches 262144.
+        # Scope to the launch_server argv so the required historical comment
+        # (which mentions auto/41028) does not trip the negative assertion.
+        argv = self.text.split("--sampling-defaults model", 1)[0]
+        self.assertIn("--kv-cache-dtype fp8_e4m3", argv)
+        self.assertNotIn("--kv-cache-dtype auto", argv)
 
     def test_unit_adds_dspark_speed_flags(self):
         # MiaAI 2026-08-18 start-dspark.sh speed flags (code-decode ~51 tok/s).
@@ -110,11 +122,6 @@ class Qwen38UnitContractTests(unittest.TestCase):
         # hf --local-dir never creates snapshots/<sha>; the server must use the
         # flat mount root, not a raw hub cache layout path.
         self.assertNotIn("/snapshots/", self.text)
-
-    def test_unit_pins_kv_cache_dtype_auto(self):
-        # NVFP4 declares FP8 kv calibration; auto honors fp8_e4m3 scales.
-        self.assertIn("--kv-cache-dtype auto", self.text)
-        self.assertNotIn("--kv-cache-dtype fp8_e4m3", self.text)
 
     def test_unit_pins_throughput_and_memory_contract(self):
         self.assertIn("--context-length 262144", self.text)

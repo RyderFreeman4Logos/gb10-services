@@ -47,7 +47,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --cpuset-cpus 5-8,15-18 \
   --shm-size 32g \
   -p 100.105.4.92:18010:30000 \
-  -v /home/obj/models/Blackfrost-AI/Qwen3.8-27B-ABLITERATED-NVFP4:/models/qwen38-nvfp4:ro \
+  -v /home/obj/models/RadixArk/Qwen3.8-27B-NVFP4:/models/qwen38-nvfp4:ro \
   -v /home/obj/models/RadixArk/Qwen3.8-27B-DSpark:/models/qwen38-dspark:ro \
   -e HF_HUB_OFFLINE=1 \
   --memory-swappiness 0 \
@@ -64,7 +64,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --attention-backend flashinfer \
   --chunked-prefill-size 8192 \
   --disable-prefill-cuda-graph \
-  --kv-cache-dtype auto \
+  --kv-cache-dtype fp8_e4m3 \
   --mamba-ssm-dtype float32 \
   --mamba-radix-cache-strategy extra_buffer_lazy \
   --max-mamba-cache-size 32 \
@@ -82,8 +82,10 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
   --sampling-defaults model
-# NVFP4 declares kv_cache_quant_algo FP8; --kv-cache-dtype auto honors the
-# fp8_e4m3 calibration scales. Do NOT raise KV quantization aggressiveness.
+# NVFP4 declares kv_cache_quant_algo FP8, but live --kv-cache-dtype auto
+# allocated torch.bfloat16 / 41028 tokens (it did NOT honor the fp8_e4m3
+# calibration scales). fp8_e4m3 is pinned explicitly so KV really reaches
+# 262144 tokens. Do NOT raise KV quantization aggressiveness.
 # DSpark verify window D=8 sizes a SEPARATE GDN buffer, so the max-mamba-cache-size
 # 32 (8 x 4 slots) pin stands alone. mamba-full-memory-ratio 4.21 was tuned at
 # MIAI's 0.95 and is NOT trusted at 0.72: re-derive after first boot.
