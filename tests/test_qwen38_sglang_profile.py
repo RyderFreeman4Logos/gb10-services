@@ -106,8 +106,8 @@ class Qwen38UnitContractTests(unittest.TestCase):
         for flag in (
             "--speculative-num-draft-tokens 8",
             "--enable-torch-compile",
-            "--torch-compile-max-bs 8",
-            "--cuda-graph-max-bs-decode 8",
+            "--torch-compile-max-bs 4",
+            "--cuda-graph-max-bs-decode 4",
             "--num-continuous-decode-steps 2",
         ):
             self.assertIn(flag, self.text)

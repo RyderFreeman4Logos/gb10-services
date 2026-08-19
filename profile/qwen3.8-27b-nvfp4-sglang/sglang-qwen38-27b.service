@@ -82,8 +82,8 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --speculative-draft-model-quantization unquant \
   --speculative-num-draft-tokens 8 \
   --enable-torch-compile \
-  --torch-compile-max-bs 8 \
-  --cuda-graph-max-bs-decode 8 \
+  --torch-compile-max-bs 4 \
+  --cuda-graph-max-bs-decode 4 \
   --num-continuous-decode-steps 2 \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
