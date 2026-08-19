@@ -131,12 +131,19 @@ class Qwen38UnitContractTests(unittest.TestCase):
         self.assertNotIn("/snapshots/", self.text)
 
     def test_unit_pins_throughput_and_memory_contract(self):
+        # mem-fraction 0.83 is the floor scale for a real 262144 KV pool:
+        # live 0.72 + --max-total-tokens 262144 still allocated 233344 fp8
+        # tokens with 16.53 GB leftover (262144/233344*0.72 ~= 0.81, +buffer).
         self.assertIn("--context-length 262144", self.text)
-        self.assertIn("--mem-fraction-static 0.72", self.text)
-        self.assertIn("SGLANG_MEM_FRACTION=0.72", self.text)
+        self.assertIn("--max-total-tokens 262144", self.text)
+        self.assertIn("--mem-fraction-static 0.83", self.text)
+        self.assertIn("SGLANG_MEM_FRACTION=0.83", self.text)
+        self.assertNotIn("--mem-fraction-static 0.72", self.text)
+        self.assertNotIn("SGLANG_MEM_FRACTION=0.72", self.text)
         self.assertNotIn("--mem-fraction-static 0.53", self.text)
         self.assertNotIn("SGLANG_MEM_FRACTION=0.53", self.text)
         self.assertNotIn("--mem-fraction-static 0.95", self.text)
+        self.assertNotIn("SGLANG_MEM_FRACTION=0.95", self.text)
         self.assertIn("--mamba-ssm-dtype float32", self.text)
         self.assertIn("--max-mamba-cache-size 32", self.text)
         self.assertIn("--max-running-requests 8", self.text)
