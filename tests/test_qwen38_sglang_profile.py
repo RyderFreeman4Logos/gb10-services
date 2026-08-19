@@ -129,7 +129,8 @@ class Qwen38UnitContractTests(unittest.TestCase):
         self.assertIn(SERVED_ALIAS, self.text)
 
     def test_unit_cpuset_and_no_privileged(self):
-        self.assertIn("--cpuset-cpus 5-9,15-19", self.text)
+        self.assertIn("--cpuset-cpus 5-8,15-18", self.text)
+        self.assertNotIn("--cpuset-cpus 5-9,15-19", self.text)
         self.assertNotIn("--privileged", self.text)
 
     def test_unit_conflicts_with_aeon_text_units(self):

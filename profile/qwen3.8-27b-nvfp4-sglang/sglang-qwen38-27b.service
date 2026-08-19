@@ -39,10 +39,12 @@ ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-memory-guardian
 # Server paths are the flat hf --local-dir mounts (no snapshots/<sha> subdirs).
 # Pinned hub revisions: NVFP4 @554ebba9b5f1b79dc11246341960360e6ef05ef4,
 # DSpark @85ef153be924f17ce4bf62726954eeaa4a73e854.
+# cpuset 5-8,15-18 are the MiaAI text acceleration set; leave cores 9 and 19
+# for embedding/reranker.
 ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/sglang-text.cid --name qwen3.8-27b-sglang \
   --cgroup-parent app.slice \
   --gpus all --ipc host \
-  --cpuset-cpus 5-9,15-19 \
+  --cpuset-cpus 5-8,15-18 \
   --shm-size 32g \
   -p 100.105.4.92:18010:30000 \
   -v /home/obj/models/RadixArk/Qwen3.8-27B-NVFP4:/models/qwen38-nvfp4:ro \
