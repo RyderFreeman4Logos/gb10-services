@@ -118,7 +118,11 @@ class Qwen38UnitContractTests(unittest.TestCase):
 
     def test_unit_pins_throughput_and_memory_contract(self):
         self.assertIn("--context-length 262144", self.text)
-        self.assertIn("--mem-fraction-static 0.53", self.text)
+        self.assertIn("--mem-fraction-static 0.72", self.text)
+        self.assertIn("SGLANG_MEM_FRACTION=0.72", self.text)
+        self.assertNotIn("--mem-fraction-static 0.53", self.text)
+        self.assertNotIn("SGLANG_MEM_FRACTION=0.53", self.text)
+        self.assertNotIn("--mem-fraction-static 0.95", self.text)
         self.assertIn("--mamba-ssm-dtype float32", self.text)
         self.assertIn("--max-mamba-cache-size 32", self.text)
         self.assertIn("--max-running-requests 8", self.text)
@@ -187,6 +191,26 @@ class Qwen38GuardContractTests(unittest.TestCase):
         self.assertNotIn("thinking_mode = \"force_disable\"", self.text)
         self.assertNotIn("thinking_mode = \"force_thinking\"", self.text)
         self.assertNotIn("temperature = 0.6", self.text)
+
+    def test_live_guard_rejects_unknown_upstreams_retry_table(self):
+        # Live Guard 8adcce30 fails on table [upstreams.retry]; keep ladder + [retry].
+        self.assertIsNone(
+            re.search(r"(?m)^\[upstreams\.retry\]\s*$", self.text),
+            "unknown [upstreams.retry] table is not parseable by live Guard",
+        )
+        self.assertIn("[[upstreams.retry.ladder]]", self.text)
+        self.assertIn("[retry]", self.text)
+
+    def test_default_chat_local_recovery_is_disarmed(self):
+        # AEON helper Conflicts-kills SGLang if either recovery block stays armed.
+        for header in ("[upstream.local_recovery]", "[upstreams.local_recovery]"):
+            start = self.text.index(header)
+            nxt = self.text.find("\n[", start + len(header))
+            block = self.text[start:] if nxt < 0 else self.text[start:nxt]
+            self.assertTrue(
+                re.search(r"(?m)^enabled\s*=\s*false\s*$", block),
+                f"{header} must be disabled",
+            )
 
 
 if __name__ == "__main__":

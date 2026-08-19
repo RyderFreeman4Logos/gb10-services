@@ -71,7 +71,7 @@ recovery_budget_window_ms = 900000
 recovery_max_per_window = 2
 
 [upstream.local_recovery]
-enabled = true
+enabled = false
 restart_command = ["/home/obj/scripts/aeon_text_stop_start.sh"]
 restart_timeout_ms = 300000
 readiness_endpoint = "/v1/chat/completions"
@@ -124,7 +124,7 @@ probe_interval_secs = 5
 probe_timeout_secs = 600
 
 [upstreams.local_recovery]
-enabled = true
+enabled = false
 restart_command = ["/home/obj/scripts/aeon_text_stop_start.sh"]
 restart_timeout_ms = 300000
 readiness_endpoint = "/v1/chat/completions"
@@ -150,14 +150,7 @@ enabled = false
 mode = "disabled"
 
 # Single-rung neutral ladder: no retry that mutates thinking or sampling.
-[upstreams.retry]
-enabled = true
-max_attempts = 1
-request_deadline_ms = 1200000
-anti_loop_hint_enabled = false
-shielded_streaming_enabled = true
-downstream_drop_policy = "cancel"
-
+# Live Guard 8adcce30 rejects unknown table [upstreams.retry]; keep ladder only.
 [[upstreams.retry.ladder]]
 name = "same-policy"
 thinking_mode = "passthrough"
