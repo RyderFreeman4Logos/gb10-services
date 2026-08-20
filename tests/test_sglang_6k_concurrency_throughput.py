@@ -45,6 +45,7 @@ def _completed_request(**overrides):
         "decode_tok_s": 20.0,
         "finish_reason": "stop",
         "n_fail_short": 0,
+        "request_timeout_s": 600.0,
     }
     request.update(overrides)
     return request
@@ -53,6 +54,7 @@ def _completed_request(**overrides):
 def _completed_wave(concurrency, **overrides):
     result = {
         "concurrency": concurrency,
+        "work_units": concurrency,
         "n_ok": concurrency,
         "n_fail": 0,
         "n_finish_length": 0,
@@ -289,6 +291,16 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             )
             self.assertEqual(self.mod.load_config(config)["execution"]["concurrencies"], [1])
 
+    def test_config_rejects_unknown_top_level_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "run.toml"
+            config.write_text(
+                "[execution]\nconcurrencies = [1]\n\n[mystery]\nvalue = true\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "unknown top-level config section.*mystery"):
+                self.mod.load_config(config)
+
     def test_incomplete_stream_body_is_retried_but_permanent_4xx_is_not(self):
         response = {
             "ttft_s": 0.1, "wall_s": 0.2, "gen_s": 0.1,
@@ -364,6 +376,62 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             ):
                 with self.assertRaises(ConnectionError):
                     self.mod._stream_chat("http://e/v1", {}, MIN_PROMPT_TOKENS)
+
+    def test_stream_chat_rejects_early_duplicate_and_post_usage_events(self):
+        class Response:
+            def __init__(self, lines):
+                self.lines = lines
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def __iter__(self):
+                return iter(self.lines)
+
+        content = b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}\n'
+        terminal = b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n'
+        usage = b'data: {"choices":[],"usage":{"prompt_tokens":6000,"completion_tokens":1}}\n'
+        done = b"data: [DONE]\n"
+        invalid_streams = (
+            [content, usage, terminal, done],
+            [content, terminal, usage, usage, done],
+            [content, terminal, usage, content, done],
+            [content, done, terminal, usage],
+        )
+        for lines in invalid_streams:
+            with self.subTest(lines=lines), mock.patch.object(
+                self.mod.urllib.request, "urlopen", return_value=Response(lines)
+            ):
+                with self.assertRaises(ConnectionError):
+                    self.mod._stream_chat("http://e/v1", {}, MIN_PROMPT_TOKENS)
+
+    def test_request_timeout_is_total_attempt_deadline_for_trickle_stream(self):
+        clock = [0.0]
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def __iter__(self):
+                for line in (
+                    b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}\n',
+                    b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+                ):
+                    clock[0] += 0.75
+                    yield line
+
+        with mock.patch.object(self.mod.urllib.request, "urlopen", return_value=Response()):
+            with mock.patch.object(self.mod.time, "monotonic", side_effect=lambda: clock[0]):
+                with self.assertRaisesRegex(TimeoutError, "deadline"):
+                    self.mod._stream_chat(
+                        "http://e/v1", {}, MIN_PROMPT_TOKENS, request_timeout_s=1.0
+                    )
 
     def test_clean_eof_stream_is_retryable_and_never_complete(self):
         class Response:
@@ -505,6 +573,42 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                         root / "other.json", root / "other.state.json"
                     ):
                         pass
+
+    def test_artifact_locks_reject_duplicate_absent_bindings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "absent.json"
+            with self.assertRaisesRegex(RuntimeError, "duplicate artifact"):
+                with self.mod._exclusive_artifact_locks(target, target):
+                    pass
+
+    def test_artifact_io_reuses_locked_parent_bindings_for_full_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(self.mod, "run_wave", return_value=_completed_wave(1)):
+                with mock.patch.object(
+                    self.mod,
+                    "_open_artifact_parent",
+                    wraps=self.mod._open_artifact_parent,
+                ) as open_parent:
+                    self.assertEqual(
+                        self.mod.main(
+                            [
+                                "--config", str(config), "--state", str(state),
+                                "--progress", str(progress), "--out", str(out),
+                            ]
+                        ),
+                        0,
+                    )
+            self.assertEqual(open_parent.call_count, 3)
 
     def test_exclusive_run_lock_is_held_over_main_run(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -886,6 +990,82 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             self.mod._ensure_state_capacity(state, 1)
         self.assertEqual(state["total"], 3)
 
+    def test_resume_rejects_changed_active_config_epoch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m0"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(self.mod, "run_wave", side_effect=RuntimeError("stop")):
+                with self.assertRaisesRegex(RuntimeError, "stop"):
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out),
+                        ]
+                    )
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m1"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(self.mod, "run_wave") as run_wave:
+                with self.assertRaisesRegex(RuntimeError, "active wave config epoch"):
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out), "--resume",
+                        ]
+                    )
+            run_wave.assert_not_called()
+
+    def test_resume_strictly_recomputes_epoch_and_wave_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "run.toml"
+            state_path = root / "run.state.json"
+            progress_path = root / "run.progress.yaml"
+            out_path = root / "run.json"
+            config_path.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\nmax_tokens = 7\n[resources]\n",
+                encoding="utf-8",
+            )
+            config = self.mod.load_config(config_path)
+            epoch = "0" * 64
+            result = _completed_wave(
+                1,
+                wave=0,
+                config_epoch=epoch,
+                provider="p",
+                endpoint="http://e/v1",
+                model="m",
+                max_tokens=7,
+            )
+            state = self.mod._new_state()
+            self.mod._ensure_state_capacity(state, 1, [1])
+            state["waves"][0] = result
+            state["completed_waves"] = [0]
+            state["completed_work_units"] = 1
+            state["config_epochs"] = {epoch: config}
+            state["pid"], state["start_time"] = (999999, 1)
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            progress_path.write_text("keep\n", encoding="utf-8")
+            out_path.write_text("keep\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "config epoch|provenance"):
+                self.mod.main(
+                    [
+                        "--config", str(config_path), "--state", str(state_path),
+                        "--progress", str(progress_path), "--out", str(out_path), "--resume",
+                    ]
+                )
+
     def test_loaded_completed_wave_schema_is_strict_and_rejected_before_mutation(self):
         cases = {
             "counts": lambda result: result.update(n_ok=0),
@@ -1071,6 +1251,77 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             self.assertEqual(report["base_url"], "http://e1/v1")
             self.assertEqual(report["endpoint"], "http://e1/v1")
             self.assertEqual(report["config_epoch"], report["waves"][-1]["config_epoch"])
+
+    def test_final_wave_config_mutation_is_not_reloaded_into_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+
+            def mutate_after_final(*args, **kwargs):
+                config.write_text(
+                    "[execution]\nconcurrencies = [1]\nunknown = true\n",
+                    encoding="utf-8",
+                )
+                return _completed_wave(1)
+
+            with mock.patch.object(self.mod, "run_wave", side_effect=mutate_after_final):
+                self.assertEqual(
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out),
+                        ]
+                    ),
+                    0,
+                )
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "COMPLETE")
+            self.assertTrue(report["complete"])
+
+    def test_progress_uses_request_work_units_for_rate_and_eta(self):
+        state = self.mod._new_state()
+        plan_config = self.mod.load_config(None)
+        plan_config["execution"]["concurrencies"] = [1, 8]
+        epoch = self.mod.config_epoch(plan_config)
+        self.mod._ensure_state_capacity(state, 2, [1, 8])
+        state["waves"][0] = _completed_wave(
+            1,
+            wave=0,
+            config_epoch=epoch,
+            provider="p",
+            endpoint="http://e/v1",
+            model="m",
+            max_tokens=7,
+        )
+        state["completed_waves"] = [0]
+        state["config_epochs"][epoch] = plan_config
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "state.json"
+            progress_path = root / "progress.yaml"
+            self.mod._checkpoint(
+                state,
+                state_path,
+                progress_path,
+                elapsed_s=1.0,
+                active_wave=1,
+                total=2,
+                config_epoch_value=epoch,
+            )
+            progress = progress_path.read_text(encoding="utf-8")
+            self.assertIn("completed_work_units: 1", progress)
+            self.assertIn("total_work_units: 9", progress)
+            self.assertIn("work_rate: 1.0", progress)
+            self.assertIn("eta_s: 8.0", progress)
+            self.assertIn("work_unit: 8", progress)
 
     def test_request_errors_produce_incomplete_report_and_nonzero_result(self):
         cases = (

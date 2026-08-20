@@ -177,7 +177,11 @@ printf 'pid=%s start_time=%s\n' "$pid" "$start_time"
 The `/proc/$pid/stat` value above is field 22 (the process start time), not the
 wall-clock launch time. `--wave-timeout-s` is an observational deadline: a
 slow wave is marked in the result, but running Python worker threads are not
-force-cancelled; each request retains its own timeout and retry policy.
+force-cancelled; each request retains its own timeout and retry policy. The
+`request_timeout_s` value is a monotonic total-attempt deadline covering URL
+open and every SSE read (the remaining I/O timeout is refreshed per read), and
+is recorded in each request metric. Progress `work_rate` and `eta_s` are
+weighted by request work units (the wave concurrency), not by wave count.
 
 Before resuming, verify the checkpoint's recorded PID identity so a reused PID
 cannot be mistaken for the old benchmark. A missing `/proc` entry means the old

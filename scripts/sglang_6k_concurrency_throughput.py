@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 import errno
 import fcntl
 import hashlib
@@ -60,6 +61,7 @@ _ALLOWED_CONFIG = {
         "backoff_max_s",
     ),
 }
+_IGNORED_CONFIG_SECTIONS = {"service", "server"}
 
 
 def _default_config() -> dict:
@@ -86,6 +88,11 @@ def _default_config() -> dict:
 
 
 def _validate_config(config: dict) -> dict:
+    if not isinstance(config, dict) or set(config) != set(_ALLOWED_CONFIG):
+        raise ValueError("config must contain exactly the client sections: run, execution, resources")
+    for section, keys in _ALLOWED_CONFIG.items():
+        if not isinstance(config[section], dict) or set(config[section]) != set(keys):
+            raise ValueError(f"config section [{section}] has an invalid shape")
     run = config["run"]
     execution = config["execution"]
     resources = config["resources"]
@@ -127,6 +134,13 @@ def load_config(path: str | os.PathLike[str] | None) -> dict:
     if path is not None:
         with open(path, "rb") as f:
             raw = tomllib.load(f)
+        unknown_sections = sorted(
+            set(raw) - set(_ALLOWED_CONFIG) - _IGNORED_CONFIG_SECTIONS
+        )
+        if unknown_sections:
+            raise ValueError(
+                "unknown top-level config section(s): " + ", ".join(unknown_sections)
+            )
         for section, keys in _ALLOWED_CONFIG.items():
             values = raw.get(section, {})
             if not isinstance(values, dict):
@@ -228,13 +242,49 @@ def build_payload(model: str, nonce: str, min_tokens: int, max_tokens: int) -> d
     }
 
 
+def _remaining_deadline(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("request deadline exceeded")
+    return remaining
+
+
+def _set_response_io_timeout(response, timeout: float) -> None:
+    candidate = response
+    seen = set()
+    while candidate is not None and id(candidate) not in seen:
+        seen.add(id(candidate))
+        setter = getattr(candidate, "settimeout", None)
+        if callable(setter):
+            setter(timeout)
+            return
+        candidate = getattr(candidate, "fp", None) or getattr(candidate, "raw", None)
+    raw = getattr(getattr(response, "fp", None), "raw", None)
+    sock = getattr(raw, "_sock", None)
+    setter = getattr(sock, "settimeout", None)
+    if callable(setter):
+        setter(timeout)
+
+
 def _stream_chat(
     base_url: str,
     payload: dict,
     min_tokens: int,
     request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
 ) -> dict:
-    """POST a streaming chat request, returning SSE usage and throughput."""
+    """POST a streaming chat request.
+
+    ``request_timeout_s`` is a monotonic total-attempt deadline covering URL
+    open and every SSE read.  The remaining deadline is also installed as the
+    socket I/O timeout before each read, so trickle frames cannot extend it.
+    """
+    if (
+        isinstance(request_timeout_s, bool)
+        or not isinstance(request_timeout_s, (int, float))
+        or not math.isfinite(request_timeout_s)
+        or request_timeout_s <= 0
+    ):
+        raise ValueError("request_timeout_s must be a finite positive number")
     url = base_url.rstrip("/") + "/chat/completions"
     req = urllib.request.Request(
         url,
@@ -243,69 +293,105 @@ def _stream_chat(
         method="POST",
     )
     start = time.monotonic()
+    deadline = start + request_timeout_s
     ttft = None
     gen_ts = 0.0
     last_ts = start
     finish_reason = None
     usage = None
+    saw_usage = False
     saw_done = False
-    with urllib.request.urlopen(req, timeout=request_timeout_s) as resp:
-        for raw in resp:
+    with urllib.request.urlopen(req, timeout=_remaining_deadline(deadline)) as resp:
+        iterator = iter(resp)
+        while True:
+            io_timeout = _remaining_deadline(deadline)
+            _set_response_io_timeout(resp, io_timeout)
+            try:
+                raw = next(iterator)
+            except StopIteration:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError("request deadline exceeded during SSE read")
             try:
                 line = raw.decode("utf-8").strip()
             except UnicodeDecodeError as exc:
                 raise StreamProtocolError("stream contained invalid UTF-8") from exc
-            if not line or not line.startswith("data: "):
+            if not line:
+                continue
+            if not line.startswith("data: "):
                 continue
             data = line[len("data: ") :]
+            if saw_done:
+                raise StreamProtocolError("stream contained data after [DONE]")
             if data == "[DONE]":
+                if finish_reason is None or not saw_usage:
+                    raise StreamProtocolError(
+                        "stream [DONE] arrived before terminal usage event"
+                    )
                 saw_done = True
-                break
+                continue
             try:
                 chunk = json.loads(data)
             except json.JSONDecodeError as exc:
                 raise StreamProtocolError("stream contained invalid JSON") from exc
             if not isinstance(chunk, dict):
                 raise StreamProtocolError("stream event was not an object")
-            now = time.monotonic()
-            if "usage" in chunk:
-                usage = chunk["usage"]
-                if usage is not None and not isinstance(usage, dict):
+            if saw_usage:
+                raise StreamProtocolError("stream contained data after usage event")
+            choices = chunk.get("choices")
+            has_non_null_usage = "usage" in chunk and chunk["usage"] is not None
+            if has_non_null_usage:
+                if finish_reason is None or choices != []:
+                    raise StreamProtocolError(
+                        "stream usage event must follow terminal finish reason"
+                    )
+                candidate_usage = chunk["usage"]
+                if not isinstance(candidate_usage, dict):
                     raise StreamProtocolError("stream usage was not an object")
-            choices = chunk.get("choices") or []
-            if not isinstance(choices, list):
-                raise StreamProtocolError("stream choices was not an array")
-            choice = choices[0] if choices else {}
+                prompt_tokens = candidate_usage.get("prompt_tokens")
+                completion_tokens = candidate_usage.get("completion_tokens")
+                if (
+                    isinstance(prompt_tokens, bool)
+                    or not isinstance(prompt_tokens, int)
+                    or prompt_tokens < 0
+                    or isinstance(completion_tokens, bool)
+                    or not isinstance(completion_tokens, int)
+                    or completion_tokens < 0
+                ):
+                    raise StreamProtocolError("stream usage token fields were invalid")
+                usage = candidate_usage
+                saw_usage = True
+                continue
+            if finish_reason is not None:
+                raise StreamProtocolError("stream contained content after terminal event")
+            if not isinstance(choices, list) or len(choices) != 1:
+                raise StreamProtocolError("stream content event must have one choice")
+            choice = choices[0]
             if not isinstance(choice, dict):
                 raise StreamProtocolError("stream choice was not an object")
+            candidate_finish = choice.get("finish_reason")
             delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                raise StreamProtocolError("stream delta was not an object")
             content = delta.get("content")
+            now = time.monotonic()
             if content:
                 if ttft is None:
                     ttft = now - start
                 else:
                     gen_ts += now - last_ts
                 last_ts = now
-                if choice.get("finish_reason"):
-                    finish_reason = choice["finish_reason"]
-            elif choice.get("finish_reason") is not None:
-                finish_reason = choice["finish_reason"]
+            if candidate_finish is not None:
+                if not isinstance(candidate_finish, str) or not candidate_finish:
+                    raise StreamProtocolError("stream finish reason was invalid")
+                finish_reason = candidate_finish
     if not saw_done:
         raise StreamProtocolError("stream ended before [DONE]")
-    if not isinstance(usage, dict):
-        raise StreamProtocolError("stream did not provide usage")
+    if not saw_usage or not isinstance(usage, dict):
+        raise StreamProtocolError("stream did not provide final usage")
     wall = time.monotonic() - start
-    prompt_tokens = usage.get("prompt_tokens")
-    completion_tokens = usage.get("completion_tokens")
-    if (
-        isinstance(prompt_tokens, bool)
-        or not isinstance(prompt_tokens, int)
-        or prompt_tokens < 0
-        or isinstance(completion_tokens, bool)
-        or not isinstance(completion_tokens, int)
-        or completion_tokens < 0
-    ):
-        raise StreamProtocolError("stream usage token fields were invalid")
+    prompt_tokens = usage["prompt_tokens"]
+    completion_tokens = usage["completion_tokens"]
     if not isinstance(finish_reason, str) or not finish_reason:
         raise StreamProtocolError("stream did not provide a finish reason")
     if ttft is None:
@@ -321,6 +407,7 @@ def _stream_chat(
         "decode_tok_s": decode_tok_s,
         "finish_reason": finish_reason,
         "n_fail_short": 1 if prompt_tokens < min_tokens else 0,
+        "request_timeout_s": request_timeout_s,
     }
 
 
@@ -338,6 +425,7 @@ def _failure_metric(
     attempts: int,
     retry_exhausted: bool,
     *,
+    request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
     logical_wall_s: float = 0.0,
     retry_backoff_s: float = 0.0,
     failed_attempt_wall_s: float = 0.0,
@@ -364,6 +452,7 @@ def _failure_metric(
         "decode_tok_s": 0.0,
         "finish_reason": None,
         "n_fail_short": 0,
+        "request_timeout_s": request_timeout_s,
     }
 
 
@@ -388,6 +477,7 @@ def run_request(
             final_attempt_wall_s = attempt_wall_s or float(metric.get("wall_s", 0.0))
             metric["attempts"] = attempt
             metric["retry_exhausted"] = False
+            metric["request_timeout_s"] = request_timeout_s
             metric["ok"] = False if metric["n_fail_short"] else True
             metric["final_attempt_wall_s"] = final_attempt_wall_s
             metric["logical_wall_s"] = failed_attempt_wall_s + retry_backoff_s + final_attempt_wall_s
@@ -403,6 +493,7 @@ def run_request(
                     exc,
                     attempt,
                     transient and attempt >= max_attempts,
+                    request_timeout_s=request_timeout_s,
                     logical_wall_s=failed_attempt_wall_s + retry_backoff_s,
                     retry_backoff_s=retry_backoff_s,
                     failed_attempt_wall_s=failed_attempt_wall_s,
@@ -475,6 +566,7 @@ def run_wave(
     sum_prompt = sum(result["prompt_tokens"] for result in ok)
     return {
         "concurrency": n,
+        "work_units": n,
         "n_ok": n_ok,
         "n_fail": n_fail,
         "n_finish_length": sum(result.get("finish_reason") == "length" for result in results),
@@ -558,14 +650,73 @@ def _open_artifact_parent(path: str | os.PathLike[str]) -> tuple[int, str]:
         raise
 
 
-def _validate_artifact_paths(*paths: str | os.PathLike[str]) -> None:
-    for path in paths:
-        directory_fd, _target_name = _open_artifact_parent(path)
-        os.close(directory_fd)
+@dataclass(frozen=True)
+class _ArtifactBinding:
+    """A locked parent descriptor and immutable artifact leaf for one run."""
+
+    display_path: str
+    parent_fd: int
+    leaf: str
+    parent_identity: tuple[int, int]
+
+    def __fspath__(self) -> str:
+        return self.display_path
+
+    @property
+    def key(self) -> tuple[int, int, str]:
+        return (*self.parent_identity, self.leaf)
 
 
-def _atomic_write(path: str | os.PathLike[str], content: str) -> None:
+def _binding_for(path: str | os.PathLike[str] | _ArtifactBinding) -> tuple[_ArtifactBinding, bool]:
+    if isinstance(path, _ArtifactBinding):
+        return path, False
     directory_fd, target_name = _open_artifact_parent(path)
+    directory_stat = os.fstat(directory_fd)
+    return (
+        _ArtifactBinding(
+            os.fsdecode(os.fspath(path)),
+            directory_fd,
+            target_name,
+            (int(directory_stat.st_dev), int(directory_stat.st_ino)),
+        ),
+        True,
+    )
+
+
+def _artifact_exists(path: str | os.PathLike[str] | _ArtifactBinding) -> bool:
+    binding, owned = _binding_for(path)
+    try:
+        try:
+            os.stat(binding.leaf, dir_fd=binding.parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
+    finally:
+        if owned:
+            os.close(binding.parent_fd)
+
+
+def _validate_artifact_paths(*paths: str | os.PathLike[str] | _ArtifactBinding) -> None:
+    bindings = []
+    owned = []
+    try:
+        for path in paths:
+            binding, is_owned = _binding_for(path)
+            bindings.append(binding)
+            if is_owned:
+                owned.append(binding.parent_fd)
+        keys = [binding.key for binding in bindings]
+        if len(keys) != len(set(keys)):
+            raise RuntimeError("duplicate artifact binding")
+    finally:
+        for descriptor in owned:
+            os.close(descriptor)
+
+
+def _atomic_write(path: str | os.PathLike[str] | _ArtifactBinding, content: str) -> None:
+    binding, owned = _binding_for(path)
+    directory_fd = binding.parent_fd
+    target_name = binding.leaf
     temporary_name = f".{target_name}.{uuid.uuid4().hex}.tmp"
     temporary_fd = None
     temporary_identity = None
@@ -612,11 +763,36 @@ def _atomic_write(path: str | os.PathLike[str], content: str) -> None:
                     pass
         if temporary_fd is not None:
             os.close(temporary_fd)
-        os.close(directory_fd)
+        if owned:
+            os.close(directory_fd)
 
 
-def _atomic_write_json(path: str | os.PathLike[str], value: dict) -> None:
+def _atomic_write_json(
+    path: str | os.PathLike[str] | _ArtifactBinding, value: dict
+) -> None:
     _atomic_write(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def _read_artifact_text(path: str | os.PathLike[str] | _ArtifactBinding) -> str:
+    binding, owned = _binding_for(path)
+    try:
+        descriptor = os.open(
+            binding.leaf,
+            os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC,
+            dir_fd=binding.parent_fd,
+        )
+        try:
+            with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+                return stream.read()
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+    finally:
+        if owned:
+            os.close(binding.parent_fd)
 
 
 def _yaml_scalar(value) -> str:
@@ -655,6 +831,7 @@ def _process_identity() -> tuple[int, int | None]:
 _REQUIRED_WAVE_RESULT_FIELDS = {
     "wave",
     "concurrency",
+    "work_units",
     "n_ok",
     "n_fail",
     "n_finish_length",
@@ -687,6 +864,7 @@ _REQUIRED_REQUEST_RESULT_FIELDS = {
     "decode_tok_s",
     "finish_reason",
     "n_fail_short",
+    "request_timeout_s",
 }
 _REQUEST_FLOAT_FIELDS = (
     "ttft_s",
@@ -698,6 +876,7 @@ _REQUEST_FLOAT_FIELDS = (
     "failed_attempt_wall_s",
     "gen_s",
     "decode_tok_s",
+    "request_timeout_s",
 )
 
 
@@ -724,6 +903,12 @@ def _completed_wave_error(
         or concurrency != expected_requests
     ):
         return "wave result concurrency does not match the plan"
+    if (
+        isinstance(result["work_units"], bool)
+        or not isinstance(result["work_units"], int)
+        or result["work_units"] != expected_requests
+    ):
+        return "wave result work units do not match concurrency"
     for field in ("n_ok", "n_fail", "n_finish_length", "sum_completion"):
         value = result[field]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -813,14 +998,26 @@ def _exclusive_artifact_locks(
     with ExitStack() as stack:
         pinned = []
         parent_fds = {}
+        binding_keys = set()
         target_owners = {}
         for artifact in artifacts:
             directory_fd, target_name = _open_artifact_parent(artifact)
-            stack.callback(os.close, directory_fd)
             directory_stat = os.fstat(directory_fd)
             directory_identity = (int(directory_stat.st_dev), int(directory_stat.st_ino))
-            parent_fds.setdefault(directory_identity, directory_fd)
-            pinned.append((artifact, directory_fd, target_name))
+            if directory_identity in parent_fds:
+                os.close(directory_fd)
+                directory_fd = parent_fds[directory_identity]
+            else:
+                parent_fds[directory_identity] = directory_fd
+                stack.callback(os.close, directory_fd)
+            display_path = os.fsdecode(os.fspath(artifact))
+            binding = _ArtifactBinding(
+                display_path, directory_fd, target_name, directory_identity
+            )
+            if binding.key in binding_keys:
+                raise RuntimeError(f"duplicate artifact binding: {display_path}")
+            binding_keys.add(binding.key)
+            pinned.append(binding)
         for directory_identity in sorted(parent_fds):
             descriptor = parent_fds[directory_identity]
             try:
@@ -832,23 +1029,23 @@ def _exclusive_artifact_locks(
                     ) from exc
                 raise
             stack.callback(fcntl.flock, descriptor, fcntl.LOCK_UN)
-        for artifact, directory_fd, target_name in pinned:
+        for binding in pinned:
             try:
                 target_stat = os.stat(
-                    target_name, dir_fd=directory_fd, follow_symlinks=False
+                    binding.leaf, dir_fd=binding.parent_fd, follow_symlinks=False
                 )
             except FileNotFoundError:
                 continue
             if stat.S_ISLNK(target_stat.st_mode):
-                raise RuntimeError(f"refusing symlink artifact path: {artifact}")
+                raise RuntimeError(f"refusing symlink artifact path: {binding.display_path}")
             target_identity = (int(target_stat.st_dev), int(target_stat.st_ino))
             prior = target_owners.get(target_identity)
             if prior is not None:
                 raise RuntimeError(
-                    f"artifact path collision/alias: {prior} and {artifact}"
+                    f"artifact path collision/alias: {prior} and {binding.display_path}"
                 )
-            target_owners[target_identity] = artifact
-        yield
+            target_owners[target_identity] = binding.display_path
+        yield tuple(pinned)
 
 
 def _validate_checkpoint_owner(state: dict) -> None:
@@ -875,6 +1072,22 @@ def _validate_checkpoint_owner(state: dict) -> None:
         raise RuntimeError("refusing resume: saved benchmark owner is still live")
 
 
+def _validate_epoch_config(epoch: object, config: object) -> dict:
+    if (
+        not isinstance(epoch, str)
+        or len(epoch) != 64
+        or any(character not in "0123456789abcdef" for character in epoch)
+    ):
+        raise RuntimeError("refusing resume: malformed config epoch key")
+    try:
+        normalized = _validate_config(json.loads(json.dumps(config)))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("refusing resume: malformed stored config epoch shape") from exc
+    if config_epoch(normalized) != epoch:
+        raise RuntimeError("refusing resume: stored config epoch hash mismatch")
+    return normalized
+
+
 def _validate_loaded_checkpoint(state: object) -> dict:
     if not isinstance(state, dict):
         raise RuntimeError("refusing resume: malformed checkpoint root")
@@ -886,6 +1099,10 @@ def _validate_loaded_checkpoint(state: object) -> dict:
         "total",
         "planned_total",
         "planned_wave_ids",
+        "planned_work_units",
+        "completed_work_units",
+        "active_wave",
+        "active_config_epoch",
         "completed_waves",
         "waves",
         "config_epochs",
@@ -931,6 +1148,12 @@ def _validate_loaded_checkpoint(state: object) -> dict:
     planned_total = state["planned_total"]
     if total != planned_total:
         raise RuntimeError("refusing resume: inconsistent checkpoint plan totals")
+    for field in ("planned_work_units", "completed_work_units"):
+        value = state[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError(f"refusing resume: malformed checkpoint {field}")
+    if total > 0 and state["planned_work_units"] < 1:
+        raise RuntimeError("refusing resume: malformed checkpoint planned work units")
     planned_ids = state["planned_wave_ids"]
     if planned_ids != list(range(planned_total)):
         raise RuntimeError("refusing resume: malformed checkpoint planned wave IDs")
@@ -946,6 +1169,29 @@ def _validate_loaded_checkpoint(state: object) -> dict:
     if not isinstance(waves, list) or len(waves) != planned_total:
         raise RuntimeError("refusing resume: malformed checkpoint wave results")
     completed_set = set(completed)
+    active_wave = state["active_wave"]
+    if active_wave is not None and (
+        isinstance(active_wave, bool)
+        or not isinstance(active_wave, int)
+        or active_wave < 0
+        or active_wave >= planned_total
+    ):
+        raise RuntimeError("refusing resume: malformed checkpoint active wave")
+    active_epoch = state["active_config_epoch"]
+    if active_wave is None and active_epoch is not None:
+        raise RuntimeError("refusing resume: inactive checkpoint has an active config epoch")
+    if active_wave is not None and not isinstance(active_epoch, str):
+        raise RuntimeError("refusing resume: active wave config epoch is missing")
+    if active_wave is not None and active_wave in completed_set:
+        raise RuntimeError("refusing resume: active wave is already completed")
+    if len(completed_set) == planned_total and active_wave is not None:
+        raise RuntimeError("refusing resume: complete checkpoint has an active wave")
+    if len(completed_set) < planned_total and active_wave is None:
+        raise RuntimeError("refusing resume: incomplete checkpoint has no active wave")
+    if len(completed_set) == planned_total and state["completed_work_units"] < 1:
+        raise RuntimeError("refusing resume: complete checkpoint has no work units")
+    if state["completed_work_units"] > state["planned_work_units"]:
+        raise RuntimeError("refusing resume: completed work exceeds planned work")
     for wave_id, result in enumerate(waves):
         if wave_id not in completed_set:
             if result is not None:
@@ -956,16 +1202,41 @@ def _validate_loaded_checkpoint(state: object) -> dict:
         if error is not None:
             raise RuntimeError("refusing resume: malformed checkpoint " + error)
     config_epochs = state["config_epochs"]
-    if (
-        not isinstance(config_epochs, dict)
-        or any(not isinstance(epoch, str) or not isinstance(value, dict)
-               for epoch, value in config_epochs.items())
-    ):
+    if not isinstance(config_epochs, dict):
         raise RuntimeError("refusing resume: malformed checkpoint config epochs")
+    validated_epochs = {}
+    for epoch, value in config_epochs.items():
+        validated_epochs[epoch] = _validate_epoch_config(epoch, value)
+    completed_work_units = 0
     for wave_id in completed_set:
         result = waves[wave_id]
-        if result["config_epoch"] not in config_epochs:
+        epoch = result["config_epoch"]
+        epoch_config = validated_epochs.get(epoch)
+        if epoch_config is None:
             raise RuntimeError("refusing resume: completed wave provenance epoch is absent")
+        expected_plan = epoch_config["execution"]["concurrencies"]
+        if wave_id >= len(expected_plan) or result["concurrency"] != expected_plan[wave_id]:
+            raise RuntimeError(
+                f"refusing resume: completed wave {wave_id} provenance does not match its config epoch"
+            )
+        if (
+            result["provider"] != epoch_config["run"]["provider"]
+            or result["endpoint"] != epoch_config["run"]["endpoint"]
+            or result["model"] != epoch_config["run"]["model_id"]
+            or result["max_tokens"] != epoch_config["execution"]["max_tokens"]
+        ):
+            raise RuntimeError(
+                f"refusing resume: completed wave {wave_id} provenance fields do not match its config epoch"
+            )
+        completed_work_units += result["work_units"]
+    if completed_work_units != state["completed_work_units"]:
+        raise RuntimeError("refusing resume: completed work units do not match wave results")
+    if active_wave is not None and active_epoch not in validated_epochs:
+        raise RuntimeError("refusing resume: active wave config epoch is absent")
+    if active_wave is not None:
+        active_plan = validated_epochs[active_epoch]["execution"]["concurrencies"]
+        if active_wave >= len(active_plan):
+            raise RuntimeError("refusing resume: active wave provenance is outside its config plan")
     if "failure" in state:
         failure = state["failure"]
         if (
@@ -986,8 +1257,8 @@ def _validate_loaded_checkpoint(state: object) -> dict:
 
 def _checkpoint(
     state: dict,
-    state_path: Path,
-    progress_path: Path,
+    state_path: Path | _ArtifactBinding,
+    progress_path: Path | _ArtifactBinding,
     *,
     elapsed_s: float,
     active_wave: int | None,
@@ -998,21 +1269,43 @@ def _checkpoint(
     pid, start_time = _process_identity()
     if start_time is None:
         raise RuntimeError("refusing checkpoint: unavailable owner start time")
+    completed_waves = set(state["completed_waves"])
+    completed_work_units = sum(
+        state["waves"][wave]["work_units"]
+        for wave in completed_waves
+        if isinstance(state["waves"][wave], dict)
+    )
+    state["completed_work_units"] = completed_work_units
+    state["active_wave"] = active_wave
+    state["active_config_epoch"] = config_epoch_value if active_wave is not None else None
     state["elapsed_s"] = elapsed_s
     state["pid"] = pid
     state["start_time"] = start_time
     _atomic_write_json(state_path, state)
-    completed = len(state["completed_waves"])
-    rate = completed / elapsed_s if elapsed_s > 0 else 0.0
-    remaining = max(total - completed, 0)
-    eta_s = remaining / rate if rate > 0 else None
+    planned_work_units = state["planned_work_units"]
+    work_rate = completed_work_units / elapsed_s if elapsed_s > 0 else 0.0
+    remaining_work_units = max(planned_work_units - completed_work_units, 0)
+    eta_s = remaining_work_units / work_rate if work_rate > 0 else None
+    active_work_unit = None
+    if active_wave is not None:
+        epoch_config = state["config_epochs"].get(config_epoch_value)
+        if isinstance(epoch_config, dict):
+            plan = epoch_config.get("execution", {}).get("concurrencies")
+            if isinstance(plan, list) and active_wave < len(plan):
+                active_work_unit = plan[active_wave]
     progress = {
-        "completed": completed,
-        "total": total,
+        "completed": completed_work_units,
+        "total": planned_work_units,
+        "completed_waves": len(completed_waves),
+        "total_waves": total,
+        "completed_work_units": completed_work_units,
+        "total_work_units": planned_work_units,
         "elapsed_s": round(elapsed_s, 6),
-        "rate": rate,
+        "rate": work_rate,
+        "work_rate": work_rate,
         "eta_s": eta_s,
         "active_wave": active_wave,
+        "work_unit": active_work_unit,
         "config_epoch": config_epoch_value,
         "pid": pid,
         "start_time": start_time,
@@ -1022,10 +1315,7 @@ def _checkpoint(
         progress["failure_wave"] = failure.get("wave")
         progress["failure_stage"] = failure.get("stage")
         progress["failure_reason"] = failure.get("reason")
-    _atomic_write(
-        progress_path,
-        _progress_yaml(progress),
-    )
+    _atomic_write(progress_path, _progress_yaml(progress))
 
 
 def _new_state() -> dict:
@@ -1036,6 +1326,10 @@ def _new_state() -> dict:
         "elapsed_s": 0.0,
         "total": 0,
         "planned_total": 0,
+        "planned_work_units": 0,
+        "completed_work_units": 0,
+        "active_wave": None,
+        "active_config_epoch": None,
         "planned_wave_ids": [],
         "completed_waves": [],
         "waves": [],
@@ -1043,9 +1337,8 @@ def _new_state() -> dict:
     }
 
 
-def _load_state(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as stream:
-        state = json.load(stream)
+def _load_state(path: Path | _ArtifactBinding) -> dict:
+    state = json.loads(_read_artifact_text(path))
     return _validate_loaded_checkpoint(state)
 
 
@@ -1091,15 +1384,20 @@ def _ensure_state_capacity(
         ids = ", ".join(str(wave) for wave in dropped)
         raise ValueError(f"config reload would drop incomplete planned wave IDs: {ids}")
     if concurrencies is not None:
-        for wave in sorted(completed):
-            if wave >= len(concurrencies):
-                continue
-            result = state["waves"][wave] if wave < len(state["waves"]) else None
-            expected = result.get("concurrency") if isinstance(result, dict) else None
-            if expected is not None and concurrencies[wave] != expected:
+        for wave in range(planned_total):
+            if wave in completed:
+                if wave >= len(concurrencies):
+                    continue
+                result = state["waves"][wave] if wave < len(state["waves"]) else None
+                expected = result.get("concurrency") if isinstance(result, dict) else None
+                if expected is not None and concurrencies[wave] != expected:
+                    raise ValueError(
+                        f"config reload changed completed wave {wave}: "
+                        f"expected concurrency {expected}, got {concurrencies[wave]}"
+                    )
+            elif wave >= len(concurrencies):
                 raise ValueError(
-                    f"config reload changed completed wave {wave}: "
-                    f"expected concurrency {expected}, got {concurrencies[wave]}"
+                    f"config reload has no concurrency for incomplete wave {wave}"
                 )
     planned_total = max(planned_total, total)
     state["planned_total"] = planned_total
@@ -1107,6 +1405,15 @@ def _ensure_state_capacity(
     if len(state["waves"]) < planned_total:
         state["waves"].extend([None] * (planned_total - len(state["waves"])))
     state["total"] = planned_total
+    if concurrencies is not None:
+        planned_work_units = 0
+        for wave in range(planned_total):
+            result = state["waves"][wave]
+            if wave in completed and isinstance(result, dict):
+                planned_work_units += result["concurrency"]
+            elif wave < len(concurrencies):
+                planned_work_units += concurrencies[wave]
+        state["planned_work_units"] = planned_work_units
 
 
 def _next_active_wave(state: dict, total: int, start: int = 0) -> int | None:
@@ -1183,9 +1490,9 @@ def _make_report(
 def _publish_incomplete(
     state: dict,
     config: dict,
-    out_path: Path,
-    state_path: Path,
-    progress_path: Path,
+    out_path: Path | _ArtifactBinding,
+    state_path: Path | _ArtifactBinding,
+    progress_path: Path | _ArtifactBinding,
     *,
     elapsed_s: float,
     active_wave: int,
@@ -1220,18 +1527,23 @@ def _run(
     args: argparse.Namespace,
     config_path: Path | None,
     config: dict,
-    out_path: Path,
-    state_path: Path,
-    progress_path: Path,
+    out_path: Path | _ArtifactBinding,
+    state_path: Path | _ArtifactBinding,
+    progress_path: Path | _ArtifactBinding,
 ) -> int:
     if args.resume:
-        if not state_path.exists():
+        if not _artifact_exists(state_path):
             raise FileNotFoundError(f"cannot resume without checkpoint: {state_path}")
         state = _load_state(state_path)
+        active_wave = state["active_wave"]
+        current_epoch = config_epoch(config)
+        if active_wave is not None and state["active_config_epoch"] != current_epoch:
+            raise RuntimeError(
+                "refusing resume: active wave config epoch does not match current config"
+            )
+        _validate_loaded_plan(state, config["execution"]["concurrencies"])
     else:
         state = _new_state()
-    if args.resume:
-        _validate_loaded_plan(state, config["execution"]["concurrencies"])
     _ensure_state_capacity(
         state,
         len(config["execution"]["concurrencies"]),
@@ -1241,23 +1553,23 @@ def _run(
     base_elapsed = float(state.get("elapsed_s", 0.0))
     run_start = time.monotonic()
     last_epoch = config_epoch(config)
+    active = _next_active_wave(state, state["total"])
 
-    # Progress is written before the first wave as well as after every complete
-    # wave, so a detached launch is observable before its first response.
-    _checkpoint(
-        state,
-        state_path,
-        progress_path,
-        elapsed_s=base_elapsed,
-        active_wave=_next_active_wave(state, state["total"]),
-        total=state["total"],
-        config_epoch_value=last_epoch,
-    )
-    state_initialized = True
+    # Persist the active wave and its exact config epoch before any request.
+    if active is not None:
+        state["config_epochs"][last_epoch] = config
+        _checkpoint(
+            state,
+            state_path,
+            progress_path,
+            elapsed_s=base_elapsed,
+            active_wave=active,
+            total=state["total"],
+            config_epoch_value=last_epoch,
+        )
 
-    wave = 0
-    while True:
-        # This is the sole reload point: config changes affect only future waves.
+    wave = active
+    while wave is not None:
         prior_config = config
         prior_epoch = last_epoch
         try:
@@ -1268,8 +1580,6 @@ def _run(
                 state, len(candidate_concurrencies), candidate_concurrencies
             )
         except Exception as exc:
-            if not state_initialized:
-                raise
             config = prior_config
             last_epoch = prior_epoch
             failure = {
@@ -1296,20 +1606,6 @@ def _run(
         last_epoch = candidate_epoch
         concurrencies = candidate_concurrencies
         total = state["total"]
-        if wave >= total:
-            break
-        if wave in state["completed_waves"]:
-            wave += 1
-            _checkpoint(
-                state,
-                state_path,
-                progress_path,
-                elapsed_s=base_elapsed + (time.monotonic() - run_start),
-                active_wave=_next_active_wave(state, total, wave),
-                total=total,
-                config_epoch_value=last_epoch,
-            )
-            continue
         state["config_epochs"][last_epoch] = config
         n = concurrencies[wave]
         resources = config["resources"]
@@ -1340,6 +1636,7 @@ def _run(
         result.update(
             {
                 "wave": wave,
+                "work_units": n,
                 "config_epoch": last_epoch,
                 "provider": config["run"]["provider"],
                 "endpoint": config["run"]["endpoint"],
@@ -1374,18 +1671,17 @@ def _run(
             )
         state["waves"][wave] = result
         state["completed_waves"] = sorted(set(state["completed_waves"]) | {wave})
-        next_wave = wave + 1
+        wave = _next_active_wave(state, total, wave + 1)
         elapsed = base_elapsed + (time.monotonic() - run_start)
         _checkpoint(
             state,
             state_path,
             progress_path,
             elapsed_s=elapsed,
-            active_wave=_next_active_wave(state, total, next_wave),
+            active_wave=wave,
             total=total,
             config_epoch_value=last_epoch,
         )
-        wave = next_wave
 
     report = _make_report(
         state,
@@ -1425,8 +1721,8 @@ def main(argv=None) -> int:
     out_path = Path(args.out)
     state_path = Path(args.state) if args.state else Path(f"{args.out}.state.json")
     progress_path = Path(args.progress) if args.progress else Path(f"{args.out}.progress.yaml")
-    with _exclusive_artifact_locks(out_path, state_path, progress_path):
-        return _run(args, config_path, config, out_path, state_path, progress_path)
+    with _exclusive_artifact_locks(out_path, state_path, progress_path) as bindings:
+        return _run(args, config_path, config, *bindings)
 
 
 if __name__ == "__main__":
