@@ -233,6 +233,21 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "client_workers.*wave concurrency"):
                 self.mod.load_config(config)
 
+    def test_config_rejects_unknown_client_keys_but_ignores_service_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "run.toml"
+            config.write_text(
+                "[execution]\nconcurrencies = [1]\nunknown_client_key = true\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "unknown.*execution.*unknown_client_key"):
+                self.mod.load_config(config)
+            config.write_text(
+                "[execution]\nconcurrencies = [1]\n\n[service]\nunknown_service_key = true\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(self.mod.load_config(config)["execution"]["concurrencies"], [1])
+
     def test_incomplete_stream_body_is_retried_but_permanent_4xx_is_not(self):
         response = {
             "ttft_s": 0.1, "wall_s": 0.2, "gen_s": 0.1,
@@ -306,14 +321,13 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                     raise RuntimeError("simulated interruption")
                 return {
                     "concurrency": n,
-                    "n_ok": 0,
-                    "n_fail": n,
+                    "n_ok": n,
+                    "n_fail": 0,
                     "sum_completion": 0,
                     "requests": [{
-                        "ok": False,
-                        "attempts": 5,
-                        "retry_exhausted": True,
-                        "error_status": 503,
+                        "ok": True,
+                        "attempts": 1,
+                        "retry_exhausted": False,
                     }],
                 }
 
@@ -327,8 +341,8 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                     )
             checkpoint = json.loads(state.read_text(encoding="utf-8"))
             self.assertEqual(checkpoint["completed_waves"], [0])
-            self.assertEqual(checkpoint["waves"][0]["requests"][0]["attempts"], 5)
-            self.assertTrue(checkpoint["waves"][0]["requests"][0]["retry_exhausted"])
+            self.assertEqual(checkpoint["waves"][0]["requests"][0]["attempts"], 1)
+            self.assertFalse(checkpoint["waves"][0]["requests"][0]["retry_exhausted"])
             progress_text = progress.read_text(encoding="utf-8")
             for field in ("completed:", "total:", "elapsed_s:", "rate:", "eta_s:",
                           "active_wave:", "config_epoch:", "pid:", "start_time:"):
@@ -339,7 +353,13 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
 
             def completed_wave(base_url, model, wave, n, min_tokens, max_tokens, **kwargs):
                 calls.append((base_url, model, wave, n, kwargs))
-                return {"concurrency": n, "n_ok": n, "n_fail": 0, "sum_completion": n}
+                return {
+                    "concurrency": n,
+                    "n_ok": n,
+                    "n_fail": 0,
+                    "sum_completion": n,
+                    "requests": [{"ok": True} for _ in range(n)],
+                }
 
             def completed_wave_and_capture(*args, **kwargs):
                 progress_before_resume_wave.append(progress.read_text(encoding="utf-8"))
@@ -451,6 +471,85 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                     with self.mod._exclusive_artifact_locks(hardlink, state_b):
                         pass
 
+    def test_artifact_locks_reject_progress_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "run.json"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out.write_text("{}\n", encoding="utf-8")
+            os.link(out, progress)
+            with self.assertRaisesRegex(RuntimeError, "collision|alias"):
+                with self.mod._exclusive_artifact_locks(out, state, progress):
+                    pass
+
+    def test_atomic_publication_rejects_symlinked_ancestor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_parent = root / "real-parent"
+            real_parent.mkdir()
+            symlink_parent = root / "symlink-parent"
+            symlink_parent.symlink_to(real_parent, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                self.mod._atomic_write(symlink_parent / "run.json", "safe\n")
+            self.assertFalse((real_parent / "run.json").exists())
+
+    def test_atomic_publication_uses_pinned_parent_after_rename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            parent = root / "parent"
+            parent.mkdir()
+            moved = root / "moved"
+            target = parent / "run.json"
+            replace = self.mod.os.replace
+
+            def rename_parent_then_replace(source, destination, *args, **kwargs):
+                parent.rename(moved)
+                parent.mkdir()
+                return replace(source, destination, *args, **kwargs)
+
+            with mock.patch.object(
+                self.mod.os, "replace", side_effect=rename_parent_then_replace
+            ):
+                try:
+                    self.mod._atomic_write(target, "pinned\n")
+                except FileNotFoundError as exc:
+                    self.fail(f"publication lost its parent pin: {exc}")
+            self.assertEqual((moved / "run.json").read_text(encoding="utf-8"), "pinned\n")
+            self.assertFalse((parent / "run.json").exists())
+
+    def test_atomic_publication_does_not_ignore_parent_fsync_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run.json"
+            fsync_calls = 0
+            real_fsync = self.mod.os.fsync
+
+            def fail_parent_fsync(fd):
+                nonlocal fsync_calls
+                fsync_calls += 1
+                if fsync_calls == 2:
+                    raise OSError("parent fsync failed")
+                return real_fsync(fd)
+
+            with mock.patch.object(self.mod.os, "fsync", side_effect=fail_parent_fsync):
+                with self.assertRaisesRegex(OSError, "parent fsync failed"):
+                    self.mod._atomic_write(target, "must fail closed\n")
+
+    def test_atomic_publication_fails_when_parent_open_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "run.json"
+            real_open = self.mod.os.open
+            directory_flag = getattr(self.mod.os, "O_DIRECTORY", 0)
+
+            def fail_directory_open(path, flags, *args, **kwargs):
+                if flags & directory_flag:
+                    raise OSError("parent open failed")
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(self.mod.os, "open", side_effect=fail_directory_open):
+                with self.assertRaisesRegex(OSError, "parent open failed"):
+                    self.mod._atomic_write(target, "must fail closed\n")
+
     def test_main_rejects_symlink_artifacts_before_any_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -557,6 +656,55 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             for path, content in before.items():
                 self.assertEqual(path.read_bytes(), content)
 
+    def test_resume_rejects_ownerless_or_malformed_schema1_before_mutation(self):
+        cases = ("ownerless", "duplicate-completed", "out-of-range", "bad-plan", "bad-config")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config = root / "run.toml"
+                state_path = root / "run.state.json"
+                progress_path = root / "run.progress.yaml"
+                out_path = root / "run.json"
+                config.write_text(
+                    '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                    "[execution]\nconcurrencies = [1]\n[resources]\n",
+                    encoding="utf-8",
+                )
+                checkpoint = self.mod._new_state()
+                self.mod._ensure_state_capacity(checkpoint, 1, [1])
+                checkpoint["waves"][0] = {"concurrency": 1}
+                checkpoint["completed_waves"] = [0]
+                if case != "ownerless":
+                    checkpoint["pid"], checkpoint["start_time"] = self.mod._process_identity()
+                if case == "duplicate-completed":
+                    checkpoint["completed_waves"] = [0, 0]
+                elif case == "out-of-range":
+                    checkpoint["completed_waves"] = [1]
+                elif case == "bad-plan":
+                    checkpoint["planned_wave_ids"] = [0, 0]
+                elif case == "bad-config":
+                    checkpoint["config_epochs"] = []
+                state_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+                with mock.patch.object(
+                    self.mod, "_ensure_state_capacity", wraps=self.mod._ensure_state_capacity
+                ) as capacity:
+                    with mock.patch.object(
+                        self.mod, "_checkpoint", wraps=self.mod._checkpoint
+                    ) as checkpoint_writer:
+                        with mock.patch.object(self.mod, "run_wave") as benchmark:
+                            with self.assertRaises(Exception) as caught:
+                                self.mod.main(
+                                    [
+                                        "--config", str(config), "--state", str(state_path),
+                                        "--progress", str(progress_path), "--out", str(out_path),
+                                        "--resume",
+                                    ]
+                                )
+                self.assertRegex(str(caught.exception), "refusing resume")
+                capacity.assert_not_called()
+                checkpoint_writer.assert_not_called()
+                benchmark.assert_not_called()
+
     def test_plan_reload_rejects_changed_completed_wave_prefix(self):
         state = self.mod._new_state()
         self.mod._ensure_state_capacity(state, 2, [1, 2])
@@ -598,7 +746,13 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                         "[resources]\nclient_workers = 5\nrequest_timeout_s = 22\n",
                         encoding="utf-8",
                     )
-                return {"concurrency": n, "n_ok": n, "n_fail": 0, "sum_completion": n}
+                return {
+                    "concurrency": n,
+                    "n_ok": n,
+                    "n_fail": 0,
+                    "sum_completion": n,
+                    "requests": [{"ok": True} for _ in range(n)],
+                }
 
             with mock.patch.object(self.mod, "run_wave", side_effect=reload_wave):
                 self.assertEqual(
@@ -642,7 +796,13 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                     write_config("p1", "m1", "http://e1/v1")
                 else:
                     write_config("p2", "m2", "http://e2/v1")
-                return {"concurrency": n, "n_ok": n, "n_fail": 0, "sum_completion": n}
+                return {
+                    "concurrency": n,
+                    "n_ok": n,
+                    "n_fail": 0,
+                    "sum_completion": n,
+                    "requests": [{"ok": True} for _ in range(n)],
+                }
 
             with mock.patch.object(self.mod, "run_wave", side_effect=reload_after_final_wave):
                 self.assertEqual(
@@ -659,6 +819,50 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             self.assertEqual(report["base_url"], "http://e1/v1")
             self.assertEqual(report["endpoint"], "http://e1/v1")
             self.assertEqual(report["config_epoch"], report["waves"][-1]["config_epoch"])
+
+    def test_request_errors_produce_incomplete_report_and_nonzero_result(self):
+        cases = (
+            {
+                "n_ok": 0,
+                "n_fail": 1,
+                "requests": [{"ok": False, "error_type": "HTTPError", "error": "busy"}],
+            },
+            {
+                "n_ok": 1,
+                "n_fail": 0,
+                "requests": [{"ok": True, "error": "unexpected server error"}],
+            },
+        )
+        for failed_result in cases:
+            with self.subTest(failed_result=failed_result), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config = root / "run.toml"
+                state = root / "run.state.json"
+                progress = root / "run.progress.yaml"
+                out = root / "run.json"
+                config.write_text(
+                    '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                    "[execution]\nconcurrencies = [1]\n[resources]\n",
+                    encoding="utf-8",
+                )
+                result = {
+                    "concurrency": 1,
+                    "sum_completion": 0,
+                    **failed_result,
+                }
+                with mock.patch.object(self.mod, "run_wave", return_value=result):
+                    with self.assertRaisesRegex(RuntimeError, "incomplete|failed"):
+                        self.mod.main(
+                            [
+                                "--config", str(config), "--state", str(state),
+                                "--progress", str(progress), "--out", str(out),
+                            ]
+                        )
+                report = json.loads(out.read_text(encoding="utf-8"))
+                self.assertEqual(report["status"], "INCOMPLETE")
+                self.assertFalse(report["complete"])
+                checkpoint = json.loads(state.read_text(encoding="utf-8"))
+                self.assertEqual(checkpoint["completed_waves"], [])
 
 
 if __name__ == "__main__":
