@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -281,7 +282,10 @@ def _stream_chat(
 def _is_transient(exc: BaseException) -> bool:
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code == 429 or 500 <= exc.code <= 599
-    return isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError))
+    return isinstance(
+        exc,
+        (http.client.IncompleteRead, urllib.error.URLError, TimeoutError, ConnectionError),
+    )
 
 
 def _failure_metric(exc: BaseException, attempts: int, retry_exhausted: bool) -> dict:
@@ -348,6 +352,13 @@ def run_wave(
     backoff_initial_s: float = DEFAULT_BACKOFF_INITIAL_S,
     backoff_max_s: float = DEFAULT_BACKOFF_MAX_S,
 ) -> dict:
+    """Run a wave and join workers before returning its complete metrics.
+
+    ``wave_timeout_s`` is a non-hard observational deadline. Python cannot
+    force-stop a running ``ThreadPoolExecutor`` worker, so the deadline only
+    records that the wave exceeded its observation window; each request still
+    uses its own timeout and retry policy, and the wave waits for those workers.
+    """
     del provider  # retained in the wave/report metadata; endpoint is the transport.
     payloads = [
         build_payload(model, make_nonce(wave, i), min_tokens, max_tokens)
@@ -369,17 +380,15 @@ def run_wave(
         )
         for payload in payloads
     ]
-    timed_out = False
+    observation_deadline_exceeded = False
     try:
-        done, pending = concurrent.futures.wait(futures, timeout=wave_timeout_s)
-        if pending:
-            timed_out = True
-            for future in pending:
-                future.cancel()
-            raise TimeoutError(f"wave {wave} exceeded {wave_timeout_s}s timeout")
+        _done, pending = concurrent.futures.wait(futures, timeout=wave_timeout_s)
+        observation_deadline_exceeded = bool(pending)
+        # A running thread cannot be cancelled safely. Waiting here preserves
+        # complete per-request metrics and lets request_timeout_s bound I/O.
         results = [future.result() for future in futures]
     finally:
-        executor.shutdown(wait=not timed_out, cancel_futures=timed_out)
+        executor.shutdown(wait=True)
     wave_wall = time.monotonic() - wave_start
     ok = [result for result in results if result["ok"]]
     n_ok = len(ok)
@@ -393,6 +402,7 @@ def run_wave(
         "n_finish_length": sum(result.get("finish_reason") == "length" for result in results),
         "sum_completion": sum_completion,
         "wave_wall_s": wave_wall,
+        "wave_observation_deadline_exceeded": observation_deadline_exceeded,
         "agg_decode_tok_s": sum_completion / wave_wall if wave_wall > 0 else 0.0,
         "agg_prompt_tok_s": sum_prompt / wave_wall if wave_wall > 0 else 0.0,
         "requests": results,
@@ -534,7 +544,12 @@ def parse_args(argv):
     )
     p.add_argument("--client-workers", type=int, default=None)
     p.add_argument("--request-timeout-s", type=float, default=None)
-    p.add_argument("--wave-timeout-s", type=float, default=None)
+    p.add_argument(
+        "--wave-timeout-s",
+        type=float,
+        default=None,
+        help="observational wave deadline; does not cancel running workers",
+    )
     p.add_argument("--max-attempts", type=int, default=None)
     p.add_argument("--backoff-initial-s", type=float, default=None)
     p.add_argument("--backoff-max-s", type=float, default=None)

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import http.client
 import importlib.util
 import json
 import os
@@ -10,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from unittest import mock
@@ -169,6 +171,58 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
         self.assertTrue(result["retry_exhausted"])
         self.assertEqual(result["error_status"], 429)
         self.assertEqual(request.call_count, 2)
+
+    def test_incomplete_stream_body_is_retried_but_permanent_4xx_is_not(self):
+        response = {
+            "ttft_s": 0.1, "wall_s": 0.2, "gen_s": 0.1,
+            "prompt_tokens": MIN_PROMPT_TOKENS, "completion_tokens": 2,
+            "decode_tok_s": 20.0, "finish_reason": "stop", "n_fail_short": 0,
+        }
+        incomplete = http.client.IncompleteRead(b"partial", 2)
+        with mock.patch.object(
+            self.mod, "_stream_chat", side_effect=[incomplete, response]
+        ) as request:
+            with mock.patch.object(self.mod.time, "sleep"):
+                result = self.mod.run_request(
+                    "http://e", {}, MIN_PROMPT_TOKENS,
+                    max_attempts=2, backoff_initial_s=0.01, backoff_max_s=0.02,
+                )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["attempts"], 2)
+        self.assertFalse(result["retry_exhausted"])
+        self.assertEqual(request.call_count, 2)
+
+        permanent = urllib.error.HTTPError("http://e", 400, "bad", {}, None)
+        with mock.patch.object(self.mod, "_stream_chat", side_effect=permanent) as request:
+            result = self.mod.run_request(
+                "http://e", {}, MIN_PROMPT_TOKENS,
+                max_attempts=5, backoff_initial_s=0, backoff_max_s=0,
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["attempts"], 1)
+        self.assertFalse(result["retry_exhausted"])
+        self.assertEqual(request.call_count, 1)
+
+    def test_wave_timeout_is_observational_and_waits_for_worker_completion(self):
+        response = {
+            "ttft_s": 0.1, "wall_s": 0.2, "gen_s": 0.1,
+            "prompt_tokens": MIN_PROMPT_TOKENS, "completion_tokens": 2,
+            "decode_tok_s": 20.0, "finish_reason": "stop", "n_fail_short": 0,
+            "ok": True,
+        }
+
+        def slow_request(*args, **kwargs):
+            time.sleep(0.02)
+            return response
+
+        with mock.patch.object(self.mod, "run_request", side_effect=slow_request):
+            result = self.mod.run_wave(
+                "http://e", DEFAULT_MODEL, 0, 1, MIN_PROMPT_TOKENS, 256,
+                client_workers=1, request_timeout_s=1, wave_timeout_s=0.001,
+            )
+        self.assertTrue(result["wave_observation_deadline_exceeded"])
+        self.assertEqual(result["n_ok"], 1)
+        self.assertEqual(len(result["requests"]), 1)
 
     def test_checkpoint_progress_and_resume_skip_completed_waves(self):
         with tempfile.TemporaryDirectory() as tmp:
