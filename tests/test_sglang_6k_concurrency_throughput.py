@@ -561,7 +561,11 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
         request.assert_called_once()
         sleep.assert_not_called()
 
-    def test_clean_eof_stream_is_retryable_and_never_complete(self):
+    def test_stream_truncation_is_not_transient_but_incomplete_read_is(self):
+        self.assertFalse(self.mod._is_transient(self.mod.StreamTruncatedError("clean EOF")))
+        self.assertTrue(self.mod._is_transient(http.client.IncompleteRead(b"partial", 2)))
+
+    def test_clean_eof_stream_is_not_retryable_and_never_complete(self):
         class Response:
             def __enter__(self):
                 return self
@@ -578,15 +582,20 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                     ]
                 )
 
-        with mock.patch.object(self.mod.urllib.request, "urlopen", return_value=Response()):
-            with mock.patch.object(self.mod.time, "sleep"):
+        with mock.patch.object(
+            self.mod.urllib.request, "urlopen", return_value=Response()
+        ) as urlopen:
+            with mock.patch.object(self.mod.time, "sleep") as sleep:
                 result = self.mod.run_request(
                     "http://e/v1", {}, MIN_PROMPT_TOKENS,
                     max_attempts=2, backoff_initial_s=0, backoff_max_s=0,
                 )
         self.assertFalse(result["ok"])
-        self.assertEqual(result["attempts"], 2)
-        self.assertTrue(result["retry_exhausted"])
+        self.assertEqual(result["attempts"], 1)
+        self.assertFalse(result["retry_exhausted"])
+        self.assertEqual(result["error_type"], "StreamTruncatedError")
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
 
     def test_wave_timeout_is_observational_and_waits_for_worker_completion(self):
         response = {

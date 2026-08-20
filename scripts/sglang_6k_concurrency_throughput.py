@@ -420,7 +420,7 @@ def _stream_chat(
 
 
 def _is_transient(exc: BaseException) -> bool:
-    if isinstance(exc, StreamProtocolError):
+    if isinstance(exc, (StreamProtocolError, StreamTruncatedError)):
         return False
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code == 429 or 500 <= exc.code <= 599
