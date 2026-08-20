@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import errno
 import fcntl
 import hashlib
@@ -456,13 +456,22 @@ def _progress_yaml(progress: dict) -> str:
     return "".join(f"{key}: {_yaml_scalar(value)}\n" for key, value in progress.items())
 
 
-def _process_identity() -> tuple[int, int | None]:
-    pid = os.getpid()
+def _read_process_start_time(pid: int) -> int | None:
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         fields = stat.rsplit(")", 1)[1].split()
-        return pid, int(fields[19])
-    except (OSError, ValueError, IndexError):
+        return int(fields[19])
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, IndexError) as exc:
+        raise RuntimeError(f"refusing resume: malformed /proc/{pid}/stat") from exc
+
+
+def _process_identity() -> tuple[int, int | None]:
+    pid = os.getpid()
+    try:
+        return pid, _read_process_start_time(pid)
+    except RuntimeError:
         return pid, None
 
 
@@ -486,8 +495,70 @@ def _exclusive_run_lock(path: str | os.PathLike[str]):
         os.close(descriptor)
 
 
+def _artifact_lock_identities(path: str | os.PathLike[str]) -> set[tuple]:
+    resolved = Path(path).resolve(strict=False)
+    identities: set[tuple] = {("path", str(resolved))}
+    try:
+        stat = resolved.stat()
+    except OSError as exc:
+        if exc.errno not in (errno.ENOENT, errno.ENOTDIR):
+            raise
+    else:
+        identities.add(("inode", int(stat.st_dev), int(stat.st_ino)))
+    return identities
+
+
+def _artifact_lock_path(identity: tuple) -> Path:
+    digest = hashlib.sha256(
+        json.dumps(identity, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return Path(tempfile.gettempdir()) / "aeon-bench-artifact-locks" / f"{digest}.lock"
+
+
+@contextmanager
+def _exclusive_artifact_locks(
+    out_path: Path,
+    state_path: Path,
+):
+    identities = set()
+    for artifact in (out_path, state_path):
+        identities.update(_artifact_lock_identities(artifact))
+    lock_paths = [_artifact_lock_path(identity) for identity in sorted(identities)]
+    with ExitStack() as stack:
+        for lock_path in lock_paths:
+            stack.enter_context(_exclusive_run_lock(lock_path))
+        yield
+
+
 def _run_lock_path(state_path: Path) -> Path:
-    return state_path.with_name(f".{state_path.name}.lock")
+    resolved = state_path.resolve(strict=False)
+    return _artifact_lock_path(("path", str(resolved)))
+
+
+def _validate_checkpoint_owner(state: dict) -> None:
+    owner_fields = ("pid", "start_time")
+    present = [field in state for field in owner_fields]
+    if not any(present):
+        return
+    if not all(present):
+        raise RuntimeError("refusing resume: malformed checkpoint owner identity")
+    pid = state["pid"]
+    start_time = state["start_time"]
+    if (
+        isinstance(pid, bool)
+        or not isinstance(pid, int)
+        or pid < 1
+        or isinstance(start_time, bool)
+        or not isinstance(start_time, int)
+        or start_time < 1
+    ):
+        raise RuntimeError("refusing resume: malformed checkpoint owner identity")
+    live_start_time = _read_process_start_time(pid)
+    if live_start_time is None or live_start_time != start_time:
+        return
+    current_pid, current_start_time = _process_identity()
+    if (pid, start_time) != (current_pid, current_start_time):
+        raise RuntimeError("refusing resume: saved benchmark owner is still live")
 
 
 def _checkpoint(
@@ -639,6 +710,7 @@ def _run(
         if not state_path.exists():
             raise FileNotFoundError(f"cannot resume without checkpoint: {state_path}")
         state = _load_state(state_path)
+        _validate_checkpoint_owner(state)
     else:
         state = _new_state()
     _ensure_state_capacity(
@@ -755,7 +827,7 @@ def main(argv=None) -> int:
     out_path = Path(args.out)
     state_path = Path(args.state) if args.state else Path(f"{args.out}.state.json")
     progress_path = Path(args.progress) if args.progress else Path(f"{args.out}.progress.yaml")
-    with _exclusive_run_lock(_run_lock_path(state_path)):
+    with _exclusive_artifact_locks(out_path, state_path):
         return _run(args, config_path, config, out_path, state_path, progress_path)
 
 

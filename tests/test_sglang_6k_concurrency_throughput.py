@@ -342,6 +342,113 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                     0,
                 )
 
+    def test_artifact_locks_refuse_same_output_with_different_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "run.json"
+            state_a = root / "a.state.json"
+            state_b = root / "b.state.json"
+            with self.mod._exclusive_artifact_locks(out, state_a):
+                with self.assertRaisesRegex(RuntimeError, "already owned"):
+                    with self.mod._exclusive_artifact_locks(out, state_b):
+                        pass
+
+    def test_artifact_locks_refuse_symlink_and_hardlink_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "run.json"
+            hardlink = root / "hardlink.json"
+            symlink = root / "symlink.json"
+            out.write_text("{}\n", encoding="utf-8")
+            os.link(out, hardlink)
+            symlink.symlink_to(out)
+            state_a = root / "a.state.json"
+            state_b = root / "b.state.json"
+            with self.mod._exclusive_artifact_locks(out, state_a):
+                for alias in (hardlink, symlink):
+                    with self.assertRaisesRegex(RuntimeError, "already owned"):
+                        with self.mod._exclusive_artifact_locks(alias, state_b):
+                            pass
+
+    def test_resume_rejects_live_different_owner_before_rewriting_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state_path = root / "run.state.json"
+            progress_path = root / "run.progress.yaml"
+            out_path = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+            checkpoint = self.mod._new_state()
+            self.mod._ensure_state_capacity(checkpoint, 1, [1])
+            checkpoint["completed_waves"] = [0]
+            checkpoint["waves"][0] = {"concurrency": 1}
+            owner = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"]
+            )
+            try:
+                stat = Path(f"/proc/{owner.pid}/stat").read_text(encoding="utf-8")
+                start_time = int(stat.rsplit(")", 1)[1].split()[19])
+                checkpoint["pid"] = owner.pid
+                checkpoint["start_time"] = start_time
+                state_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+                progress_path.write_text("keep progress\n", encoding="utf-8")
+                out_path.write_text("keep output\n", encoding="utf-8")
+                before = {
+                    path: path.read_bytes()
+                    for path in (state_path, progress_path, out_path)
+                }
+                with self.assertRaisesRegex(RuntimeError, "saved benchmark owner is still live"):
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state_path),
+                            "--progress", str(progress_path), "--out", str(out_path),
+                            "--resume",
+                        ]
+                    )
+                for path, content in before.items():
+                    self.assertEqual(path.read_bytes(), content)
+            finally:
+                owner.terminate()
+                owner.wait()
+
+    def test_resume_rejects_malformed_present_owner_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state_path = root / "run.state.json"
+            progress_path = root / "run.progress.yaml"
+            out_path = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+            checkpoint = self.mod._new_state()
+            self.mod._ensure_state_capacity(checkpoint, 1, [1])
+            checkpoint["pid"] = os.getpid()
+            checkpoint["start_time"] = "not-an-integer"
+            state_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+            progress_path.write_text("keep progress\n", encoding="utf-8")
+            out_path.write_text("keep output\n", encoding="utf-8")
+            before = {
+                path: path.read_bytes()
+                for path in (state_path, progress_path, out_path)
+            }
+            with self.assertRaisesRegex(RuntimeError, "malformed checkpoint owner identity"):
+                self.mod.main(
+                    [
+                        "--config", str(config), "--state", str(state_path),
+                        "--progress", str(progress_path), "--out", str(out_path),
+                        "--resume",
+                    ]
+                )
+            for path, content in before.items():
+                self.assertEqual(path.read_bytes(), content)
+
     def test_plan_reload_rejects_changed_completed_wave_prefix(self):
         state = self.mod._new_state()
         self.mod._ensure_state_capacity(state, 2, [1, 2])
