@@ -62,7 +62,7 @@ def _completed_wave(concurrency, **overrides):
         "sum_completion": concurrency * 2,
         "wave_wall_s": 0.2,
         "wave_observation_deadline_exceeded": False,
-        "agg_decode_tok_s": 10.0,
+        "agg_decode_tok_s": float(concurrency * 2) / 0.2,
         "agg_prompt_tok_s": float(concurrency * MIN_PROMPT_TOKENS) / 0.2,
         "requests": [_completed_request() for _ in range(concurrency)],
     }
@@ -674,7 +674,7 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         copy = 'cp "$repo_root/examples/sglang-6k-concurrency-throughput.toml" "$run_dir/run.toml"'
         self.assertIn(copy, readme)
-        self.assertLess(readme.index(copy), readme.index('--config "$run_dir/run.toml"'))
+        self.assertLess(readme.index(copy), readme.index('--config "$run_dir/run.toml"', readme.index(copy)))
         self.assertIn("refusing resume: saved benchmark owner is still live", readme)
         resume = readme[readme.index("--resume") :]
         self.assertIn("pid=$!", resume)
@@ -1489,6 +1489,222 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                 self.assertFalse(report["complete"])
                 checkpoint = json.loads(state.read_text(encoding="utf-8"))
                 self.assertEqual(checkpoint["completed_waves"], [])
+
+    def test_run_wave_exception_replaces_stale_complete_output_and_persists_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+            out.write_text('{"status":"COMPLETE","complete":true}\n', encoding="utf-8")
+            with mock.patch.object(self.mod, "run_wave", side_effect=ValueError("worker boom")):
+                with self.assertRaisesRegex(ValueError, "worker boom"):
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out),
+                        ]
+                    )
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "INCOMPLETE")
+            self.assertFalse(report["complete"])
+            self.assertEqual(report["failure"]["stage"], "run_wave")
+            self.assertEqual(report["failure"]["error"], "worker boom")
+            checkpoint = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint["failure"]["stage"], "run_wave")
+            self.assertEqual(checkpoint["active_wave"], 0)
+            self.assertIn('failure_stage: "run_wave"', progress.read_text(encoding="utf-8"))
+
+    def test_result_processing_exception_replaces_stale_complete_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+            out.write_text('{"status":"COMPLETE","complete":true}\n', encoding="utf-8")
+            with mock.patch.object(self.mod, "run_wave", return_value=object()):
+                with self.assertRaises(AttributeError):
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out),
+                        ]
+                    )
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "INCOMPLETE")
+            self.assertFalse(report["complete"])
+            self.assertEqual(report["failure"]["stage"], "result_processing")
+            self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["failure"]["stage"], "result_processing")
+
+    def test_derived_wave_metrics_are_consistent_on_acceptance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "run.toml"
+            config_path.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\nmax_tokens = 7\n[resources]\nrequest_timeout_s = 11\n",
+                encoding="utf-8",
+            )
+            config = self.mod.load_config(config_path)
+            epoch = self.mod.config_epoch(config)
+            base = _completed_wave(
+                1, wave=0, config_epoch=epoch, provider="p", endpoint="http://e/v1",
+                model="m", max_tokens=7, request_timeout_s=11,
+            )
+            cases = {
+                "wave_wall": lambda result: result.update(wave_wall_s=0.0),
+                "aggregate_decode": lambda result: result.update(agg_decode_tok_s=999.0),
+                "aggregate_prompt": lambda result: result.update(agg_prompt_tok_s=999.0),
+                "request_decode": lambda result: result["requests"][0].update(decode_tok_s=999.0),
+                "logical_wall": lambda result: result["requests"][0].update(logical_wall_s=0.3),
+            }
+            for name, forge in cases.items():
+                with self.subTest(case=name):
+                    result = json.loads(json.dumps(base))
+                    forge(result)
+                    error = self.mod._wave_acceptance_error(result, 1, config)
+                    self.assertIsNotNone(error)
+                    self.assertIn(name.replace("_", " ").split()[0], error.lower())
+
+    def test_derived_wave_metrics_allow_small_json_rounding(self):
+        config = self.mod.load_config(None)
+        config["execution"]["concurrencies"] = [1]
+        epoch = self.mod.config_epoch(config)
+        result = _completed_wave(
+            1, wave=0, config_epoch=epoch, provider=config["run"]["provider"],
+            endpoint=config["run"]["endpoint"], model=config["run"]["model_id"],
+            max_tokens=config["execution"]["max_tokens"],
+        )
+        result["wave_wall_s"] = 0.2000000001
+        result["agg_decode_tok_s"] = 2.0 / result["wave_wall_s"]
+        result["agg_prompt_tok_s"] = MIN_PROMPT_TOKENS / result["wave_wall_s"]
+        result["requests"][0]["decode_tok_s"] = 20.0000000001
+        result["requests"][0]["retry_overhead_s"] = 1e-10
+        result["requests"][0]["logical_wall_s"] = 0.2000000001
+        self.assertIsNone(self.mod._wave_acceptance_error(result, 1, config))
+
+    def test_resume_rejects_forged_derived_wave_metrics_before_publication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "run.toml"
+            state_path = root / "run.state.json"
+            progress_path = root / "run.progress.yaml"
+            out_path = root / "run.json"
+            config_path.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\nmax_tokens = 7\n[resources]\nrequest_timeout_s = 11\n",
+                encoding="utf-8",
+            )
+            config = self.mod.load_config(config_path)
+            epoch = self.mod.config_epoch(config)
+            result = _completed_wave(
+                1, wave=0, config_epoch=epoch, provider="p", endpoint="http://e/v1",
+                model="m", max_tokens=7, request_timeout_s=11, agg_prompt_tok_s=1.0,
+            )
+            state = self.mod._new_state()
+            self.mod._ensure_state_capacity(state, 1, [1])
+            state["waves"][0] = result
+            state["completed_waves"] = [0]
+            state["completed_work_units"] = 1
+            state["config_epochs"] = {epoch: config}
+            state["pid"], state["start_time"] = (999999, 1)
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            progress_path.write_text("keep progress\n", encoding="utf-8")
+            out_path.write_text("keep output\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "refusing resume: malformed checkpoint"):
+                self.mod.main(
+                    [
+                        "--config", str(config_path), "--state", str(state_path),
+                        "--progress", str(progress_path), "--out", str(out_path), "--resume",
+                    ]
+                )
+            self.assertEqual(out_path.read_text(encoding="utf-8"), "keep output\n")
+
+    def test_schema1_complete_checkpoint_is_durably_migrated_before_return(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "run.toml"
+            state_path = root / "run.state.json"
+            progress_path = root / "run.progress.yaml"
+            out_path = root / "run.json"
+            config_path.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1, 2]\nmax_tokens = 7\n[resources]\nrequest_timeout_s = 11\n",
+                encoding="utf-8",
+            )
+            config = self.mod.load_config(config_path)
+            epoch = self.mod.config_epoch(config)
+            waves = [
+                _completed_wave(
+                    n, wave=wave, config_epoch=epoch, provider="p", endpoint="http://e/v1",
+                    model="m", max_tokens=7, request_timeout_s=11,
+                )
+                for wave, n in enumerate((1, 2))
+            ]
+            for result in waves:
+                result.pop("work_units", None)
+            legacy = {
+                "schema_version": 1,
+                "run_id": "legacy-complete",
+                "started_at": 1.0,
+                "elapsed_s": 0.5,
+                "total": 2,
+                "planned_total": 2,
+                "planned_wave_ids": [0, 1],
+                "completed_waves": [0, 1],
+                "waves": waves,
+                "config_epochs": {epoch: config},
+                "pid": 999999,
+                "start_time": 1,
+            }
+            state_path.write_text(json.dumps(legacy), encoding="utf-8")
+            with mock.patch.object(self.mod, "run_wave") as run_wave:
+                self.assertEqual(
+                    self.mod.main(
+                        [
+                            "--config", str(config_path), "--state", str(state_path),
+                            "--progress", str(progress_path), "--out", str(out_path), "--resume",
+                        ]
+                    ),
+                    0,
+                )
+            run_wave.assert_not_called()
+            migrated = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(migrated["schema_version"], 2)
+            self.assertEqual(migrated["completed_work_units"], 3)
+            self.assertIsNone(migrated["active_wave"])
+            self.assertIn("completed: 3", progress_path.read_text(encoding="utf-8"))
+            self.assertEqual(json.loads(out_path.read_text(encoding="utf-8"))["status"], "COMPLETE")
+
+    def test_dedicated_64k_config_has_five_waves_per_level_and_raw_requirements(self):
+        example = ROOT / "examples" / "sglang-64k-concurrency-throughput.toml"
+        self.assertTrue(example.is_file())
+        loaded = self.mod.load_config(example)
+        levels = [1, 2, 4, 6, 8, 10, 12, 14, 16]
+        self.assertEqual(loaded["execution"]["min_prompt_tokens"], 64000)
+        self.assertEqual(loaded["execution"]["concurrencies"], [level for level in levels for _ in range(5)])
+        self.assertGreaterEqual(loaded["resources"]["client_workers"], 16)
+        self.assertGreaterEqual(loaded["execution"]["max_tokens"], 128)
+        self.assertGreaterEqual(loaded["resources"]["request_timeout_s"], 600)
+        self.assertGreaterEqual(loaded["resources"]["wave_timeout_s"], loaded["resources"]["request_timeout_s"])
+        self.assertTrue(loaded["run"]["endpoint"].endswith("/v1"))
+        self.assertTrue(loaded["run"]["model_id"])
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        copy = 'cp "$repo_root/examples/sglang-64k-concurrency-throughput.toml" "$run_dir/run.toml"'
+        self.assertIn(copy, readme)
+        self.assertLess(readme.index(copy), readme.index('--config "$run_dir/run.toml"', readme.index(copy)))
 
 
 if __name__ == "__main__":

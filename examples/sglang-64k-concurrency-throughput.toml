@@ -1,0 +1,30 @@
+# Dedicated raw SGLang 64K-input throughput run.
+# endpoint must be the raw SGLang OpenAI-compatible listener, not Guard.
+[run]
+provider = "openai"
+model_id = "abliterated-qwen-latest-27b-nvfp4"
+endpoint = "http://100.105.4.92:18010/v1"
+
+[execution]
+# Five waves at each requested concurrency level.
+concurrencies = [
+  1, 1, 1, 1, 1,
+  2, 2, 2, 2, 2,
+  4, 4, 4, 4, 4,
+  6, 6, 6, 6, 6,
+  8, 8, 8, 8, 8,
+  10, 10, 10, 10, 10,
+  12, 12, 12, 12, 12,
+  14, 14, 14, 14, 14,
+  16, 16, 16, 16, 16,
+]
+min_prompt_tokens = 64000
+max_tokens = 512
+
+[resources]
+client_workers = 16
+request_timeout_s = 1800.0
+wave_timeout_s = 7200.0
+max_attempts = 5
+backoff_initial_s = 1.0
+backoff_max_s = 30.0

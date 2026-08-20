@@ -154,6 +154,31 @@ gb10-services/
 
 ## Resumable SGLang throughput benchmark
 
+### Dedicated 64K raw-endpoint run
+
+The tracked 64K plan runs five waves at each concurrency level
+`1,2,4,6,8,10,12,14,16` (45 waves total). It targets the raw SGLang
+OpenAI-compatible listener and served model from the TOML; do not point it at
+Guard or invent a model alias that the server does not expose. The example is
+client-only and does not change any live service configuration:
+
+```bash
+repo_root="$(git rev-parse --show-toplevel)"
+run_dir="$repo_root/sglang-64k-run"
+mkdir -p "$run_dir"
+cp "$repo_root/examples/sglang-64k-concurrency-throughput.toml" "$run_dir/run.toml"
+nohup python3 "$repo_root/scripts/sglang_6k_concurrency_throughput.py" \
+  --config "$run_dir/run.toml" \
+  --state "$run_dir/run.state.json" \
+  --progress "$run_dir/run.progress.yaml" \
+  --out "$run_dir/run.json" \
+  >"$run_dir/run.log" 2>&1 &
+pid=$!
+start_time=$(awk '{print $22}' "/proc/$pid/stat")
+printf '%s %s\n' "$pid" "$start_time" >"$run_dir/run.pid-start"
+printf 'pid=%s start_time=%s\n' "$pid" "$start_time"
+```
+
 Run the benchmark detached and keep its checkpoint, progress sidecar, output,
 log, and launcher identity together:
 

@@ -880,6 +880,17 @@ _REQUEST_FLOAT_FIELDS = (
     "decode_tok_s",
     "request_timeout_s",
 )
+_METRIC_REL_TOL = 1e-6
+_METRIC_ABS_TOL = 1e-9
+
+
+def _metrics_close(actual: float, expected: float) -> bool:
+    return math.isclose(
+        actual,
+        expected,
+        rel_tol=_METRIC_REL_TOL,
+        abs_tol=_METRIC_ABS_TOL,
+    )
 
 
 def _completed_wave_error(
@@ -931,6 +942,8 @@ def _completed_wave_error(
             or value < 0
         ):
             return f"wave result {field} is invalid"
+    if result["wave_wall_s"] <= 0:
+        return "wave result wave wall must be positive"
     if (
         not isinstance(result["config_epoch"], str)
         or len(result["config_epoch"]) != 64
@@ -965,6 +978,7 @@ def _completed_wave_error(
     if not isinstance(requests, list) or len(requests) != expected_requests:
         return "wave did not return one result for every request"
     completion_total = 0
+    prompt_total = 0
     finish_length_total = 0
     for index, request in enumerate(requests):
         if not isinstance(request, dict):
@@ -1008,16 +1022,28 @@ def _completed_wave_error(
                 min(resources["backoff_max_s"], resources["backoff_initial_s"] * (2 ** retry))
                 for retry in range(attempts - 1)
             )
-            if request["retry_backoff_s"] != expected_backoff:
+            if not _metrics_close(request["retry_backoff_s"], expected_backoff):
                 return f"request {index} retry backoff does not match its metrics"
-        if request["retry_overhead_s"] != (
-            request["failed_attempt_wall_s"] + request["retry_backoff_s"]
+        if request["ttft_s"] > request["wall_s"] + _METRIC_ABS_TOL:
+            return f"request {index} TTFT exceeds wall time"
+        if request["gen_s"] > request["wall_s"] - request["ttft_s"] + _METRIC_ABS_TOL:
+            return f"request {index} generation time exceeds decode window"
+        decode_window = request["wall_s"] - request["ttft_s"]
+        expected_decode = (
+            request["completion_tokens"] / decode_window if decode_window > 0 else 0.0
+        )
+        if not _metrics_close(request["decode_tok_s"], expected_decode):
+            return f"request {index} decode rate does not match its metrics"
+        if not _metrics_close(
+            request["retry_overhead_s"],
+            request["failed_attempt_wall_s"] + request["retry_backoff_s"],
         ):
             return f"request {index} retry overhead does not match its metrics"
-        if request["logical_wall_s"] != (
+        if not _metrics_close(
+            request["logical_wall_s"],
             request["failed_attempt_wall_s"]
             + request["retry_backoff_s"]
-            + request["final_attempt_wall_s"]
+            + request["final_attempt_wall_s"],
         ):
             return f"request {index} logical wall time does not match its metrics"
         if request["n_fail_short"] != 0:
@@ -1025,9 +1051,17 @@ def _completed_wave_error(
         if not isinstance(request["finish_reason"], str) or not request["finish_reason"]:
             return f"request {index} finish reason is invalid"
         completion_total += request["completion_tokens"]
+        prompt_total += request["prompt_tokens"]
         finish_length_total += request["finish_reason"] == "length"
     if result["sum_completion"] != completion_total:
         return "wave result completion total does not match request metrics"
+    wave_wall = result["wave_wall_s"]
+    expected_decode = completion_total / wave_wall
+    expected_prompt = prompt_total / wave_wall
+    if not _metrics_close(result["agg_decode_tok_s"], expected_decode):
+        return "wave aggregate decode rate does not match request metrics"
+    if not _metrics_close(result["agg_prompt_tok_s"], expected_prompt):
+        return "wave aggregate prompt rate does not match request metrics"
     if result["n_finish_length"] != finish_length_total:
         return "wave result finish-length count does not match request metrics"
     return None
@@ -1731,9 +1765,12 @@ def _run(
     state_path: Path | _ArtifactBinding,
     progress_path: Path | _ArtifactBinding,
 ) -> int:
+    legacy_checkpoint = False
     if args.resume:
         if not _artifact_exists(state_path):
             raise FileNotFoundError(f"cannot resume without checkpoint: {state_path}")
+        raw_state = json.loads(_read_artifact_text(state_path))
+        legacy_checkpoint = raw_state.get("schema_version") == _LEGACY_CHECKPOINT_SCHEMA_VERSION
         state = _load_state(state_path, config)
         active_wave = state["active_wave"]
         current_epoch = config_epoch(config)
@@ -1764,6 +1801,18 @@ def _run(
             progress_path,
             elapsed_s=base_elapsed,
             active_wave=active,
+            total=state["total"],
+            config_epoch_value=last_epoch,
+        )
+    elif legacy_checkpoint:
+        # Complete legacy checkpoints still need schema-2 state and progress
+        # persisted before the terminal report is published.
+        _checkpoint(
+            state,
+            state_path,
+            progress_path,
+            elapsed_s=base_elapsed,
+            active_wave=None,
             total=state["total"],
             config_epoch_value=last_epoch,
         )
@@ -1818,42 +1867,52 @@ def _run(
             total=total,
             config_epoch_value=last_epoch,
         )
-        result = run_wave(
-            config["run"]["endpoint"],
-            config["run"]["model_id"],
-            wave,
-            n,
-            config["execution"]["min_prompt_tokens"],
-            config["execution"]["max_tokens"],
-            provider=config["run"]["provider"],
-            client_workers=resources["client_workers"],
-            request_timeout_s=resources["request_timeout_s"],
-            wave_timeout_s=resources["wave_timeout_s"],
-            max_attempts=resources["max_attempts"],
-            backoff_initial_s=resources["backoff_initial_s"],
-            backoff_max_s=resources["backoff_max_s"],
-        )
-        result.update(
-            {
-                "wave": wave,
-                "work_units": n,
-                "config_epoch": last_epoch,
-                "provider": config["run"]["provider"],
-                "endpoint": config["run"]["endpoint"],
-                "model": config["run"]["model_id"],
-                "max_tokens": config["execution"]["max_tokens"],
-            }
-        )
-        acceptance_error = _wave_acceptance_error(result, n, config)
-        if acceptance_error is not None:
+        result = None
+        acceptance_error = None
+        stage = "run_wave"
+        try:
+            result = run_wave(
+                config["run"]["endpoint"],
+                config["run"]["model_id"],
+                wave,
+                n,
+                config["execution"]["min_prompt_tokens"],
+                config["execution"]["max_tokens"],
+                provider=config["run"]["provider"],
+                client_workers=resources["client_workers"],
+                request_timeout_s=resources["request_timeout_s"],
+                wave_timeout_s=resources["wave_timeout_s"],
+                max_attempts=resources["max_attempts"],
+                backoff_initial_s=resources["backoff_initial_s"],
+                backoff_max_s=resources["backoff_max_s"],
+            )
+            stage = "result_processing"
+            result.update(
+                {
+                    "wave": wave,
+                    "work_units": n,
+                    "config_epoch": last_epoch,
+                    "provider": config["run"]["provider"],
+                    "endpoint": config["run"]["endpoint"],
+                    "model": config["run"]["model_id"],
+                    "max_tokens": config["execution"]["max_tokens"],
+                }
+            )
+            acceptance_error = _wave_acceptance_error(result, n, config)
+            if acceptance_error is not None:
+                stage = "wave_acceptance"
+                raise RuntimeError(acceptance_error)
+        except Exception as exc:
+            reason = acceptance_error or str(exc)
             failure = {
                 "wave": wave,
-                "stage": "wave_acceptance",
-                "reason": acceptance_error,
-                "error_type": "RuntimeError",
-                "error": acceptance_error,
-                "result": result,
+                "stage": stage,
+                "reason": reason,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
             }
+            if isinstance(result, dict):
+                failure["result"] = result
             _publish_incomplete(
                 state,
                 config,
@@ -1866,9 +1925,11 @@ def _run(
                 config_epoch_value=last_epoch,
                 failure=failure,
             )
-            raise RuntimeError(
-                f"benchmark incomplete at wave {wave}: {acceptance_error}"
-            )
+            if acceptance_error is not None:
+                raise RuntimeError(
+                    f"benchmark incomplete at wave {wave}: {acceptance_error}"
+                ) from exc
+            raise
         state["waves"][wave] = result
         state["completed_waves"] = sorted(set(state["completed_waves"]) | {wave})
         wave = _next_active_wave(state, total, wave + 1)
