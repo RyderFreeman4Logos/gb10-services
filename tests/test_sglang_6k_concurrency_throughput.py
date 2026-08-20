@@ -52,6 +52,7 @@ def _completed_request(**overrides):
 
 
 def _completed_wave(concurrency, **overrides):
+    request_timeout_s = overrides.pop("request_timeout_s", None)
     result = {
         "concurrency": concurrency,
         "work_units": concurrency,
@@ -65,6 +66,9 @@ def _completed_wave(concurrency, **overrides):
         "agg_prompt_tok_s": float(concurrency * MIN_PROMPT_TOKENS) / 0.2,
         "requests": [_completed_request() for _ in range(concurrency)],
     }
+    if request_timeout_s is not None:
+        for request in result["requests"]:
+            request["request_timeout_s"] = request_timeout_s
     result.update(overrides)
     return result
 
@@ -499,7 +503,9 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                 calls.append((base_url, model, wave, n, kwargs))
                 if wave == 1:
                     raise RuntimeError("simulated interruption")
-                return _completed_wave(n)
+                return _completed_wave(
+                    n, request_timeout_s=kwargs.get("request_timeout_s", 600.0)
+                )
 
             with mock.patch.object(self.mod, "run_wave", side_effect=interrupting_wave):
                 with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
@@ -523,7 +529,9 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
 
             def completed_wave(base_url, model, wave, n, min_tokens, max_tokens, **kwargs):
                 calls.append((base_url, model, wave, n, kwargs))
-                return _completed_wave(n)
+                return _completed_wave(
+                    n, request_timeout_s=kwargs.get("request_timeout_s", 600.0)
+                )
 
             def completed_wave_and_capture(*args, **kwargs):
                 progress_before_resume_wave.append(progress.read_text(encoding="utf-8"))
@@ -544,6 +552,119 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             report = json.loads(out.read_text(encoding="utf-8"))
             self.assertEqual(len(report["waves"]), 3)
             self.assertEqual([wave["concurrency"] for wave in report["waves"]], [1, 2, 3])
+
+    def test_schema1_checkpoint_migrates_and_resumes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "run.toml"
+            state_path = root / "run.state.json"
+            progress_path = root / "run.progress.yaml"
+            out_path = root / "run.json"
+            config_path.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1, 2]\nmax_tokens = 7\n"
+                "[resources]\nclient_workers = 2\nrequest_timeout_s = 11\n",
+                encoding="utf-8",
+            )
+            config = self.mod.load_config(config_path)
+            epoch = self.mod.config_epoch(config)
+            completed = _completed_wave(
+                1,
+                wave=0,
+                config_epoch=epoch,
+                provider="p",
+                endpoint="http://e/v1",
+                model="m",
+                max_tokens=7,
+            )
+            for request in completed["requests"]:
+                request.pop("request_timeout_s")
+            completed.pop("work_units")
+            legacy = {
+                "schema_version": 1,
+                "run_id": "legacy-run",
+                "started_at": 1.0,
+                "elapsed_s": 0.5,
+                "total": 2,
+                "planned_total": 2,
+                "planned_wave_ids": [0, 1],
+                "completed_waves": [0],
+                "waves": [completed, None],
+                "config_epochs": {epoch: config},
+                "pid": 999999,
+                "start_time": 1,
+            }
+            state_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+            calls = []
+
+            def complete_remaining(*args, **kwargs):
+                calls.append((args, kwargs))
+                return _completed_wave(
+                    2, request_timeout_s=kwargs.get("request_timeout_s", 600.0)
+                )
+
+            with mock.patch.object(self.mod, "run_wave", side_effect=complete_remaining):
+                self.assertEqual(
+                    self.mod.main(
+                        [
+                            "--config", str(config_path), "--state", str(state_path),
+                            "--progress", str(progress_path), "--out", str(out_path), "--resume",
+                        ]
+                    ),
+                    0,
+                )
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0][2:4], (1, 2))
+            migrated = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(migrated["schema_version"], 2)
+            self.assertEqual(migrated["completed_waves"], [0, 1])
+            self.assertEqual(migrated["completed_work_units"], 3)
+            self.assertEqual(migrated["planned_work_units"], 3)
+            self.assertIsNone(migrated["active_wave"])
+            self.assertIsNone(migrated["active_config_epoch"])
+            self.assertEqual(migrated["waves"][0]["work_units"], 1)
+            self.assertEqual(
+                migrated["waves"][0]["requests"][0]["request_timeout_s"], 11
+            )
+
+    def test_completed_wave_metrics_must_match_referenced_config_epoch(self):
+        cases = {
+            "prompt_floor": lambda request: request.update(prompt_tokens=MIN_PROMPT_TOKENS - 1),
+            "request_timeout": lambda request: request.update(request_timeout_s=12.0),
+            "max_attempts": lambda request: request.update(attempts=3),
+            "retry_backoff": lambda request: request.update(retry_backoff_s=0.1),
+        }
+        for case, forge in cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_path = root / "run.toml"
+                state_path = root / "run.state.json"
+                progress_path = root / "run.progress.yaml"
+                out_path = root / "run.json"
+                config_path.write_text(
+                    '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                    "[execution]\nconcurrencies = [1]\nmax_tokens = 7\n"
+                    "[resources]\nmax_attempts = 2\nrequest_timeout_s = 11\n"
+                    "backoff_initial_s = 0.1\nbackoff_max_s = 0.2\n",
+                    encoding="utf-8",
+                )
+                def forged_wave(*args, **kwargs):
+                    result = _completed_wave(1)
+                    forge(result["requests"][0])
+                    return result
+
+                with mock.patch.object(self.mod, "run_wave", side_effect=forged_wave):
+                    with self.assertRaisesRegex(RuntimeError, "benchmark incomplete"):
+                        self.mod.main(
+                            [
+                                "--config", str(config_path), "--state", str(state_path),
+                                "--progress", str(progress_path), "--out", str(out_path),
+                            ]
+                        )
+                report = json.loads(out_path.read_text(encoding="utf-8"))
+                self.assertEqual(report["status"], "INCOMPLETE")
+                self.assertFalse(report["complete"])
 
     def test_config_example_exists_and_readme_copies_it_before_launch(self):
         example = ROOT / "examples" / "sglang-6k-concurrency-throughput.toml"
@@ -1190,7 +1311,9 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                         "[resources]\nclient_workers = 5\nrequest_timeout_s = 22\n",
                         encoding="utf-8",
                     )
-                return _completed_wave(n)
+                return _completed_wave(
+                    n, request_timeout_s=kwargs.get("request_timeout_s", 600.0)
+                )
 
             with mock.patch.object(self.mod, "run_wave", side_effect=reload_wave):
                 self.assertEqual(

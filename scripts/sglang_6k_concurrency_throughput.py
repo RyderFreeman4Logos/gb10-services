@@ -62,6 +62,8 @@ _ALLOWED_CONFIG = {
     ),
 }
 _IGNORED_CONFIG_SECTIONS = {"service", "server"}
+_CHECKPOINT_SCHEMA_VERSION = 2
+_LEGACY_CHECKPOINT_SCHEMA_VERSION = 1
 
 
 def _default_config() -> dict:
@@ -881,7 +883,10 @@ _REQUEST_FLOAT_FIELDS = (
 
 
 def _completed_wave_error(
-    result: object, expected_requests: int, expected_wave: int | None = None
+    result: object,
+    expected_requests: int,
+    expected_wave: int | None = None,
+    config: dict | None = None,
 ) -> str | None:
     if not isinstance(result, dict):
         return "wave result is not an object"
@@ -941,6 +946,21 @@ def _completed_wave_error(
     max_tokens = result["max_tokens"]
     if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
         return "wave result max_tokens provenance is invalid"
+    if config is not None:
+        execution = config["execution"]
+        resources = config["resources"]
+        wave_index = expected_wave if expected_wave is not None else wave
+        expected_plan = execution["concurrencies"]
+        if (
+            wave_index >= len(expected_plan)
+            or concurrency != expected_plan[wave_index]
+            or result["config_epoch"] != config_epoch(config)
+            or result["provider"] != config["run"]["provider"]
+            or result["endpoint"] != config["run"]["endpoint"]
+            or result["model"] != config["run"]["model_id"]
+            or max_tokens != execution["max_tokens"]
+        ):
+            return "wave result provenance does not match its config epoch"
     requests = result["requests"]
     if not isinstance(requests, list) or len(requests) != expected_requests:
         return "wave did not return one result for every request"
@@ -960,6 +980,12 @@ def _completed_wave_error(
         attempts = request["attempts"]
         if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
             return f"request {index} attempts is invalid"
+        if config is not None:
+            resources = config["resources"]
+            if attempts > resources["max_attempts"]:
+                return f"request {index} attempts exceeds configured max_attempts"
+            if request["request_timeout_s"] != resources["request_timeout_s"]:
+                return f"request {index} request timeout does not match its config epoch"
         for field in _REQUEST_FLOAT_FIELDS:
             value = request[field]
             if (
@@ -973,6 +999,27 @@ def _completed_wave_error(
             value = request[field]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 return f"request {index} metric {field} is invalid"
+        if config is not None:
+            execution = config["execution"]
+            resources = config["resources"]
+            if request["prompt_tokens"] < execution["min_prompt_tokens"]:
+                return f"request {index} prompt tokens are below configured minimum"
+            expected_backoff = sum(
+                min(resources["backoff_max_s"], resources["backoff_initial_s"] * (2 ** retry))
+                for retry in range(attempts - 1)
+            )
+            if request["retry_backoff_s"] != expected_backoff:
+                return f"request {index} retry backoff does not match its metrics"
+        if request["retry_overhead_s"] != (
+            request["failed_attempt_wall_s"] + request["retry_backoff_s"]
+        ):
+            return f"request {index} retry overhead does not match its metrics"
+        if request["logical_wall_s"] != (
+            request["failed_attempt_wall_s"]
+            + request["retry_backoff_s"]
+            + request["final_attempt_wall_s"]
+        ):
+            return f"request {index} logical wall time does not match its metrics"
         if request["n_fail_short"] != 0:
             return f"request {index} was marked short"
         if not isinstance(request["finish_reason"], str) or not request["finish_reason"]:
@@ -1088,9 +1135,155 @@ def _validate_epoch_config(epoch: object, config: object) -> dict:
     return normalized
 
 
-def _validate_loaded_checkpoint(state: object) -> dict:
+def _migrate_legacy_checkpoint(state: dict, config: dict | None) -> dict:
+    """Normalize checkpoints written by the schema-1 producer."""
+    legacy_required = {
+        "schema_version",
+        "run_id",
+        "started_at",
+        "elapsed_s",
+        "total",
+        "planned_total",
+        "planned_wave_ids",
+        "completed_waves",
+        "waves",
+        "config_epochs",
+        "pid",
+        "start_time",
+    }
+    normalized_fields = {
+        "planned_work_units",
+        "completed_work_units",
+        "active_wave",
+        "active_config_epoch",
+    }
+    unknown = sorted(set(state) - legacy_required - normalized_fields - {"failure"})
+    if unknown:
+        raise RuntimeError(
+            "refusing resume: malformed checkpoint unknown field(s): "
+            + ", ".join(unknown)
+        )
+    missing = sorted(legacy_required - set(state))
+    if missing:
+        raise RuntimeError(
+            "refusing resume: malformed checkpoint missing " + ", ".join(missing)
+        )
+    total = state["total"]
+    planned_total = state["planned_total"]
+    if (
+        isinstance(total, bool)
+        or not isinstance(total, int)
+        or total < 0
+        or isinstance(planned_total, bool)
+        or not isinstance(planned_total, int)
+        or planned_total != total
+    ):
+        raise RuntimeError("refusing resume: inconsistent legacy checkpoint plan totals")
+    completed = state["completed_waves"]
+    if (
+        not isinstance(completed, list)
+        or any(isinstance(wave, bool) or not isinstance(wave, int) for wave in completed)
+        or len(set(completed)) != len(completed)
+        or any(wave < 0 or wave >= planned_total for wave in completed)
+    ):
+        raise RuntimeError("refusing resume: malformed legacy checkpoint completed wave IDs")
+    waves = state["waves"]
+    if not isinstance(waves, list) or len(waves) != planned_total:
+        raise RuntimeError("refusing resume: malformed legacy checkpoint wave results")
+    planned_ids = state["planned_wave_ids"]
+    if planned_ids != list(range(planned_total)):
+        raise RuntimeError("refusing resume: malformed legacy checkpoint planned wave IDs")
+    config_epochs = state["config_epochs"]
+    if not isinstance(config_epochs, dict):
+        raise RuntimeError("refusing resume: malformed legacy checkpoint config epochs")
+    validated_epochs = {}
+    for epoch, value in config_epochs.items():
+        validated_epochs[epoch] = _validate_epoch_config(epoch, value)
+    migrated = dict(state)
+    migrated["config_epochs"] = dict(config_epochs)
+    completed_set = set(completed)
+    completed_work_units = 0
+    for wave_id in completed_set:
+        result = waves[wave_id]
+        if not isinstance(result, dict):
+            continue
+        concurrency = result.get("concurrency")
+        if isinstance(concurrency, int) and not isinstance(concurrency, bool) and concurrency > 0:
+            result = dict(result)
+            result.setdefault("work_units", concurrency)
+            migrated["waves"][wave_id] = result
+            completed_work_units += concurrency
+        epoch_config = validated_epochs.get(result.get("config_epoch"))
+        requests = result.get("requests")
+        if epoch_config is not None and isinstance(requests, list):
+            for index, request in enumerate(requests):
+                if isinstance(request, dict):
+                    request = dict(request)
+                    request.setdefault(
+                        "request_timeout_s",
+                        epoch_config["resources"]["request_timeout_s"],
+                    )
+                    requests[index] = request
+    current_config = None
+    current_epoch = None
+    if config is not None:
+        current_config = _validate_config(json.loads(json.dumps(config)))
+        current_epoch = config_epoch(current_config)
+        if completed_set != set(range(planned_total)):
+            migrated["config_epochs"][current_epoch] = current_config
+            validated_epochs[current_epoch] = current_config
+    planned_work_units = 0
+    current_plan = (
+        current_config["execution"]["concurrencies"] if current_config is not None else None
+    )
+    for wave_id in range(planned_total):
+        result = migrated["waves"][wave_id]
+        if wave_id in completed_set and isinstance(result, dict):
+            value = result.get("concurrency")
+        elif current_plan is not None and wave_id < len(current_plan):
+            value = current_plan[wave_id]
+        else:
+            candidates = [
+                epoch_config["execution"]["concurrencies"][wave_id]
+                for epoch_config in validated_epochs.values()
+                if wave_id < len(epoch_config["execution"]["concurrencies"])
+            ]
+            value = candidates[0] if candidates and len(set(candidates)) == 1 else None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise RuntimeError(
+                f"refusing resume: cannot safely migrate legacy work plan for wave {wave_id}"
+            )
+        planned_work_units += value
+    active_wave = next(
+        (wave for wave in range(planned_total) if wave not in completed_set),
+        None,
+    )
+    if active_wave is None:
+        active_epoch = None
+    elif current_epoch is not None:
+        active_epoch = current_epoch
+    elif len(validated_epochs) == 1:
+        active_epoch = next(iter(validated_epochs))
+    else:
+        raise RuntimeError(
+            "refusing resume: cannot safely migrate legacy active config epoch"
+        )
+    migrated["schema_version"] = _CHECKPOINT_SCHEMA_VERSION
+    migrated["planned_work_units"] = planned_work_units
+    migrated["completed_work_units"] = completed_work_units
+    migrated["active_wave"] = active_wave
+    migrated["active_config_epoch"] = active_epoch
+    return migrated
+
+
+def _validate_loaded_checkpoint(state: object, config: dict | None = None) -> dict:
     if not isinstance(state, dict):
         raise RuntimeError("refusing resume: malformed checkpoint root")
+    schema_version = state.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+        raise RuntimeError("refusing resume: unsupported checkpoint schema")
+    if schema_version == _LEGACY_CHECKPOINT_SCHEMA_VERSION:
+        state = _migrate_legacy_checkpoint(state, config)
     required = {
         "schema_version",
         "run_id",
@@ -1124,7 +1317,7 @@ def _validate_loaded_checkpoint(state: object) -> dict:
     if (
         isinstance(state["schema_version"], bool)
         or not isinstance(state["schema_version"], int)
-        or state["schema_version"] != 1
+        or state["schema_version"] != _CHECKPOINT_SCHEMA_VERSION
     ):
         raise RuntimeError("refusing resume: unsupported checkpoint schema")
     _validate_checkpoint_owner(state)
@@ -1214,6 +1407,11 @@ def _validate_loaded_checkpoint(state: object) -> dict:
         epoch_config = validated_epochs.get(epoch)
         if epoch_config is None:
             raise RuntimeError("refusing resume: completed wave provenance epoch is absent")
+        error = _completed_wave_error(
+            result, result["concurrency"], wave_id, epoch_config
+        )
+        if error is not None:
+            raise RuntimeError("refusing resume: malformed checkpoint " + error)
         expected_plan = epoch_config["execution"]["concurrencies"]
         if wave_id >= len(expected_plan) or result["concurrency"] != expected_plan[wave_id]:
             raise RuntimeError(
@@ -1320,7 +1518,7 @@ def _checkpoint(
 
 def _new_state() -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": _CHECKPOINT_SCHEMA_VERSION,
         "run_id": str(uuid.uuid4()),
         "started_at": time.time(),
         "elapsed_s": 0.0,
@@ -1337,9 +1535,9 @@ def _new_state() -> dict:
     }
 
 
-def _load_state(path: Path | _ArtifactBinding) -> dict:
+def _load_state(path: Path | _ArtifactBinding, config: dict | None = None) -> dict:
     state = json.loads(_read_artifact_text(path))
-    return _validate_loaded_checkpoint(state)
+    return _validate_loaded_checkpoint(state, config)
 
 
 def _validate_loaded_plan(state: dict, concurrencies: list[int]) -> None:
@@ -1455,8 +1653,10 @@ def parse_args(argv):
     return p.parse_args(argv)
 
 
-def _wave_acceptance_error(result: object, expected_requests: int) -> str | None:
-    return _completed_wave_error(result, expected_requests)
+def _wave_acceptance_error(
+    result: object, expected_requests: int, config: dict | None = None
+) -> str | None:
+    return _completed_wave_error(result, expected_requests, config=config)
 
 
 def _make_report(
@@ -1534,7 +1734,7 @@ def _run(
     if args.resume:
         if not _artifact_exists(state_path):
             raise FileNotFoundError(f"cannot resume without checkpoint: {state_path}")
-        state = _load_state(state_path)
+        state = _load_state(state_path, config)
         active_wave = state["active_wave"]
         current_epoch = config_epoch(config)
         if active_wave is not None and state["active_config_epoch"] != current_epoch:
@@ -1644,7 +1844,7 @@ def _run(
                 "max_tokens": config["execution"]["max_tokens"],
             }
         )
-        acceptance_error = _wave_acceptance_error(result, n)
+        acceptance_error = _wave_acceptance_error(result, n, config)
         if acceptance_error is not None:
             failure = {
                 "wave": wave,
