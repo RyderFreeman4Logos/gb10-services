@@ -204,6 +204,12 @@ nohup python3 "$repo_root/scripts/sglang_6k_concurrency_throughput.py" \
   --out "$run_dir/run.json" \
   --resume \
   >"$run_dir/run.log" 2>&1 &
+pid=$!
+start_time=$(awk '{print $22}' "/proc/$pid/stat")
+pid_start_tmp="$run_dir/.run.pid-start.$pid.tmp"
+printf '%s %s\n' "$pid" "$start_time" >"$pid_start_tmp"
+mv -f -- "$pid_start_tmp" "$run_dir/run.pid-start"
+printf 'pid=%s start_time=%s\n' "$pid" "$start_time"
 ```
 
 ---

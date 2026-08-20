@@ -172,6 +172,67 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
         self.assertEqual(result["error_status"], 429)
         self.assertEqual(request.call_count, 2)
 
+    def test_retry_metrics_account_for_failed_attempt_and_backoff_time(self):
+        response = {
+            "ttft_s": 0.1, "wall_s": 0.2, "gen_s": 0.1,
+            "prompt_tokens": MIN_PROMPT_TOKENS, "completion_tokens": 2,
+            "decode_tok_s": 20.0, "finish_reason": "stop", "n_fail_short": 0,
+        }
+        transient = urllib.error.HTTPError("http://e", 429, "busy", {}, None)
+        clock = [0.0]
+
+        def monotonic():
+            return clock[0]
+
+        def failed_attempt(*args, **kwargs):
+            clock[0] += 0.4
+            raise transient
+
+        def final_attempt(*args, **kwargs):
+            clock[0] += 0.2
+            return response
+
+        def sleep(delay):
+            clock[0] += delay
+
+        attempts = [failed_attempt, final_attempt]
+
+        def stream(*args, **kwargs):
+            return attempts.pop(0)(*args, **kwargs)
+
+        with mock.patch.object(self.mod, "_stream_chat", side_effect=stream):
+            with mock.patch.object(self.mod.time, "monotonic", side_effect=monotonic):
+                with mock.patch.object(self.mod.time, "sleep", side_effect=sleep):
+                    result = self.mod.run_request(
+                        "http://e", {}, MIN_PROMPT_TOKENS,
+                        max_attempts=2, backoff_initial_s=0.1, backoff_max_s=0.1,
+                    )
+        self.assertTrue(result["ok"])
+        self.assertAlmostEqual(result["wall_s"], 0.2)
+        self.assertAlmostEqual(result["ttft_s"], 0.1)
+        self.assertAlmostEqual(result["decode_tok_s"], 20.0)
+        self.assertAlmostEqual(result["failed_attempt_wall_s"], 0.4)
+        self.assertAlmostEqual(result["retry_backoff_s"], 0.1)
+        self.assertAlmostEqual(result["retry_overhead_s"], 0.5)
+        self.assertAlmostEqual(result["logical_wall_s"], 0.7)
+        self.assertAlmostEqual(
+            result["logical_wall_s"],
+            result["failed_attempt_wall_s"]
+            + result["retry_backoff_s"]
+            + result["final_attempt_wall_s"],
+        )
+
+    def test_config_rejects_workers_below_requested_wave_concurrency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "run.toml"
+            config.write_text(
+                "[execution]\nconcurrencies = [1, 3]\n"
+                "[resources]\nclient_workers = 2\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "client_workers.*wave concurrency"):
+                self.mod.load_config(config)
+
     def test_incomplete_stream_body_is_retried_but_permanent_4xx_is_not(self):
         response = {
             "ttft_s": 0.1, "wall_s": 0.2, "gen_s": 0.1,
@@ -234,7 +295,7 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             config.write_text(
                 '[run]\nprovider = "p0"\nmodel_id = "m0"\nendpoint = "http://e0/v1"\n'
                 "[execution]\nconcurrencies = [1, 2, 3]\nmax_tokens = 7\n"
-                "[resources]\nclient_workers = 2\nrequest_timeout_s = 11\n",
+                "[resources]\nclient_workers = 3\nrequest_timeout_s = 11\n",
                 encoding="utf-8",
             )
             calls = []
@@ -274,11 +335,17 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                 self.assertIn(field, progress_text)
 
             calls.clear()
+            progress_before_resume_wave = []
+
             def completed_wave(base_url, model, wave, n, min_tokens, max_tokens, **kwargs):
                 calls.append((base_url, model, wave, n, kwargs))
                 return {"concurrency": n, "n_ok": n, "n_fail": 0, "sum_completion": n}
 
-            with mock.patch.object(self.mod, "run_wave", side_effect=completed_wave):
+            def completed_wave_and_capture(*args, **kwargs):
+                progress_before_resume_wave.append(progress.read_text(encoding="utf-8"))
+                return completed_wave(*args, **kwargs)
+
+            with mock.patch.object(self.mod, "run_wave", side_effect=completed_wave_and_capture):
                 self.assertEqual(
                     self.mod.main(
                         [
@@ -288,6 +355,7 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                     ),
                     0,
                 )
+            self.assertIn("active_wave: 1", progress_before_resume_wave[0])
             self.assertEqual([call[2] for call in calls], [1, 2])
             report = json.loads(out.read_text(encoding="utf-8"))
             self.assertEqual(len(report["waves"]), 3)
@@ -303,6 +371,12 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
         self.assertIn(copy, readme)
         self.assertLess(readme.index(copy), readme.index('--config "$run_dir/run.toml"'))
         self.assertIn("refusing resume: saved benchmark owner is still live", readme)
+        resume = readme[readme.index("--resume") :]
+        self.assertIn("pid=$!", resume)
+        self.assertIn('start_time=$(awk', resume)
+        self.assertIn('pid_start_tmp="$run_dir/.run.pid-start.', resume)
+        self.assertIn('>"$pid_start_tmp"', resume)
+        self.assertIn('mv -f -- "$pid_start_tmp" "$run_dir/run.pid-start"', resume)
 
     def test_exclusive_run_lock_refuses_second_owner(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -365,10 +439,44 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             state_a = root / "a.state.json"
             state_b = root / "b.state.json"
             with self.mod._exclusive_artifact_locks(out, state_a):
-                for alias in (hardlink, symlink):
-                    with self.assertRaisesRegex(RuntimeError, "already owned"):
-                        with self.mod._exclusive_artifact_locks(alias, state_b):
-                            pass
+                with self.assertRaisesRegex(RuntimeError, "symlink"):
+                    with self.mod._exclusive_artifact_locks(symlink, state_b):
+                        pass
+                broken = root / "broken.json"
+                broken.symlink_to(root / "missing.json")
+                with self.assertRaisesRegex(RuntimeError, "symlink"):
+                    with self.mod._exclusive_artifact_locks(broken, state_b):
+                        pass
+                with self.assertRaisesRegex(RuntimeError, "already owned"):
+                    with self.mod._exclusive_artifact_locks(hardlink, state_b):
+                        pass
+
+    def test_main_rejects_symlink_artifacts_before_any_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+            artifacts = {
+                "run.json": root / "run.json",
+                "run.state.json": root / "run.state.json",
+                "run.progress.yaml": root / "run.progress.yaml",
+            }
+            for artifact_name, artifact in artifacts.items():
+                artifact.symlink_to(root / f"missing-{artifact_name}")
+                with self.assertRaisesRegex(RuntimeError, "symlink"):
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(artifacts["run.state.json"]),
+                            "--progress", str(artifacts["run.progress.yaml"]),
+                            "--out", str(artifacts["run.json"]),
+                        ]
+                    )
+                self.assertTrue(artifact.is_symlink())
+                artifact.unlink()
 
     def test_resume_rejects_live_different_owner_before_rewriting_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -509,6 +617,48 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             report = json.loads(out.read_text(encoding="utf-8"))
             self.assertNotEqual(report["waves"][0]["config_epoch"], report["waves"][1]["config_epoch"])
             self.assertEqual(len(report["config_epochs"]), 2)
+
+    def test_terminal_report_uses_last_executed_config_epoch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+
+            def write_config(provider, model, endpoint):
+                config.write_text(
+                    f'[run]\nprovider = "{provider}"\nmodel_id = "{model}"\n'
+                    f'endpoint = "{endpoint}"\n'
+                    "[execution]\nconcurrencies = [1, 2]\nmax_tokens = 7\n"
+                    "[resources]\nclient_workers = 2\n",
+                    encoding="utf-8",
+                )
+
+            write_config("p0", "m0", "http://e0/v1")
+
+            def reload_after_final_wave(base_url, model, wave, n, min_tokens, max_tokens, **kwargs):
+                if wave == 0:
+                    write_config("p1", "m1", "http://e1/v1")
+                else:
+                    write_config("p2", "m2", "http://e2/v1")
+                return {"concurrency": n, "n_ok": n, "n_fail": 0, "sum_completion": n}
+
+            with mock.patch.object(self.mod, "run_wave", side_effect=reload_after_final_wave):
+                self.assertEqual(
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out),
+                        ]
+                    ),
+                    0,
+                )
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(report["model"], "m1")
+            self.assertEqual(report["base_url"], "http://e1/v1")
+            self.assertEqual(report["endpoint"], "http://e1/v1")
+            self.assertEqual(report["config_epoch"], report["waves"][-1]["config_epoch"])
 
 
 if __name__ == "__main__":

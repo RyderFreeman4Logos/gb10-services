@@ -100,6 +100,10 @@ def _validate_config(config: dict) -> dict:
             raise ValueError(f"execution.{key} must be a positive integer")
     if isinstance(resources["client_workers"], bool) or not isinstance(resources["client_workers"], int) or resources["client_workers"] < 1:
         raise ValueError("resources.client_workers must be a positive integer")
+    if resources["client_workers"] < max(concurrencies):
+        raise ValueError(
+            "resources.client_workers must be >= requested wave concurrency"
+        )
     if isinstance(resources["max_attempts"], bool) or not isinstance(resources["max_attempts"], int) or resources["max_attempts"] < 1:
         raise ValueError("resources.max_attempts must be a positive integer")
     for key in ("request_timeout_s", "wave_timeout_s", "backoff_initial_s", "backoff_max_s"):
@@ -291,8 +295,17 @@ def _is_transient(exc: BaseException) -> bool:
     )
 
 
-def _failure_metric(exc: BaseException, attempts: int, retry_exhausted: bool) -> dict:
+def _failure_metric(
+    exc: BaseException,
+    attempts: int,
+    retry_exhausted: bool,
+    *,
+    logical_wall_s: float = 0.0,
+    retry_backoff_s: float = 0.0,
+    failed_attempt_wall_s: float = 0.0,
+) -> dict:
     status = getattr(exc, "code", None)
+    retry_overhead_s = failed_attempt_wall_s + retry_backoff_s
     return {
         "ok": False,
         "attempts": attempts,
@@ -302,6 +315,11 @@ def _failure_metric(exc: BaseException, attempts: int, retry_exhausted: bool) ->
         "error_status": status if isinstance(status, int) else None,
         "ttft_s": 0.0,
         "wall_s": 0.0,
+        "final_attempt_wall_s": 0.0,
+        "logical_wall_s": logical_wall_s,
+        "retry_overhead_s": retry_overhead_s,
+        "retry_backoff_s": retry_backoff_s,
+        "failed_attempt_wall_s": failed_attempt_wall_s,
         "gen_s": 0.0,
         "prompt_tokens": 0,
         "completion_tokens": 0,
@@ -322,18 +340,37 @@ def run_request(
     backoff_max_s: float = DEFAULT_BACKOFF_MAX_S,
 ) -> dict:
     """Run one request with bounded retries for transient failures only."""
+    retry_backoff_s = 0.0
+    failed_attempt_wall_s = 0.0
     for attempt in range(1, max_attempts + 1):
+        attempt_start = time.monotonic()
         try:
             metric = dict(_stream_chat(base_url, payload, min_tokens, request_timeout_s))
+            attempt_wall_s = max(0.0, time.monotonic() - attempt_start)
+            final_attempt_wall_s = attempt_wall_s or float(metric.get("wall_s", 0.0))
             metric["attempts"] = attempt
             metric["retry_exhausted"] = False
             metric["ok"] = False if metric["n_fail_short"] else True
+            metric["final_attempt_wall_s"] = final_attempt_wall_s
+            metric["logical_wall_s"] = failed_attempt_wall_s + retry_backoff_s + final_attempt_wall_s
+            metric["retry_backoff_s"] = retry_backoff_s
+            metric["failed_attempt_wall_s"] = failed_attempt_wall_s
+            metric["retry_overhead_s"] = failed_attempt_wall_s + retry_backoff_s
             return metric
         except Exception as exc:  # network/HTTP errors are classified below
+            failed_attempt_wall_s += max(0.0, time.monotonic() - attempt_start)
             transient = _is_transient(exc)
             if not transient or attempt >= max_attempts:
-                return _failure_metric(exc, attempt, transient and attempt >= max_attempts)
+                return _failure_metric(
+                    exc,
+                    attempt,
+                    transient and attempt >= max_attempts,
+                    logical_wall_s=failed_attempt_wall_s + retry_backoff_s,
+                    retry_backoff_s=retry_backoff_s,
+                    failed_attempt_wall_s=failed_attempt_wall_s,
+                )
             delay = min(backoff_max_s, backoff_initial_s * (2 ** (attempt - 1)))
+            retry_backoff_s += delay
             if delay > 0:
                 time.sleep(delay)
     raise AssertionError("unreachable retry loop")
@@ -412,7 +449,19 @@ def run_wave(
     }
 
 
+def _reject_symlink_artifact(path: str | os.PathLike[str]) -> None:
+    target = Path(path)
+    if target.is_symlink():
+        raise RuntimeError(f"refusing symlink artifact path: {target}")
+
+
+def _validate_artifact_paths(*paths: str | os.PathLike[str]) -> None:
+    for path in paths:
+        _reject_symlink_artifact(path)
+
+
 def _atomic_write(path: str | os.PathLike[str], content: str) -> None:
+    _reject_symlink_artifact(path)
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
@@ -496,6 +545,7 @@ def _exclusive_run_lock(path: str | os.PathLike[str]):
 
 
 def _artifact_lock_identities(path: str | os.PathLike[str]) -> set[tuple]:
+    _reject_symlink_artifact(path)
     resolved = Path(path).resolve(strict=False)
     identities: set[tuple] = {("path", str(resolved))}
     try:
@@ -519,7 +569,12 @@ def _artifact_lock_path(identity: tuple) -> Path:
 def _exclusive_artifact_locks(
     out_path: Path,
     state_path: Path,
+    progress_path: Path | None = None,
 ):
+    artifacts = (out_path, state_path)
+    if progress_path is not None:
+        artifacts += (progress_path,)
+    _validate_artifact_paths(*artifacts)
     identities = set()
     for artifact in (out_path, state_path):
         identities.update(_artifact_lock_identities(artifact))
@@ -571,6 +626,7 @@ def _checkpoint(
     total: int,
     config_epoch_value: str,
 ) -> None:
+    _validate_artifact_paths(state_path, progress_path)
     pid, start_time = _process_identity()
     state["elapsed_s"] = elapsed_s
     state["pid"] = pid
@@ -667,6 +723,14 @@ def _ensure_state_capacity(
     state["total"] = planned_total
 
 
+def _next_active_wave(state: dict, total: int, start: int = 0) -> int | None:
+    completed = set(state["completed_waves"])
+    return next(
+        (wave for wave in range(start, total) if wave not in completed),
+        None,
+    )
+
+
 def parse_args(argv):
     p = argparse.ArgumentParser(description="6k-input SGLang concurrency throughput harness")
     p.add_argument("--base-url", default=DEFAULT_BASE_URL)
@@ -729,7 +793,7 @@ def _run(
         state_path,
         progress_path,
         elapsed_s=base_elapsed,
-        active_wave=0,
+        active_wave=_next_active_wave(state, state["total"]),
         total=state["total"],
         config_epoch_value=last_epoch,
     )
@@ -746,10 +810,28 @@ def _run(
             break
         if wave in state["completed_waves"]:
             wave += 1
+            _checkpoint(
+                state,
+                state_path,
+                progress_path,
+                elapsed_s=base_elapsed + (time.monotonic() - run_start),
+                active_wave=_next_active_wave(state, total, wave),
+                total=total,
+                config_epoch_value=last_epoch,
+            )
             continue
         state["config_epochs"][last_epoch] = config
         n = concurrencies[wave]
         resources = config["resources"]
+        _checkpoint(
+            state,
+            state_path,
+            progress_path,
+            elapsed_s=base_elapsed + (time.monotonic() - run_start),
+            active_wave=wave,
+            total=total,
+            config_epoch_value=last_epoch,
+        )
         result = run_wave(
             config["run"]["endpoint"],
             config["run"]["model_id"],
@@ -777,23 +859,29 @@ def _run(
         )
         state["waves"][wave] = result
         state["completed_waves"] = sorted(set(state["completed_waves"]) | {wave})
+        next_wave = wave + 1
         elapsed = base_elapsed + (time.monotonic() - run_start)
         _checkpoint(
             state,
             state_path,
             progress_path,
             elapsed_s=elapsed,
-            active_wave=wave + 1,
+            active_wave=_next_active_wave(state, total, next_wave),
             total=total,
             config_epoch_value=last_epoch,
         )
-        wave += 1
+        wave = next_wave
 
+    waves = [result for result in state["waves"] if result is not None]
+    last_executed = waves[-1] if waves else None
     report = {
         "run_id": state["run_id"],
-        "base_url": config["run"]["endpoint"],
-        "model": config["run"]["model_id"],
-        "waves": [result for result in state["waves"] if result is not None],
+        "base_url": last_executed["endpoint"] if last_executed else config["run"]["endpoint"],
+        "endpoint": last_executed["endpoint"] if last_executed else config["run"]["endpoint"],
+        "provider": last_executed["provider"] if last_executed else config["run"]["provider"],
+        "model": last_executed["model"] if last_executed else config["run"]["model_id"],
+        "config_epoch": last_executed["config_epoch"] if last_executed else last_epoch,
+        "waves": waves,
         "config_epochs": state["config_epochs"],
     }
     _atomic_write_json(out_path, report)
@@ -827,7 +915,7 @@ def main(argv=None) -> int:
     out_path = Path(args.out)
     state_path = Path(args.state) if args.state else Path(f"{args.out}.state.json")
     progress_path = Path(args.progress) if args.progress else Path(f"{args.out}.progress.yaml")
-    with _exclusive_artifact_locks(out_path, state_path):
+    with _exclusive_artifact_locks(out_path, state_path, progress_path):
         return _run(args, config_path, config, out_path, state_path, progress_path)
 
 
