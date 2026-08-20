@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+from contextlib import contextmanager
+import errno
+import fcntl
 import hashlib
 import http.client
 import json
@@ -463,6 +466,30 @@ def _process_identity() -> tuple[int, int | None]:
         return pid, None
 
 
+@contextmanager
+def _exclusive_run_lock(path: str | os.PathLike[str]):
+    lock_path = Path(path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise RuntimeError(f"refusing run: {lock_path} is already owned") from exc
+            raise
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _run_lock_path(state_path: Path) -> Path:
+    return state_path.with_name(f".{state_path.name}.lock")
+
+
 def _checkpoint(
     state: dict,
     state_path: Path,
@@ -507,6 +534,8 @@ def _new_state() -> dict:
         "started_at": time.time(),
         "elapsed_s": 0.0,
         "total": 0,
+        "planned_total": 0,
+        "planned_wave_ids": [],
         "completed_waves": [],
         "waves": [],
         "config_epochs": {},
@@ -522,13 +551,49 @@ def _load_state(path: Path) -> dict:
     state.setdefault("waves", [])
     state.setdefault("config_epochs", {})
     state.setdefault("elapsed_s", 0.0)
+    state.setdefault("planned_total", max(len(state["waves"]), state.get("total", 0)))
+    state.setdefault("planned_wave_ids", list(range(state["planned_total"])))
     return state
 
 
-def _ensure_state_capacity(state: dict, total: int) -> None:
-    if len(state["waves"]) < total:
-        state["waves"].extend([None] * (total - len(state["waves"])))
-    state["total"] = total
+def _ensure_state_capacity(
+    state: dict,
+    total: int,
+    concurrencies: list[int] | None = None,
+) -> None:
+    completed = {int(wave) for wave in state["completed_waves"]}
+    planned_total = max(
+        int(state.get("planned_total", 0)),
+        int(state.get("total", 0)),
+        len(state["waves"]),
+        max(completed, default=-1) + 1,
+    )
+    if planned_total == 0:
+        planned_total = total
+    dropped = [
+        wave for wave in range(planned_total)
+        if wave not in completed and wave >= total
+    ]
+    if dropped:
+        ids = ", ".join(str(wave) for wave in dropped)
+        raise ValueError(f"config reload would drop incomplete planned wave IDs: {ids}")
+    if concurrencies is not None:
+        for wave in sorted(completed):
+            if wave >= len(concurrencies):
+                continue
+            result = state["waves"][wave] if wave < len(state["waves"]) else None
+            expected = result.get("concurrency") if isinstance(result, dict) else None
+            if expected is not None and concurrencies[wave] != expected:
+                raise ValueError(
+                    f"config reload changed completed wave {wave}: "
+                    f"expected concurrency {expected}, got {concurrencies[wave]}"
+                )
+    planned_total = max(planned_total, total)
+    state["planned_total"] = planned_total
+    state["planned_wave_ids"] = list(range(planned_total))
+    if len(state["waves"]) < planned_total:
+        state["waves"].extend([None] * (planned_total - len(state["waves"])))
+    state["total"] = planned_total
 
 
 def parse_args(argv):
@@ -562,40 +627,25 @@ def parse_args(argv):
     return p.parse_args(argv)
 
 
-def main(argv=None) -> int:
-    args = parse_args(argv)
-    config_path = Path(args.config) if args.config else None
-    config = resolve_config(config_path, args)
-    if args.dry_run:
-        nonce = make_nonce(0, 0)
-        sample = build_prompt(nonce, config["execution"]["min_prompt_tokens"])
-        print(
-            json.dumps(
-                {
-                    "concurrencies": config["execution"]["concurrencies"],
-                    "model": config["run"]["model_id"],
-                    "base_url": config["run"]["endpoint"],
-                    "provider": config["run"]["provider"],
-                    "min_prompt_tokens": config["execution"]["min_prompt_tokens"],
-                    "max_tokens": config["execution"]["max_tokens"],
-                    "sample_prompt": sample,
-                    "config_epoch": config_epoch(config),
-                },
-                indent=2,
-            )
-        )
-        return 0
-
-    out_path = Path(args.out)
-    state_path = Path(args.state) if args.state else Path(f"{args.out}.state.json")
-    progress_path = Path(args.progress) if args.progress else Path(f"{args.out}.progress.yaml")
+def _run(
+    args: argparse.Namespace,
+    config_path: Path | None,
+    config: dict,
+    out_path: Path,
+    state_path: Path,
+    progress_path: Path,
+) -> int:
     if args.resume:
         if not state_path.exists():
             raise FileNotFoundError(f"cannot resume without checkpoint: {state_path}")
         state = _load_state(state_path)
     else:
         state = _new_state()
-    _ensure_state_capacity(state, len(config["execution"]["concurrencies"]))
+    _ensure_state_capacity(
+        state,
+        len(config["execution"]["concurrencies"]),
+        config["execution"]["concurrencies"],
+    )
     base_elapsed = float(state.get("elapsed_s", 0.0))
     run_start = time.monotonic()
     last_epoch = config_epoch(config)
@@ -618,7 +668,7 @@ def main(argv=None) -> int:
         config = resolve_config(config_path, args)
         last_epoch = config_epoch(config)
         concurrencies = config["execution"]["concurrencies"]
-        _ensure_state_capacity(state, len(concurrencies))
+        _ensure_state_capacity(state, len(concurrencies), concurrencies)
         total = state["total"]
         if wave >= total:
             break
@@ -676,6 +726,37 @@ def main(argv=None) -> int:
     }
     _atomic_write_json(out_path, report)
     return 0
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    config_path = Path(args.config) if args.config else None
+    config = resolve_config(config_path, args)
+    if args.dry_run:
+        nonce = make_nonce(0, 0)
+        sample = build_prompt(nonce, config["execution"]["min_prompt_tokens"])
+        print(
+            json.dumps(
+                {
+                    "concurrencies": config["execution"]["concurrencies"],
+                    "model": config["run"]["model_id"],
+                    "base_url": config["run"]["endpoint"],
+                    "provider": config["run"]["provider"],
+                    "min_prompt_tokens": config["execution"]["min_prompt_tokens"],
+                    "max_tokens": config["execution"]["max_tokens"],
+                    "sample_prompt": sample,
+                    "config_epoch": config_epoch(config),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    out_path = Path(args.out)
+    state_path = Path(args.state) if args.state else Path(f"{args.out}.state.json")
+    progress_path = Path(args.progress) if args.progress else Path(f"{args.out}.progress.yaml")
+    with _exclusive_run_lock(_run_lock_path(state_path)):
+        return _run(args, config_path, config, out_path, state_path, progress_path)
 
 
 if __name__ == "__main__":

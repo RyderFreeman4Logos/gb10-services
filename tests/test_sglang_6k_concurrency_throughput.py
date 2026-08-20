@@ -293,6 +293,72 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             self.assertEqual(len(report["waves"]), 3)
             self.assertEqual([wave["concurrency"] for wave in report["waves"]], [1, 2, 3])
 
+    def test_config_example_exists_and_readme_copies_it_before_launch(self):
+        example = ROOT / "examples" / "sglang-6k-concurrency-throughput.toml"
+        self.assertTrue(example.is_file())
+        loaded = self.mod.load_config(example)
+        self.assertEqual(loaded["execution"]["concurrencies"], EXPECTED_CONCURRENCIES)
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        copy = 'cp "$repo_root/examples/sglang-6k-concurrency-throughput.toml" "$run_dir/run.toml"'
+        self.assertIn(copy, readme)
+        self.assertLess(readme.index(copy), readme.index('--config "$run_dir/run.toml"'))
+        self.assertIn("refusing resume: saved benchmark owner is still live", readme)
+
+    def test_exclusive_run_lock_refuses_second_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "run.lock"
+            with self.mod._exclusive_run_lock(lock_path):
+                with self.assertRaisesRegex(RuntimeError, "already owned"):
+                    with self.mod._exclusive_run_lock(lock_path):
+                        pass
+
+    def test_exclusive_run_lock_is_held_over_main_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+
+            def run_while_locked(args, config_path, loaded, out_path, state_path, progress_path):
+                with self.assertRaisesRegex(RuntimeError, "already owned"):
+                    with self.mod._exclusive_run_lock(self.mod._run_lock_path(state_path)):
+                        pass
+                return 0
+
+            with mock.patch.object(self.mod, "_run", side_effect=run_while_locked):
+                self.assertEqual(
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out),
+                        ]
+                    ),
+                    0,
+                )
+
+    def test_plan_reload_rejects_changed_completed_wave_prefix(self):
+        state = self.mod._new_state()
+        self.mod._ensure_state_capacity(state, 2, [1, 2])
+        state["waves"][0] = {"concurrency": 1}
+        state["completed_waves"] = [0]
+        with self.assertRaisesRegex(ValueError, "changed completed wave 0"):
+            self.mod._ensure_state_capacity(state, 2, [9, 4])
+
+    def test_plan_reload_refuses_to_drop_incomplete_wave_ids(self):
+        state = self.mod._new_state()
+        self.mod._ensure_state_capacity(state, 3)
+        state["waves"][0] = {"concurrency": 1}
+        state["completed_waves"] = [0]
+        with self.assertRaisesRegex(ValueError, "incomplete planned wave"):
+            self.mod._ensure_state_capacity(state, 1)
+        self.assertEqual(state["total"], 3)
+
     def test_config_reload_changes_future_wave_and_config_epoch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

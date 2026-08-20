@@ -158,9 +158,11 @@ Run the benchmark detached and keep its checkpoint, progress sidecar, output,
 log, and launcher identity together:
 
 ```bash
-run_dir="$PWD/sglang-run"
+repo_root="$(git rev-parse --show-toplevel)"
+run_dir="$repo_root/sglang-run"
 mkdir -p "$run_dir"
-nohup python3 scripts/sglang_6k_concurrency_throughput.py \
+cp "$repo_root/examples/sglang-6k-concurrency-throughput.toml" "$run_dir/run.toml"
+nohup python3 "$repo_root/scripts/sglang_6k_concurrency_throughput.py" \
   --config "$run_dir/run.toml" \
   --state "$run_dir/run.state.json" \
   --progress "$run_dir/run.progress.yaml" \
@@ -179,19 +181,23 @@ force-cancelled; each request retains its own timeout and retry policy.
 
 Before resuming, verify the checkpoint's recorded PID identity so a reused PID
 cannot be mistaken for the old benchmark. A missing `/proc` entry means the old
-owner is no longer running; a present entry must match its saved start time:
+owner is no longer running; a present entry with a matching start time means the
+owner is still live and the resume is refused. A mismatched start time identifies
+PID reuse, so the old owner is no longer running:
 
 ```bash
+repo_root="$(git rev-parse --show-toplevel)"
+run_dir="$repo_root/sglang-run"
 state="$run_dir/run.state.json"
 saved_pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$state")
 saved_start=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["start_time"])' "$state")
 if [ -r "/proc/$saved_pid/stat" ]; then
-  test "$(awk '{print $22}' "/proc/$saved_pid/stat")" = "$saved_start" || {
-    echo "refusing resume: PID identity changed" >&2
+  if [ "$(awk '{print $22}' "/proc/$saved_pid/stat")" = "$saved_start" ]; then
+    echo "refusing resume: saved benchmark owner is still live" >&2
     exit 1
-  }
+  fi
 fi
-nohup python3 scripts/sglang_6k_concurrency_throughput.py \
+nohup python3 "$repo_root/scripts/sglang_6k_concurrency_throughput.py" \
   --config "$run_dir/run.toml" \
   --state "$state" \
   --progress "$run_dir/run.progress.yaml" \
