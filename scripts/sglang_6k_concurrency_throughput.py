@@ -307,6 +307,7 @@ def _stream_chat(
     usage = None
     saw_usage = False
     pending_usage = None
+    saw_content_event = False
     saw_done = False
     with urllib.request.urlopen(req, timeout=_remaining_deadline(deadline)) as resp:
         iterator = iter(resp)
@@ -370,6 +371,10 @@ def _stream_chat(
                     raise StreamProtocolError("stream usage token fields were invalid")
                 usage = candidate_usage
                 if finish_reason is None:
+                    if not saw_content_event:
+                        raise StreamProtocolError(
+                            "stream usage event arrived before content"
+                        )
                     pending_usage = candidate_usage
                 else:
                     saw_usage = True
@@ -385,6 +390,7 @@ def _stream_chat(
             delta = choice.get("delta") or {}
             if not isinstance(delta, dict):
                 raise StreamProtocolError("stream delta was not an object")
+            saw_content_event = True
             content = delta.get("content")
             now = time.monotonic()
             if content:
@@ -1869,6 +1875,21 @@ def _invalidate_artifact(path: Path | _ArtifactBinding) -> None:
             os.close(binding.parent_fd)
 
 
+def _invalidate_prior_receipts(
+    state: dict,
+    *,
+    resume: bool,
+    out_path: Path | _ArtifactBinding,
+    state_path: Path | _ArtifactBinding,
+    progress_path: Path | _ArtifactBinding,
+) -> None:
+    """Clear receipts that could be mistaken for this run's terminal result."""
+    _invalidate_artifact(out_path)
+    if not resume or state.get("active_wave") is None:
+        _invalidate_artifact(state_path)
+    _invalidate_artifact(progress_path)
+
+
 def _publish_incomplete_artifact(
     path: Path | _ArtifactBinding,
     content: str,
@@ -2025,6 +2046,21 @@ def _run(
                     exc.add_note(f"INCOMPLETE failure-fence publication failed: {publication_error}")
                 except BaseException:
                     pass
+                for label, artifact in (
+                    ("report", out_path),
+                    ("checkpoint", state_path),
+                    ("progress", progress_path),
+                ):
+                    try:
+                        _invalidate_artifact(artifact)
+                    except BaseException as invalidate_error:
+                        try:
+                            exc.add_note(
+                                f"INCOMPLETE {label} fallback invalidation failed: "
+                                f"{invalidate_error}"
+                            )
+                        except BaseException:
+                            pass
         raise
 
 
@@ -2067,14 +2103,25 @@ def _run_inner(
     runtime["initialized"] = True
     had_failure = "failure" in state
     state.pop("failure", None)
+    _invalidate_prior_receipts(
+        state,
+        resume=args.resume,
+        out_path=out_path,
+        state_path=state_path,
+        progress_path=progress_path,
+    )
     base_elapsed = float(state.get("elapsed_s", 0.0))
     run_start = time.monotonic()
     last_epoch = config_epoch(config)
-    active = _next_active_wave(state, state["total"])
     runtime["total"] = state["total"]
+    active = _next_active_wave(state, state["total"])
     runtime["wave"] = active if active is not None else max(state["total"] - 1, 0)
     runtime["config"] = config
     runtime["config_epoch"] = last_epoch
+    preflighted_epochs = set()
+    runtime["stage"] = "backend_preflight"
+    backend_identity_preflight(config)
+    preflighted_epochs.add(last_epoch)
 
     # Persist the active wave and its exact config epoch before any request.
     if active is not None:
@@ -2090,12 +2137,13 @@ def _run_inner(
             total=state["total"],
             config_epoch_value=last_epoch,
         )
-    elif legacy_checkpoint or had_failure:
+    elif args.resume or legacy_checkpoint or had_failure:
         # Complete legacy checkpoints and terminal failure checkpoints both need
         # schema-2 state and progress persisted before the terminal report is
         # published.  Never publish COMPLETE while durable failure remains.
         runtime["stage"] = "checkpoint_transition"
         runtime["elapsed_s"] = base_elapsed
+        state["config_epochs"][last_epoch] = config
         _checkpoint(
             state,
             state_path,
@@ -2113,14 +2161,18 @@ def _run_inner(
         runtime["stage"] = "reload_or_plan_validation"
         candidate_config = resolve_config(config_path, args)
         candidate_epoch = config_epoch(candidate_config)
-        candidate_concurrencies = candidate_config["execution"]["concurrencies"]
-        _ensure_state_capacity(
-            state, len(candidate_concurrencies), candidate_concurrencies
-        )
         config = candidate_config
         last_epoch = candidate_epoch
         runtime["config"] = config
         runtime["config_epoch"] = last_epoch
+        if candidate_epoch not in preflighted_epochs:
+            runtime["stage"] = "backend_preflight"
+            backend_identity_preflight(config)
+            preflighted_epochs.add(candidate_epoch)
+        candidate_concurrencies = candidate_config["execution"]["concurrencies"]
+        _ensure_state_capacity(
+            state, len(candidate_concurrencies), candidate_concurrencies
+        )
         concurrencies = candidate_concurrencies
         total = state["total"]
         state["config_epochs"][last_epoch] = config
@@ -2238,9 +2290,6 @@ def main(argv=None) -> int:
         return 0
     if args.out is None:
         raise ValueError("--out is required unless --dry-run or --preflight is used")
-    # Every executable path verifies the configured served-model identity before
-    # acquiring artifacts or issuing a chat completion.
-    backend_identity_preflight(config)
     out_path = Path(args.out)
     state_path = Path(args.state) if args.state else Path(f"{args.out}.state.json")
     progress_path = Path(args.progress) if args.progress else Path(f"{args.out}.progress.yaml")

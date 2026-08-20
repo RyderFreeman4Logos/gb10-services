@@ -463,6 +463,34 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                 with self.assertRaises(ConnectionError):
                     self.mod._stream_chat("http://e/v1", {}, MIN_PROMPT_TOKENS)
 
+    def test_early_usage_event_is_protocol_error_and_not_retried(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def __iter__(self):
+                return iter(
+                    [
+                        b'data: {"choices":[],"usage":{"prompt_tokens":6000,"completion_tokens":1}}',
+                    ]
+                )
+
+        with mock.patch.object(
+            self.mod.urllib.request, "urlopen", return_value=Response()
+        ):
+            with mock.patch.object(self.mod.time, "sleep") as sleep:
+                result = self.mod.run_request(
+                    "http://e/v1", {}, MIN_PROMPT_TOKENS,
+                    max_attempts=2, backoff_initial_s=0, backoff_max_s=0,
+                )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_type"], "StreamProtocolError")
+        self.assertEqual(result["attempts"], 1)
+        sleep.assert_not_called()
+
     def test_request_timeout_is_total_attempt_deadline_for_trickle_stream(self):
         clock = [0.0]
 
@@ -1413,9 +1441,43 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                         ]
                     )
             run_wave.assert_not_called()
-            self.assertFalse(out.exists())
-            self.assertFalse(state.exists())
-            self.assertFalse(progress.exists())
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "INCOMPLETE")
+            self.assertFalse(report["complete"])
+            self.assertEqual(report["failure"]["stage"], "backend_preflight")
+
+    def test_initial_preflight_failure_settles_incomplete_after_state_init(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "required"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+            out.write_text('{"status":"COMPLETE","complete":true}\n', encoding="utf-8")
+            state.write_text('{"status":"COMPLETE","complete":true}\n', encoding="utf-8")
+            progress.write_text("status: COMPLETE\n", encoding="utf-8")
+            self.preflight.side_effect = RuntimeError("initial model identity mismatch")
+            with mock.patch.object(self.mod, "run_wave") as run_wave:
+                with self.assertRaisesRegex(RuntimeError, "initial model identity mismatch"):
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out),
+                        ]
+                    )
+            run_wave.assert_not_called()
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "INCOMPLETE")
+            self.assertFalse(report["complete"])
+            self.assertEqual(report["failure"]["stage"], "backend_preflight")
+            checkpoint = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint["failure"]["stage"], "backend_preflight")
+            self.assertIn('failure_stage: "backend_preflight"', progress.read_text(encoding="utf-8"))
 
     def test_config_reload_changes_future_wave_and_config_epoch(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1462,6 +1524,92 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             report = json.loads(out.read_text(encoding="utf-8"))
             self.assertNotEqual(report["waves"][0]["config_epoch"], report["waves"][1]["config_epoch"])
             self.assertEqual(len(report["config_epochs"]), 2)
+
+    def test_reloaded_backend_identity_is_preflighted_before_next_post(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p0"\nmodel_id = "m0"\nendpoint = "http://e0/v1"\n'
+                "[execution]\nconcurrencies = [1, 2]\n[resources]\n",
+                encoding="utf-8",
+            )
+            seen_waves = []
+
+            def mutate_after_first_wave(*args, **kwargs):
+                seen_waves.append(args[2])
+                config.write_text(
+                    '[run]\nprovider = "p1"\nmodel_id = "wrong"\nendpoint = "http://e1/v1"\n'
+                    "[execution]\nconcurrencies = [1, 2]\n[resources]\n",
+                    encoding="utf-8",
+                )
+                return _completed_wave(args[3])
+
+            self.preflight.side_effect = [
+                {"status": "PASS"},
+                RuntimeError("reloaded model identity mismatch"),
+            ]
+            with mock.patch.object(
+                self.mod, "run_wave", side_effect=mutate_after_first_wave
+            ) as run_wave:
+                with self.assertRaisesRegex(RuntimeError, "reloaded model identity mismatch"):
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out),
+                        ]
+                    )
+            self.assertEqual(seen_waves, [0])
+            run_wave.assert_called_once()
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "INCOMPLETE")
+            self.assertFalse(report["complete"])
+            self.assertEqual(report["failure"]["stage"], "backend_preflight")
+            self.assertEqual(self.preflight.call_count, 2)
+
+    def test_terminal_resume_repairs_progress_before_publishing_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(self.mod, "run_wave", return_value=_completed_wave(1)):
+                self.assertEqual(
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out),
+                        ]
+                    ),
+                    0,
+                )
+            self.assertIsNone(json.loads(state.read_text(encoding="utf-8"))["active_wave"])
+            progress.write_text("status: RUNNING\nactive_wave: 0\n", encoding="utf-8")
+            with mock.patch.object(self.mod, "run_wave") as run_wave:
+                self.assertEqual(
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out), "--resume",
+                        ]
+                    ),
+                    0,
+                )
+            run_wave.assert_not_called()
+            repaired = progress.read_text(encoding="utf-8")
+            self.assertIn("completed: 1", repaired)
+            self.assertIn("total: 1", repaired)
+            self.assertIn("active_wave: null", repaired)
+            self.assertNotIn("status: RUNNING", repaired)
 
     def test_terminal_report_uses_last_executed_config_epoch(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1820,6 +1968,76 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             checkpoint = json.loads(state.read_text(encoding="utf-8"))
             self.assertEqual(checkpoint["failure"]["stage"], "run_wave")
             self.assertIn('failure_stage: "run_wave"', progress.read_text(encoding="utf-8"))
+
+    def test_failure_fence_invalidates_prior_complete_receipts_before_faulty_settlement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+            out.write_text('{"status":"COMPLETE","complete":true}\n', encoding="utf-8")
+            state.write_text('{"status":"COMPLETE","complete":true}\n', encoding="utf-8")
+            progress.write_text("status: COMPLETE\n", encoding="utf-8")
+            with mock.patch.object(self.mod, "run_wave", side_effect=ValueError("worker boom")):
+                with mock.patch.object(
+                    self.mod,
+                    "_publish_fatal_failure",
+                    side_effect=OSError("failure publisher unavailable"),
+                ):
+                    with self.assertRaisesRegex(ValueError, "worker boom"):
+                        self.mod.main(
+                            [
+                                "--config", str(config), "--state", str(state),
+                                "--progress", str(progress), "--out", str(out),
+                            ]
+                        )
+            for artifact in (out, state, progress):
+                self.assertFalse(artifact.exists(), artifact)
+
+    def test_resume_failure_fence_invalidates_prior_complete_receipts_before_faulty_settlement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(self.mod, "run_wave", return_value=_completed_wave(1)):
+                self.assertEqual(
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out),
+                        ]
+                    ),
+                    0,
+                )
+            self.preflight.reset_mock()
+            self.preflight.side_effect = RuntimeError("resume preflight failed")
+            with mock.patch.object(
+                self.mod,
+                "_publish_fatal_failure",
+                side_effect=OSError("failure publisher unavailable"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "resume preflight failed"):
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out), "--resume",
+                        ]
+                    )
+            for artifact in (out, state, progress):
+                self.assertFalse(artifact.exists(), artifact)
 
     def test_checkpoint_transition_failure_publishes_incomplete_without_recursing(self):
         with tempfile.TemporaryDirectory() as tmp:
