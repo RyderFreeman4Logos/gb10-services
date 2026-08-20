@@ -140,6 +140,12 @@ class Qwen38UnitContractTests(unittest.TestCase):
         # flat mount root, not a raw hub cache layout path.
         self.assertNotIn("/snapshots/", self.text)
 
+    def test_unit_enables_sleep_on_idle(self):
+        # The DFlash2 scheduler must use SGLang's idle-sleep path rather than
+        # burning a CPU core in its default nonblocking receive loop.
+        argv = self.text.split("python3 -m sglang.launch_server", 1)[1]
+        self.assertIn("--sleep-on-idle", argv)
+
     def test_unit_pins_throughput_and_memory_contract(self):
         # mem-fraction 0.83 remains fixed while the DFlash2 trial uses 262144
         # context within the unchanged 74g memory envelope.

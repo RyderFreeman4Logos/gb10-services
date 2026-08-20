@@ -46,6 +46,13 @@ ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-memory-guardian
 # DFlash2 @50307d4c4cde6860d4eee73e2547cd786fe8e8a4.
 # cpuset 5-8,15-18 are the MiaAI text acceleration set; leave cores 9 and 19
 # for embedding/reranker.
+# SGLang's pinned image defaults sleep_on_idle=False, leaving the scheduler's
+# nonblocking receive path in a zero-timeout ppoll busy-spin when idle. Enable
+# the official IdleSleeper path: it polls tokenizer/RPC sockets with poll(1000),
+# but readiness wakes it immediately, so requests incur no fixed 1s delay.
+# Active batches stay on the normal scheduler path and do not enter the idle
+# sleeper; freeing the idle core helps co-resident embedding/reranker work
+# without changing model quality.
 ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/sglang-text.cid --name qwen3.8-27b-sglang \
   --cgroup-parent app.slice \
   --gpus all --ipc host \
@@ -61,6 +68,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --oom-score-adj 800 \
   lmsysorg/sglang@sha256:f6c809a2ebdeea97a3732e8bc139a32c18c9fb00a6e2fd770d257d9f72466ed3 \
   python3 -m sglang.launch_server \
+  --sleep-on-idle \
   --model-path /models/qwen38-nvfp4 \
   --host 0.0.0.0 --port 30000 \
   --served-model-name "abliterated-qwen-latest-27b-nvfp4" \
