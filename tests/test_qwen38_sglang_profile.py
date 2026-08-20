@@ -153,7 +153,7 @@ class Qwen38UnitContractTests(unittest.TestCase):
         self.assertNotIn("--mem-fraction-static 0.95", self.text)
         self.assertNotIn("SGLANG_MEM_FRACTION=0.95", self.text)
         self.assertIn("--mamba-ssm-dtype float32", self.text)
-        self.assertIn("--max-mamba-cache-size 64", self.text)
+        self.assertIn("--max-mamba-cache-size 80", self.text)
         self.assertIn("--max-running-requests 16", self.text)
 
     def test_unit_scales_dflash_mamba_capacity_with_admission(self):
@@ -165,7 +165,7 @@ class Qwen38UnitContractTests(unittest.TestCase):
         max_running = int(running_match.group(1))
         max_mamba = int(mamba_match.group(1))
         self.assertEqual(max_running, 16)
-        self.assertEqual(max_mamba, max_running * 4)
+        self.assertEqual(max_mamba, max_running * 5)
 
     def test_unit_pins_backend_and_chunked_prefill(self):
         self.assertIn("--attention-backend flashinfer", self.text)
