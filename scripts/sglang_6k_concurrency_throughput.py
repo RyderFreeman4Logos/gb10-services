@@ -306,8 +306,6 @@ def _stream_chat(
     finish_reason = None
     usage = None
     saw_usage = False
-    pending_usage = None
-    saw_content_event = False
     saw_done = False
     with urllib.request.urlopen(req, timeout=_remaining_deadline(deadline)) as resp:
         iterator = iter(resp)
@@ -344,13 +342,13 @@ def _stream_chat(
                 raise StreamProtocolError("stream contained invalid JSON") from exc
             if not isinstance(chunk, dict):
                 raise StreamProtocolError("stream event was not an object")
-            if pending_usage is not None:
-                raise StreamProtocolError("stream usage event preceded terminal finish event")
             if saw_usage:
                 raise StreamProtocolError("stream contained data after usage event")
             choices = chunk.get("choices")
             has_non_null_usage = "usage" in chunk and chunk["usage"] is not None
             if has_non_null_usage:
+                if finish_reason is None:
+                    raise StreamProtocolError("stream usage event arrived before terminal finish event")
                 if choices != []:
                     raise StreamProtocolError(
                         "stream usage event must have an empty choices list"
@@ -370,14 +368,7 @@ def _stream_chat(
                 ):
                     raise StreamProtocolError("stream usage token fields were invalid")
                 usage = candidate_usage
-                if finish_reason is None:
-                    if not saw_content_event:
-                        raise StreamProtocolError(
-                            "stream usage event arrived before content"
-                        )
-                    pending_usage = candidate_usage
-                else:
-                    saw_usage = True
+                saw_usage = True
                 continue
             if finish_reason is not None:
                 raise StreamProtocolError("stream contained content after terminal event")
@@ -390,7 +381,6 @@ def _stream_chat(
             delta = choice.get("delta") or {}
             if not isinstance(delta, dict):
                 raise StreamProtocolError("stream delta was not an object")
-            saw_content_event = True
             content = delta.get("content")
             now = time.monotonic()
             if content:
@@ -1960,17 +1950,20 @@ def _publish_fatal_failure(
         config_epoch_value=str(runtime.get("config_epoch", config_epoch(config))),
         elapsed_s=elapsed_s,
     )
-    _publish_incomplete_artifact(
+    publication_failed = not _publish_incomplete_artifact(
         state_path,
         json.dumps(state, indent=2, sort_keys=True) + "\n",
         "checkpoint",
         original_error,
     )
-    _publish_incomplete_artifact(
-        progress_path,
-        _progress_yaml(progress),
-        "progress",
-        original_error,
+    publication_failed = (
+        not _publish_incomplete_artifact(
+            progress_path,
+            _progress_yaml(progress),
+            "progress",
+            original_error,
+        )
+        or publication_failed
     )
     try:
         report = _make_report(
@@ -1983,6 +1976,7 @@ def _publish_fatal_failure(
         )
         report_content = json.dumps(report, indent=2, sort_keys=True) + "\n"
     except BaseException as exc:
+        publication_failed = True
         _add_publication_note(original_error, f"INCOMPLETE report construction failed: {exc}")
         try:
             _invalidate_artifact(out_path)
@@ -1992,12 +1986,17 @@ def _publish_fatal_failure(
                 f"INCOMPLETE report invalidation failed after construction error: {invalidate_error}",
             )
     else:
-        _publish_incomplete_artifact(
-            out_path,
-            report_content,
-            "report",
-            original_error,
+        publication_failed = (
+            not _publish_incomplete_artifact(
+                out_path,
+                report_content,
+                "report",
+                original_error,
+            )
+            or publication_failed
         )
+    if publication_failed:
+        raise RuntimeError("INCOMPLETE failure-fence publication did not settle")
 
 
 def _run(
@@ -2118,10 +2117,8 @@ def _run_inner(
     runtime["wave"] = active if active is not None else max(state["total"] - 1, 0)
     runtime["config"] = config
     runtime["config_epoch"] = last_epoch
-    preflighted_epochs = set()
     runtime["stage"] = "backend_preflight"
     backend_identity_preflight(config)
-    preflighted_epochs.add(last_epoch)
 
     # Persist the active wave and its exact config epoch before any request.
     if active is not None:
@@ -2161,14 +2158,14 @@ def _run_inner(
         runtime["stage"] = "reload_or_plan_validation"
         candidate_config = resolve_config(config_path, args)
         candidate_epoch = config_epoch(candidate_config)
+        previous_epoch = last_epoch
         config = candidate_config
-        last_epoch = candidate_epoch
         runtime["config"] = config
-        runtime["config_epoch"] = last_epoch
-        if candidate_epoch not in preflighted_epochs:
+        runtime["config_epoch"] = candidate_epoch
+        if candidate_epoch != previous_epoch:
             runtime["stage"] = "backend_preflight"
             backend_identity_preflight(config)
-            preflighted_epochs.add(candidate_epoch)
+        last_epoch = candidate_epoch
         candidate_concurrencies = candidate_config["execution"]["concurrencies"]
         _ensure_state_capacity(
             state, len(candidate_concurrencies), candidate_concurrencies

@@ -491,6 +491,35 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
         self.assertEqual(result["attempts"], 1)
         sleep.assert_not_called()
 
+    def test_usage_before_finish_reason_after_content_is_protocol_error_and_not_retried(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def __iter__(self):
+                return iter(
+                    [
+                        b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}\n',
+                        b'data: {"choices":[],"usage":{"prompt_tokens":6000,"completion_tokens":1}}\n',
+                    ]
+                )
+
+        with mock.patch.object(
+            self.mod.urllib.request, "urlopen", return_value=Response()
+        ):
+            with mock.patch.object(self.mod.time, "sleep") as sleep:
+                result = self.mod.run_request(
+                    "http://e/v1", {}, MIN_PROMPT_TOKENS,
+                    max_attempts=3, backoff_initial_s=0, backoff_max_s=0,
+                )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_type"], "StreamProtocolError")
+        self.assertEqual(result["attempts"], 1)
+        sleep.assert_not_called()
+
     def test_request_timeout_is_total_attempt_deadline_for_trickle_stream(self):
         clock = [0.0]
 
@@ -544,6 +573,7 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                 return iter(
                     [
                         b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}\n',
+                        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
                         b'data: {"choices":[],"usage":{"prompt_tokens":6000,"completion_tokens":1}}\n',
                     ]
                 )
@@ -1570,6 +1600,63 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             self.assertEqual(report["failure"]["stage"], "backend_preflight")
             self.assertEqual(self.preflight.call_count, 2)
 
+    def test_repeated_config_epoch_is_preflighted_again_after_intervening_reload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+
+            def write_config(provider, model, endpoint):
+                config.write_text(
+                    f'[run]\nprovider = "{provider}"\nmodel_id = "{model}"\n'
+                    f'endpoint = "{endpoint}"\n'
+                    "[execution]\nconcurrencies = [1, 2, 3]\n[resources]\n",
+                    encoding="utf-8",
+                )
+
+            write_config("p0", "m0", "http://e0/v1")
+            events = []
+            preflight_epochs = []
+
+            def preflight(config_value):
+                epoch = self.mod.config_epoch(config_value)
+                preflight_epochs.append(epoch)
+                events.append(("preflight", epoch))
+                return {"status": "PASS"}
+
+            def run_wave(*args, **kwargs):
+                wave = args[2]
+                events.append(("post", wave))
+                if wave == 0:
+                    write_config("p1", "m1", "http://e1/v1")
+                elif wave == 1:
+                    write_config("p0", "m0", "http://e0/v1")
+                return _completed_wave(args[3], request_timeout_s=kwargs.get("request_timeout_s", 600.0))
+
+            self.preflight.side_effect = preflight
+            with mock.patch.object(self.mod, "run_wave", side_effect=run_wave) as request:
+                self.assertEqual(
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out),
+                        ]
+                    ),
+                    0,
+                )
+
+            self.assertEqual(len(preflight_epochs), 3)
+            self.assertEqual(preflight_epochs, [preflight_epochs[0], preflight_epochs[1], preflight_epochs[0]])
+            self.assertNotEqual(preflight_epochs[0], preflight_epochs[1])
+            self.assertEqual(events, [
+                ("preflight", preflight_epochs[0]), ("post", 0),
+                ("preflight", preflight_epochs[1]), ("post", 1),
+                ("preflight", preflight_epochs[0]), ("post", 2),
+            ])
+            self.assertEqual(request.call_count, 3)
+
     def test_terminal_resume_repairs_progress_before_publishing_complete(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1828,6 +1915,66 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
                 self.assertFalse(artifact.exists(), artifact)
             self.assertTrue(
                 any("INCOMPLETE" in note for note in getattr(caught.exception, "__notes__", []))
+            )
+
+    def test_report_settlement_fault_propagates_to_outer_cleanup_and_preserves_original_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+            real_atomic_write = self.mod._atomic_write
+            real_invalidate = self.mod._invalidate_artifact
+            failing = False
+            report_invalidations = 0
+
+            def fail_after_worker(path, content):
+                if failing:
+                    raise OSError("publish failed")
+                return real_atomic_write(path, content)
+
+            def worker(*args, **kwargs):
+                nonlocal failing
+                failing = True
+                for artifact, content in (
+                    (out, '{"status":"COMPLETE","complete":true}\n'),
+                    (state, '{"status":"COMPLETE","complete":true}\n'),
+                    (progress, "status: COMPLETE\n"),
+                ):
+                    artifact.write_text(content, encoding="utf-8")
+                raise ValueError("worker boom")
+
+            def fail_first_report_invalidation(path):
+                nonlocal report_invalidations
+                if failing and os.fspath(path) == os.fspath(out):
+                    report_invalidations += 1
+                    if report_invalidations == 1:
+                        raise OSError("initial report invalidation fault")
+                return real_invalidate(path)
+
+            with mock.patch.object(self.mod, "run_wave", side_effect=worker):
+                with mock.patch.object(self.mod, "_atomic_write", side_effect=fail_after_worker):
+                    with mock.patch.object(
+                        self.mod, "_invalidate_artifact", side_effect=fail_first_report_invalidation
+                    ):
+                        with self.assertRaisesRegex(ValueError, "worker boom") as caught:
+                            self.mod.main(
+                                [
+                                    "--config", str(config), "--state", str(state),
+                                    "--progress", str(progress), "--out", str(out),
+                                ]
+                            )
+            self.assertGreaterEqual(report_invalidations, 2)
+            for artifact in (out, state, progress):
+                self.assertFalse(artifact.exists(), artifact)
+            self.assertTrue(
+                any("initial report invalidation fault" in note for note in caught.exception.__notes__)
             )
 
     def test_checkpoint_failure_for_next_wave_does_not_attach_prior_wave_result(self):
