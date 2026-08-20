@@ -44,7 +44,11 @@ FILLER_WORD = "aluminium"
 
 
 class StreamProtocolError(ConnectionError):
-    """The upstream ended without a complete, attributable SSE result."""
+    """The upstream emitted malformed or out-of-order SSE data."""
+
+
+class StreamTruncatedError(ConnectionError):
+    """The upstream ended before a complete SSE result was delivered."""
 
 
 # Only benchmark-client settings are admitted; service/server sections are not
@@ -302,6 +306,7 @@ def _stream_chat(
     finish_reason = None
     usage = None
     saw_usage = False
+    pending_usage = None
     saw_done = False
     with urllib.request.urlopen(req, timeout=_remaining_deadline(deadline)) as resp:
         iterator = iter(resp)
@@ -338,14 +343,16 @@ def _stream_chat(
                 raise StreamProtocolError("stream contained invalid JSON") from exc
             if not isinstance(chunk, dict):
                 raise StreamProtocolError("stream event was not an object")
+            if pending_usage is not None:
+                raise StreamProtocolError("stream usage event preceded terminal finish event")
             if saw_usage:
                 raise StreamProtocolError("stream contained data after usage event")
             choices = chunk.get("choices")
             has_non_null_usage = "usage" in chunk and chunk["usage"] is not None
             if has_non_null_usage:
-                if finish_reason is None or choices != []:
+                if choices != []:
                     raise StreamProtocolError(
-                        "stream usage event must follow terminal finish reason"
+                        "stream usage event must have an empty choices list"
                     )
                 candidate_usage = chunk["usage"]
                 if not isinstance(candidate_usage, dict):
@@ -362,7 +369,10 @@ def _stream_chat(
                 ):
                     raise StreamProtocolError("stream usage token fields were invalid")
                 usage = candidate_usage
-                saw_usage = True
+                if finish_reason is None:
+                    pending_usage = candidate_usage
+                else:
+                    saw_usage = True
                 continue
             if finish_reason is not None:
                 raise StreamProtocolError("stream contained content after terminal event")
@@ -388,9 +398,9 @@ def _stream_chat(
                     raise StreamProtocolError("stream finish reason was invalid")
                 finish_reason = candidate_finish
     if not saw_done:
-        raise StreamProtocolError("stream ended before [DONE]")
+        raise StreamTruncatedError("stream ended before [DONE]")
     if not saw_usage or not isinstance(usage, dict):
-        raise StreamProtocolError("stream did not provide final usage")
+        raise StreamTruncatedError("stream did not provide final usage")
     wall = time.monotonic() - start
     prompt_tokens = usage["prompt_tokens"]
     completion_tokens = usage["completion_tokens"]
@@ -414,6 +424,8 @@ def _stream_chat(
 
 
 def _is_transient(exc: BaseException) -> bool:
+    if isinstance(exc, StreamProtocolError):
+        return False
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code == 429 or 500 <= exc.code <= 599
     return isinstance(
@@ -1836,6 +1848,60 @@ def _prepare_fatal_state(
     }
 
 
+def _add_publication_note(original_error: BaseException, message: str) -> None:
+    try:
+        original_error.add_note(message)
+    except BaseException:
+        pass
+
+
+def _invalidate_artifact(path: Path | _ArtifactBinding) -> None:
+    """Remove an unreplaceable artifact from the locked operator directory."""
+    binding, owned = _binding_for(path)
+    try:
+        try:
+            os.unlink(binding.leaf, dir_fd=binding.parent_fd)
+        except FileNotFoundError:
+            return
+        os.fsync(binding.parent_fd)
+    finally:
+        if owned:
+            os.close(binding.parent_fd)
+
+
+def _publish_incomplete_artifact(
+    path: Path | _ArtifactBinding,
+    content: str,
+    label: str,
+    original_error: BaseException,
+) -> bool:
+    """Publish once, retry once on the same artifact, then fail closed."""
+    failures = []
+    for attempt in (1, 2):
+        try:
+            _atomic_write(path, content)
+            return True
+        except BaseException as exc:
+            failures.append(exc)
+            _add_publication_note(
+                original_error,
+                f"INCOMPLETE {label} publication attempt {attempt} failed: {exc}",
+            )
+    try:
+        _invalidate_artifact(path)
+    except BaseException as exc:
+        _add_publication_note(
+            original_error,
+            f"INCOMPLETE {label} invalidation failed after publication errors: {exc}",
+        )
+    else:
+        _add_publication_note(
+            original_error,
+            f"INCOMPLETE {label} invalidated after {len(failures)} publication failures",
+        )
+    return False
+
+
 def _publish_fatal_failure(
     state: dict,
     config: dict,
@@ -1873,20 +1939,18 @@ def _publish_fatal_failure(
         config_epoch_value=str(runtime.get("config_epoch", config_epoch(config))),
         elapsed_s=elapsed_s,
     )
-    try:
-        _atomic_write(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
-    except BaseException as exc:
-        try:
-            original_error.add_note(f"INCOMPLETE checkpoint publication failed: {exc}")
-        except BaseException:
-            pass
-    try:
-        _atomic_write(progress_path, _progress_yaml(progress))
-    except BaseException as exc:
-        try:
-            original_error.add_note(f"INCOMPLETE progress publication failed: {exc}")
-        except BaseException:
-            pass
+    _publish_incomplete_artifact(
+        state_path,
+        json.dumps(state, indent=2, sort_keys=True) + "\n",
+        "checkpoint",
+        original_error,
+    )
+    _publish_incomplete_artifact(
+        progress_path,
+        _progress_yaml(progress),
+        "progress",
+        original_error,
+    )
     try:
         report = _make_report(
             state,
@@ -1896,12 +1960,23 @@ def _publish_fatal_failure(
             complete=False,
             failure=failure,
         )
-        _atomic_write(out_path, json.dumps(report, indent=2, sort_keys=True) + "\n")
+        report_content = json.dumps(report, indent=2, sort_keys=True) + "\n"
     except BaseException as exc:
+        _add_publication_note(original_error, f"INCOMPLETE report construction failed: {exc}")
         try:
-            original_error.add_note(f"INCOMPLETE report publication failed: {exc}")
-        except BaseException:
-            pass
+            _invalidate_artifact(out_path)
+        except BaseException as invalidate_error:
+            _add_publication_note(
+                original_error,
+                f"INCOMPLETE report invalidation failed after construction error: {invalidate_error}",
+            )
+    else:
+        _publish_incomplete_artifact(
+            out_path,
+            report_content,
+            "report",
+            original_error,
+        )
 
 
 def _run(
@@ -1920,6 +1995,7 @@ def _run(
         "wave": 0,
         "stage": "state_initialization",
         "elapsed_s": 0.0,
+        "initialized": False,
     }
     try:
         return _run_inner(
@@ -1933,7 +2009,7 @@ def _run(
         )
     except BaseException as exc:
         state = runtime.get("state")
-        if state is not None:
+        if state is not None and runtime.get("initialized", False):
             try:
                 _publish_fatal_failure(
                     state,
@@ -1988,6 +2064,8 @@ def _run_inner(
         len(config["execution"]["concurrencies"]),
         config["execution"]["concurrencies"],
     )
+    runtime["initialized"] = True
+    had_failure = "failure" in state
     state.pop("failure", None)
     base_elapsed = float(state.get("elapsed_s", 0.0))
     run_start = time.monotonic()
@@ -2012,9 +2090,10 @@ def _run_inner(
             total=state["total"],
             config_epoch_value=last_epoch,
         )
-    elif legacy_checkpoint:
-        # Complete legacy checkpoints still need schema-2 state and progress
-        # persisted before the terminal report is published.
+    elif legacy_checkpoint or had_failure:
+        # Complete legacy checkpoints and terminal failure checkpoints both need
+        # schema-2 state and progress persisted before the terminal report is
+        # published.  Never publish COMPLETE while durable failure remains.
         runtime["stage"] = "checkpoint_transition"
         runtime["elapsed_s"] = base_elapsed
         _checkpoint(
@@ -2029,6 +2108,7 @@ def _run_inner(
 
     wave = active
     while wave is not None:
+        runtime["result"] = None
         runtime["wave"] = wave
         runtime["stage"] = "reload_or_plan_validation"
         candidate_config = resolve_config(config_path, args)
@@ -2103,6 +2183,7 @@ def _run_inner(
         state["completed_waves"] = sorted(set(state["completed_waves"]) | {wave})
         wave = _next_active_wave(state, total, wave + 1)
         runtime["wave"] = wave if wave is not None else max(total - 1, 0)
+        runtime["result"] = None
         elapsed = base_elapsed + (time.monotonic() - run_start)
         runtime["stage"] = "checkpoint_transition"
         runtime["elapsed_s"] = elapsed
@@ -2157,6 +2238,9 @@ def main(argv=None) -> int:
         return 0
     if args.out is None:
         raise ValueError("--out is required unless --dry-run or --preflight is used")
+    # Every executable path verifies the configured served-model identity before
+    # acquiring artifacts or issuing a chat completion.
+    backend_identity_preflight(config)
     out_path = Path(args.out)
     state_path = Path(args.state) if args.state else Path(f"{args.out}.state.json")
     progress_path = Path(args.progress) if args.progress else Path(f"{args.out}.progress.yaml")
