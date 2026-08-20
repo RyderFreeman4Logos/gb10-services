@@ -11,6 +11,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "sglang_6k_concurrency_throughput.py"
@@ -103,6 +105,183 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
         self.assertEqual(payload["min_p"], 0.0)
         self.assertEqual(payload["presence_penalty"], 0.0)
         self.assertEqual(payload["repetition_penalty"], 1.0)
+
+    def test_prompt_construction_does_not_reestimate_whole_prompt(self):
+        with mock.patch.object(self.mod, "estimate_tokens", wraps=self.mod.estimate_tokens) as estimate:
+            prompt = self.mod.build_prompt("wave-0-request-0", MIN_PROMPT_TOKENS)
+        self.assertGreaterEqual(len(prompt.split()), MIN_PROMPT_TOKENS)
+        self.assertLessEqual(estimate.call_count, 1)
+
+    def test_reliability_defaults_and_retry_classification(self):
+        defaults = self.mod.load_config(None)
+        self.assertEqual(defaults["resources"]["max_attempts"], 5)
+        self.assertGreaterEqual(defaults["resources"]["request_timeout_s"], 600)
+        self.assertGreaterEqual(defaults["resources"]["wave_timeout_s"], 3600)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "run.toml"
+            config.write_text(
+                "[resources]\nmax_attempts = 2\nbackoff_initial_s = 0.01\n"
+                "backoff_max_s = 0.02\nrequest_timeout_s = 17\nwave_timeout_s = 23\n",
+                encoding="utf-8",
+            )
+            loaded = self.mod.load_config(config)
+            self.assertEqual(loaded["resources"]["max_attempts"], 2)
+            self.assertEqual(loaded["resources"]["request_timeout_s"], 17)
+            self.assertEqual(loaded["resources"]["wave_timeout_s"], 23)
+
+        transient = urllib.error.HTTPError("http://e", 429, "busy", {}, None)
+        response = {
+            "ttft_s": 0.1, "wall_s": 0.2, "gen_s": 0.1,
+            "prompt_tokens": MIN_PROMPT_TOKENS, "completion_tokens": 2,
+            "decode_tok_s": 20.0, "finish_reason": "stop", "n_fail_short": 0,
+        }
+        with mock.patch.object(self.mod, "_stream_chat", side_effect=[transient, response]) as request:
+            with mock.patch.object(self.mod.time, "sleep") as sleep:
+                result = self.mod.run_request(
+                    "http://e", {}, MIN_PROMPT_TOKENS,
+                    max_attempts=2, backoff_initial_s=0.01, backoff_max_s=0.02,
+                )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["attempts"], 2)
+        self.assertFalse(result["retry_exhausted"])
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(0.01)
+
+        permanent = urllib.error.HTTPError("http://e", 400, "bad", {}, None)
+        with mock.patch.object(self.mod, "_stream_chat", side_effect=permanent) as request:
+            result = self.mod.run_request(
+                "http://e", {}, MIN_PROMPT_TOKENS,
+                max_attempts=5, backoff_initial_s=0.01, backoff_max_s=0.02,
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["attempts"], 1)
+        self.assertFalse(result["retry_exhausted"])
+        self.assertEqual(request.call_count, 1)
+
+        with mock.patch.object(self.mod, "_stream_chat", side_effect=transient) as request:
+            result = self.mod.run_request(
+                "http://e", {}, MIN_PROMPT_TOKENS,
+                max_attempts=2, backoff_initial_s=0, backoff_max_s=0,
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["attempts"], 2)
+        self.assertTrue(result["retry_exhausted"])
+        self.assertEqual(result["error_status"], 429)
+        self.assertEqual(request.call_count, 2)
+
+    def test_checkpoint_progress_and_resume_skip_completed_waves(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p0"\nmodel_id = "m0"\nendpoint = "http://e0/v1"\n'
+                "[execution]\nconcurrencies = [1, 2, 3]\nmax_tokens = 7\n"
+                "[resources]\nclient_workers = 2\nrequest_timeout_s = 11\n",
+                encoding="utf-8",
+            )
+            calls = []
+
+            def interrupting_wave(base_url, model, wave, n, min_tokens, max_tokens, **kwargs):
+                calls.append((base_url, model, wave, n, kwargs))
+                if wave == 1:
+                    raise RuntimeError("simulated interruption")
+                return {
+                    "concurrency": n,
+                    "n_ok": 0,
+                    "n_fail": n,
+                    "sum_completion": 0,
+                    "requests": [{
+                        "ok": False,
+                        "attempts": 5,
+                        "retry_exhausted": True,
+                        "error_status": 503,
+                    }],
+                }
+
+            with mock.patch.object(self.mod, "run_wave", side_effect=interrupting_wave):
+                with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out),
+                        ]
+                    )
+            checkpoint = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint["completed_waves"], [0])
+            self.assertEqual(checkpoint["waves"][0]["requests"][0]["attempts"], 5)
+            self.assertTrue(checkpoint["waves"][0]["requests"][0]["retry_exhausted"])
+            progress_text = progress.read_text(encoding="utf-8")
+            for field in ("completed:", "total:", "elapsed_s:", "rate:", "eta_s:",
+                          "active_wave:", "config_epoch:", "pid:", "start_time:"):
+                self.assertIn(field, progress_text)
+
+            calls.clear()
+            def completed_wave(base_url, model, wave, n, min_tokens, max_tokens, **kwargs):
+                calls.append((base_url, model, wave, n, kwargs))
+                return {"concurrency": n, "n_ok": n, "n_fail": 0, "sum_completion": n}
+
+            with mock.patch.object(self.mod, "run_wave", side_effect=completed_wave):
+                self.assertEqual(
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out), "--resume",
+                        ]
+                    ),
+                    0,
+                )
+            self.assertEqual([call[2] for call in calls], [1, 2])
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(len(report["waves"]), 3)
+            self.assertEqual([wave["concurrency"] for wave in report["waves"]], [1, 2, 3])
+
+    def test_config_reload_changes_future_wave_and_config_epoch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p0"\nmodel_id = "m0"\nendpoint = "http://e0/v1"\n'
+                "[execution]\nconcurrencies = [1, 2]\nmax_tokens = 7\n"
+                "[resources]\nclient_workers = 2\nrequest_timeout_s = 11\n",
+                encoding="utf-8",
+            )
+            seen = []
+
+            def reload_wave(base_url, model, wave, n, min_tokens, max_tokens, **kwargs):
+                seen.append((base_url, model, wave, n, kwargs))
+                if wave == 0:
+                    config.write_text(
+                        '[run]\nprovider = "p1"\nmodel_id = "m1"\nendpoint = "http://e1/v1"\n'
+                        "[execution]\nconcurrencies = [1, 4]\nmax_tokens = 9\n"
+                        "[resources]\nclient_workers = 5\nrequest_timeout_s = 22\n",
+                        encoding="utf-8",
+                    )
+                return {"concurrency": n, "n_ok": n, "n_fail": 0, "sum_completion": n}
+
+            with mock.patch.object(self.mod, "run_wave", side_effect=reload_wave):
+                self.assertEqual(
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out),
+                        ]
+                    ),
+                    0,
+                )
+            self.assertEqual(seen[0][0:4], ("http://e0/v1", "m0", 0, 1))
+            self.assertEqual(seen[1][0:4], ("http://e1/v1", "m1", 1, 4))
+            self.assertEqual(seen[1][4]["provider"], "p1")
+            self.assertEqual(seen[1][4]["client_workers"], 5)
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertNotEqual(report["waves"][0]["config_epoch"], report["waves"][1]["config_epoch"])
+            self.assertEqual(len(report["config_epochs"]), 2)
 
 
 if __name__ == "__main__":

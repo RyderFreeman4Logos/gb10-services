@@ -1,29 +1,164 @@
 #!/usr/bin/env python3
-"""Measures SGLang text-backend prefill/decode throughput at >=6k prompt tokens.
+"""Resumable SGLang text-backend prefill/decode throughput benchmark.
 
-Stdlib only. Builds unique uncached prompts (nonce first line), runs waves of
-concurrency 1/2/4/6/8 sequentially, streams responses to get real TTFT, and
-writes per-request + per-wave metrics as JSON.
+Stdlib only. Builds unique uncached prompts, runs deterministic concurrency
+waves, and atomically checkpoints each completed wave for resume/observation.
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
+import math
+import os
+from pathlib import Path
 import sys
+import tempfile
 import time
+import tomllib
 import urllib.error
 import urllib.request
 import uuid
 
 DEFAULT_BASE_URL = "http://100.105.4.92:18010/v1"
 DEFAULT_MODEL = "abliterated-qwen-latest-27b-nvfp4"
+DEFAULT_PROVIDER = "openai"
 DEFAULT_MIN_PROMPT_TOKENS = 6000
 DEFAULT_MAX_TOKENS = 256
 DEFAULT_CONCURRENCIES = [1, 2, 4, 6, 8]
+DEFAULT_CLIENT_WORKERS = 8
+DEFAULT_REQUEST_TIMEOUT_S = 600.0
+DEFAULT_WAVE_TIMEOUT_S = 3600.0
+DEFAULT_MAX_ATTEMPTS = 5
+DEFAULT_BACKOFF_INITIAL_S = 1.0
+DEFAULT_BACKOFF_MAX_S = 30.0
 
 FILLER_WORD = "aluminium"
+
+
+# Only benchmark-client settings are admitted; service/server sections are not
+# read or hot-reloaded by this harness.
+_ALLOWED_CONFIG = {
+    "run": ("provider", "model_id", "endpoint"),
+    "execution": ("concurrencies", "min_prompt_tokens", "max_tokens"),
+    "resources": (
+        "client_workers",
+        "request_timeout_s",
+        "wave_timeout_s",
+        "max_attempts",
+        "backoff_initial_s",
+        "backoff_max_s",
+    ),
+}
+
+
+def _default_config() -> dict:
+    return {
+        "run": {
+            "provider": DEFAULT_PROVIDER,
+            "model_id": DEFAULT_MODEL,
+            "endpoint": DEFAULT_BASE_URL,
+        },
+        "execution": {
+            "concurrencies": list(DEFAULT_CONCURRENCIES),
+            "min_prompt_tokens": DEFAULT_MIN_PROMPT_TOKENS,
+            "max_tokens": DEFAULT_MAX_TOKENS,
+        },
+        "resources": {
+            "client_workers": DEFAULT_CLIENT_WORKERS,
+            "request_timeout_s": DEFAULT_REQUEST_TIMEOUT_S,
+            "wave_timeout_s": DEFAULT_WAVE_TIMEOUT_S,
+            "max_attempts": DEFAULT_MAX_ATTEMPTS,
+            "backoff_initial_s": DEFAULT_BACKOFF_INITIAL_S,
+            "backoff_max_s": DEFAULT_BACKOFF_MAX_S,
+        },
+    }
+
+
+def _validate_config(config: dict) -> dict:
+    run = config["run"]
+    execution = config["execution"]
+    resources = config["resources"]
+    for key in ("provider", "model_id", "endpoint"):
+        if not isinstance(run[key], str) or not run[key]:
+            raise ValueError(f"run.{key} must be a non-empty string")
+    concurrencies = execution["concurrencies"]
+    if (
+        not isinstance(concurrencies, list)
+        or not concurrencies
+        or any(isinstance(n, bool) or not isinstance(n, int) or n < 1 for n in concurrencies)
+    ):
+        raise ValueError("execution.concurrencies must be a non-empty list of positive integers")
+    for key in ("min_prompt_tokens", "max_tokens"):
+        if isinstance(execution[key], bool) or not isinstance(execution[key], int) or execution[key] < 1:
+            raise ValueError(f"execution.{key} must be a positive integer")
+    if isinstance(resources["client_workers"], bool) or not isinstance(resources["client_workers"], int) or resources["client_workers"] < 1:
+        raise ValueError("resources.client_workers must be a positive integer")
+    if isinstance(resources["max_attempts"], bool) or not isinstance(resources["max_attempts"], int) or resources["max_attempts"] < 1:
+        raise ValueError("resources.max_attempts must be a positive integer")
+    for key in ("request_timeout_s", "wave_timeout_s", "backoff_initial_s", "backoff_max_s"):
+        value = resources[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"resources.{key} must be a finite non-negative number")
+    if resources["request_timeout_s"] == 0 or resources["wave_timeout_s"] == 0:
+        raise ValueError("request and wave timeouts must be greater than zero")
+    if resources["backoff_max_s"] < resources["backoff_initial_s"]:
+        raise ValueError("resources.backoff_max_s must be >= backoff_initial_s")
+    return config
+
+
+def load_config(path: str | os.PathLike[str] | None) -> dict:
+    """Load the adjacent TOML client config, applying safe defaults."""
+    config = _default_config()
+    if path is not None:
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+        for section, keys in _ALLOWED_CONFIG.items():
+            values = raw.get(section, {})
+            if not isinstance(values, dict):
+                raise ValueError(f"config section [{section}] must be a table")
+            for key in keys:
+                if key in values:
+                    config[section][key] = values[key]
+    return _validate_config(config)
+
+
+def config_epoch(config: dict) -> str:
+    normalized = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
+    if args.base_url is not None:
+        config["run"]["endpoint"] = args.base_url
+    if args.model is not None:
+        config["run"]["model_id"] = args.model
+    if args.min_prompt_tokens is not None:
+        config["execution"]["min_prompt_tokens"] = args.min_prompt_tokens
+    if args.max_tokens is not None:
+        config["execution"]["max_tokens"] = args.max_tokens
+    if args.concurrencies is not None:
+        config["execution"]["concurrencies"] = [
+            int(value) for value in args.concurrencies.split(",") if value.strip()
+        ]
+    for key in ("client_workers", "max_attempts"):
+        value = getattr(args, key)
+        if value is not None:
+            config["resources"][key] = value
+    for key in ("request_timeout_s", "wave_timeout_s", "backoff_initial_s", "backoff_max_s"):
+        value = getattr(args, key)
+        if value is not None:
+            config["resources"][key] = value
+    return _validate_config(config)
+
+
+def resolve_config(path: str | os.PathLike[str] | None, args: argparse.Namespace) -> dict:
+    config = load_config(path)
+    # An explicit TOML file is the hot-reload source. CLI flags retain the old
+    # behavior when no config file is supplied.
+    return config if path is not None else _apply_cli_overrides(config, args)
 
 
 def estimate_tokens(text: str) -> int:
@@ -37,33 +172,32 @@ def make_nonce(wave: int, index: int) -> str:
 
 
 def _grow_to_min_tokens(nonce: str, min_tokens: int) -> str:
-    """Deterministic filler grown until the local estimate is >= min_tokens."""
-    word = FILLER_WORD + " "
-    tokens = estimate_tokens(
-        f"{nonce}\n<|startoftext|>\n{word * 16}\nPlease echo this nonce at the very end: {nonce}\n"
-    )
-    count = 1
-    while tokens < min_tokens:
-        count += 1
-        tokens = estimate_tokens(
-            f"{nonce}\n<|startoftext|>\n{word * count}\nPlease echo this nonce at the very end: {nonce}\n"
-        )
-    body = word * count
-    return f"{nonce}\n<|startoftext|>\n{body}\nPlease echo this nonce at the very end: {nonce}\n"
+    """Build filler once at the required size instead of re-estimating it."""
+    prefix = f"{nonce}\n<|startoftext|>\n"
+    suffix = f"\nPlease echo this nonce at the very end: {nonce}\n"
+    # prefix/suffix contain a bounded number of words, so this arithmetic is
+    # O(n) in the output size and never copies an expanding whole prompt.
+    fixed_tokens = estimate_tokens(prefix + suffix)
+    filler_count = max(16, min_tokens - fixed_tokens)
+    body = (FILLER_WORD + " ") * filler_count
+    prompt = prefix + body + suffix
+    # The estimate is intentionally conservative; account for its exact fixed
+    # word count without a second whole-string scan.
+    shortfall = min_tokens - (fixed_tokens + filler_count)
+    if shortfall > 0:
+        body += (FILLER_WORD + " ") * shortfall
+        prompt = prefix + body + suffix
+    return prompt
 
 
 def build_prompt(nonce: str, min_tokens: int) -> str:
     return _grow_to_min_tokens(nonce, min_tokens)
 
 
-def build_payload(
-    model: str, nonce: str, min_tokens: int, max_tokens: int
-) -> dict:
+def build_payload(model: str, nonce: str, min_tokens: int, max_tokens: int) -> dict:
     return {
         "model": model,
-        "messages": [
-            {"role": "user", "content": build_prompt(nonce, min_tokens)}
-        ],
+        "messages": [{"role": "user", "content": build_prompt(nonce, min_tokens)}],
         "temperature": 1.0,
         "top_p": 0.95,
         "top_k": 20,
@@ -77,8 +211,13 @@ def build_payload(
     }
 
 
-def _stream_chat(base_url: str, payload: dict, min_tokens: int) -> dict:
-    """POST a streaming chat request, return parsed SSE usage + throughput."""
+def _stream_chat(
+    base_url: str,
+    payload: dict,
+    min_tokens: int,
+    request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
+) -> dict:
+    """POST a streaming chat request, returning SSE usage and throughput."""
     url = base_url.rstrip("/") + "/chat/completions"
     req = urllib.request.Request(
         url,
@@ -88,17 +227,16 @@ def _stream_chat(base_url: str, payload: dict, min_tokens: int) -> dict:
     )
     start = time.monotonic()
     ttft = None
-    first_chunk_ts = None
     gen_ts = 0.0
     last_ts = start
     finish_reason = None
     usage = None
-    with urllib.request.urlopen(req, timeout=600) as resp:
+    with urllib.request.urlopen(req, timeout=request_timeout_s) as resp:
         for raw in resp:
             line = raw.decode("utf-8").strip()
             if not line or not line.startswith("data: "):
                 continue
-            data = line[len("data: "):]
+            data = line[len("data: ") :]
             if data == "[DONE]":
                 break
             try:
@@ -114,7 +252,6 @@ def _stream_chat(base_url: str, payload: dict, min_tokens: int) -> dict:
             if content:
                 if ttft is None:
                     ttft = now - start
-                    first_chunk_ts = now
                 else:
                     gen_ts += now - last_ts
                 last_ts = now
@@ -141,30 +278,119 @@ def _stream_chat(base_url: str, payload: dict, min_tokens: int) -> dict:
     }
 
 
-def run_request(base_url: str, payload: dict, min_tokens: int) -> dict:
-    metric = _stream_chat(base_url, payload, min_tokens)
-    metric["ok"] = False if metric["n_fail_short"] else True
-    return metric
+def _is_transient(exc: BaseException) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code == 429 or 500 <= exc.code <= 599
+    return isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError))
 
 
-def run_wave(base_url: str, model: str, wave: int, n: int, min_tokens: int, max_tokens: int) -> dict:
+def _failure_metric(exc: BaseException, attempts: int, retry_exhausted: bool) -> dict:
+    status = getattr(exc, "code", None)
+    return {
+        "ok": False,
+        "attempts": attempts,
+        "retry_exhausted": retry_exhausted,
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+        "error_status": status if isinstance(status, int) else None,
+        "ttft_s": 0.0,
+        "wall_s": 0.0,
+        "gen_s": 0.0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "decode_tok_s": 0.0,
+        "finish_reason": None,
+        "n_fail_short": 0,
+    }
+
+
+def run_request(
+    base_url: str,
+    payload: dict,
+    min_tokens: int,
+    *,
+    request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    backoff_initial_s: float = DEFAULT_BACKOFF_INITIAL_S,
+    backoff_max_s: float = DEFAULT_BACKOFF_MAX_S,
+) -> dict:
+    """Run one request with bounded retries for transient failures only."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            metric = dict(_stream_chat(base_url, payload, min_tokens, request_timeout_s))
+            metric["attempts"] = attempt
+            metric["retry_exhausted"] = False
+            metric["ok"] = False if metric["n_fail_short"] else True
+            return metric
+        except Exception as exc:  # network/HTTP errors are classified below
+            transient = _is_transient(exc)
+            if not transient or attempt >= max_attempts:
+                return _failure_metric(exc, attempt, transient and attempt >= max_attempts)
+            delay = min(backoff_max_s, backoff_initial_s * (2 ** (attempt - 1)))
+            if delay > 0:
+                time.sleep(delay)
+    raise AssertionError("unreachable retry loop")
+
+
+def run_wave(
+    base_url: str,
+    model: str,
+    wave: int,
+    n: int,
+    min_tokens: int,
+    max_tokens: int,
+    *,
+    provider: str = DEFAULT_PROVIDER,
+    client_workers: int | None = None,
+    request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
+    wave_timeout_s: float = DEFAULT_WAVE_TIMEOUT_S,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    backoff_initial_s: float = DEFAULT_BACKOFF_INITIAL_S,
+    backoff_max_s: float = DEFAULT_BACKOFF_MAX_S,
+) -> dict:
+    del provider  # retained in the wave/report metadata; endpoint is the transport.
     payloads = [
         build_payload(model, make_nonce(wave, i), min_tokens, max_tokens)
         for i in range(n)
     ]
     wave_start = time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
-        results = list(ex.map(lambda p: run_request(base_url, p, min_tokens), payloads))
+    workers = max(1, min(n, client_workers or n))
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    futures = [
+        executor.submit(
+            run_request,
+            base_url,
+            payload,
+            min_tokens,
+            request_timeout_s=request_timeout_s,
+            max_attempts=max_attempts,
+            backoff_initial_s=backoff_initial_s,
+            backoff_max_s=backoff_max_s,
+        )
+        for payload in payloads
+    ]
+    timed_out = False
+    try:
+        done, pending = concurrent.futures.wait(futures, timeout=wave_timeout_s)
+        if pending:
+            timed_out = True
+            for future in pending:
+                future.cancel()
+            raise TimeoutError(f"wave {wave} exceeded {wave_timeout_s}s timeout")
+        results = [future.result() for future in futures]
+    finally:
+        executor.shutdown(wait=not timed_out, cancel_futures=timed_out)
     wave_wall = time.monotonic() - wave_start
-    ok = [r for r in results if r["ok"]]
+    ok = [result for result in results if result["ok"]]
     n_ok = len(ok)
     n_fail = len(results) - n_ok
-    sum_completion = sum(r["completion_tokens"] for r in ok)
-    sum_prompt = sum(r["prompt_tokens"] for r in ok)
+    sum_completion = sum(result["completion_tokens"] for result in ok)
+    sum_prompt = sum(result["prompt_tokens"] for result in ok)
     return {
         "concurrency": n,
         "n_ok": n_ok,
         "n_fail": n_fail,
+        "n_finish_length": sum(result.get("finish_reason") == "length" for result in results),
         "sum_completion": sum_completion,
         "wave_wall_s": wave_wall,
         "agg_decode_tok_s": sum_completion / wave_wall if wave_wall > 0 else 0.0,
@@ -173,10 +399,130 @@ def run_wave(base_url: str, model: str, wave: int, n: int, min_tokens: int, max_
     }
 
 
-def parse_args(argv):
-    p = argparse.ArgumentParser(
-        description="6k-input SGLang concurrency throughput harness"
+def _atomic_write(path: str | os.PathLike[str], content: str) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        try:
+            directory_fd = os.open(target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        except OSError:
+            directory_fd = None
+        if directory_fd is not None:
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_write_json(path: str | os.PathLike[str], value: dict) -> None:
+    _atomic_write(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def _yaml_scalar(value) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(str(value))
+
+
+def _progress_yaml(progress: dict) -> str:
+    return "".join(f"{key}: {_yaml_scalar(value)}\n" for key, value in progress.items())
+
+
+def _process_identity() -> tuple[int, int | None]:
+    pid = os.getpid()
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = stat.rsplit(")", 1)[1].split()
+        return pid, int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return pid, None
+
+
+def _checkpoint(
+    state: dict,
+    state_path: Path,
+    progress_path: Path,
+    *,
+    elapsed_s: float,
+    active_wave: int | None,
+    total: int,
+    config_epoch_value: str,
+) -> None:
+    pid, start_time = _process_identity()
+    state["elapsed_s"] = elapsed_s
+    state["pid"] = pid
+    state["start_time"] = start_time
+    _atomic_write_json(state_path, state)
+    completed = len(state["completed_waves"])
+    rate = completed / elapsed_s if elapsed_s > 0 else 0.0
+    remaining = max(total - completed, 0)
+    eta_s = remaining / rate if rate > 0 else None
+    _atomic_write(
+        progress_path,
+        _progress_yaml(
+            {
+                "completed": completed,
+                "total": total,
+                "elapsed_s": round(elapsed_s, 6),
+                "rate": rate,
+                "eta_s": eta_s,
+                "active_wave": active_wave,
+                "config_epoch": config_epoch_value,
+                "pid": pid,
+                "start_time": start_time,
+            }
+        ),
     )
+
+
+def _new_state() -> dict:
+    return {
+        "schema_version": 1,
+        "run_id": str(uuid.uuid4()),
+        "started_at": time.time(),
+        "elapsed_s": 0.0,
+        "total": 0,
+        "completed_waves": [],
+        "waves": [],
+        "config_epochs": {},
+    }
+
+
+def _load_state(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as stream:
+        state = json.load(stream)
+    if state.get("schema_version") != 1:
+        raise ValueError(f"unsupported checkpoint schema in {path}")
+    state.setdefault("completed_waves", [])
+    state.setdefault("waves", [])
+    state.setdefault("config_epochs", {})
+    state.setdefault("elapsed_s", 0.0)
+    return state
+
+
+def _ensure_state_capacity(state: dict, total: int) -> None:
+    if len(state["waves"]) < total:
+        state["waves"].extend([None] * (total - len(state["waves"])))
+    state["total"] = total
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(description="6k-input SGLang concurrency throughput harness")
     p.add_argument("--base-url", default=DEFAULT_BASE_URL)
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--min-prompt-tokens", type=int, default=DEFAULT_MIN_PROMPT_TOKENS)
@@ -186,6 +532,16 @@ def parse_args(argv):
         default=",".join(str(c) for c in DEFAULT_CONCURRENCIES),
         help="comma-separated concurrency levels",
     )
+    p.add_argument("--client-workers", type=int, default=None)
+    p.add_argument("--request-timeout-s", type=float, default=None)
+    p.add_argument("--wave-timeout-s", type=float, default=None)
+    p.add_argument("--max-attempts", type=int, default=None)
+    p.add_argument("--backoff-initial-s", type=float, default=None)
+    p.add_argument("--backoff-max-s", type=float, default=None)
+    p.add_argument("--config", help="adjacent TOML benchmark-client config")
+    p.add_argument("--state", help="JSON checkpoint path")
+    p.add_argument("--progress", help="YAML progress sidecar path")
+    p.add_argument("--resume", action="store_true", help="resume incomplete waves from --state")
     p.add_argument("--out", required=True, help="path for JSON output")
     p.add_argument("--dry-run", action="store_true", help="build prompts only, no HTTP")
     return p.parse_args(argv)
@@ -193,31 +549,117 @@ def parse_args(argv):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    concurrencies = [int(c) for c in args.concurrencies.split(",") if c.strip()]
+    config_path = Path(args.config) if args.config else None
+    config = resolve_config(config_path, args)
     if args.dry_run:
         nonce = make_nonce(0, 0)
-        sample = build_prompt(nonce, args.min_prompt_tokens)
+        sample = build_prompt(nonce, config["execution"]["min_prompt_tokens"])
         print(
             json.dumps(
                 {
-                    "concurrencies": concurrencies,
-                    "model": args.model,
-                    "base_url": args.base_url,
-                    "min_prompt_tokens": args.min_prompt_tokens,
-                    "max_tokens": args.max_tokens,
+                    "concurrencies": config["execution"]["concurrencies"],
+                    "model": config["run"]["model_id"],
+                    "base_url": config["run"]["endpoint"],
+                    "provider": config["run"]["provider"],
+                    "min_prompt_tokens": config["execution"]["min_prompt_tokens"],
+                    "max_tokens": config["execution"]["max_tokens"],
                     "sample_prompt": sample,
+                    "config_epoch": config_epoch(config),
                 },
                 indent=2,
             )
         )
         return 0
-    report = {"base_url": args.base_url, "model": args.model, "waves": []}
-    for wave, n in enumerate(concurrencies):
-        report["waves"].append(
-            run_wave(args.base_url, args.model, wave, n, args.min_prompt_tokens, args.max_tokens)
+
+    out_path = Path(args.out)
+    state_path = Path(args.state) if args.state else Path(f"{args.out}.state.json")
+    progress_path = Path(args.progress) if args.progress else Path(f"{args.out}.progress.yaml")
+    if args.resume:
+        if not state_path.exists():
+            raise FileNotFoundError(f"cannot resume without checkpoint: {state_path}")
+        state = _load_state(state_path)
+    else:
+        state = _new_state()
+    _ensure_state_capacity(state, len(config["execution"]["concurrencies"]))
+    base_elapsed = float(state.get("elapsed_s", 0.0))
+    run_start = time.monotonic()
+    last_epoch = config_epoch(config)
+
+    # Progress is written before the first wave as well as after every complete
+    # wave, so a detached launch is observable before its first response.
+    _checkpoint(
+        state,
+        state_path,
+        progress_path,
+        elapsed_s=base_elapsed,
+        active_wave=0,
+        total=state["total"],
+        config_epoch_value=last_epoch,
+    )
+
+    wave = 0
+    while True:
+        # This is the sole reload point: config changes affect only future waves.
+        config = resolve_config(config_path, args)
+        last_epoch = config_epoch(config)
+        concurrencies = config["execution"]["concurrencies"]
+        _ensure_state_capacity(state, len(concurrencies))
+        total = state["total"]
+        if wave >= total:
+            break
+        if wave in state["completed_waves"]:
+            wave += 1
+            continue
+        state["config_epochs"][last_epoch] = config
+        n = concurrencies[wave]
+        resources = config["resources"]
+        result = run_wave(
+            config["run"]["endpoint"],
+            config["run"]["model_id"],
+            wave,
+            n,
+            config["execution"]["min_prompt_tokens"],
+            config["execution"]["max_tokens"],
+            provider=config["run"]["provider"],
+            client_workers=resources["client_workers"],
+            request_timeout_s=resources["request_timeout_s"],
+            wave_timeout_s=resources["wave_timeout_s"],
+            max_attempts=resources["max_attempts"],
+            backoff_initial_s=resources["backoff_initial_s"],
+            backoff_max_s=resources["backoff_max_s"],
         )
-    with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2)
+        result.update(
+            {
+                "wave": wave,
+                "config_epoch": last_epoch,
+                "provider": config["run"]["provider"],
+                "endpoint": config["run"]["endpoint"],
+                "model": config["run"]["model_id"],
+                "max_tokens": config["execution"]["max_tokens"],
+            }
+        )
+        state["waves"][wave] = result
+        state["completed_waves"] = sorted(set(state["completed_waves"]) | {wave})
+        elapsed = base_elapsed + (time.monotonic() - run_start)
+        _checkpoint(
+            state,
+            state_path,
+            progress_path,
+            elapsed_s=elapsed,
+            active_wave=wave + 1,
+            total=total,
+            config_epoch_value=last_epoch,
+        )
+        wave += 1
+
+    report = {
+        "run_id": state["run_id"],
+        "base_url": config["run"]["endpoint"],
+        "model": config["run"]["model_id"],
+        "waves": [result for result in state["waves"] if result is not None],
+        "config_epochs": state["config_epochs"],
+    }
+    _atomic_write_json(out_path, report)
     return 0
 
 
