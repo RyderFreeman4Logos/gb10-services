@@ -1656,6 +1656,42 @@ def _next_active_wave(state: dict, total: int, start: int = 0) -> int | None:
     )
 
 
+def backend_identity_preflight(config: dict) -> dict:
+    """Fail closed unless the configured raw backend offers the required alias."""
+    endpoint = config["run"]["endpoint"].rstrip("/") + "/models"
+    request = urllib.request.Request(endpoint, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(
+            request, timeout=config["resources"]["request_timeout_s"]
+        ) as response:
+            status = response.getcode()
+            body = response.read()
+    except (OSError, urllib.error.URLError) as exc:
+        raise RuntimeError(f"backend identity preflight failed for {endpoint}: {exc}") from exc
+    if status != 200:
+        raise RuntimeError(
+            f"backend identity preflight failed for {endpoint}: HTTP {status}"
+        )
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"backend identity preflight returned invalid JSON: {endpoint}") from exc
+    models = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(models, list) or any(
+        not isinstance(model, dict) or not isinstance(model.get("id"), str) or not model["id"]
+        for model in models
+    ):
+        raise RuntimeError(f"backend identity preflight returned malformed model data: {endpoint}")
+    offered = [model["id"] for model in models]
+    required = config["run"]["model_id"]
+    if required not in offered:
+        raise RuntimeError(
+            f"backend identity preflight rejected required alias {required!r}; "
+            f"offered aliases: {', '.join(offered) or '<none>'}"
+        )
+    return {"status": "PASS", "endpoint": endpoint, "required_model": required, "offered_models": offered}
+
+
 def parse_args(argv):
     p = argparse.ArgumentParser(description="6k-input SGLang concurrency throughput harness")
     p.add_argument("--base-url", default=DEFAULT_BASE_URL)
@@ -1682,8 +1718,13 @@ def parse_args(argv):
     p.add_argument("--state", help="JSON checkpoint path")
     p.add_argument("--progress", help="YAML progress sidecar path")
     p.add_argument("--resume", action="store_true", help="resume incomplete waves from --state")
-    p.add_argument("--out", required=True, help="path for JSON output")
+    p.add_argument("--out", help="path for JSON output")
     p.add_argument("--dry-run", action="store_true", help="build prompts only, no HTTP")
+    p.add_argument(
+        "--preflight",
+        action="store_true",
+        help="verify the configured raw backend model alias, then exit",
+    )
     return p.parse_args(argv)
 
 
@@ -1721,40 +1762,146 @@ def _make_report(
     return report
 
 
-def _publish_incomplete(
+def _prepare_fatal_state(
+    state: dict,
+    config: dict,
+    failure: dict,
+    *,
+    active_wave: int,
+    total: int,
+    config_epoch_value: str,
+    elapsed_s: float,
+) -> dict:
+    """Build truthful failure artifacts without invoking the checkpoint path."""
+    state["failure"] = failure
+    state["elapsed_s"] = max(0.0, elapsed_s)
+    completed = set(state.get("completed_waves", []))
+    total = max(total, int(state.get("total", 0)), len(state.get("waves", [])))
+    state["total"] = total
+    state["planned_total"] = total
+    state["planned_wave_ids"] = list(range(total))
+    state.setdefault("waves", []).extend(
+        [None] * max(0, total - len(state.get("waves", [])))
+    )
+    state.setdefault("config_epochs", {})[config_epoch_value] = config
+    state["active_wave"] = (
+        active_wave if 0 <= active_wave < total and active_wave not in completed else None
+    )
+    state["active_config_epoch"] = (
+        config_epoch_value if state["active_wave"] is not None else None
+    )
+    completed_work_units = 0
+    planned_work_units = 0
+    plan = config["execution"]["concurrencies"]
+    for wave, result in enumerate(state["waves"][:total]):
+        if wave in completed and isinstance(result, dict):
+            completed_work_units += result.get("work_units", result.get("concurrency", 0))
+            planned_work_units += result.get("work_units", result.get("concurrency", 0))
+        elif wave < len(plan):
+            planned_work_units += plan[wave]
+    state["completed_work_units"] = completed_work_units
+    state["planned_work_units"] = max(planned_work_units, completed_work_units)
+    pid, start_time = _process_identity()
+    state["pid"] = pid
+    if start_time is not None:
+        state["start_time"] = start_time
+    work_rate = completed_work_units / elapsed_s if elapsed_s > 0 else 0.0
+    return {
+        "completed": completed_work_units,
+        "total": state["planned_work_units"],
+        "completed_waves": len(completed),
+        "total_waves": total,
+        "completed_work_units": completed_work_units,
+        "total_work_units": state["planned_work_units"],
+        "elapsed_s": round(max(0.0, elapsed_s), 6),
+        "rate": work_rate,
+        "work_rate": work_rate,
+        "eta_s": (
+            (state["planned_work_units"] - completed_work_units) / work_rate
+            if work_rate > 0
+            else None
+        ),
+        "active_wave": state["active_wave"],
+        "work_unit": (
+            plan[state["active_wave"]]
+            if state["active_wave"] is not None and state["active_wave"] < len(plan)
+            else None
+        ),
+        "config_epoch": config_epoch_value,
+        "pid": pid,
+        "start_time": state.get("start_time"),
+        "failure_wave": failure["wave"],
+        "failure_stage": failure["stage"],
+        "failure_reason": failure["reason"],
+    }
+
+
+def _publish_fatal_failure(
     state: dict,
     config: dict,
     out_path: Path | _ArtifactBinding,
     state_path: Path | _ArtifactBinding,
     progress_path: Path | _ArtifactBinding,
     *,
-    elapsed_s: float,
-    active_wave: int,
-    total: int,
-    config_epoch_value: str,
-    failure: dict,
+    runtime: dict,
+    original_error: BaseException,
 ) -> None:
-    state["failure"] = failure
-    _checkpoint(
+    """Best-effort failure publication that cannot recurse through _checkpoint."""
+    error_text = str(original_error) or type(original_error).__name__
+    failure = {
+        "wave": int(runtime.get("wave", 0)),
+        "stage": str(runtime.get("stage", "unknown")),
+        "reason": error_text,
+        "error_type": type(original_error).__name__,
+        "error": error_text,
+    }
+    result = runtime.get("result")
+    if isinstance(result, dict):
+        try:
+            json.dumps(result)
+        except (TypeError, ValueError):
+            pass
+        else:
+            failure["result"] = result
+    elapsed_s = float(runtime.get("elapsed_s", state.get("elapsed_s", 0.0)))
+    progress = _prepare_fatal_state(
         state,
-        state_path,
-        progress_path,
+        config,
+        failure,
+        active_wave=failure["wave"],
+        total=int(runtime.get("total", state.get("total", 0))),
+        config_epoch_value=str(runtime.get("config_epoch", config_epoch(config))),
         elapsed_s=elapsed_s,
-        active_wave=active_wave,
-        total=total,
-        config_epoch_value=config_epoch_value,
     )
-    _atomic_write_json(
-        out_path,
-        _make_report(
+    try:
+        _atomic_write(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+    except BaseException as exc:
+        try:
+            original_error.add_note(f"INCOMPLETE checkpoint publication failed: {exc}")
+        except BaseException:
+            pass
+    try:
+        _atomic_write(progress_path, _progress_yaml(progress))
+    except BaseException as exc:
+        try:
+            original_error.add_note(f"INCOMPLETE progress publication failed: {exc}")
+        except BaseException:
+            pass
+    try:
+        report = _make_report(
             state,
             config,
-            config_epoch_value,
+            str(runtime.get("config_epoch", config_epoch(config))),
             status="INCOMPLETE",
             complete=False,
             failure=failure,
-        ),
-    )
+        )
+        _atomic_write(out_path, json.dumps(report, indent=2, sort_keys=True) + "\n")
+    except BaseException as exc:
+        try:
+            original_error.add_note(f"INCOMPLETE report publication failed: {exc}")
+        except BaseException:
+            pass
 
 
 def _run(
@@ -1765,6 +1912,59 @@ def _run(
     state_path: Path | _ArtifactBinding,
     progress_path: Path | _ArtifactBinding,
 ) -> int:
+    runtime = {
+        "state": None,
+        "config": config,
+        "config_epoch": config_epoch(config),
+        "total": len(config["execution"]["concurrencies"]),
+        "wave": 0,
+        "stage": "state_initialization",
+        "elapsed_s": 0.0,
+    }
+    try:
+        return _run_inner(
+            args,
+            config_path,
+            config,
+            out_path,
+            state_path,
+            progress_path,
+            runtime,
+        )
+    except BaseException as exc:
+        state = runtime.get("state")
+        if state is not None:
+            try:
+                _publish_fatal_failure(
+                    state,
+                    runtime.get("config", config),
+                    out_path,
+                    state_path,
+                    progress_path,
+                    runtime=runtime,
+                    original_error=exc,
+                )
+            except BaseException as publication_error:
+                try:
+                    exc.add_note(f"INCOMPLETE failure-fence publication failed: {publication_error}")
+                except BaseException:
+                    pass
+        raise
+
+
+def _run_inner(
+    args: argparse.Namespace,
+    config_path: Path | None,
+    config: dict,
+    out_path: Path | _ArtifactBinding,
+    state_path: Path | _ArtifactBinding,
+    progress_path: Path | _ArtifactBinding,
+    runtime: dict,
+) -> int:
+    runtime["config"] = config
+    runtime["config_epoch"] = config_epoch(config)
+    runtime["total"] = len(config["execution"]["concurrencies"])
+    runtime["stage"] = "state_initialization"
     legacy_checkpoint = False
     if args.resume:
         if not _artifact_exists(state_path):
@@ -1772,6 +1972,7 @@ def _run(
         raw_state = json.loads(_read_artifact_text(state_path))
         legacy_checkpoint = raw_state.get("schema_version") == _LEGACY_CHECKPOINT_SCHEMA_VERSION
         state = _load_state(state_path, config)
+        runtime["state"] = state
         active_wave = state["active_wave"]
         current_epoch = config_epoch(config)
         if active_wave is not None and state["active_config_epoch"] != current_epoch:
@@ -1781,6 +1982,7 @@ def _run(
         _validate_loaded_plan(state, config["execution"]["concurrencies"])
     else:
         state = _new_state()
+        runtime["state"] = state
     _ensure_state_capacity(
         state,
         len(config["execution"]["concurrencies"]),
@@ -1791,9 +1993,15 @@ def _run(
     run_start = time.monotonic()
     last_epoch = config_epoch(config)
     active = _next_active_wave(state, state["total"])
+    runtime["total"] = state["total"]
+    runtime["wave"] = active if active is not None else max(state["total"] - 1, 0)
+    runtime["config"] = config
+    runtime["config_epoch"] = last_epoch
 
     # Persist the active wave and its exact config epoch before any request.
     if active is not None:
+        runtime["stage"] = "checkpoint_transition"
+        runtime["elapsed_s"] = base_elapsed
         state["config_epochs"][last_epoch] = config
         _checkpoint(
             state,
@@ -1807,6 +2015,8 @@ def _run(
     elif legacy_checkpoint:
         # Complete legacy checkpoints still need schema-2 state and progress
         # persisted before the terminal report is published.
+        runtime["stage"] = "checkpoint_transition"
+        runtime["elapsed_s"] = base_elapsed
         _checkpoint(
             state,
             state_path,
@@ -1819,45 +2029,25 @@ def _run(
 
     wave = active
     while wave is not None:
-        prior_config = config
-        prior_epoch = last_epoch
-        try:
-            candidate_config = resolve_config(config_path, args)
-            candidate_epoch = config_epoch(candidate_config)
-            candidate_concurrencies = candidate_config["execution"]["concurrencies"]
-            _ensure_state_capacity(
-                state, len(candidate_concurrencies), candidate_concurrencies
-            )
-        except Exception as exc:
-            config = prior_config
-            last_epoch = prior_epoch
-            failure = {
-                "wave": wave,
-                "stage": "reload_or_plan_validation",
-                "reason": str(exc),
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            }
-            _publish_incomplete(
-                state,
-                config,
-                out_path,
-                state_path,
-                progress_path,
-                elapsed_s=base_elapsed + (time.monotonic() - run_start),
-                active_wave=wave,
-                total=state["total"],
-                config_epoch_value=last_epoch,
-                failure=failure,
-            )
-            raise
+        runtime["wave"] = wave
+        runtime["stage"] = "reload_or_plan_validation"
+        candidate_config = resolve_config(config_path, args)
+        candidate_epoch = config_epoch(candidate_config)
+        candidate_concurrencies = candidate_config["execution"]["concurrencies"]
+        _ensure_state_capacity(
+            state, len(candidate_concurrencies), candidate_concurrencies
+        )
         config = candidate_config
         last_epoch = candidate_epoch
+        runtime["config"] = config
+        runtime["config_epoch"] = last_epoch
         concurrencies = candidate_concurrencies
         total = state["total"]
         state["config_epochs"][last_epoch] = config
         n = concurrencies[wave]
         resources = config["resources"]
+        runtime["stage"] = "checkpoint_transition"
+        runtime["elapsed_s"] = base_elapsed + (time.monotonic() - run_start)
         _checkpoint(
             state,
             state_path,
@@ -1869,8 +2059,8 @@ def _run(
         )
         result = None
         acceptance_error = None
-        stage = "run_wave"
         try:
+            runtime["stage"] = "run_wave"
             result = run_wave(
                 config["run"]["endpoint"],
                 config["run"]["model_id"],
@@ -1886,7 +2076,8 @@ def _run(
                 backoff_initial_s=resources["backoff_initial_s"],
                 backoff_max_s=resources["backoff_max_s"],
             )
-            stage = "result_processing"
+            runtime["result"] = result
+            runtime["stage"] = "result_processing"
             result.update(
                 {
                     "wave": wave,
@@ -1900,31 +2091,9 @@ def _run(
             )
             acceptance_error = _wave_acceptance_error(result, n, config)
             if acceptance_error is not None:
-                stage = "wave_acceptance"
+                runtime["stage"] = "wave_acceptance"
                 raise RuntimeError(acceptance_error)
-        except Exception as exc:
-            reason = acceptance_error or str(exc)
-            failure = {
-                "wave": wave,
-                "stage": stage,
-                "reason": reason,
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            }
-            if isinstance(result, dict):
-                failure["result"] = result
-            _publish_incomplete(
-                state,
-                config,
-                out_path,
-                state_path,
-                progress_path,
-                elapsed_s=base_elapsed + (time.monotonic() - run_start),
-                active_wave=wave,
-                total=total,
-                config_epoch_value=last_epoch,
-                failure=failure,
-            )
+        except BaseException as exc:
             if acceptance_error is not None:
                 raise RuntimeError(
                     f"benchmark incomplete at wave {wave}: {acceptance_error}"
@@ -1933,7 +2102,10 @@ def _run(
         state["waves"][wave] = result
         state["completed_waves"] = sorted(set(state["completed_waves"]) | {wave})
         wave = _next_active_wave(state, total, wave + 1)
+        runtime["wave"] = wave if wave is not None else max(total - 1, 0)
         elapsed = base_elapsed + (time.monotonic() - run_start)
+        runtime["stage"] = "checkpoint_transition"
+        runtime["elapsed_s"] = elapsed
         _checkpoint(
             state,
             state_path,
@@ -1944,6 +2116,7 @@ def _run(
             config_epoch_value=last_epoch,
         )
 
+    runtime["stage"] = "report_publication"
     report = _make_report(
         state,
         config,
@@ -1979,6 +2152,11 @@ def main(argv=None) -> int:
         )
         return 0
 
+    if args.preflight:
+        print(json.dumps(backend_identity_preflight(config), indent=2, sort_keys=True))
+        return 0
+    if args.out is None:
+        raise ValueError("--out is required unless --dry-run or --preflight is used")
     out_path = Path(args.out)
     state_path = Path(args.state) if args.state else Path(f"{args.out}.state.json")
     progress_path = Path(args.progress) if args.progress else Path(f"{args.out}.progress.yaml")

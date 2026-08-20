@@ -130,6 +130,47 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             )
             self.assertIn("-", prompt.splitlines()[0])
 
+    def test_backend_identity_preflight_requires_configured_alias_on_raw_models_route(self):
+        config = self.mod.load_config(None)
+        config["run"]["endpoint"] = "http://raw.example/v1"
+        config["run"]["model_id"] = "required-alias"
+
+        class Response:
+            def __init__(self, body, status=200):
+                self.body = body
+                self.status = status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def getcode(self):
+                return self.status
+
+            def read(self):
+                return self.body
+
+        with mock.patch.object(
+            self.mod.urllib.request,
+            "urlopen",
+            return_value=Response(b'{"data":[{"id":"required-alias"}]}'),
+        ) as urlopen:
+            result = self.mod.backend_identity_preflight(config)
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["endpoint"], "http://raw.example/v1/models")
+        self.assertEqual(result["offered_models"], ["required-alias"])
+        self.assertEqual(urlopen.call_args.args[0].full_url, "http://raw.example/v1/models")
+
+        with mock.patch.object(
+            self.mod.urllib.request,
+            "urlopen",
+            return_value=Response(b'{"data":[{"id":"different-alias"}]}'),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "rejected required alias"):
+                self.mod.backend_identity_preflight(config)
+
     def test_built_prompt_word_count_at_least_6000(self):
         nonce = self.mod.make_nonce(0, 0)
         prompt = self.mod.build_prompt(nonce, MIN_PROMPT_TOKENS)
@@ -1548,6 +1589,68 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
             self.assertEqual(report["failure"]["stage"], "result_processing")
             self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["failure"]["stage"], "result_processing")
 
+    def test_keyboard_interrupt_replaces_stale_complete_output_and_preserves_original_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+            out.write_text('{"status":"COMPLETE","complete":true}\n', encoding="utf-8")
+            with mock.patch.object(self.mod, "run_wave", side_effect=KeyboardInterrupt("user stop")):
+                with self.assertRaisesRegex(KeyboardInterrupt, "user stop"):
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out),
+                        ]
+                    )
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "INCOMPLETE")
+            self.assertFalse(report["complete"])
+            self.assertEqual(report["failure"]["stage"], "run_wave")
+            self.assertEqual(report["failure"]["error_type"], "KeyboardInterrupt")
+            self.assertEqual(report["failure"]["error"], "user stop")
+            checkpoint = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint["failure"]["stage"], "run_wave")
+            self.assertIn('failure_stage: "run_wave"', progress.read_text(encoding="utf-8"))
+
+    def test_checkpoint_transition_failure_publishes_incomplete_without_recursing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "run.toml"
+            state = root / "run.state.json"
+            progress = root / "run.progress.yaml"
+            out = root / "run.json"
+            config.write_text(
+                '[run]\nprovider = "p"\nmodel_id = "m"\nendpoint = "http://e/v1"\n'
+                "[execution]\nconcurrencies = [1]\n[resources]\n",
+                encoding="utf-8",
+            )
+            out.write_text('{"status":"COMPLETE","complete":true}\n', encoding="utf-8")
+            with mock.patch.object(self.mod, "_checkpoint", side_effect=OSError("checkpoint transition failed")) as checkpoint:
+                with self.assertRaisesRegex(OSError, "checkpoint transition failed"):
+                    self.mod.main(
+                        [
+                            "--config", str(config), "--state", str(state),
+                            "--progress", str(progress), "--out", str(out),
+                        ]
+                    )
+            checkpoint.assert_called_once()
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "INCOMPLETE")
+            self.assertFalse(report["complete"])
+            self.assertEqual(report["failure"]["stage"], "checkpoint_transition")
+            self.assertEqual(report["failure"]["error"], "checkpoint transition failed")
+            checkpoint_data = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint_data["failure"]["stage"], "checkpoint_transition")
+            self.assertIn('failure_stage: "checkpoint_transition"', progress.read_text(encoding="utf-8"))
+
     def test_derived_wave_metrics_are_consistent_on_acceptance(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1705,6 +1808,21 @@ class SglangConcurrencyThroughputTest(unittest.TestCase):
         copy = 'cp "$repo_root/examples/sglang-64k-concurrency-throughput.toml" "$run_dir/run.toml"'
         self.assertIn(copy, readme)
         self.assertLess(readme.index(copy), readme.index('--config "$run_dir/run.toml"', readme.index(copy)))
+        self.assertIn("explicitly authorized operator", readme)
+        self.assertIn("does **not** activate,", readme)
+        dedicated_resume = readme[readme.index("### Dedicated 64K resume") :]
+        dedicated_resume = dedicated_resume[:dedicated_resume.index("### Legacy 6K run")]
+        for text in (
+            "set -euo pipefail",
+            'run_dir="$repo_root/sglang-64k-run"',
+            'config="$run_dir/run.toml"',
+            'state="$run_dir/run.state.json"',
+            "--preflight",
+            "--resume",
+            'pid_start_tmp="$run_dir/.run.pid-start.',
+            'mv -f -- "$pid_start_tmp" "$run_dir/run.pid-start"',
+        ):
+            self.assertIn(text, dedicated_resume)
 
 
 if __name__ == "__main__":

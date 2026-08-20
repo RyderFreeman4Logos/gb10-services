@@ -160,13 +160,22 @@ The tracked 64K plan runs five waves at each concurrency level
 `1,2,4,6,8,10,12,14,16` (45 waves total). It targets the raw SGLang
 OpenAI-compatible listener and served model from the TOML; do not point it at
 Guard or invent a model alias that the server does not expose. The example is
-client-only and does not change any live service configuration:
+client-only and does not change any live service configuration. Before launch,
+an explicitly authorized operator must perform the SGLang backend cutover to
+the configured raw listener and alias. This procedure does **not** activate,
+restart, or mutate any service; it only verifies the already-authorized target
+and runs the client benchmark. The preflight is fail-closed and checks the
+configured raw `/v1/models` route for the required served alias before
+`nohup` is reached.
 
 ```bash
+set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 run_dir="$repo_root/sglang-64k-run"
 mkdir -p "$run_dir"
 cp "$repo_root/examples/sglang-64k-concurrency-throughput.toml" "$run_dir/run.toml"
+python3 "$repo_root/scripts/sglang_6k_concurrency_throughput.py" \
+  --config "$run_dir/run.toml" --preflight
 nohup python3 "$repo_root/scripts/sglang_6k_concurrency_throughput.py" \
   --config "$run_dir/run.toml" \
   --state "$run_dir/run.state.json" \
@@ -178,6 +187,44 @@ start_time=$(awk '{print $22}' "/proc/$pid/stat")
 printf '%s %s\n' "$pid" "$start_time" >"$run_dir/run.pid-start"
 printf 'pid=%s start_time=%s\n' "$pid" "$start_time"
 ```
+
+### Dedicated 64K resume
+
+Resume only the dedicated 64K run from `sglang-64k-run`; do not reuse the
+legacy 6K `sglang-run` directory or its TOML. Re-run the raw backend identity
+preflight before adopting the checkpoint, then verify the saved PID/start-time
+receipt before launching the same artifact paths:
+
+```bash
+set -euo pipefail
+repo_root="$(git rev-parse --show-toplevel)"
+run_dir="$repo_root/sglang-64k-run"
+config="$run_dir/run.toml"
+state="$run_dir/run.state.json"
+python3 "$repo_root/scripts/sglang_6k_concurrency_throughput.py" \
+  --config "$config" --preflight
+saved_pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$state")
+saved_start=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["start_time"])' "$state")
+if [ -r "/proc/$saved_pid/stat" ] && [ "$(awk '{print $22}' "/proc/$saved_pid/stat")" = "$saved_start" ]; then
+  echo "refusing resume: saved benchmark owner is still live" >&2
+  exit 1
+fi
+nohup python3 "$repo_root/scripts/sglang_6k_concurrency_throughput.py" \
+  --config "$config" \
+  --state "$state" \
+  --progress "$run_dir/run.progress.yaml" \
+  --out "$run_dir/run.json" \
+  --resume \
+  >"$run_dir/run.log" 2>&1 &
+pid=$!
+start_time=$(awk '{print $22}' "/proc/$pid/stat")
+pid_start_tmp="$run_dir/.run.pid-start.$pid.tmp"
+printf '%s %s\n' "$pid" "$start_time" >"$pid_start_tmp"
+mv -f -- "$pid_start_tmp" "$run_dir/run.pid-start"
+printf 'pid=%s start_time=%s\n' "$pid" "$start_time"
+```
+
+### Legacy 6K run
 
 Run the benchmark detached and keep its checkpoint, progress sidecar, output,
 log, and launcher identity together:
