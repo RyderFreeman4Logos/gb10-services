@@ -19,20 +19,20 @@ ALIAS = ROOT / "profile" / "abliterated-qwen-latest-27b-nvfp4"
 UNIT = PROFILE_DIR / "sglang-qwen38-27b.service"
 GUARD = PROFILE_DIR / "llm-guard-proxy" / "config.toml"
 
-# Exact immutable arm64 image digest inspected for this box (brief / cookbook).
-SGLANG_DIGEST = "lmsysorg/sglang@sha256:3c0abdf41ef22de9d7a859dc16ed71eae69452e36c91f071a25e60c85a6d1fc6"
-# Host source of the read-only draft mount (docker -v source, always stays).
-DSPARK_DRAFT_PATH = "/home/obj/models/RadixArk/Qwen3.8-27B-DSpark"
+# Exact immutable arm64 image digest built for the DFlash2 trial.
+SGLANG_DIGEST = "lmsysorg/sglang@sha256:f6c809a2ebdeea97a3732e8bc139a32c18c9fb00a6e2fd770d257d9f72466ed3"
+# Host source of the read-only DFlash2 draft mount (docker -v source).
+DFLASH_DRAFT_PATH = "/home/obj/models/z-lab/Qwen3.8-27B-DFlash2"
 # The stable public alias every caller uses; must survive model swaps.
 SERVED_ALIAS = "abliterated-qwen-latest-27b-nvfp4"
 # Flat hf --local-dir docker mount targets the server paths must resolve to
 # (the snapshots/<sha> subdirs do NOT exist under a --local-dir install).
 MODEL_MOUNT = "/models/qwen38-nvfp4"
-DRAFT_MOUNT = "/models/qwen38-dspark"
+DRAFT_MOUNT = "/models/qwen38-dflash2"
 # Revision-locked hub SHA pins, documented in the unit comments (kept when the
 # server path is the flat mount, not the hub snapshots/<sha> path).
 NVFP4_SHA = "faf7945020c138c8ef864ab1644273f3158f85fa"
-DSPARK_SHA = "85ef153be924f17ce4bf62726954eeaa4a73e854"
+DFLASH_SHA = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
 
 
 class Qwen38ProfileLayoutTests(unittest.TestCase):
@@ -67,6 +67,10 @@ class Qwen38UnitContractTests(unittest.TestCase):
 
     def test_unit_pins_exact_sglang_digest(self):
         self.assertIn(SGLANG_DIGEST, self.text)
+        self.assertNotIn(
+            "lmsysorg/sglang@sha256:3c0abdf41ef22de9d7a859dc16ed71eae69452e36c91f071a25e60c85a6d1fc6",
+            self.text,
+        )
         # tag-comment must be present and not the deleted spark image.
         self.assertIn("lmsysorg/sglang:qwen38-27b", self.text)
         self.assertNotIn("lmsysorg/sglang:spark", self.text)
@@ -85,7 +89,7 @@ class Qwen38UnitContractTests(unittest.TestCase):
 
     def test_unit_pins_kv_cache_dtype_fp8(self):
         # Live `auto` allocated torch.bfloat16 / 41028 tokens and did NOT honor
-        # NVFP4's FP8 calibration; fp8_e4m3 is pinned so KV really reaches 262144.
+        # NVFP4's FP8 calibration; fp8_e4m3 is pinned for the 262144 trial window.
         # Scope to the launch_server argv so the required historical comment
         # (which mentions auto/41028) does not trip the negative assertion.
         argv = self.text.split("--sampling-defaults model", 1)[0]
@@ -101,8 +105,8 @@ class Qwen38UnitContractTests(unittest.TestCase):
         self.assertNotIn("--max-total-tokens", argv)
         self.assertIn("--context-length 262144", argv)
 
-    def test_unit_adds_dspark_speed_flags(self):
-        # MiaAI 2026-08-18 start-dspark.sh speed flags (code-decode ~51 tok/s).
+    def test_unit_adds_dflash_speed_flags(self):
+        # Keep the tuned compile/decode flags for the DFlash2 trial.
         for flag in (
             "--speculative-num-draft-tokens 8",
             "--enable-torch-compile",
@@ -116,16 +120,19 @@ class Qwen38UnitContractTests(unittest.TestCase):
         self.assertNotIn("--cuda-graph-max-bs \\", self.text)
         self.assertNotIn("--cuda-graph-max-bs \n", self.text)
 
-    def test_unit_uses_dspark_speculative_decoding(self):
-        self.assertIn("--speculative-algorithm DSPARK", self.text)
+    def test_unit_uses_dflash2_speculative_decoding(self):
+        self.assertIn("--speculative-algorithm DFLASH", self.text)
+        self.assertNotIn("--speculative-algorithm DSPARK", self.text)
         self.assertNotIn("--speculative-algorithm EAGLE", self.text)
-        self.assertIn("--speculative-dspark-block-size 7", self.text)
-        self.assertIn("--speculative-draft-model-quantization unquant", self.text)
+        self.assertIn("--mamba-radix-cache-strategy extra_buffer", self.text)
+        self.assertNotIn("--mamba-radix-cache-strategy extra_buffer_lazy", self.text)
+        self.assertNotIn("--speculative-dspark-block-size", self.text)
+        self.assertNotIn("--speculative-draft-model-quantization", self.text)
         # Draft server path is the flat --local-dir mount target.
         self.assertIn(f"--speculative-draft-model-path {DRAFT_MOUNT}", self.text)
-        self.assertIn(DSPARK_DRAFT_PATH, self.text)
+        self.assertIn(DFLASH_DRAFT_PATH, self.text)
         # Hub SHA pin kept as a documented comment, not a snapshots path.
-        self.assertIn(DSPARK_SHA, self.text)
+        self.assertIn(DFLASH_SHA, self.text)
 
     def test_unit_has_no_hub_snapshots_paths(self):
         # hf --local-dir never creates snapshots/<sha>; the server must use the
@@ -133,9 +140,8 @@ class Qwen38UnitContractTests(unittest.TestCase):
         self.assertNotIn("/snapshots/", self.text)
 
     def test_unit_pins_throughput_and_memory_contract(self):
-        # mem-fraction 0.83 is the floor scale for a real 262144 KV pool:
-        # live 0.72 + --max-total-tokens 262144 still allocated 233344 fp8
-        # tokens with 16.53 GB leftover (262144/233344*0.72 ~= 0.81, +buffer).
+        # mem-fraction 0.83 remains fixed while the DFlash2 trial uses 262144
+        # context within the unchanged 74g memory envelope.
         self.assertIn("--context-length 262144", self.text)
         self.assertIn("--mem-fraction-static 0.83", self.text)
         self.assertIn("SGLANG_MEM_FRACTION=0.83", self.text)
@@ -237,6 +243,10 @@ class Qwen38GuardContractTests(unittest.TestCase):
         self.assertNotIn("thinking_mode = \"force_disable\"", self.text)
         self.assertNotIn("thinking_mode = \"force_thinking\"", self.text)
         self.assertNotIn("temperature = 0.6", self.text)
+
+    def test_retry_disables_shielded_streaming(self):
+        self.assertIn("shielded_streaming_enabled = false", self.text)
+        self.assertNotIn("shielded_streaming_enabled = true", self.text)
 
     def test_live_guard_rejects_unknown_upstreams_retry_table(self):
         # Live Guard 8adcce30 fails on table [upstreams.retry]; keep ladder + [retry].

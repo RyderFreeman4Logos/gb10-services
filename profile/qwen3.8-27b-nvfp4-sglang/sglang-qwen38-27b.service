@@ -4,8 +4,8 @@
 # alias. Do not enable/start here; a later authorized cutover activates it.
 [Unit]
 # SGLang image release: lmsysorg/sglang:qwen38-27b, immutable arm64 digest
-# sha256:3c0abdf41ef22de9d7a859dc16ed71eae69452e36c91f071a25e60c85a6d1fc6
-Description=SGLang Qwen3.8-27B NVFP4 + DSpark (profile-selected, DSPARK)
+# sha256:f6c809a2ebdeea97a3732e8bc139a32c18c9fb00a6e2fd770d257d9f72466ed3
+Description=SGLang Qwen3.8-27B NVFP4 + DFlash2 (profile-selected, DFLASH)
 # Independent of embedding/reranker so text can restart alone (no HTTP poll).
 After=network.target
 Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service vllm-aeon-27b-dflash-hikv.service
@@ -20,8 +20,7 @@ Environment=HF_HUB_OFFLINE=1
 Environment=GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1
 Environment=GB10_CONTAINER_CIDFILE=%t/gb10-memory-guardian/sglang-text.cid
 # Ferries the 0.83 mem-fraction reservation through the env -i exec below.
-# 0.83 is the static fraction floor scale (262144/233344*0.72~=0.81) plus
-# buffer so the real KV pool reaches >= 262144 within the 74g envelope.
+# 0.83 is retained for the 262144-context DFlash2 trial within the 74g envelope.
 Environment=SGLANG_MEM_FRACTION=0.83
 # Swap is impossible for this unit: systemd MemorySwapMax=0 AND docker
 # memory==memory-swap (74g/74g) with swappiness 0. No swap can be created
@@ -29,7 +28,7 @@ Environment=SGLANG_MEM_FRACTION=0.83
 MemorySwapMax=0
 # 74g is the text share of (MemTotal - 5G OS pad - emb 24g - querit 18g).
 # Dropping the max-total-tokens pool cap lets the leftover envelope become
-# concurrent KV; --context-length 262144 remains the window floor.
+# concurrent KV; --context-length 262144 remains the DFlash2 trial window.
 # OS residual target: leave 5-10 GiB MemAvailable for the host; the rest goes
 # to the three model services (text 74g + emb 24g + querit 18g <= ~116g, with a
 # 5 GiB OS pad outside every --memory).
@@ -40,11 +39,11 @@ TimeoutStartSec=3000
 TimeoutStopSec=60
 
 ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-memory-guardian
-# Host-pinned NVFP4 weights + DSpark draft, mounted read-only. Both are
+# Host-pinned NVFP4 weights + DFlash2 draft, mounted read-only. Both are
 # revision-locked destinations (download/prepare may still be running).
 # Server paths are the flat hf --local-dir mounts (no snapshots/<sha> subdirs).
 # Pinned hub revisions: NVFP4 @faf7945020c138c8ef864ab1644273f3158f85fa,
-# DSpark @85ef153be924f17ce4bf62726954eeaa4a73e854.
+# DFlash2 @50307d4c4cde6860d4eee73e2547cd786fe8e8a4.
 # cpuset 5-8,15-18 are the MiaAI text acceleration set; leave cores 9 and 19
 # for embedding/reranker.
 ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/sglang-text.cid --name qwen3.8-27b-sglang \
@@ -54,13 +53,13 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --shm-size 32g \
   -p 100.105.4.92:18010:30000 \
   -v /home/obj/models/RadixArk/Qwen3.8-27B-NVFP4:/models/qwen38-nvfp4:ro \
-  -v /home/obj/models/RadixArk/Qwen3.8-27B-DSpark:/models/qwen38-dspark:ro \
+  -v /home/obj/models/z-lab/Qwen3.8-27B-DFlash2:/models/qwen38-dflash2:ro \
   -e HF_HUB_OFFLINE=1 \
   --memory-swappiness 0 \
   --memory 74g \
   --memory-swap 74g \
   --oom-score-adj 800 \
-  lmsysorg/sglang@sha256:3c0abdf41ef22de9d7a859dc16ed71eae69452e36c91f071a25e60c85a6d1fc6 \
+  lmsysorg/sglang@sha256:f6c809a2ebdeea97a3732e8bc139a32c18c9fb00a6e2fd770d257d9f72466ed3 \
   python3 -m sglang.launch_server \
   --model-path /models/qwen38-nvfp4 \
   --host 0.0.0.0 --port 30000 \
@@ -72,14 +71,12 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --disable-prefill-cuda-graph \
   --kv-cache-dtype fp8_e4m3 \
   --mamba-ssm-dtype float32 \
-  --mamba-radix-cache-strategy extra_buffer_lazy \
+  --mamba-radix-cache-strategy extra_buffer \
   --max-mamba-cache-size 32 \
   --max-running-requests 8 \
   --context-length 262144 \
-  --speculative-algorithm DSPARK \
-  --speculative-draft-model-path /models/qwen38-dspark \
-  --speculative-dspark-block-size 7 \
-  --speculative-draft-model-quantization unquant \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path /models/qwen38-dflash2 \
   --speculative-num-draft-tokens 8 \
   --enable-torch-compile \
   --torch-compile-max-bs 4 \
@@ -90,10 +87,9 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --sampling-defaults model
 # NVFP4 declares kv_cache_quant_algo FP8, but live --kv-cache-dtype auto
 # allocated torch.bfloat16 / 41028 tokens (it did NOT honor the fp8_e4m3
-# calibration scales). fp8_e4m3 is pinned explicitly so KV really reaches
-# 262144 tokens. Do NOT raise KV quantization aggressiveness.
-# DSpark verify window D=8 sizes a SEPARATE GDN buffer, so the max-mamba-cache-size
-# 32 (8 x 4 slots) pin stands alone. mamba-full-memory-ratio 4.21 was tuned at
+# calibration scales). fp8_e4m3 is pinned explicitly for the 262144-token
+# DFlash2 trial. Do NOT raise KV quantization aggressiveness.
+# DFlash2 keeps the max-mamba-cache-size 32 pin. mamba-full-memory-ratio 4.21 was tuned at
 # MIAI's 0.95 and is NOT trusted at 0.72: re-derive after first boot.
 #   ponytail: ratio 4.21 untrusted at mem-fraction 0.72; re-derive post-boot.
 # mamba-ssm-dtype float32 (operator quality choice) about 2x the GDN slot cost
