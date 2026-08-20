@@ -1,0 +1,138 @@
+{
+  "receipt_type": "sglang_throughput_result",
+  "run_date": "2026-08-20",
+  "run_status": "COMPLETE",
+  "raw_endpoint": "http://100.105.4.92:18010/v1",
+  "raw_model": "abliterated-qwen-latest-27b-nvfp4",
+  "source_commit": "95ebde62c36422d0e8d117539c8e1b29c4e6f1c1",
+  "configuration_epoch": "daa3b82509713c2b3ddc9011b357e92edc73837d45570ca326cf1e1fdd6f5b12",
+  "plan": {
+    "minimum_prompt_tokens": 64000,
+    "max_tokens": 512,
+    "concurrency_levels": [1, 2, 4, 6, 8, 10, 12, 14, 16],
+    "waves_per_level": 5,
+    "total_waves": 45,
+    "work_units": 365,
+    "client_workers": 16
+  },
+  "totals": {
+    "successful": 365,
+    "failed": 0,
+    "retries": 0,
+    "min_observed_prompt_tokens": 64122,
+    "aggregate_completion_tokens": 47903,
+    "finish_length": 46,
+    "elapsed_seconds": 19535.79376
+  },
+  "level_aggregates": [
+    {
+      "concurrency": 1,
+      "waves": 5,
+      "successful": 5,
+      "failed": 0,
+      "retries": 0,
+      "prompt_tok_s_mean": 1201.065973,
+      "decode_tok_s_mean": 2.732271,
+      "wave_wall_s_mean": 53.545902
+    },
+    {
+      "concurrency": 2,
+      "waves": 5,
+      "successful": 10,
+      "failed": 0,
+      "retries": 0,
+      "prompt_tok_s_mean": 1183.971472,
+      "decode_tok_s_mean": 2.449674,
+      "wave_wall_s_mean": 108.810425
+    },
+    {
+      "concurrency": 4,
+      "waves": 5,
+      "successful": 20,
+      "failed": 0,
+      "retries": 0,
+      "prompt_tok_s_mean": 1183.563204,
+      "decode_tok_s_mean": 3.320521,
+      "wave_wall_s_mean": 217.019389
+    },
+    {
+      "concurrency": 6,
+      "waves": 5,
+      "successful": 30,
+      "failed": 0,
+      "retries": 0,
+      "prompt_tok_s_mean": 1187.676039,
+      "decode_tok_s_mean": 3.155899,
+      "wave_wall_s_mean": 324.120617
+    },
+    {
+      "concurrency": 8,
+      "waves": 5,
+      "successful": 40,
+      "failed": 0,
+      "retries": 0,
+      "prompt_tok_s_mean": 1163.471858,
+      "decode_tok_s_mean": 2.369992,
+      "wave_wall_s_mean": 442.443507
+    },
+    {
+      "concurrency": 10,
+      "waves": 5,
+      "successful": 50,
+      "failed": 0,
+      "retries": 0,
+      "prompt_tok_s_mean": 1163.086594,
+      "decode_tok_s_mean": 2.083333,
+      "wave_wall_s_mean": 552.402979
+    },
+    {
+      "concurrency": 12,
+      "waves": 5,
+      "successful": 60,
+      "failed": 0,
+      "retries": 0,
+      "prompt_tok_s_mean": 1209.406421,
+      "decode_tok_s_mean": 2.454606,
+      "wave_wall_s_mean": 636.682853
+    },
+    {
+      "concurrency": 14,
+      "waves": 5,
+      "successful": 70,
+      "failed": 0,
+      "retries": 0,
+      "prompt_tok_s_mean": 1224.082036,
+      "decode_tok_s_mean": 2.040408,
+      "wave_wall_s_mean": 733.830588
+    },
+    {
+      "concurrency": 16,
+      "waves": 5,
+      "successful": 80,
+      "failed": 0,
+      "retries": 0,
+      "prompt_tok_s_mean": 1226.411614,
+      "decode_tok_s_mean": 2.520377,
+      "wave_wall_s_mean": 838.143542
+    }
+  ],
+  "artifact_sha256": {
+    "run_json": "29f74c3675eeaed214ae306fc67d68c1e3e654c7c2f7caeb89f5ed7904590bda",
+    "state": "4ff933f50841515c6c00b8b2d8936951936294d284aa0058f9a6b992571ed9be",
+    "progress": "0e1aa87c5f33d3e56631b22b7dc2e1285d2a3f19ad072b10ac63155363031e78",
+    "copied_harness": "743a4c3967c80d36dd2d487246cf5cb1cfd185811bd38b008bc512e0c0f90529",
+    "copied_toml": "0780ef037ae6977dc5e5f3693e0a28643edd18ef907f6f643e3d70d1d5d609d0"
+  },
+  "validation": {
+    "checkpoint_schema": 2,
+    "statement": "All 45 waves were independently revalidated by harness _load_state/_completed_wave_error; state and report waves equal; all service NRestarts=0 during/after run.",
+    "service_units": [
+      "sglang-qwen38-27b.service",
+      "llm-guard-proxy.service",
+      "vllm-embedding.service",
+      "vllm-querit-4b-reranker.service"
+    ],
+    "service_nrestarts": 0,
+    "throughput_scope": "All throughput metrics are harness client-observed; this receipt makes no server/GPU throughput claim."
+  }
+}
