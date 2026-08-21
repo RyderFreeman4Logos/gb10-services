@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PROFILE_DIR = ROOT / "profile" / "qwen3.8-27b-nvfp4-sglang"
 ALIAS = ROOT / "profile" / "abliterated-qwen-latest-27b-nvfp4"
 UNIT = PROFILE_DIR / "sglang-qwen38-27b.service"
+QUERIT_UNIT = ROOT / "systemd" / "vllm-querit-4b-reranker.service"
 GUARD = PROFILE_DIR / "llm-guard-proxy" / "config.toml"
 
 # Exact immutable arm64 image digest built for the DFlash2 trial.
@@ -34,6 +35,29 @@ DRAFT_MOUNT = "/models/qwen38-dflash2"
 # server path is the flat mount, not the hub snapshots/<sha> path).
 NVFP4_SHA = "faf7945020c138c8ef864ab1644273f3158f85fa"
 DFLASH_SHA = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
+
+
+class ModelStartupOrderingContractTests(unittest.TestCase):
+    def test_model_units_wait_on_real_readiness_probes(self):
+        querit = QUERIT_UNIT.read_text()
+        sglang = UNIT.read_text()
+
+        self.assertIn("After=network.target", querit)
+        self.assertIn("After=vllm-embedding.service", querit)
+        self.assertIn("After=network.target", sglang)
+        self.assertIn("After=vllm-querit-4b-reranker.service", sglang)
+        self.assertIn("After=vllm-embedding.service", sglang)
+        self.assertRegex(
+            sglang,
+            r"(?m)^ExecStartPost=.*gb10_service_ready\.sh chat "
+            r"http://100\.105\.4\.92:18010 "
+            r"abliterated-qwen-latest-27b-nvfp4 --deadline \d+$",
+        )
+        for unit in (querit, sglang):
+            self.assertNotRegex(
+                unit,
+                r"(?m)^(?:Requires|BindsTo|PartOf)=.*vllm-embedding\.service",
+            )
 
 
 class Qwen38ProfileLayoutTests(unittest.TestCase):
