@@ -19,6 +19,7 @@ GUARD_CONFIG = ROOT / "config" / "llm-guard-proxy" / "config.toml"
 PRODUCTION_STATE = "/home/obj/.local/state/gb10-lifecycle"
 UNIT = "vllm-aeon-27b-dflash.service"
 HIKV_UNIT = "vllm-aeon-27b-dflash-hikv.service"
+QWEN38_UNIT = "vllm-aeon-qwen38-dflash.service"
 
 
 class LifecycleAuditScriptTests(unittest.TestCase):
@@ -483,6 +484,29 @@ class LifecycleAuditScriptTests(unittest.TestCase):
         audit = (self.state / "lifecycle-audit.log").read_text()
         self.assertIn(
             f"event=request action=start unit={HIKV_UNIT} "
+            "actor=test-operator reason=approved-maintenance outcome=accepted "
+            "reset_failed=false",
+            audit,
+        )
+
+    def test_qwen38_canary_unit_is_accepted_for_audited_lifecycle(self) -> None:
+        result = self.execute(
+            "start",
+            "--unit",
+            QWEN38_UNIT,
+            "--actor",
+            "test-operator",
+            "--reason",
+            "approved-maintenance",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            self.systemctl_log.read_text(), f"--user start --no-block {QWEN38_UNIT}\n"
+        )
+        audit = (self.state / "lifecycle-audit.log").read_text()
+        self.assertIn(
+            f"event=request action=start unit={QWEN38_UNIT} "
             "actor=test-operator reason=approved-maintenance outcome=accepted "
             "reset_failed=false",
             audit,

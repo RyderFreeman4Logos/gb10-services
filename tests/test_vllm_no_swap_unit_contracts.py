@@ -47,6 +47,10 @@ SERVICE_CONTRACTS = {
         "vllm-aeon-27b-dflash",
         "%t/gb10-memory-guardian/aeon-text.cid",
     ),
+    "vllm-aeon-qwen38-dflash.service": (
+        "vllm-aeon-qwen38-dflash",
+        "%t/gb10-memory-guardian/aeon-qwen38-text.cid",
+    ),
     "vllm-embedding.service": (
         "vllm-embedding",
         "%t/gb10-vllm-cids/vllm-embedding.cid",
@@ -65,6 +69,11 @@ DFLASH_CLEANUP_CONTAINERS = (
     "vllm-aeon-27b-dflash-hikv",
     "vllm-aeon-27b-dflash",
 )
+QWEN38_CLEANUP_CONTAINERS = ("vllm-aeon-qwen38-dflash",)
+AEON_UNITS = {
+    "vllm-aeon-27b-dflash.service",
+    "vllm-aeon-qwen38-dflash.service",
+}
 
 
 def _logical_argv(unit: str, directive: str) -> list[list[str]]:
@@ -128,7 +137,7 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                 start = _logical_argv(unit, "ExecStart")
                 self.assertEqual(len(start), 1)
                 argv = start[0]
-                if name == "vllm-aeon-27b-dflash.service":
+                if name in AEON_UNITS:
                     self.assertEqual(
                         argv[: len(AEON_DOCKER_PREFIX)], AEON_DOCKER_PREFIX
                     )
@@ -162,7 +171,10 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                 self.assertIn(f"--cidfile={cidfile}", argv)
                 self.assertIn("UMask=0077", unit)
                 expected_memory_swap_max = (
-                    ["0"] if name == "vllm-querit-4b-reranker.service" else []
+                    ["0"]
+                    if name
+                    in {"vllm-aeon-qwen38-dflash.service", "vllm-querit-4b-reranker.service"}
+                    else []
                 )
                 self.assertEqual(
                     [
@@ -175,7 +187,7 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                 unit_path = f"{UNIT_ROOT}/{name}"
                 verification_prefix = (
                     AEON_PRODUCTION_PREFIX
-                    if name == "vllm-aeon-27b-dflash.service"
+                    if name in AEON_UNITS
                     else PRODUCTION_PREFIX
                 )
                 condition = verification_prefix + ["--unit", unit_path]
@@ -215,6 +227,8 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                 cleanup_containers = (
                     DFLASH_CLEANUP_CONTAINERS
                     if name == "vllm-aeon-27b-dflash.service"
+                    else QWEN38_CLEANUP_CONTAINERS
+                    if name == "vllm-aeon-qwen38-dflash.service"
                     else (container,)
                 )
                 for cleanup_container in cleanup_containers:
@@ -308,7 +322,7 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                 for argv in helper_commands:
                     expected_prefix = (
                         AEON_PRODUCTION_PREFIX
-                        if name == "vllm-aeon-27b-dflash.service"
+                        if name in AEON_UNITS
                         and "--cleanup" not in argv
                         else PRODUCTION_PREFIX
                     )
