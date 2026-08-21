@@ -12,7 +12,11 @@ ROOT = Path(__file__).resolve().parents[1]
 UNIT = ROOT / "systemd" / "vllm-aeon-qwen38-dflash.service"
 QWEN36_UNIT = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
 SGLANG_UNIT = ROOT / "profile" / "qwen3.8-27b-nvfp4-sglang" / "sglang-qwen38-27b.service"
-IMAGE = "ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f"
+IMAGE_REPOSITORY = "ghcr.io/aeon-7/aeon-vllm-ultimate"
+IMAGE_TAG = "latest"
+IMAGE_DIGEST = "sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f"
+IMAGE = f"ghcr.io/aeon-7/aeon-vllm-ultimate@{IMAGE_DIGEST}"
+IMAGE_CREATED = "2026-08-20T21:17:36.420048521-04:00"
 ALIAS = "abliterated-qwen-latest-27b-nvfp4"
 NVFP4_HOST = "/home/obj/models/RadixArk/Qwen3.8-27B-NVFP4"
 DFLASH_HOST = "/home/obj/models/z-lab/Qwen3.8-27B-DFlash2"
@@ -57,9 +61,15 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
         self.assertEqual(speculative["model"], DFLASH_MOUNT)
         self.assertEqual(speculative["num_speculative_tokens"], 10)
 
-    def test_unit_pins_slim_aeon_engine_and_quality_envelope(self) -> None:
+    def test_unit_pins_latest_aeon_engine_and_quality_envelope(self) -> None:
         text = _unit_text()
         argv = _runtime_argv(text)
+        exec_start = _logical_argv(text, "ExecStart")
+        self.assertEqual(len(exec_start), 1)
+        self.assertIn(f"image tag: {IMAGE_TAG} (repository {IMAGE_REPOSITORY})", text)
+        self.assertIn(f"resolved immutable digest: {IMAGE_DIGEST}", text)
+        self.assertIn(f"created: {IMAGE_CREATED}", text)
+        self.assertNotIn(f"{IMAGE_REPOSITORY}:{IMAGE_TAG}", " ".join(exec_start[0]))
         self.assertIn(IMAGE, text)
         self.assertIn("/opt/hang_guard/aeon_vllm_wrapper.py", text)
         self.assertEqual(_option_value(argv, "--max-model-len"), "262144")
@@ -77,6 +87,11 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
         self.assertIn("--memory-swappiness 0", text)
         self.assertIn("MemoryMax=74G", text)
         self.assertIn("MemorySwapMax=0", text)
+
+    def test_unit_omits_pooling_only_prefill_flags_for_generative_serve(self) -> None:
+        argv = _runtime_argv(_unit_text())
+        self.assertNotIn("--max-num-partial-prefills", argv)
+        self.assertNotIn("--max-long-partial-prefills", argv)
 
     def test_unit_serves_stable_alias_first_and_uses_distinct_identity(self) -> None:
         text = _unit_text()

@@ -1,4 +1,6 @@
 # AEON image release: 2026-08-17-v0.27.1-slim; immutable digest: sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f
+# AEON image tag: latest (repository ghcr.io/aeon-7/aeon-vllm-ultimate); resolved immutable digest: sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f; created: 2026-08-20T21:17:36.420048521-04:00
+# As of 2026-08-21, :latest resolves to this digest; ExecStart uses the immutable digest pin.
 # This is a canary of the AEON engine + incumbent Qwen3.8 weights.
 # Capacity note: KV≥262144 is a live receipt, not a source claim.
 [Unit]
@@ -67,8 +69,6 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
     --max-model-len 262144 \
     --max-num-seqs 16 \
     --max-num-batched-tokens 4096 \
-    --max-num-partial-prefills 1 \
-    --max-long-partial-prefills 1 \
     --enable-prefix-caching \
     --gpu-memory-utilization ${AEON_GPU_MEMORY_UTILIZATION} \
     --enable-chunked-prefill \
