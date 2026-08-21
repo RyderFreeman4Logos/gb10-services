@@ -100,7 +100,7 @@ class Qwen38UnitContractTests(unittest.TestCase):
     def test_unit_omits_max_total_tokens_pool_cap(self):
         # --max-total-tokens is a pool CAP, not an OOM guard; it blocks leftover
         # envelope from becoming concurrent KV. Dropping it lets SGLang grow KV
-        # into the new 74g envelope within --mem-fraction-static 0.83.
+        # into the 69g envelope within --mem-fraction-static 0.83.
         # Scope to launch_server argv so comments cannot false-positive.
         argv = self.text.split("--sampling-defaults model", 1)[0]
         self.assertNotIn("--max-total-tokens", argv)
@@ -148,7 +148,7 @@ class Qwen38UnitContractTests(unittest.TestCase):
 
     def test_unit_pins_throughput_and_memory_contract(self):
         # mem-fraction 0.83 remains fixed while the DFlash2 trial uses 262144
-        # context within the unchanged 74g memory envelope.
+        # context within the 69g memory envelope (5g soak vs the prior 74g).
         self.assertIn("--context-length 262144", self.text)
         self.assertIn("--mem-fraction-static 0.83", self.text)
         self.assertIn("SGLANG_MEM_FRACTION=0.83", self.text)
@@ -205,8 +205,12 @@ class Qwen38UnitContractTests(unittest.TestCase):
     def test_unit_swap_is_impossible(self):
         # Docker: memory == memory-swap (zero extra swap) + swappiness 0.
         self.assertIn("--memory-swappiness 0", self.text)
-        self.assertRegex(self.text, r"--memory\s+74g")
-        self.assertRegex(self.text, r"--memory-swap\s+74g")
+        self.assertRegex(self.text, r"--memory\s+69g")
+        self.assertRegex(self.text, r"--memory-swap\s+69g")
+        self.assertNotIn("--memory 74g", self.text)
+        self.assertNotIn("--memory-swap 74g", self.text)
+        self.assertIn("MemoryMax=69G", self.text)
+        self.assertNotIn("MemoryMax=74G", self.text)
         # systemd: no swap escapes the unit.
         self.assertIn("MemorySwapMax=0", self.text)
 
