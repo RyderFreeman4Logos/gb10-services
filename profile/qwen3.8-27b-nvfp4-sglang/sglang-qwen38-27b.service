@@ -92,8 +92,8 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --speculative-draft-model-path /models/qwen38-dflash2 \
   --speculative-num-draft-tokens 8 \
   --enable-torch-compile \
-  --torch-compile-max-bs 16 \
-  --cuda-graph-max-bs-decode 16 \
+  --torch-compile-max-bs 4 \
+  --cuda-graph-max-bs-decode 4 \
   --num-continuous-decode-steps 2 \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
@@ -107,9 +107,11 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
 # and extra arrivals queue. The leftover UMA envelope is not a promise of
 # multiple KV windows under co-residency: float32 mamba still dominates.
 # Keep GDN float32, fp8_e4m3, and 16-way admission unchanged.
-# Decode CUDA graphs and torch.compile follow max-running-requests=16 so
-# concurrent lean-digest chunks stay on-graph. max-prefill-tokens 32768 lets
-# one ~18k compression chunk enter in a single prefill step.
+# Co-resident decode CUDA graphs and torch.compile cap at batch 4. The
+# graph-16 capture path failed at decode bs=10 with ~3.15GB leftover during
+# GDN Triton target_verify; graph-4 is the last known co-resident capture size.
+# max-prefill-tokens 32768 lets one ~18k compression chunk enter in a single
+# prefill step.
 # mamba-full-memory-ratio 4.21 was tuned at
 # MIAI's 0.95 and is NOT trusted at 0.72: re-derive after first boot.
 #   ponytail: ratio 4.21 untrusted at mem-fraction 0.72; re-derive post-boot.

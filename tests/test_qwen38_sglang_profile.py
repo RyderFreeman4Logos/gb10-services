@@ -138,11 +138,13 @@ class Qwen38UnitContractTests(unittest.TestCase):
         for flag in (
             "--speculative-num-draft-tokens 8",
             "--enable-torch-compile",
-            "--torch-compile-max-bs 16",
-            "--cuda-graph-max-bs-decode 16",
+            "--torch-compile-max-bs 4",
+            "--cuda-graph-max-bs-decode 4",
             "--num-continuous-decode-steps 2",
         ):
             self.assertIn(flag, self.text)
+        self.assertNotIn("--torch-compile-max-bs 16", self.text)
+        self.assertNotIn("--cuda-graph-max-bs-decode 16", self.text)
         # Deprecated prefill CUDA-graph flag must NOT be used; only the decode
         # variant above. Prefill CUDA graphs remain disabled (see unit test).
         self.assertNotIn("--cuda-graph-max-bs \\", self.text)
@@ -211,7 +213,8 @@ class Qwen38UnitContractTests(unittest.TestCase):
             "--mamba-ssm-dtype float32",
             "--max-mamba-cache-size 80",
             "--max-running-requests 16",
-            "--cuda-graph-max-bs-decode 16",
+            "--torch-compile-max-bs 4",
+            "--cuda-graph-max-bs-decode 4",
             "--speculative-draft-model-path /models/qwen38-dflash2",
             "--reasoning-parser qwen3",
         ):
