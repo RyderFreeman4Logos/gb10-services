@@ -18,7 +18,7 @@ profile = importlib.import_module("gb10_embedding_profile_contract")
 UNIT = ROOT / "systemd" / "vllm-embedding.service"
 IMAGE = (
     "ghcr.io/aeon-7/aeon-vllm-ultimate@"
-    "sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7"
+    "sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f"
 )
 MODELS = ("qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B")
 CONTAINER_ID = "a" * 64

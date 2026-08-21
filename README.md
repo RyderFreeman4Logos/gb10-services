@@ -23,7 +23,7 @@ graph TD
 
 ### The 5 Core Services
 1. **vllm-aeon-27b-dflash.service**
-   Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside the pinned AEON v0.26.0 GB10 Docker image for long-context processing up to 256k tokens, with FP8 KV cache and DFlash `TRITON_ATTN` enabled.
+   Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside the pinned AEON v0.27.1-slim GB10 Docker image for long-context processing up to 256k tokens, with FP8 KV cache and DFlash `TRITON_ATTN` enabled.
 2. **vllm-embedding.service**
    Serves BF16 `Qwen/Qwen3-Embedding-8B` with its full 4,096-dimensional output. This is the reliability-critical baseline service. The tracked source profile contracts for 32,768 tokens and 4,800 MiB explicit KV while preserving 8,192 batched tokens, 64 sequences, aliases, and quality semantics. It requests an equal 24g Docker memory/swap envelope (the 5 GiB OS pad lives outside every `--memory`), with the 32,768/4,800M quality contract unchanged. Before readiness, its verifier binds the full Docker ID, PID, Docker `StartedAt`, `/proc` PID starttime and canonical Docker scope, scope inode, and `cgroup.events` population, then proves `HostConfig.MemorySwap == HostConfig.Memory`, `memory.swap.max == 0`, and `memory.swap.current == 0` on that unchanged generation. Its raw backend listens only on port `18012`; clients should use `llm-guard-proxy` on port `18009` or the guard-owned legacy listener `18002` with model `qwen3-embedding-8b`.
 3. **vllm-querit-4b-reranker.service**
@@ -85,24 +85,26 @@ checkout owns the integrated guardian implementation and build. The retained
 `%t/gb10-memory-guardian` name is only the runtime registration directory
 shared by the proxy and text unit.
 
-### Reference Production Profile (source updated 2026-07-27)
+### Reference Production Profile (source updated 2026-08-17)
 
 The tracked source selects this friendly release and immutable repository digest
 for every AEON-backed unit. The running containers remain on their prior image
 until a separately authorized deployment changes them.
 
 ```text
-friendly tag: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-27-v0.26.0
-repository digest: sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7
-rollback/superseded: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-14-v0.25.0 @ sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55
-runtime version: v0.26.0
+friendly tag: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-08-17-v0.27.1-slim
+repository digest: sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f
+rollback/superseded: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-08-16-v0.27.1 @ sha256:13c0df6a321ade60507a9026b0d2963ad51f0499a228de430eeba3bb74ad7954
+runtime version: v0.27.1-slim
 ```
 
-The v0.26.0 image's `ai.aeon.vllm_base` metadata identifies vLLM 0.26.0. Its
-inherited OCI description still names v0.25.1, so the dated friendly tag and
-immutable digest above are the release identity; the stale description is not
-release provenance. Historical v0.25.1 feature claims and deployment evidence
-remain in their dated research records and do not establish v0.26.0 behavior.
+The v0.27.1-slim image's `ai.aeon.vllm_base` metadata identifies vLLM
+0.27.1+aeon.sm121a.dspark with torch 2.13.0+cu130 and FlashInfer 0.6.16.post3;
+the slim rebase is 18.3GB. Its inherited OCI description still names v0.25.1,
+so the dated friendly tag and immutable digest above are the release identity;
+the stale description is not release provenance. Historical prior-generation
+feature claims and deployment evidence remain in their dated research records
+and do not establish v0.27.1 behavior.
 
 Capacity contracts and evidence:
 

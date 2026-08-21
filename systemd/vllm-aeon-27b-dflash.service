@@ -1,7 +1,7 @@
 # DFlash profile selection and capacity history: docs/deployment/AGENTS.md.
 [Unit]
-# AEON image release: 2026-07-27-v0.26.0; immutable digest: sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7
-Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (profile-selected, v0.26.0)
+# AEON image release: 2026-08-17-v0.27.1-slim; immutable digest: sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f
+Description=vLLM AEON-7 Qwen3.6-27B DFlash n=10 (profile-selected, v0.27.1-slim)
 # Independent of embedding/reranker so text can restart alone (no HTTP poll).
 After=network.target
 Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
@@ -33,7 +33,9 @@ TimeoutStopSec=60
 
 ExecCondition=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock AEON_GPU_MEMORY_UTILIZATION=${AEON_GPU_MEMORY_UTILIZATION} /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-aeon-27b-dflash.service
 ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-memory-guardian
-ExecStartPre=/usr/bin/install -d -m 0700 /home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473
+# v0.27.1 slim cache namespace; rollback cache remains at
+# /home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473 -> /var/cache/vllm/aeon-qwen36-v0260.
+ExecStartPre=/usr/bin/install -d -m 0700 /home/obj/.cache/vllm-compile/aeon-qwen36-v0271-2fb855
 ExecStartPre=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-aeon-27b-dflash-n12 --container vllm-aeon-27b-dflash-hikv --container vllm-aeon-27b-dflash --cidfile %t/gb10-memory-guardian/aeon-text.cid
 ExecStartPre=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1
 ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-text.cid --name vllm-aeon-27b-dflash \
@@ -42,7 +44,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   -p 100.105.4.92:18010:8000 \
   -v /home/obj/.cache/huggingface/hub/models--AEON-7--Qwen3.6-27B-AEON-Ultimate-Uncensored-Multimodal-NVFP4-MTP-XS:/models/aeon-cache:ro \
   -v /home/obj/.cache/huggingface/hub/models--z-lab--Qwen3.6-27B-DFlash:/models/dflash-cache:ro \
-  -v /home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473:/var/cache/vllm/aeon-qwen36-v0260 \
+  -v /home/obj/.cache/vllm-compile/aeon-qwen36-v0271-2fb855:/var/cache/vllm/aeon-qwen36-v0271 \
   -v /home/obj/scripts/aeon_hang_guard.py:/opt/hang_guard/aeon_hang_guard.py:ro \
   -v /home/obj/scripts/aeon_vllm_wrapper.py:/opt/hang_guard/aeon_vllm_wrapper.py:ro \
   -e HF_HUB_OFFLINE=1 \
@@ -50,13 +52,14 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   -e CMAKE_BUILD_PARALLEL_LEVEL=1 \
   -e PYTHONPATH=/opt/hang_guard \
   -e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768 \
+  -e VLLM_USE_V2_MODEL_RUNNER=0 \
   -e AEON_THINKING_BUDGET_GUARD=0 \
   --memory-swappiness 0 \
   --memory 74g \
   --memory-swap 74g \
   --oom-score-adj 800 \
   --entrypoint python3 \
-  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7 \
+  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f \
   /opt/hang_guard/aeon_vllm_wrapper.py serve \
     /models/aeon-cache/snapshots/6394b93fa092dcbfbf09e952f56f30337509d17c \
     --host 0.0.0.0 --port 8000 \
@@ -74,7 +77,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
     --gpu-memory-utilization ${AEON_GPU_MEMORY_UTILIZATION} \
     --enable-chunked-prefill \
     --scheduler-reserve-full-isl \
-    --compilation-config "{\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_num_of_warmups\":0,\"cache_dir\":\"/var/cache/vllm/aeon-qwen36-v0260\"}" \
+    --compilation-config "{\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_num_of_warmups\":0,\"cache_dir\":\"/var/cache/vllm/aeon-qwen36-v0271\"}" \
     --jit-monitor-mode warn \
     --max-logprobs 20 \
     --speculative-config "{\"method\":\"dflash\",\"model\":\"/models/dflash-cache/snapshots/0919688658996800f86b895034249700e9481106\",\"num_speculative_tokens\":10,\"attention_backend\":\"TRITON_ATTN\"}" \

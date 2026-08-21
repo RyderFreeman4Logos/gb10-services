@@ -26,7 +26,7 @@ NO_SWAP_PREFIX = [
 ]
 IMAGE = (
     "ghcr.io/aeon-7/aeon-vllm-ultimate@"
-    "sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7"
+    "sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f"
 )
 EXCLUSIVE_PRODUCTION_OWNERS = {
     "vllm-querit-4b-reranker.service",

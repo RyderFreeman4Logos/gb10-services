@@ -13,7 +13,7 @@ from typing import Any, Mapping
 MODEL_ID = "Querit/Querit-4B"
 PINNED_REVISION = "7b796de30ad8dc772d6c46c75659c1341283a665"
 PINNED_CONTAINER_IMAGE_DIGEST = (
-    "sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7"
+    "sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f"
 )
 HF_COMMIT_URL = (
     "https://huggingface.co/Querit/Querit-4B/commit/"

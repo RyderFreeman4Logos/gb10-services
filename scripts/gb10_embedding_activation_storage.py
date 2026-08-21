@@ -38,7 +38,7 @@ __all__ = [
 EXPECTED_VERIFIER_AUTHORITY: dict[str, str] = {
     "gb10_bounded_process.py": "248762c2fdc73fdf54914fc5a20c2292bcc90430e59523c5767409ebf0f4c230",
     "gb10_verify_embedding_profile.py": "5ddbea42ec11ab6cf8fd8a0df14d40edd6b3920d33851510274c24a5092732f4",
-    "gb10_embedding_profile_contract.py": "7ff765fa249b1191cf3205f170efd63e7f6b7368c23652d1a10d3c9615cd9efb",
+    "gb10_embedding_profile_contract.py": "3a20c1f1c5cce48d51b1b5bf44e8b0b45271a7ddd69c7c5f26b723a40e551a54",
     "gb10_embedding_verifier_runtime.py": "e52242e13d6a8aaa6be9c73b4a6f2cb46bb73a01a8a8592d73ccdacbc0b35434",
 }
 NO_SWAP_KEYS = ("core", "wrapper")

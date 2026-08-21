@@ -28,9 +28,9 @@ class ImageRelease:
 
 
 CURRENT_RELEASE = ImageRelease(
-    date="2026-07-27",
-    version="v0.26.0",
-    digest="sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7",
+    date="2026-08-17",
+    version="v0.27.1-slim",
+    digest="sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f",
 )
 PREVIOUS_RELEASE = ImageRelease(
     date="2026-07-16",
@@ -50,7 +50,7 @@ CURRENT_DOCS = (
 UNIT_RELEASE_ANNOTATION = re.compile(
     r"^# AEON image release: "
     r"(?P<date>\d{4}-\d{2}-\d{2})-"
-    r"(?P<version>v\d+\.\d+\.\d+); "
+    r"(?P<version>v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?); "
     r"immutable digest: (?P<digest>sha256:[0-9a-f]{64})$",
     re.MULTILINE,
 )
@@ -152,8 +152,8 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                 self.assertNotRegex(text, r"aeon-vllm-ultimate:[^\s\\]+")
 
     def test_aeon_compile_cache_namespace_rotates_with_the_release(self) -> None:
-        host_cache = "/home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473"
-        container_cache = "/var/cache/vllm/aeon-qwen36-v0260"
+        host_cache = "/home/obj/.cache/vllm-compile/aeon-qwen36-v0271-2fb855"
+        container_cache = "/var/cache/vllm/aeon-qwen36-v0271"
         for unit_name in ("vllm-aeon-27b-dflash.service",):
             text = (ROOT / "systemd" / unit_name).read_text()
             with self.subTest(unit=unit_name):
@@ -166,9 +166,26 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                 self.assertNotIn("aeon-qwen36-v0251-c15e2c", text)
                 self.assertNotIn("/var/cache/vllm/aeon-qwen36-v0251", text)
 
+    def test_aeon_text_pins_v2_runner_for_native_thinking_budget(self) -> None:
+        text = (ROOT / "systemd" / "vllm-aeon-27b-dflash.service").read_text()
+        self.assertIn(
+            "  -e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768 \\\n"
+            "  -e VLLM_USE_V2_MODEL_RUNNER=0 \\\n",
+            text,
+        )
+        for unit_name in (
+            "vllm-embedding.service",
+            "vllm-querit-4b-reranker.service",
+            "vllm-qwen3-reranker-8b.service",
+        ):
+            self.assertNotIn(
+                "-e VLLM_USE_V2_MODEL_RUNNER=0",
+                (ROOT / "systemd" / unit_name).read_text(),
+            )
+
     def test_current_docs_publish_one_coherent_release_identity(self) -> None:
         readme = (ROOT / "README.md").read_text()
-        self.assertIn("pinned AEON v0.26.0 GB10 Docker image", readme)
+        self.assertIn("pinned AEON v0.27.1-slim GB10 Docker image", readme)
         self.assertNotIn("pinned AEON v0.25 GB10 Docker image", readme)
         self.assertRegex(
             readme,
@@ -264,7 +281,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
             "gpu-memory-utilization=0.355",
             "hikv.env",
             "286,962 KV tokens",
-            "record a v0.26.0 live receipt",
+            "record a v0.27.1 live receipt",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, reference_row)

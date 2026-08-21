@@ -21,12 +21,12 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 
 ## Current Reference Runtime
 
-* Tracked vLLM source image for embedding, AEON chat, Querit, and the disabled vLLM reranker fallback: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-27-v0.26.0` (`sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7`; runtime `v0.26.0`).
-* Rollback/superseded image retained on GB10: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-14-v0.25.0` (`sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55`).
-* The prior v0.25.1 AEON build's MRv2/torchcodec/TP>1 notes are historical release evidence, not v0.26.0 feature claims. The v0.26.0 OCI description inherits a stale v0.25.1 string; use the dated tag plus immutable digest above as authority and do not infer unverified feature parity or multi-Spark hardware validation.
+* Tracked vLLM source image for embedding, AEON chat, Querit, and the disabled vLLM reranker fallback: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-08-17-v0.27.1-slim` (`sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f`; runtime `v0.27.1-slim`).
+* Rollback/superseded fat image retained on GB10: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-08-16-v0.27.1` (`sha256:13c0df6a321ade60507a9026b0d2963ad51f0499a228de430eeba3bb74ad7954`).
+* The prior v0.25.1 AEON build's MRv2/torchcodec/TP>1 notes are historical release evidence, not v0.27.1 feature claims. The v0.27.1 OCI description may inherit a stale v0.25.1 string; use the dated tag plus immutable digest above as authority and do not infer unverified feature parity or multi-Spark hardware validation.
 * `vllm-embedding.service` tracked source contract: BF16 Qwen3-Embedding-8B with 4,096-dimensional output, `max-model-len=32768`, `max-num-batched-tokens=8192`, `max-num-seqs=64`, and `kv-cache-memory-bytes=4800M`. It requests equal 128 GiB Docker memory/swap caps without imposing the obsolete 20 GiB service budget. Its post-start verifier binds full Docker ID/PID/`StartedAt`, `/proc` starttime and canonical Docker scope, scope dev/inode, and authoritative `cgroup.events`, then re-reads the unchanged identity and proves exact `memory.max`, zero `memory.swap.max`, and zero activation-time `memory.swap.current`. The validated 5,820 MiB baseline yielded 41,376 KV tokens; 4,800 MiB projects about 34,124 tokens (4.14% above 32,768) but is not production-verified until an authorized live restart prints at least 32,768 tokens.
-* `vllm-aeon-27b-dflash.service` is the sole AEON text runtime owner: DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-seqs=16`, and `max-num-batched-tokens=4096`. It reads `/home/obj/.config/gb10/aeon-dflash-profiles/active.env`; tracked `baseline.env` selects `gpu-memory-utilization=0.355` and `hikv.env` selects `0.45`. `active.env` currently links to HiKV. Historical clean-start baseline capacity was 286,962 KV tokens; record a v0.26.0 live receipt before making a capacity claim. Common unit bounds are `TimeoutStartSec=3000` and readiness deadline 2800. The HiKV-named unit is only a compatibility symlink to this canonical unit, never a profile selector. Guard `readiness_deadline_ms` remains `1500000` (25 minutes) and `restart_queue` timeouts remain 600 — cold start can take 15–20 minutes. See the unit header comment for deployment constraints.
-* The v0.26.0 AEON text units rotate compiled artifacts into `/home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473` (mounted as `/var/cache/vllm/aeon-qwen36-v0260`); do not reuse the v0.25.1 `c15e2c` namespace.
+* `vllm-aeon-27b-dflash.service` is the sole AEON text runtime owner: DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-seqs=16`, and `max-num-batched-tokens=4096`. It reads `/home/obj/.config/gb10/aeon-dflash-profiles/active.env`; tracked `baseline.env` selects `gpu-memory-utilization=0.355` and `hikv.env` selects `0.45`. `active.env` currently links to HiKV. Historical clean-start baseline capacity was 286,962 KV tokens; record a v0.27.1 live receipt before making a capacity claim. Common unit bounds are `TimeoutStartSec=3000` and readiness deadline 2800. The HiKV-named unit is only a compatibility symlink to this canonical unit, never a profile selector. Guard `readiness_deadline_ms` remains `1500000` (25 minutes) and `restart_queue` timeouts remain 600 — cold start can take 15–20 minutes. See the unit header comment for deployment constraints.
+* The v0.27.1-slim AEON text unit rotates compiled artifacts into `/home/obj/.cache/vllm-compile/aeon-qwen36-v0271-2fb855` (mounted as `/var/cache/vllm/aeon-qwen36-v0271`); the prior v0.26.0 namespace `/home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473` -> `/var/cache/vllm/aeon-qwen36-v0260` remains the rollback cache. Do not reuse the v0.25.1 `c15e2c` namespace.
 * `vllm-querit-4b-reranker.service`: single canonical BF16 pooling production owner on `18013`, with a 32,768-token context, 4,800 MiB KV cache, equal 18 GiB Docker memory/swap caps, and the live-proven AEON scheduler profile `--max-num-batched-tokens 16384`, `--max-num-seqs 32`, `--max-num-partial-prefills 1`, and `--max-long-partial-prefills 1`. Every startup first binds the exact Docker generation, then runs the unit-owned strict no-swap verifier, and finally completes the bounded rerank-readiness probe; the verifier does not query the still-starting `Type=simple` service's active state.
 * `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
 * `llm-guard-proxy` routes by request `model` to AEON chat (`aeon-ultimate`, `qwen3.6-27b-decensor-by-aeon`, `qwen3.6-27b-decensored`), embedding (`qwen3-embedding-8b`, `Qwen/Qwen3-Embedding-8B`), or reranker (`qwen3-reranker-8b`, `Qwen/Qwen3-Reranker-8B`).
@@ -512,7 +512,7 @@ running.
 
 ## Troubleshooting & Recovery
 
-### 0. Historical v0.25.1 FlashInfer JIT Compilation (not v0.26.0 guidance)
+### 0. Historical v0.25.1 FlashInfer JIT Compilation (not v0.27.1-slim guidance)
 
 The historical v0.25.1 image (`sha256:c15e2c4b...`) used FlashInfer 0.6.13 which required JIT
 compilation of 30+ CUTLASS FP4 GEMM kernels on first startup. Without `MAX_JOBS=1`,
@@ -520,14 +520,14 @@ ninja compiles in parallel → multiple nvcc/cc1plus procs exhaust UMA → kerne
 → `ninja: build stopped` → `RuntimeError` exit 1.
 
 **This was the #1 cause of text startup failures on v0.25.x; it is historical
-evidence, not a v0.26.0 readiness diagnosis.**
+evidence, not a v0.27.1-slim readiness diagnosis.**
 
 The tracked text units retain `MAX_JOBS=1` + `CMAKE_BUILD_PARALLEL_LEVEL=1` to
 serialize compilation. The container itself is ephemeral (`--rm`), but both text
 units bind-mount a host compile cache at
-`/home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473` into the container
+`/home/obj/.cache/vllm-compile/aeon-qwen36-v0271-2fb855` into the container
 cache path, so host-side JIT/compile artifacts persist across container recycles.
-This retained v0.25.1 observation does not establish v0.26.0's HIGH-KV
+This retained v0.25.1 observation does not establish v0.27.1-slim's HIGH-KV
 compilation/profiling latency. The integrated guardian remains active and enforces
 the configured 5 GiB `MemAvailable` threshold during startup; serialized
 compilation is pressure reduction, not an exemption from that guard.
