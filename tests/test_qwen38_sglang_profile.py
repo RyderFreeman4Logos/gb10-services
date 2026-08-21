@@ -159,8 +159,8 @@ class Qwen38UnitContractTests(unittest.TestCase):
         self.assertNotIn("--mem-fraction-static 0.95", self.text)
         self.assertNotIn("SGLANG_MEM_FRACTION=0.95", self.text)
         self.assertIn("--mamba-ssm-dtype float32", self.text)
-        self.assertIn("--max-mamba-cache-size 80", self.text)
-        self.assertIn("--max-running-requests 16", self.text)
+        self.assertIn("--max-mamba-cache-size 40", self.text)
+        self.assertIn("--max-running-requests 8", self.text)
 
     def test_unit_scales_dflash_mamba_capacity_with_admission(self):
         argv = self.text.split("python3 -m sglang.launch_server", 1)[1]
@@ -170,7 +170,7 @@ class Qwen38UnitContractTests(unittest.TestCase):
             self.fail("SGLang admission flags are missing")
         max_running = int(running_match.group(1))
         max_mamba = int(mamba_match.group(1))
-        self.assertEqual(max_running, 16)
+        self.assertEqual(max_running, 8)
         self.assertEqual(max_mamba, max_running * 5)
 
     def test_unit_pins_backend_and_chunked_prefill(self):
@@ -221,15 +221,15 @@ class Qwen38GuardContractTests(unittest.TestCase):
         cls.text = GUARD.read_text()
         cls.config = tomllib.loads(cls.text)
 
-    def test_dflash_chat_admission_is_16_in_flight_and_queued(self):
+    def test_dflash_chat_admission_is_8_in_flight_and_queued(self) -> None:
         default_chat = next(
             profile
             for profile in self.config["upstreams"]
             if profile["name"] == "qwen3.8-sglang-default-chat"
         )
         for admission in (self.config["server"], default_chat):
-            self.assertEqual(admission["max_in_flight_requests"], 16)
-            self.assertEqual(admission["max_queued_generation_requests"], 16)
+            self.assertEqual(admission["max_in_flight_requests"], 8)
+            self.assertEqual(admission["max_queued_generation_requests"], 8)
 
     def test_default_chat_keeps_public_stable_alias(self):
         self.assertIn(SERVED_ALIAS, self.text)

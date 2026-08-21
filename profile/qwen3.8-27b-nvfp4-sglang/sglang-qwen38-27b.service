@@ -82,8 +82,8 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --kv-cache-dtype fp8_e4m3 \
   --mamba-ssm-dtype float32 \
   --mamba-radix-cache-strategy extra_buffer \
-  --max-mamba-cache-size 80 \
-  --max-running-requests 16 \
+  --max-mamba-cache-size 40 \
+  --max-running-requests 8 \
   --context-length 262144 \
   --speculative-algorithm DFLASH \
   --speculative-draft-model-path /models/qwen38-dflash2 \
@@ -99,12 +99,16 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
 # allocated torch.bfloat16 / 41028 tokens (it did NOT honor the fp8_e4m3
 # calibration scales). fp8_e4m3 is pinned explicitly for the 262144-token
 # DFlash2 trial. Do NOT raise KV quantization aggressiveness.
-# DFlash2 uses five mamba state slots per admitted request, so 80 slots admits 16 requests.
+# DFlash2 uses five mamba state slots per admitted request, so 40 slots admits 8 requests.
+# 16-way float32 GDN (~12.3 GiB) starved the KV pool to 77884 tokens on the
+# 69g/0.83 boot — below one 262144-token window. 8-way was the last measured
+# generation that reached max_total_num_tokens>=262144 without raising
+# mem-fraction or dropping GDN float32 / fp8_e4m3.
 # mamba-full-memory-ratio 4.21 was tuned at
 # MIAI's 0.95 and is NOT trusted at 0.72: re-derive after first boot.
 #   ponytail: ratio 4.21 untrusted at mem-fraction 0.72; re-derive post-boot.
 # mamba-ssm-dtype float32 (operator quality choice) about 2x the GDN slot cost
-# (fp32 ~153.9 MiB vs bf16 ~78.4 MiB); pool is 80 slots -> ~12.3 GiB budgeted.
+# (fp32 ~153.9 MiB vs bf16 ~78.4 MiB); pool is 40 slots -> ~6.2 GiB budgeted.
 # A request with no thinking fields gets the SGLang default medium reasoning
 # effort via --sampling-defaults model (temp 1.0/top_p 0.95/top_k 20), not a
 # Guard rewrite.
