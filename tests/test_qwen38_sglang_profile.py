@@ -111,8 +111,8 @@ class Qwen38UnitContractTests(unittest.TestCase):
         for flag in (
             "--speculative-num-draft-tokens 8",
             "--enable-torch-compile",
-            "--torch-compile-max-bs 4",
-            "--cuda-graph-max-bs-decode 4",
+            "--torch-compile-max-bs 16",
+            "--cuda-graph-max-bs-decode 16",
             "--num-continuous-decode-steps 2",
         ):
             self.assertIn(flag, self.text)
@@ -179,6 +179,8 @@ class Qwen38UnitContractTests(unittest.TestCase):
     def test_unit_pins_backend_and_chunked_prefill(self):
         self.assertIn("--attention-backend flashinfer", self.text)
         self.assertIn("--chunked-prefill-size 8192", self.text)
+        argv = self.text.split("python3 -m sglang.launch_server", 1)[1]
+        self.assertIn("--max-prefill-tokens 32768", argv)
 
     def test_unit_serves_public_stable_alias(self):
         # Image CLI accepts ONE SERVED_MODEL_NAME; only the stable public alias
