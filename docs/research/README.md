@@ -17,6 +17,7 @@ Do not paste prompts, private transcripts, credentials, raw request payloads, or
 
 Newest first. These are dated observations and decisions, not substitutes for the current tracked deployment source; later entries may supersede earlier conclusions.
 
+- [2026-08-21 — SGLang lean-digest exclusive 16-graph](2026-08-21-sglang-lean-digest-exclusive-16-graph.md): stop embedding/reranker, size decode graphs and prefill to 16-way without dropping GDN float32 / 262K / fp8 KV, and measure Hermes lean-compression wall-clock. Optimum `c` not claimed until the exclusive ladder finishes.
 - [2026-07-17 — AEON text post-ready UMA high-water](2026-07-17-aeon-text-post-ready-uma-high-water.md): same-PID retained high-water, request-boundary gaps, predictive admission, and cold-canary acceptance plan.
 - [2026-07-16 — GB10 OOM crash analysis](2026-07-16-gb10-oom-crash-analysis.md): pre-freeze memory/thermal timeline and historical mitigation recommendations.
 - [2026-07-16 — Querit vLLM migration](2026-07-16-querit-vllm-migration.md): source-controlled reranker migration research and implementation plan.
