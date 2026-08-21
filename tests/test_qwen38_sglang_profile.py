@@ -124,11 +124,14 @@ class Qwen38UnitContractTests(unittest.TestCase):
     def test_unit_omits_max_total_tokens_pool_cap(self):
         # --max-total-tokens is a pool CAP, not an OOM guard; it blocks leftover
         # envelope from becoming concurrent KV. Dropping it lets SGLang grow KV
-        # into the 69g envelope within --mem-fraction-static 0.90.
+        # into the leftover envelope within --mem-fraction-static 0.90.
         # Scope to launch_server argv so comments cannot false-positive.
         argv = self.text.split("--sampling-defaults model", 1)[0]
         self.assertNotIn("--max-total-tokens", argv)
         self.assertIn("--context-length 262144", argv)
+        launch_argv = self.text.split("python3 -m sglang.launch_server", 1)[1]
+        launch_argv = launch_argv.split("--sampling-defaults model", 1)[0]
+        self.assertEqual(launch_argv.count("--context-length 262144"), 1)
 
     def test_unit_adds_dflash_speed_flags(self):
         # Keep the tuned compile/decode flags for the DFlash2 trial.
@@ -171,8 +174,8 @@ class Qwen38UnitContractTests(unittest.TestCase):
         self.assertIn("--sleep-on-idle", argv)
 
     def test_unit_pins_throughput_and_memory_contract(self):
-        # mem-fraction 0.90 funds one 262144-token KV window plus 16-way
-        # float32 GDN inside the 69g envelope (0.83 + 16-way left 77884).
+        # mem-fraction 0.90 leaves the post-weight, post-mamba, post-graph
+        # remainder available to KV without changing the model's max window.
         argv = self.text.split("python3 -m sglang.launch_server", 1)[1]
         self.assertIn("--context-length 262144", self.text)
         self.assertIn("--mem-fraction-static 0.90", argv)
@@ -199,6 +202,38 @@ class Qwen38UnitContractTests(unittest.TestCase):
         max_mamba = int(mamba_match.group(1))
         self.assertEqual(max_running, 16)
         self.assertEqual(max_mamba, max_running * 5)
+
+    def test_unit_keeps_quality_knobs_and_honest_leftover_contract(self):
+        launch_argv = self.text.split("python3 -m sglang.launch_server", 1)[1]
+        launch_argv = launch_argv.split("--sampling-defaults model", 1)[0]
+        for flag in (
+            "--kv-cache-dtype fp8_e4m3",
+            "--mamba-ssm-dtype float32",
+            "--max-mamba-cache-size 80",
+            "--max-running-requests 16",
+            "--cuda-graph-max-bs-decode 16",
+            "--speculative-draft-model-path /models/qwen38-dflash2",
+            "--reasoning-parser qwen3",
+        ):
+            self.assertIn(flag, launch_argv)
+        self.assertNotIn("--max-total-tokens", launch_argv)
+
+        for phrase in (
+            "5 GiB OS pad",
+            "74g leftover envelope",
+            "Leftover after weights+mamba+graphs goes to KV",
+            "context window remains the model max 262144",
+        ):
+            self.assertIn(phrase, self.text)
+        for stale_claim in (
+            "10 GiB OS pad",
+            "69g envelope",
+            "69g leftover",
+            "funds one 262144-token KV window",
+            "restores KV>=262144",
+        ):
+            self.assertNotIn(stale_claim, self.text)
+        self.assertNotRegex(self.text, r"74g.{0,160}(?:2.?3|two|three).{0,80}KV")
 
     def test_unit_pins_backend_and_chunked_prefill(self):
         self.assertIn("--attention-backend flashinfer", self.text)
@@ -234,12 +269,12 @@ class Qwen38UnitContractTests(unittest.TestCase):
     def test_unit_swap_is_impossible(self):
         # Docker: memory == memory-swap (zero extra swap) + swappiness 0.
         self.assertIn("--memory-swappiness 0", self.text)
-        self.assertRegex(self.text, r"--memory\s+69g")
-        self.assertRegex(self.text, r"--memory-swap\s+69g")
-        self.assertNotIn("--memory 74g", self.text)
-        self.assertNotIn("--memory-swap 74g", self.text)
-        self.assertIn("MemoryMax=69G", self.text)
-        self.assertNotIn("MemoryMax=74G", self.text)
+        self.assertRegex(self.text, r"--memory\s+74g")
+        self.assertRegex(self.text, r"--memory-swap\s+74g")
+        self.assertNotIn("--memory 69g", self.text)
+        self.assertNotIn("--memory-swap 69g", self.text)
+        self.assertIn("MemoryMax=74G", self.text)
+        self.assertNotIn("MemoryMax=69G", self.text)
         # systemd: no swap escapes the unit.
         self.assertIn("MemorySwapMax=0", self.text)
 

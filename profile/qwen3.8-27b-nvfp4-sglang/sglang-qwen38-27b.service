@@ -22,22 +22,21 @@ Environment=HF_HUB_OFFLINE=1
 Environment=GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1
 Environment=GB10_CONTAINER_CIDFILE=%t/gb10-memory-guardian/sglang-text.cid
 # Ferries the 0.90 mem-fraction reservation through the env -i exec below.
-# 0.90 funds one 262144-token KV window plus 16-way float32 GDN (80 slots)
-# inside the 69g envelope. 0.83 + 16-way left only 77884 KV tokens.
+# The 74g leftover envelope is the UMA budget for this text service.
+# Leftover after weights+mamba+graphs goes to KV; co-resident mamba float32
+# (80 slots) still dominates, so this envelope does not guarantee multiple KV
+# windows.
 Environment=SGLANG_MEM_FRACTION=0.90
 # Swap is impossible for this unit: systemd MemorySwapMax=0 AND docker
-# memory==memory-swap (69g/69g) with swappiness 0. No swap can be created
+# memory==memory-swap (74g/74g) with swappiness 0. No swap can be created
 # even if the engine overruns its reservation.
 MemorySwapMax=0
-# 69g is the text share of (MemTotal - 10G OS pad - emb 24g - querit 18g).
-# The extra 5g relative to the prior 74g envelope is host soak margin:
-# live MemAvailable was ~1.3 GiB with ~1.5 GiB swap in use.
-# Dropping the max-total-tokens pool cap lets the leftover envelope become
-# concurrent KV; --context-length 262144 remains the DFlash2 trial window.
-# OS residual target: leave ~10 GiB MemAvailable for the host; the rest goes
-# to the three model services (text 69g + emb 24g + querit 18g <= ~111g, with a
-# 10 GiB OS pad outside every --memory).
-MemoryMax=69G
+# 74g is the text share of (MemTotal(~121.6 GiB) - 5 GiB OS pad - emb 24g
+# - querit 18g) ~= 74.6 GiB, leaving a 5 GiB OS pad.
+# The context window remains the model max 262144; it is not a KV pool cap.
+# No max-total-tokens pool cap is set, so the leftover UMA envelope becomes
+# concurrent KV after weights+mamba+graphs rather than a parameter cap.
+MemoryMax=74G
 # No Restart= here: a future lifecycle wrapper owns restart policy. A manual
 # `systemctl --user stop` is treated by systemd as a clean deactivation.
 TimeoutStartSec=3000
@@ -68,8 +67,8 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   -v /home/obj/models/z-lab/Qwen3.8-27B-DFlash2:/models/qwen38-dflash2:ro \
   -e HF_HUB_OFFLINE=1 \
   --memory-swappiness 0 \
-  --memory 69g \
-  --memory-swap 69g \
+  --memory 74g \
+  --memory-swap 74g \
   --oom-score-adj 800 \
   lmsysorg/sglang@sha256:f6c809a2ebdeea97a3732e8bc139a32c18c9fb00a6e2fd770d257d9f72466ed3 \
   python3 -m sglang.launch_server \
@@ -104,10 +103,10 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
 # calibration scales). fp8_e4m3 is pinned explicitly for the 262144-token
 # DFlash2 trial. Do NOT raise KV quantization aggressiveness.
 # DFlash2 uses five mamba state slots per admitted request, so 80 slots admits 16 requests.
-# Short inputs may run 16-wide; a 262144-token request occupies the KV window
-# and extra arrivals queue. 69g/0.83 + 16-way left max_total_num_tokens=77884;
-# mem-fraction 0.90 is the extra GPU reservation that restores KV>=262144
-# without dropping GDN float32, fp8_e4m3, or 16-way admission.
+# Short inputs may run 16-wide; a 262144-token request uses the model-max window
+# and extra arrivals queue. The leftover UMA envelope is not a promise of
+# multiple KV windows under co-residency: float32 mamba still dominates.
+# Keep GDN float32, fp8_e4m3, and 16-way admission unchanged.
 # Decode CUDA graphs and torch.compile follow max-running-requests=16 so
 # concurrent lean-digest chunks stay on-graph. max-prefill-tokens 32768 lets
 # one ~18k compression chunk enter in a single prefill step.
