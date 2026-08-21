@@ -6,8 +6,8 @@
 [server]
 bind_host = "100.105.4.92"
 port = 18009
-max_in_flight_requests = 8
-max_queued_generation_requests = 8
+max_in_flight_requests = 16
+max_queued_generation_requests = 16
 generation_queue_timeout_ms = 1800000
 generation_queue_full_status = 429
 generation_queue_retry_after_secs = 10
@@ -105,8 +105,8 @@ base_url = "http://100.105.4.92:18010/v1"
 upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 match_models = ["abliterated-qwen-latest-27b-nvfp4", "qwen3.8-27b-sglang"]
 request_timeout_ms = 1800000
-max_in_flight_requests = 8
-max_queued_generation_requests = 8
+max_in_flight_requests = 16
+max_queued_generation_requests = 16
 
 [upstreams.metadata]
 discovery_enabled = true

@@ -100,7 +100,7 @@ class Qwen38UnitContractTests(unittest.TestCase):
     def test_unit_omits_max_total_tokens_pool_cap(self):
         # --max-total-tokens is a pool CAP, not an OOM guard; it blocks leftover
         # envelope from becoming concurrent KV. Dropping it lets SGLang grow KV
-        # into the 69g envelope within --mem-fraction-static 0.83.
+        # into the 69g envelope within --mem-fraction-static 0.90.
         # Scope to launch_server argv so comments cannot false-positive.
         argv = self.text.split("--sampling-defaults model", 1)[0]
         self.assertNotIn("--max-total-tokens", argv)
@@ -147,20 +147,23 @@ class Qwen38UnitContractTests(unittest.TestCase):
         self.assertIn("--sleep-on-idle", argv)
 
     def test_unit_pins_throughput_and_memory_contract(self):
-        # mem-fraction 0.83 remains fixed while the DFlash2 trial uses 262144
-        # context within the 69g memory envelope (5g soak vs the prior 74g).
+        # mem-fraction 0.90 funds one 262144-token KV window plus 16-way
+        # float32 GDN inside the 69g envelope (0.83 + 16-way left 77884).
+        argv = self.text.split("python3 -m sglang.launch_server", 1)[1]
         self.assertIn("--context-length 262144", self.text)
-        self.assertIn("--mem-fraction-static 0.83", self.text)
-        self.assertIn("SGLANG_MEM_FRACTION=0.83", self.text)
-        self.assertNotIn("--mem-fraction-static 0.72", self.text)
+        self.assertIn("--mem-fraction-static 0.90", argv)
+        self.assertIn("SGLANG_MEM_FRACTION=0.90", self.text)
+        self.assertNotIn("--mem-fraction-static 0.83", argv)
+        self.assertNotIn("SGLANG_MEM_FRACTION=0.83", self.text)
+        self.assertNotIn("--mem-fraction-static 0.72", argv)
         self.assertNotIn("SGLANG_MEM_FRACTION=0.72", self.text)
-        self.assertNotIn("--mem-fraction-static 0.53", self.text)
+        self.assertNotIn("--mem-fraction-static 0.53", argv)
         self.assertNotIn("SGLANG_MEM_FRACTION=0.53", self.text)
-        self.assertNotIn("--mem-fraction-static 0.95", self.text)
+        self.assertNotIn("--mem-fraction-static 0.95", argv)
         self.assertNotIn("SGLANG_MEM_FRACTION=0.95", self.text)
-        self.assertIn("--mamba-ssm-dtype float32", self.text)
-        self.assertIn("--max-mamba-cache-size 40", self.text)
-        self.assertIn("--max-running-requests 8", self.text)
+        self.assertIn("--mamba-ssm-dtype float32", argv)
+        self.assertIn("--max-mamba-cache-size 80", argv)
+        self.assertIn("--max-running-requests 16", argv)
 
     def test_unit_scales_dflash_mamba_capacity_with_admission(self):
         argv = self.text.split("python3 -m sglang.launch_server", 1)[1]
@@ -170,7 +173,7 @@ class Qwen38UnitContractTests(unittest.TestCase):
             self.fail("SGLang admission flags are missing")
         max_running = int(running_match.group(1))
         max_mamba = int(mamba_match.group(1))
-        self.assertEqual(max_running, 8)
+        self.assertEqual(max_running, 16)
         self.assertEqual(max_mamba, max_running * 5)
 
     def test_unit_pins_backend_and_chunked_prefill(self):
@@ -221,15 +224,15 @@ class Qwen38GuardContractTests(unittest.TestCase):
         cls.text = GUARD.read_text()
         cls.config = tomllib.loads(cls.text)
 
-    def test_dflash_chat_admission_is_8_in_flight_and_queued(self) -> None:
+    def test_dflash_chat_admission_is_16_in_flight_and_queued(self) -> None:
         default_chat = next(
             profile
             for profile in self.config["upstreams"]
             if profile["name"] == "qwen3.8-sglang-default-chat"
         )
         for admission in (self.config["server"], default_chat):
-            self.assertEqual(admission["max_in_flight_requests"], 8)
-            self.assertEqual(admission["max_queued_generation_requests"], 8)
+            self.assertEqual(admission["max_in_flight_requests"], 16)
+            self.assertEqual(admission["max_queued_generation_requests"], 16)
 
     def test_default_chat_keeps_public_stable_alias(self):
         self.assertIn(SERVED_ALIAS, self.text)
