@@ -19,9 +19,7 @@ IMAGE = f"ghcr.io/aeon-7/aeon-vllm-ultimate@{IMAGE_DIGEST}"
 IMAGE_CREATED = "2026-08-20T21:17:36.420048521-04:00"
 ALIAS = "abliterated-qwen-latest-27b-nvfp4"
 NVFP4_HOST = "/home/obj/models/RadixArk/Qwen3.8-27B-NVFP4"
-DFLASH_HOST = "/home/obj/models/z-lab/Qwen3.8-27B-DFlash2"
 NVFP4_MOUNT = "/models/qwen38-nvfp4"
-DFLASH_MOUNT = "/models/qwen38-dflash2"
 CIDFILE = "%t/gb10-memory-guardian/aeon-qwen38-text.cid"
 CONTAINER = "vllm-aeon-qwen38-dflash"
 COMPILE_HOST = "/home/obj/.cache/vllm-compile/aeon-qwen38-v0271-2fb855"
@@ -49,17 +47,19 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
     def test_qwen38_unit_exists(self) -> None:
         self.assertTrue(UNIT.is_file(), f"missing canary unit {UNIT}")
 
-    def test_unit_mounts_flat_qwen38_nvfp4_and_dflash2_paths(self) -> None:
+    def test_unit_mounts_flat_qwen38_nvfp4_without_dflash2_and_uses_mtp(self) -> None:
         text = _unit_text()
         self.assertIn(f"{NVFP4_HOST}:{NVFP4_MOUNT}:ro", text)
-        self.assertIn(f"{DFLASH_HOST}:{DFLASH_MOUNT}:ro", text)
+        self.assertNotIn("Qwen3.8-27B-DFlash2", text)
+        self.assertNotIn("/models/qwen38-dflash2", text)
         self.assertNotIn("/snapshots/", text)
         argv = _runtime_argv(text)
         self.assertEqual(argv[0], NVFP4_MOUNT)
         speculative = json.loads(_option_value(argv, "--speculative-config"))
-        self.assertEqual(speculative["method"], "dflash")
-        self.assertEqual(speculative["model"], DFLASH_MOUNT)
-        self.assertEqual(speculative["num_speculative_tokens"], 10)
+        self.assertEqual(
+            speculative,
+            {"method": "mtp", "num_speculative_tokens": 3},
+        )
 
     def test_unit_pins_latest_aeon_engine_and_quality_envelope(self) -> None:
         text = _unit_text()
@@ -75,6 +75,8 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
         self.assertEqual(_option_value(argv, "--max-model-len"), "262144")
         self.assertEqual(_option_value(argv, "--kv-cache-dtype"), "fp8_e4m3")
         self.assertEqual(_option_value(argv, "--mamba-cache-dtype"), "float32")
+        self.assertIn("--mamba-ssm-cache-dtype", argv)
+        self.assertEqual(_option_value(argv, "--mamba-ssm-cache-dtype"), "float32")
         self.assertEqual(_option_value(argv, "--quantization"), "modelopt")
         self.assertEqual(_option_value(argv, "--attention-backend"), "TRITON_ATTN")
         self.assertEqual(_option_value(argv, "--gpu-memory-utilization"), "${AEON_GPU_MEMORY_UTILIZATION}")
@@ -82,6 +84,8 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
         self.assertNotIn("--max-total-tokens", text)
         self.assertIn("-e VLLM_USE_V2_MODEL_RUNNER=0", text)
         self.assertIn("-e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768", text)
+        self.assertIn("--no-enable-prefix-caching", argv)
+        self.assertNotIn("--enable-prefix-caching", argv)
         self.assertIn("--memory 74g", text)
         self.assertIn("--memory-swap 74g", text)
         self.assertIn("--memory-swappiness 0", text)
@@ -125,7 +129,8 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
         text = _unit_text()
         self.assertIn("canary of the AEON engine + incumbent Qwen3.8 weights", text)
         self.assertIn("KV≥262144 is a live receipt, not a source claim", text)
-        self.assertIn("n=10", text)
+        self.assertIn("MTP K=3", text)
+        self.assertNotIn("DFlash n=10", text)
         self.assertIn("SGLang", text)
 
 

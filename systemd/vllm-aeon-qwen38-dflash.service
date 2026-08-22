@@ -4,7 +4,7 @@
 # This is a canary of the AEON engine + incumbent Qwen3.8 weights.
 # Capacity note: KV≥262144 is a live receipt, not a source claim.
 [Unit]
-Description=vLLM AEON-7 Qwen3.8-27B NVFP4 + DFlash2 n=10 (canary, v0.27.1-slim)
+Description=vLLM AEON-7 Qwen3.8-27B NVFP4 + MTP K=3 (canary, v0.27.1-slim)
 # Start after co-resident services are ordered, without requiring either one.
 After=network.target
 After=vllm-querit-4b-reranker.service
@@ -41,7 +41,6 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --gpus all --ipc host \
   -p 100.105.4.92:18010:8000 \
   -v /home/obj/models/RadixArk/Qwen3.8-27B-NVFP4:/models/qwen38-nvfp4:ro \
-  -v /home/obj/models/z-lab/Qwen3.8-27B-DFlash2:/models/qwen38-dflash2:ro \
   -v /home/obj/.cache/vllm-compile/aeon-qwen38-v0271-2fb855:/var/cache/vllm/aeon-qwen38-v0271 \
   -v /home/obj/scripts/aeon_hang_guard.py:/opt/hang_guard/aeon_hang_guard.py:ro \
   -v /home/obj/scripts/aeon_vllm_wrapper.py:/opt/hang_guard/aeon_vllm_wrapper.py:ro \
@@ -66,24 +65,25 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
     --kv-cache-dtype fp8_e4m3 \
     --attention-backend TRITON_ATTN \
     --mamba-cache-dtype float32 \
+    --mamba-ssm-cache-dtype float32 \
     --max-model-len 262144 \
     --max-num-seqs 16 \
     --max-num-batched-tokens 4096 \
-    --enable-prefix-caching \
+    --no-enable-prefix-caching \
     --gpu-memory-utilization ${AEON_GPU_MEMORY_UTILIZATION} \
     --enable-chunked-prefill \
     --scheduler-reserve-full-isl \
     --compilation-config "{\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_num_of_warmups\":0,\"cache_dir\":\"/var/cache/vllm/aeon-qwen38-v0271\"}" \
     --jit-monitor-mode warn \
     --max-logprobs 20 \
-    --speculative-config "{\"method\":\"dflash\",\"model\":\"/models/qwen38-dflash2\",\"num_speculative_tokens\":10,\"attention_backend\":\"TRITON_ATTN\"}" \
+    --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":3}" \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \
     --default-chat-template-kwargs "{\"enable_thinking\":false}" \
     --override-generation-config "{\"temperature\":0.6,\"top_p\":0.95,\"top_k\":20}" \
     --trust-remote-code
-# The AEON canary keeps DFlash n=10; the incumbent Qwen3.8 SGLang profile uses n=8.
+# The AEON canary uses in-checkpoint MTP K=3; the Qwen3.8 SGLang profile remains a separate reference.
 # No live KV>=262144 receipt is implied by this source unit.
 ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock AEON_GPU_MEMORY_UTILIZATION=${AEON_GPU_MEMORY_UTILIZATION} /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --bind-runtime-swap-max --unit /home/obj/.config/systemd/user/vllm-aeon-qwen38-dflash.service --container vllm-aeon-qwen38-dflash
 ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock AEON_GPU_MEMORY_UTILIZATION=${AEON_GPU_MEMORY_UTILIZATION} /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-aeon-qwen38-dflash.service --container vllm-aeon-qwen38-dflash
