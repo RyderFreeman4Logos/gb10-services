@@ -20,8 +20,6 @@ IMAGE_CREATED = "2026-08-20T21:17:36.420048521-04:00"
 ALIAS = "abliterated-qwen-latest-27b-nvfp4"
 NVFP4_HOST = "/home/obj/models/orcarouter/Qwen3.8-27B-Uncensored-NVFP4"
 NVFP4_MOUNT = "/models/qwen38-nvfp4"
-DFLASH_HOST = "/home/obj/models/kstoyanov99/Qwen3.8-27B-Dflash"
-DFLASH_MOUNT = "/models/qwen38-dflash"
 QWEN38_PROFILE = "/home/obj/.config/gb10/aeon-dflash-profiles/qwen38.env"
 QWEN38_PROFILE_SOURCE = ROOT / "config" / "aeon-dflash-profiles" / "qwen38.env"
 CIDFILE = "%t/gb10-memory-guardian/aeon-qwen38-text.cid"
@@ -69,10 +67,11 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
             "${AEON_GPU_MEMORY_UTILIZATION}",
         )
 
-    def test_unit_mounts_qwen38_nvfp4_and_dflash_without_dflash2(self) -> None:
+    def test_unit_mounts_qwen38_nvfp4_mtp_without_dflash(self) -> None:
         text = _unit_text()
         self.assertIn(f"{NVFP4_HOST}:{NVFP4_MOUNT}:ro", text)
-        self.assertIn(f"{DFLASH_HOST}:{DFLASH_MOUNT}:ro", text)
+        self.assertNotIn("kstoyanov99/Qwen3.8-27B-Dflash", text)
+        self.assertNotIn("/models/qwen38-dflash", text)
         self.assertNotIn("Qwen3.8-27B-DFlash2", text)
         self.assertNotIn("/models/qwen38-dflash2", text)
         self.assertNotIn("/snapshots/", text)
@@ -82,10 +81,8 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
         self.assertEqual(
             speculative,
             {
-                "method": "dflash",
-                "model": DFLASH_MOUNT,
-                "num_speculative_tokens": 10,
-                "attention_backend": "TRITON_ATTN",
+                "method": "mtp",
+                "num_speculative_tokens": 3,
             },
         )
 
@@ -157,8 +154,8 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
         text = _unit_text()
         self.assertIn("canary of the AEON engine + incumbent Qwen3.8 weights", text)
         self.assertIn("KV≥262144 is a live receipt, not a source claim", text)
-        self.assertIn("DFlash n=10", text)
-        self.assertNotIn("MTP K=3", text)
+        self.assertIn("MTP K=3", text)
+        self.assertNotIn("DFlash n=10", text)
         self.assertIn("SGLang", text)
 
 
