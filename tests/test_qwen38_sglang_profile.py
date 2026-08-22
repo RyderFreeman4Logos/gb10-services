@@ -301,6 +301,24 @@ class Qwen38GuardContractTests(unittest.TestCase):
     def test_default_chat_keeps_public_stable_alias(self):
         self.assertIn(SERVED_ALIAS, self.text)
 
+    def test_default_chat_rewrites_legacy_aliases_to_served_model(self):
+        default_chat = next(
+            profile
+            for profile in self.config["upstreams"]
+            if profile["name"] == "qwen3.8-sglang-default-chat"
+        )
+        self.assertEqual(default_chat["upstream_model"], SERVED_ALIAS)
+        self.assertEqual(
+            default_chat["match_models"],
+            [
+                SERVED_ALIAS,
+                "qwen3.8-27b-sglang",
+                "qwen3.6-27b-decensor-by-aeon",
+                "qwen3.6-27b-decensored",
+                "aeon-ultimate",
+            ],
+        )
+
     def test_no_force_disable_on_default_chat(self):
         # Default chat must not force thinking off; faithful forward of caller.
         self.assertNotIn("mode = \"force_disable\"", self.text)
