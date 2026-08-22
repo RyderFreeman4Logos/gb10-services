@@ -49,7 +49,10 @@ COMPONENT = re.compile(r"[A-Za-z0-9_.@:-]+")
 AEON_PROFILE_KEY = "AEON_GPU_MEMORY_UTILIZATION"
 AEON_PROFILE_PLACEHOLDER = "${AEON_GPU_MEMORY_UTILIZATION}"
 AEON_PROFILE_FILE = "/home/obj/.config/gb10/aeon-dflash-profiles/active.env"
+AEON_QWEN38_PROFILE_FILE = "/home/obj/.config/gb10/aeon-dflash-profiles/qwen38.env"
+AEON_QWEN38_PROFILE_VALUE = "0.52"
 AEON_PROFILE_TEST_SELECTOR = "GB10_VLLM_NO_SWAP_AEON_PROFILE_PATH"
+AEON_QWEN38_PROFILE_TEST_SELECTOR = "GB10_VLLM_NO_SWAP_QWEN38_PROFILE_PATH"
 AEON_PROFILE_TARGET_VALUES = {"baseline.env": "0.355", "hikv.env": "0.45"}
 AEON_PROFILE_VALUES = set(AEON_PROFILE_TARGET_VALUES.values())
 AEON_DOCKER_PREFIX = [
@@ -327,6 +330,62 @@ def read_aeon_profile_authority() -> AeonProfileAuthority:
     return AeonProfileAuthority(value, hashlib.sha256(seal_payload).hexdigest())
 
 
+def read_qwen38_profile_authority() -> AeonProfileAuthority:
+    selected = os.environ.get(AEON_QWEN38_PROFILE_TEST_SELECTOR)
+    if selected is not None and not TEST_ONLY:
+        reject("Qwen3.8 profile path override is test-only")
+    raw_path = (
+        selected
+        if TEST_ONLY and selected is not None
+        else AEON_QWEN38_PROFILE_FILE
+    )
+    path = canonical_absolute(raw_path, "Qwen3.8 profile path")
+    parent = require_directory_chain(path.parent, "Qwen3.8 profile parent")
+    if parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) & 0o022:
+        reject("Qwen3.8 profile parent owner or mode is unsafe")
+    try:
+        before = os.lstat(path)
+    except OSError as error:
+        reject(f"Qwen3.8 profile is unavailable: {error}")
+    payload, opened = read_regular(path, 128, "Qwen3.8 profile")
+    try:
+        after = os.lstat(path)
+    except OSError as error:
+        reject(f"Qwen3.8 profile changed while reading: {error}")
+    if (
+        metadata_identity(before) != metadata_identity(opened)
+        or metadata_identity(opened) != metadata_identity(after)
+    ):
+        reject("Qwen3.8 profile changed while reading")
+    if (
+        opened.st_uid != os.geteuid()
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) not in (0o600, 0o644)
+    ):
+        reject("Qwen3.8 profile owner, mode, or link count is unsafe")
+    text = decode_text(payload, "Qwen3.8 profile")
+    matched = re.fullmatch(
+        rf"AEON_GPU_MEMORY_UTILIZATION=({re.escape(AEON_QWEN38_PROFILE_VALUE)})\n?",
+        text,
+    )
+    if matched is None:
+        reject("Qwen3.8 profile must contain exactly its canonical assignment")
+    seal_payload = json.dumps(
+        [
+            str(path),
+            *metadata_identity(before),
+            *metadata_identity(after),
+            hashlib.sha256(payload).hexdigest(),
+            matched.group(1),
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return AeonProfileAuthority(
+        matched.group(1), hashlib.sha256(seal_payload).hexdigest()
+    )
+
+
 def logical_exec_start(text: str) -> list[str]:
     commands: list[list[str]] = []
     pending: list[str] = []
@@ -502,10 +561,23 @@ def parse_unit(path_raw: str) -> UnitContract:
                 profile_declarations.append((section, line))
         if variable_tokens != [AEON_PROFILE_PLACEHOLDER]:
             reject("unit ExecStart contains an unapproved variable")
-        if profile_declarations != [
-            ("[Service]", f"EnvironmentFile={AEON_PROFILE_FILE}")
-        ]:
+        profile_declaration = (
+            profile_declarations[0][1]
+            if len(profile_declarations) == 1
+            and profile_declarations[0][0] == "[Service]"
+            else ""
+        )
+        allowed_profile_declarations = {
+            f"EnvironmentFile={AEON_PROFILE_FILE}",
+            f"EnvironmentFile={AEON_QWEN38_PROFILE_FILE}",
+        }
+        if profile_declaration not in allowed_profile_declarations:
             reject("unit does not declare one exact canonical AEON profile")
+        if (
+            profile_declaration == f"EnvironmentFile={AEON_QWEN38_PROFILE_FILE}"
+            and path.name != "vllm-aeon-qwen38-dflash.service"
+        ):
+            reject("Qwen3.8 profile is reserved for the Qwen3.8 canary unit")
         if (
             command.count("--gpu-memory-utilization") != 1
             or command.count(AEON_PROFILE_PLACEHOLDER) != 1
@@ -513,8 +585,17 @@ def parse_unit(path_raw: str) -> UnitContract:
             != command.index("--gpu-memory-utilization") + 1
         ):
             reject("approved AEON profile variable is not the exact option value")
-        authority = read_aeon_profile_authority()
-        if profile_value not in AEON_PROFILE_VALUES:
+        if profile_value is None:
+            reject("AEON profile value is missing or unapproved")
+        authority = (
+            read_qwen38_profile_authority()
+            if profile_declaration == f"EnvironmentFile={AEON_QWEN38_PROFILE_FILE}"
+            else read_aeon_profile_authority()
+        )
+        if (
+            profile_declaration == f"EnvironmentFile={AEON_PROFILE_FILE}"
+            and profile_value not in AEON_PROFILE_VALUES
+        ):
             reject("AEON profile value is missing or unapproved")
         if profile_value != authority.value:
             reject("manager-expanded AEON profile value is not authorized")

@@ -440,7 +440,7 @@ install -m 0644 systemd/llm-guard-proxy.service \
   ~/.config/systemd/user/
 
 install -d -m 0755 ~/.config/gb10/aeon-dflash-profiles
-install -m 0644 config/aeon-dflash-profiles/baseline.env config/aeon-dflash-profiles/hikv.env \
+install -m 0644 config/aeon-dflash-profiles/baseline.env config/aeon-dflash-profiles/hikv.env config/aeon-dflash-profiles/qwen38.env \
   ~/.config/gb10/aeon-dflash-profiles/
 ln -sfn hikv.env ~/.config/gb10/aeon-dflash-profiles/active.env.new
 mv -Tf ~/.config/gb10/aeon-dflash-profiles/active.env.new ~/.config/gb10/aeon-dflash-profiles/active.env

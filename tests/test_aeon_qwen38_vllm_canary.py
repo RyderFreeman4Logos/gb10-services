@@ -18,8 +18,10 @@ IMAGE_DIGEST = "sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36
 IMAGE = f"ghcr.io/aeon-7/aeon-vllm-ultimate@{IMAGE_DIGEST}"
 IMAGE_CREATED = "2026-08-20T21:17:36.420048521-04:00"
 ALIAS = "abliterated-qwen-latest-27b-nvfp4"
-NVFP4_HOST = "/home/obj/models/Blackfrost-AI/Qwen3.8-27B-ABLITERATED-NVFP4"
+NVFP4_HOST = "/home/obj/models/orcarouter/Qwen3.8-27B-Uncensored-NVFP4"
 NVFP4_MOUNT = "/models/qwen38-nvfp4"
+QWEN38_PROFILE = "/home/obj/.config/gb10/aeon-dflash-profiles/qwen38.env"
+QWEN38_PROFILE_SOURCE = ROOT / "config" / "aeon-dflash-profiles" / "qwen38.env"
 CIDFILE = "%t/gb10-memory-guardian/aeon-qwen38-text.cid"
 CONTAINER = "vllm-aeon-qwen38-dflash"
 COMPILE_HOST = "/home/obj/.cache/vllm-compile/aeon-qwen38-v0271-2fb855"
@@ -46,6 +48,24 @@ def _option_value(argv: list[str], option: str) -> str:
 class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
     def test_qwen38_unit_exists(self) -> None:
         self.assertTrue(UNIT.is_file(), f"missing canary unit {UNIT}")
+
+    def test_qwen38_unit_uses_its_own_052_profile(self) -> None:
+        text = _unit_text()
+        self.assertTrue(QWEN38_PROFILE_SOURCE.is_file())
+        self.assertEqual(
+            QWEN38_PROFILE_SOURCE.read_text(),
+            "AEON_GPU_MEMORY_UTILIZATION=0.52\n",
+        )
+        self.assertIn(f"EnvironmentFile={QWEN38_PROFILE}", text)
+        self.assertNotIn(
+            "EnvironmentFile=/home/obj/.config/gb10/aeon-dflash-profiles/active.env",
+            text,
+        )
+        argv = _runtime_argv(text)
+        self.assertEqual(
+            _option_value(argv, "--gpu-memory-utilization"),
+            "${AEON_GPU_MEMORY_UTILIZATION}",
+        )
 
     def test_unit_mounts_flat_qwen38_nvfp4_without_dflash2_and_uses_mtp(self) -> None:
         text = _unit_text()
@@ -77,7 +97,7 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
         self.assertEqual(_option_value(argv, "--mamba-cache-dtype"), "float32")
         self.assertIn("--mamba-ssm-cache-dtype", argv)
         self.assertEqual(_option_value(argv, "--mamba-ssm-cache-dtype"), "float32")
-        self.assertEqual(_option_value(argv, "--quantization"), "modelopt")
+        self.assertEqual(_option_value(argv, "--quantization"), "compressed-tensors")
         self.assertEqual(_option_value(argv, "--attention-backend"), "TRITON_ATTN")
         self.assertEqual(_option_value(argv, "--gpu-memory-utilization"), "${AEON_GPU_MEMORY_UTILIZATION}")
         self.assertNotIn("--kv-cache-memory-bytes", text)
@@ -123,7 +143,7 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
             text,
             rf"(?m)^ExecStartPost=.*gb10_service_ready\.sh chat http://100\.105\.4\.92:18010 {ALIAS} --deadline 2800$",
         )
-        self.assertIn("EnvironmentFile=/home/obj/.config/gb10/aeon-dflash-profiles/active.env", text)
+        self.assertIn(f"EnvironmentFile={QWEN38_PROFILE}", text)
 
     def test_unit_documents_canary_and_keeps_capacity_claim_honest(self) -> None:
         text = _unit_text()
