@@ -36,10 +36,13 @@ done
   echo "cgroup root must be absolute" >&2
   exit 2
 }
-[[ "$container_cidfile" == "$identity_dir/aeon-text.cid" ]] || {
-  echo "container CID file must use the reviewed AEON runtime path" >&2
-  exit 2
-}
+case "$container_cidfile" in
+  "$identity_dir/aeon-text.cid"|"$identity_dir/aeon-qwen38-text.cid") ;;
+  *)
+    echo "container CID file must use the reviewed AEON runtime path" >&2
+    exit 2
+    ;;
+esac
 [[ "$registration_path" == "$identity_dir/text-cgroup.v1" ]] || {
   echo "guardian registration must use the reviewed text runtime path" >&2
   exit 2
