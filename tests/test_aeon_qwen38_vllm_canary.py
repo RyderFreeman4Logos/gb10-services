@@ -51,12 +51,12 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
     def test_qwen38_unit_exists(self) -> None:
         self.assertTrue(UNIT.is_file(), f"missing canary unit {UNIT}")
 
-    def test_qwen38_unit_uses_its_own_052_profile(self) -> None:
+    def test_qwen38_unit_uses_its_own_055_profile(self) -> None:
         text = _unit_text()
         self.assertTrue(QWEN38_PROFILE_SOURCE.is_file())
         self.assertEqual(
             QWEN38_PROFILE_SOURCE.read_text(),
-            "AEON_GPU_MEMORY_UTILIZATION=0.52\n",
+            "AEON_GPU_MEMORY_UTILIZATION=0.55\n",
         )
         self.assertIn(f"EnvironmentFile={QWEN38_PROFILE}", text)
         self.assertNotIn(

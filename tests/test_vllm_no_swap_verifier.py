@@ -327,7 +327,7 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
 
     def test_qwen38_profile_authority_uses_dedicated_value(self) -> None:
         profile = self.profile_dir / "qwen38.env"
-        profile.write_text("AEON_GPU_MEMORY_UTILIZATION=0.52\n")
+        profile.write_text("AEON_GPU_MEMORY_UTILIZATION=0.55\n")
         unit = self.root / "vllm-aeon-qwen38-dflash.service"
         literal = [
             "/usr/local/bin/vllm",
@@ -346,12 +346,12 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
             ),
         )
         rendered = [
-            "0.52" if token == literal[-1] else token for token in literal
+            "0.55" if token == literal[-1] else token for token in literal
         ]
         payload = self._inspect("vllm-test", command=rendered)
         result = self._run(
             units=(unit,),
-            profile_value="0.52",
+            profile_value="0.55",
             qwen_profile_path=profile,
             inspect_sequences={"vllm-test": [payload]},
         )

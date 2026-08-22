@@ -1038,9 +1038,10 @@ def execute(
         )
         return output.encode("utf-8")
     except RuntimeError as error:
-        raise RebuildError(
-            f"bounded command failed: {Path(command[0]).name}"
-        ) from error
+        reason = _bounded_primary_error(error)
+        if any(token in reason for token in ("deadline", "exhausted", "budget")):
+            fail("transaction command deadline exhausted")
+        raise RebuildError(reason) from error
     finally:
         for tool in used:
             tool.verify()

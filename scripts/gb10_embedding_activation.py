@@ -20,7 +20,7 @@ EXPECTED_IMPORT_AUTHORITY: dict[str, str] = {
     "gb10_bounded_process.py": "248762c2fdc73fdf54914fc5a20c2292bcc90430e59523c5767409ebf0f4c230",
     "gb10_embedding_activation_checks.py": "7e6d00538e8d952c137e5b5114fc16919f6e1bab59d6260602f989a2103f44a4",
     "gb10_embedding_activation_config.py": "fd3053512ae084418efd6acbedc09d2209dcd961cd87c503cfcad275a38668c8",
-    "gb10_embedding_activation_storage.py": "42eaeec3126ab3ecaef76a9077d70b2eb7e7ba8c1f3c00f8695adaa453714594",
+    "gb10_embedding_activation_storage.py": "7798ca00e86b8c8898359ad2c1a89bb1278526ca2ccc934d7f530c1ef286df0d",
     "gb10_embedding_profile_contract.py": "3a20c1f1c5cce48d51b1b5bf44e8b0b45271a7ddd69c7c5f26b723a40e551a54",
     "gb10_embedding_verifier_runtime.py": "e52242e13d6a8aaa6be9c73b4a6f2cb46bb73a01a8a8592d73ccdacbc0b35434",
     "gb10_verify_embedding_profile.py": "5ddbea42ec11ab6cf8fd8a0df14d40edd6b3920d33851510274c24a5092732f4",

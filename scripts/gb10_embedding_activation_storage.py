@@ -48,8 +48,8 @@ NO_SWAP_PRIVATE_FILES = {
 }
 NO_SWAP_PRIOR_FILES = {"core": "no_swap_core.before", "wrapper": "no_swap_wrapper.before"}
 EXPECTED_NO_SWAP_SHA256 = {
-    "core": "fee89a92a3d219c07b99d0b25fd829eb4647a7c353960b9aa5680a0f5213d889",
-    "wrapper": "58df9aee62e507f80787c748dc5f5571ed00d44e7098dc3492d83bfd9ba10169",
+    "core": "4eb71ff77cfed59903e9865f62868d35eaee965a52f334a0f27e1d9a53db3542",
+    "wrapper": "1d4c5c329693a470e507cf29238e782f90dfe7c3dc200af5b2defe049f4c6501",
 }
 
 class ActivationStorageError(RuntimeError):
