@@ -51,8 +51,9 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --memory 70g \
   --memory-swap 70g \
   --oom-score-adj 800 \
-  --entrypoint vllm \
+  --entrypoint python3 \
   qwen38-27b-vllm-dflash2-sm121@sha256:3bae63b93ff99690376eec892b5c52f6c8cd7cc462f70bb3bef83ef32114b53a \
+  /usr/local/bin/vllm \
   serve \
     --model /model \
     --host 0.0.0.0 --port 8000 \

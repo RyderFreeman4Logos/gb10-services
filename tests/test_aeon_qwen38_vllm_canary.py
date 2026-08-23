@@ -107,6 +107,15 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
         self.assertNotIn(f"{IMAGE_REPOSITORY}:{IMAGE_TAG}", start)
         self.assertNotIn("ghcr.io/aeon-7/aeon-vllm-ultimate", text)
         self.assertNotIn("/opt/hang_guard/aeon_vllm_wrapper.py", text)
+        self.assertEqual(
+            exec_start[0][exec_start[0].index("--entrypoint") + 1],
+            "python3",
+        )
+        self.assertIn("/usr/local/bin/vllm", exec_start[0])
+        self.assertEqual(
+            exec_start[0][exec_start[0].index("/usr/local/bin/vllm") + 1],
+            "serve",
+        )
         overlay_pins = [
             token
             for token in exec_start[0]
