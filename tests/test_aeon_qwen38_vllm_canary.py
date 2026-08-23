@@ -12,20 +12,22 @@ ROOT = Path(__file__).resolve().parents[1]
 UNIT = ROOT / "systemd" / "vllm-aeon-qwen38-dflash.service"
 QWEN36_UNIT = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
 SGLANG_UNIT = ROOT / "profile" / "qwen3.8-27b-nvfp4-sglang" / "sglang-qwen38-27b.service"
-IMAGE_REPOSITORY = "ghcr.io/aeon-7/aeon-vllm-ultimate"
-IMAGE_TAG = "latest"
-IMAGE_DIGEST = "sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f"
-IMAGE = f"ghcr.io/aeon-7/aeon-vllm-ultimate@{IMAGE_DIGEST}"
-IMAGE_CREATED = "2026-08-20T21:17:36.420048521-04:00"
+IMAGE_REPOSITORY = "ghcr.io/r0b0tlab/qwen38-27b-nvfp4-sm121"
+IMAGE_TAG = "v0.27.2rc0-sm121"
+IMAGE_DIGEST = "sha256:5bd3f329c531da4cd5f41f2c32d4ed9527b2131b88032b737364fb582e6b775f"
+OVERLAY_REPOSITORY = "qwen38-27b-vllm-dflash2-sm121"
+OVERLAY_DIGEST = "sha256:3bae63b93ff99690376eec892b5c52f6c8cd7cc462f70bb3bef83ef32114b53a"
 ALIAS = "abliterated-qwen-latest-27b-nvfp4"
-NVFP4_HOST = "/home/obj/models/orcarouter/Qwen3.8-27B-Uncensored-NVFP4"
-NVFP4_MOUNT = "/models/qwen38-nvfp4"
+NVFP4_HOST = "/home/obj/models/r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121"
+NVFP4_MOUNT = "/model"
+DRAFT_HOST = "/home/obj/models/z-lab/Qwen3.8-27B-DFlash2"
+DRAFT_MOUNT = "/draft"
 QWEN38_PROFILE = "/home/obj/.config/gb10/aeon-dflash-profiles/qwen38.env"
 QWEN38_PROFILE_SOURCE = ROOT / "config" / "aeon-dflash-profiles" / "qwen38.env"
 CIDFILE = "%t/gb10-memory-guardian/aeon-qwen38-text.cid"
 CONTAINER = "vllm-aeon-qwen38-dflash"
-COMPILE_HOST = "/home/obj/.cache/vllm-compile/aeon-qwen38-v0271-2fb855"
-COMPILE_CONTAINER = "/var/cache/vllm/aeon-qwen38-v0271"
+NVFP4_REV = "36f717a22990e82c54c1d48ee77c491b87825680"
+DRAFT_REV = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
 
 
 def _unit_text() -> str:
@@ -37,7 +39,12 @@ def _runtime_argv(text: str) -> list[str]:
     if len(command) != 1:
         return []
     argv = command[0]
-    return argv[argv.index("serve") + 1 :] if "serve" in argv else []
+    if "serve" in argv:
+        return argv[argv.index("serve") + 1 :]
+    for index, token in enumerate(argv):
+        if "@sha256:" in token:
+            return argv[index + 1 :]
+    return []
 
 
 def _option_value(argv: list[str], option: str) -> str:
@@ -67,55 +74,84 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
             "${AEON_GPU_MEMORY_UTILIZATION}",
         )
 
-    def test_unit_mounts_qwen38_nvfp4_mtp_without_dflash(self) -> None:
+    def test_unit_mounts_r0b0tlab_nvfp4_and_zlab_dflash2(self) -> None:
         text = _unit_text()
         self.assertIn(f"{NVFP4_HOST}:{NVFP4_MOUNT}:ro", text)
+        self.assertIn(f"{DRAFT_HOST}:{DRAFT_MOUNT}:ro", text)
+        self.assertIn(NVFP4_REV, text)
+        self.assertIn(DRAFT_REV, text)
+        self.assertNotIn("orcarouter/Qwen3.8-27B-Uncensored-NVFP4", text)
         self.assertNotIn("kstoyanov99/Qwen3.8-27B-Dflash", text)
         self.assertNotIn("/models/qwen38-dflash", text)
-        self.assertNotIn("Qwen3.8-27B-DFlash2", text)
-        self.assertNotIn("/models/qwen38-dflash2", text)
         self.assertNotIn("/snapshots/", text)
         argv = _runtime_argv(text)
-        self.assertEqual(argv[0], NVFP4_MOUNT)
+        self.assertEqual(_option_value(argv, "--model"), NVFP4_MOUNT)
         speculative = json.loads(_option_value(argv, "--speculative-config"))
         self.assertEqual(
             speculative,
             {
-                "method": "mtp",
-                "num_speculative_tokens": 3,
+                "method": "dflash",
+                "model": DRAFT_MOUNT,
+                "num_speculative_tokens": 8,
             },
         )
 
-    def test_unit_pins_latest_aeon_engine_and_quality_envelope(self) -> None:
+    def test_unit_pins_r0b0tlab_dflash2_overlay_and_quality_envelope(self) -> None:
         text = _unit_text()
         argv = _runtime_argv(text)
         exec_start = _logical_argv(text, "ExecStart")
         self.assertEqual(len(exec_start), 1)
+        start = " ".join(exec_start[0])
         self.assertIn(f"image tag: {IMAGE_TAG} (repository {IMAGE_REPOSITORY})", text)
         self.assertIn(f"resolved immutable digest: {IMAGE_DIGEST}", text)
-        self.assertIn(f"created: {IMAGE_CREATED}", text)
-        self.assertNotIn(f"{IMAGE_REPOSITORY}:{IMAGE_TAG}", " ".join(exec_start[0]))
-        self.assertIn(IMAGE, text)
-        self.assertIn("/opt/hang_guard/aeon_vllm_wrapper.py", text)
+        self.assertNotIn(f"{IMAGE_REPOSITORY}:{IMAGE_TAG}", start)
+        self.assertNotIn("ghcr.io/aeon-7/aeon-vllm-ultimate", text)
+        self.assertNotIn("/opt/hang_guard/aeon_vllm_wrapper.py", text)
+        overlay_pins = [
+            token
+            for token in exec_start[0]
+            if token.startswith(f"{OVERLAY_REPOSITORY}@sha256:")
+        ]
+        self.assertEqual(len(overlay_pins), 1)
+        self.assertRegex(
+            overlay_pins[0],
+            rf"^{re.escape(OVERLAY_REPOSITORY)}@sha256:[0-9a-f]{{64}}$",
+        )
+        self.assertEqual(overlay_pins[0], f"{OVERLAY_REPOSITORY}@{OVERLAY_DIGEST}")
+        self.assertNotEqual(
+            overlay_pins[0],
+            f"{OVERLAY_REPOSITORY}@sha256:{'0' * 64}",
+        )
+        self.assertIn(OVERLAY_DIGEST, text)
+        self.assertIn(IMAGE_DIGEST, text)
         self.assertEqual(_option_value(argv, "--max-model-len"), "262144")
-        self.assertEqual(_option_value(argv, "--kv-cache-dtype"), "fp8_e4m3")
+        self.assertEqual(_option_value(argv, "--kv-cache-dtype"), "fp8")
         self.assertEqual(_option_value(argv, "--mamba-cache-dtype"), "float32")
-        self.assertIn("--mamba-ssm-cache-dtype", argv)
         self.assertEqual(_option_value(argv, "--mamba-ssm-cache-dtype"), "float32")
-        self.assertEqual(_option_value(argv, "--quantization"), "compressed-tensors")
-        self.assertEqual(_option_value(argv, "--attention-backend"), "TRITON_ATTN")
-        self.assertEqual(_option_value(argv, "--gpu-memory-utilization"), "${AEON_GPU_MEMORY_UTILIZATION}")
+        self.assertEqual(
+            _option_value(argv, "--gpu-memory-utilization"),
+            "${AEON_GPU_MEMORY_UTILIZATION}",
+        )
+        self.assertEqual(_option_value(argv, "--tool-call-parser"), "qwen3_xml")
+        self.assertIn("--enable-auto-tool-choice", argv)
+        self.assertIn("--enforce-eager", argv)
+        self.assertIn("--no-enable-flashinfer-autotune", argv)
+        self.assertIn("--kernel-config.enable_jit_warmup=false", argv)
+        self.assertIn("--kernel-config.enable_cutedsl_warmup=false", argv)
+        self.assertIn("--trust-remote-code", argv)
         self.assertNotIn("--kv-cache-memory-bytes", text)
         self.assertNotIn("--max-total-tokens", text)
-        self.assertIn("-e VLLM_USE_V2_MODEL_RUNNER=0", text)
-        self.assertIn("-e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768", text)
+        self.assertIn("-e VLLM_USE_V2_MODEL_RUNNER=1", text)
+        self.assertNotIn("-e VLLM_USE_V2_MODEL_RUNNER=0", text)
         self.assertIn("--no-enable-prefix-caching", argv)
         self.assertNotIn("--enable-prefix-caching", argv)
-        self.assertIn("--memory 74g", text)
-        self.assertIn("--memory-swap 74g", text)
+        self.assertIn("--memory 70g", text)
+        self.assertIn("--memory-swap 70g", text)
         self.assertIn("--memory-swappiness 0", text)
-        self.assertIn("MemoryMax=74G", text)
+        self.assertIn("MemoryMax=70G", text)
         self.assertIn("MemorySwapMax=0", text)
+        self.assertNotIn("MemoryMax=74G", text)
+        self.assertNotIn("--memory 74g", text)
 
     def test_unit_omits_pooling_only_prefill_flags_for_generative_serve(self) -> None:
         argv = _runtime_argv(_unit_text())
@@ -133,7 +169,6 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
         self.assertIn(f"--cidfile={CIDFILE}", text)
         self.assertNotIn("--name vllm-aeon-27b-dflash", text)
         self.assertNotIn("aeon-text.cid", text)
-        self.assertIn(f"{COMPILE_HOST}:{COMPILE_CONTAINER}", text)
         self.assertNotIn("aeon-qwen36-v0271", text)
 
     def test_unit_orders_after_neighbors_and_conflicts_with_other_text_backends(self) -> None:
@@ -150,12 +185,13 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
         )
         self.assertIn(f"EnvironmentFile={QWEN38_PROFILE}", text)
 
-    def test_unit_documents_canary_and_keeps_capacity_claim_honest(self) -> None:
+    def test_unit_documents_dflash2_canary_and_keeps_capacity_claim_honest(self) -> None:
         text = _unit_text()
-        self.assertIn("canary of the AEON engine + incumbent Qwen3.8 weights", text)
+        self.assertIn("r0b0tlab DFlash2 K=8", text)
         self.assertIn("KV≥262144 is a live receipt, not a source claim", text)
-        self.assertIn("MTP K=3", text)
+        self.assertNotIn("MTP K=3", text)
         self.assertNotIn("DFlash n=10", text)
+        self.assertNotIn("canary of the AEON engine + incumbent Qwen3.8 weights", text)
         self.assertIn("SGLang", text)
 
 

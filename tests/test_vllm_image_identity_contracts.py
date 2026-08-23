@@ -125,7 +125,6 @@ class VllmImageIdentityContractTests(unittest.TestCase):
             {path.name for path in aeon_units},
             {
                 "vllm-aeon-27b-dflash.service",
-                "vllm-aeon-qwen38-dflash.service",
                 "vllm-embedding.service",
                 "vllm-qwen3-reranker-8b.service",
                 "vllm-querit-4b-reranker.service",

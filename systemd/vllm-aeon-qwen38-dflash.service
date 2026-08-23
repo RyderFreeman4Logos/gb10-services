@@ -1,10 +1,12 @@
-# AEON image release: 2026-08-17-v0.27.1-slim; immutable digest: sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f
-# AEON image tag: latest (repository ghcr.io/aeon-7/aeon-vllm-ultimate); resolved immutable digest: sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f; created: 2026-08-20T21:17:36.420048521-04:00
-# As of 2026-08-21, :latest resolves to this digest; ExecStart uses the immutable digest pin.
-# This is a canary of the AEON engine + incumbent Qwen3.8 weights.
+# r0b0tlab DFlash2 K=8 canary on the published SM121 wheel + overlay.
+# r0b0tlab image tag: v0.27.2rc0-sm121 (repository ghcr.io/r0b0tlab/qwen38-27b-nvfp4-sm121); resolved immutable digest: sha256:5bd3f329c531da4cd5f41f2c32d4ed9527b2131b88032b737364fb582e6b775f
+# Overlay image: qwen38-27b-vllm-dflash2-sm121:0.1.1 from docker/Dockerfile.dflash2; immutable overlay digest: sha256:3bae63b93ff99690376eec892b5c52f6c8cd7cc462f70bb3bef83ef32114b53a
+# Target: /home/obj/models/r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121 @ 36f717a22990e82c54c1d48ee77c491b87825680
+# Draft: /home/obj/models/z-lab/Qwen3.8-27B-DFlash2 @ 50307d4c4cde6860d4eee73e2547cd786fe8e8a4
+# This is a canary of the r0b0tlab DFlash2 K=8 engine + NVFP4 checkpoint.
 # Capacity note: KV≥262144 is a live receipt, not a source claim.
 [Unit]
-Description=vLLM AEON-7 Qwen3.8-27B NVFP4 + MTP K=3 (canary, v0.27.1-slim)
+Description=vLLM r0b0tlab Qwen3.8-27B NVFP4 + DFlash2 K=8 (canary, v0.27.2rc0-sm121)
 # Start after co-resident services are ordered, without requiring either one.
 After=network.target
 After=vllm-querit-4b-reranker.service
@@ -23,8 +25,8 @@ Environment=GB10_CONTAINER_CIDFILE=%t/gb10-memory-guardian/aeon-qwen38-text.cid
 Environment=AEON_URL=http://100.105.4.92:18010
 EnvironmentFile=/home/obj/.config/gb10/aeon-dflash-profiles/qwen38.env
 OOMScoreAdjust=800
-# No explicit KV-byte pin: AUTO KV lets the UMA guard use leftover memory.
-MemoryMax=74G
+# 70G text envelope, no swap. AUTO KV; live receipt must be KV≥262144.
+MemoryMax=70G
 MemorySwapMax=0
 Restart=always
 RestartSec=30
@@ -33,57 +35,43 @@ TimeoutStopSec=60
 
 ExecCondition=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock AEON_GPU_MEMORY_UTILIZATION=${AEON_GPU_MEMORY_UTILIZATION} /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-aeon-qwen38-dflash.service
 ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-memory-guardian
-ExecStartPre=/usr/bin/install -d -m 0700 /home/obj/.cache/vllm-compile/aeon-qwen38-v0271-2fb855
 ExecStartPre=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --cleanup --container vllm-aeon-qwen38-dflash --cidfile %t/gb10-memory-guardian/aeon-qwen38-text.cid
 ExecStartPre=/usr/bin/rm -f %t/gb10-memory-guardian/text-cgroup.v1
 ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/aeon-qwen38-text.cid --name vllm-aeon-qwen38-dflash \
   --cgroup-parent app.slice \
   --gpus all --ipc host \
   -p 100.105.4.92:18010:8000 \
-  -v /home/obj/models/orcarouter/Qwen3.8-27B-Uncensored-NVFP4:/models/qwen38-nvfp4:ro \
-  -v /home/obj/.cache/vllm-compile/aeon-qwen38-v0271-2fb855:/var/cache/vllm/aeon-qwen38-v0271 \
-  -v /home/obj/scripts/aeon_hang_guard.py:/opt/hang_guard/aeon_hang_guard.py:ro \
-  -v /home/obj/scripts/aeon_vllm_wrapper.py:/opt/hang_guard/aeon_vllm_wrapper.py:ro \
+  -v /home/obj/models/r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121:/model:ro \
+  -v /home/obj/models/z-lab/Qwen3.8-27B-DFlash2:/draft:ro \
   -e HF_HUB_OFFLINE=1 \
   -e MAX_JOBS=1 \
   -e CMAKE_BUILD_PARALLEL_LEVEL=1 \
-  -e PYTHONPATH=/opt/hang_guard \
-  -e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768 \
-  -e VLLM_USE_V2_MODEL_RUNNER=0 \
-  -e AEON_THINKING_BUDGET_GUARD=0 \
+  -e VLLM_USE_V2_MODEL_RUNNER=1 \
   --memory-swappiness 0 \
-  --memory 74g \
-  --memory-swap 74g \
+  --memory 70g \
+  --memory-swap 70g \
   --oom-score-adj 800 \
-  --entrypoint python3 \
-  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f \
-  /opt/hang_guard/aeon_vllm_wrapper.py serve \
-    /models/qwen38-nvfp4 \
+  --entrypoint vllm \
+  qwen38-27b-vllm-dflash2-sm121@sha256:3bae63b93ff99690376eec892b5c52f6c8cd7cc462f70bb3bef83ef32114b53a \
+  serve \
+    --model /model \
     --host 0.0.0.0 --port 8000 \
     --served-model-name "abliterated-qwen-latest-27b-nvfp4" \
-    --quantization compressed-tensors \
-    --kv-cache-dtype fp8_e4m3 \
-    --attention-backend TRITON_ATTN \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
     --mamba-cache-dtype float32 \
     --mamba-ssm-cache-dtype float32 \
-    --max-model-len 262144 \
-    --max-num-seqs 16 \
-    --max-num-batched-tokens 4096 \
+    --enforce-eager \
     --no-enable-prefix-caching \
+    --max-model-len 262144 \
     --gpu-memory-utilization ${AEON_GPU_MEMORY_UTILIZATION} \
-    --enable-chunked-prefill \
-    --scheduler-reserve-full-isl \
-    --compilation-config "{\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_num_of_warmups\":0,\"cache_dir\":\"/var/cache/vllm/aeon-qwen38-v0271\"}" \
-    --jit-monitor-mode warn \
-    --max-logprobs 20 \
-    --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":3}" \
-    --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
-    --tool-call-parser qwen3_coder \
-    --default-chat-template-kwargs "{\"enable_thinking\":false}" \
-    --override-generation-config "{\"temperature\":0.6,\"top_p\":0.95,\"top_k\":20}" \
-    --trust-remote-code
-# The AEON canary uses checkpoint MTP K=3; the Qwen3.8 SGLang profile remains a separate reference.
+    --tool-call-parser qwen3_xml \
+    --speculative-config "{\"method\":\"dflash\",\"model\":\"/draft\",\"num_speculative_tokens\":8}" \
+    --no-enable-flashinfer-autotune \
+    --kernel-config.enable_jit_warmup=false \
+    --kernel-config.enable_cutedsl_warmup=false
+# The Qwen3.8 canary uses r0b0tlab DFlash2 K=8; the Qwen3.8 SGLang profile remains a separate reference.
 # No live KV>=262144 receipt is implied by this source unit.
 ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock AEON_GPU_MEMORY_UTILIZATION=${AEON_GPU_MEMORY_UTILIZATION} /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --bind-runtime-swap-max --unit /home/obj/.config/systemd/user/vllm-aeon-qwen38-dflash.service --container vllm-aeon-qwen38-dflash
 ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock AEON_GPU_MEMORY_UTILIZATION=${AEON_GPU_MEMORY_UTILIZATION} /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-aeon-qwen38-dflash.service --container vllm-aeon-qwen38-dflash

@@ -122,6 +122,7 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
             if any(
                 any(
                     token.endswith("/vllm")
+                    or token == "vllm"
                     or token.endswith("/aeon_vllm_wrapper.py")
                     for token in argv
                 )
