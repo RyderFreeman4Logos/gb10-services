@@ -17,7 +17,8 @@ uses that alias gets the Qwen3.8 generation after a later authorized cutover.
 ## Layout
 
 - `sglang-qwen38-27b.service` — systemd user unit (DSpark, NVFP4, swap-impossible).
-- `llm-guard-proxy/config.toml` — faithful-forward default chat Guard config.
+- `llm-guard-proxy/config.toml` — source-prepared default chat Guard config
+  (admission 32; fill-if-absent sampling defaults; requires llm-guard-proxy #245).
 
 ## Unit contract
 
@@ -48,11 +49,19 @@ uses that alias gets the Qwen3.8 generation after a later authorized cutover.
 
 ## Guard contract
 
-The profile Guard config's default chat path (`:18009`) is **faithful
-forward**: public alias kept in `match_models`, `upstream_model` =
-`abliterated-qwen-latest-27b-nvfp4`, `param_override` disabled, thinking
-passthrough (not forced), loop_guard disabled, no retry ladder that mutates
-thinking or sampling, and no `thinking_token_budget` injection. Caller
-temperature / top_p / top_k / reasoning_effort / enable_thinking are forwarded
-unchanged; a request with no thinking fields gets the SGLang default **medium**
-reasoning effort via `--sampling-defaults model`.
+The profile Guard config's default chat path (`:18009`) is **fill-if-absent
+passthrough**: public alias kept in `match_models`, `upstream_model` =
+`abliterated-qwen-latest-27b-nvfp4`, thinking passthrough (not forced),
+loop_guard disabled, no retry ladder that mutates thinking or sampling, and
+no `thinking_token_budget` injection. Server and default-chat admission are
+32/32. `[upstreams.param_override]` is enabled with `fill_if_absent = true`
+and these defaults (caller-supplied fields win):
+
+`temperature=1.0`, `top_p=0.95`, `top_k=20`, `min_p=0.0`,
+`presence_penalty=0.0`, `repetition_penalty=1.0`, `reasoning_effort=medium`,
+`thinking_budget=32768`, `max_tokens=50000` (non-CoT remainder 17232).
+
+This file must not be copied onto live Guard until
+[llm-guard-proxy#245](https://github.com/RyderFreeman4Logos/llm-guard-proxy/issues/245)
+is deployed — current live Guard rejects unknown keys. Embedding/reranker
+admission stays 8/64.

@@ -288,15 +288,15 @@ class Qwen38GuardContractTests(unittest.TestCase):
         cls.text = GUARD.read_text()
         cls.config = tomllib.loads(cls.text)
 
-    def test_dflash_chat_admission_is_16_in_flight_and_queued(self) -> None:
+    def test_dflash_chat_admission_is_32_in_flight_and_queued(self) -> None:
         default_chat = next(
             profile
             for profile in self.config["upstreams"]
             if profile["name"] == "qwen3.8-sglang-default-chat"
         )
         for admission in (self.config["server"], default_chat):
-            self.assertEqual(admission["max_in_flight_requests"], 16)
-            self.assertEqual(admission["max_queued_generation_requests"], 16)
+            self.assertEqual(admission["max_in_flight_requests"], 32)
+            self.assertEqual(admission["max_queued_generation_requests"], 32)
 
     def test_default_chat_keeps_public_stable_alias(self):
         self.assertIn(SERVED_ALIAS, self.text)
@@ -348,13 +348,33 @@ class Qwen38GuardContractTests(unittest.TestCase):
                 "no [[listeners]] block may bind 18009",
             )
 
-    def test_param_override_disabled(self):
-        # TOML table form: [upstreams.param_override] with enabled = false.
+    def test_param_override_fill_if_absent_defaults(self):
+        # First [upstreams.param_override] is default chat; caller-wins fill.
         self.assertIn("[upstreams.param_override]", self.text)
         section_end = self.text.index("[upstreams.loop_guard]", self.text.index("[upstreams.param_override]"))
         block = self.text[self.text.index("[upstreams.param_override]"):section_end]
-        self.assertTrue(re.search(r"enabled\s*=\s*false", block), "param_override must be disabled")
-        self.assertNotIn("temperature", block)
+        self.assertTrue(re.search(r"enabled\s*=\s*true", block), "param_override must be enabled")
+        self.assertRegex(block, r"fill_if_absent\s*=\s*true")
+        default_chat = next(
+            profile
+            for profile in self.config["upstreams"]
+            if profile["name"] == "qwen3.8-sglang-default-chat"
+        )
+        override = default_chat["param_override"]
+        self.assertTrue(override["enabled"])
+        self.assertTrue(override["fill_if_absent"])
+        self.assertEqual(override["temperature"], 1.0)
+        self.assertEqual(override["top_p"], 0.95)
+        self.assertEqual(override["top_k"], 20)
+        self.assertEqual(override["min_p"], 0.0)
+        self.assertEqual(override["presence_penalty"], 0.0)
+        self.assertEqual(override["repetition_penalty"], 1.0)
+        self.assertEqual(override["max_tokens"], 50000)
+        self.assertEqual(override["reasoning_effort"], "medium")
+        self.assertEqual(override["thinking_budget"], 32768)
+        self.assertNotIn("thinking_token_budget", block)
+        self.assertNotIn("force_disable", block)
+        self.assertNotIn("force_thinking", block)
 
     def test_retry_ladder_must_not_rewrite_sampling_or_thinking(self):
         # No retry ladder that force_* thinking or rewrites sampling.

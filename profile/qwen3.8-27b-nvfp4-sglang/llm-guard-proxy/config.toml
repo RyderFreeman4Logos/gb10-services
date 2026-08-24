@@ -1,13 +1,14 @@
 # Qwen3.8 NVFP4 SGLang profile Guard config (source-prepared, NOT live).
 # Live Guard still reads /home/obj/.config/llm-guard-proxy/config.toml.
-# Deriveld from the production Guard file; the DEFAULT chat path (:18009) is
-# faithful-forward (no force_disable / force_thinking / sampling rewrite).
-# Do not require live Guard to load this file until a later cutover.
+# Derived from the production Guard file; the DEFAULT chat path (:18009)
+# applies fill-if-absent sampling/thinking defaults (caller fields win). Requires
+# llm-guard-proxy #245. Do not copy this file onto live Guard until #245
+# is deployed (unknown keys fail closed).
 [server]
 bind_host = "100.105.4.92"
 port = 18009
-max_in_flight_requests = 16
-max_queued_generation_requests = 16
+max_in_flight_requests = 32
+max_queued_generation_requests = 32
 generation_queue_timeout_ms = 1800000
 generation_queue_full_status = 429
 generation_queue_retry_after_secs = 10
@@ -42,11 +43,11 @@ name = "aggregate"
 bind_host = "100.105.4.92"
 port = 18005
 
-# Default multi-model chat entry :18009. Faithful forward of the caller's
-# temperature / top_p / top_k / reasoning_effort / enable_thinking: no
-# force_disable, no param_override, no loop salvage, no thinking_token_budget.
-# 18009 is served by the implicit default listener ([server].port); do not
-# bind a second [[listeners]] on it (live Guard rejects duplicate listener ports).
+# Default multi-model chat entry :18009. Fill-if-absent defaults only;
+# caller temperature / top_p / top_k / reasoning_effort / enable_thinking
+# win. No force_disable, no force_thinking, no loop salvage, no
+# thinking_token_budget. 18009 is the implicit default listener
+# ([server].port); do not bind a second [[listeners]] on it.
 
 [upstream]
 base_url = "http://100.105.4.92:18010/v1"
@@ -105,8 +106,8 @@ base_url = "http://100.105.4.92:18010/v1"
 upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 match_models = ["abliterated-qwen-latest-27b-nvfp4", "qwen3.8-27b-sglang", "qwen3.6-27b-decensor-by-aeon", "qwen3.6-27b-decensored", "aeon-ultimate"]
 request_timeout_ms = 1800000
-max_in_flight_requests = 16
-max_queued_generation_requests = 16
+max_in_flight_requests = 32
+max_queued_generation_requests = 32
 
 [upstreams.metadata]
 discovery_enabled = true
@@ -133,14 +134,25 @@ cooldown_ms = 300000
 budget_window_ms = 900000
 max_per_window = 2
 
-# Default chat path is faithful-forward: thinking passthrough (not forced),
-# no sampling override, no loop salvage.
+# Default chat: thinking passthrough (not forced). Sampling/thinking
+# defaults are fill-if-absent only (llm-guard-proxy #245). Do not emit
+# thinking_token_budget to this vLLM backend.
 [upstreams.thinking]
 mode = "passthrough"
 enabled = false
 
 [upstreams.param_override]
-enabled = false
+enabled = true
+fill_if_absent = true
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+max_tokens = 50000
+reasoning_effort = "medium"
+thinking_budget = 32768
 
 [upstreams.loop_guard]
 enabled = false
