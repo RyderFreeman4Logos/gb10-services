@@ -319,10 +319,26 @@ class Qwen38GuardContractTests(unittest.TestCase):
             ],
         )
 
-    def test_no_force_disable_on_default_chat(self):
-        # Default chat must not force thinking off; faithful forward of caller.
-        self.assertNotIn("mode = \"force_disable\"", self.text)
-        self.assertNotIn("force_disable = true", self.text)
+    def test_default_chat_force_disables_thinking_without_native_budget(self):
+        # Issue #53: this checkpoint dumps untagged CoT into content unless
+        # Guard injects enable_thinking=false. vllm_native also injects
+        # thinking_token_budget, which this backend rejects.
+        default_chat = next(
+            profile
+            for profile in self.config["upstreams"]
+            if profile["name"] == "qwen3.8-sglang-default-chat"
+        )
+        thinking = default_chat["thinking"]
+        self.assertEqual(thinking["mode"], "force_disable")
+        self.assertTrue(thinking["force_disable"])
+        self.assertEqual(thinking["default_injection_schema"], "chat_template_kwargs")
+        self.assertNotIn("budget_tokens", thinking)
+        self.assertEqual(self.config["thinking"]["mode"], "force_disable")
+        self.assertEqual(
+            self.config["thinking"]["default_injection_schema"],
+            "chat_template_kwargs",
+        )
+        self.assertNotIn("vllm_native", self.text)
 
     def test_default_chat_listener_port_is_unique(self):
         # [server].port is the implicit default listener for 18009; a
@@ -356,9 +372,8 @@ class Qwen38GuardContractTests(unittest.TestCase):
         self.assertTrue(re.search(r"enabled\s*=\s*false", block), "param_override must be disabled")
         self.assertNotIn("temperature", block)
 
-    def test_retry_ladder_must_not_rewrite_sampling_or_thinking(self):
-        # No retry ladder that force_* thinking or rewrites sampling.
-        self.assertNotIn("thinking_mode = \"force_disable\"", self.text)
+    def test_retry_ladder_keeps_force_disable_and_does_not_rewrite_sampling(self):
+        self.assertIn("thinking_mode = \"force_disable\"", self.text)
         self.assertNotIn("thinking_mode = \"force_thinking\"", self.text)
         self.assertNotIn("temperature = 0.6", self.text)
 
