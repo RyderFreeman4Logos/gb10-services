@@ -1,7 +1,8 @@
-# Qwen3.8 NVFP4 SGLang profile Guard config.
-# Live Guard reads /home/obj/.config/llm-guard-proxy/config.toml.
-# Default chat path (:18009) force-disables thinking so untagged CoT cannot
-# leak into content (issue #53). Sampling remains caller-passthrough.
+# Qwen3.8 NVFP4 SGLang profile Guard config (source-prepared, NOT live).
+# Live Guard still reads /home/obj/.config/llm-guard-proxy/config.toml.
+# Deriveld from the production Guard file; the DEFAULT chat path (:18009) is
+# faithful-forward (no force_disable / force_thinking / sampling rewrite).
+# Do not require live Guard to load this file until a later cutover.
 [server]
 bind_host = "100.105.4.92"
 port = 18009
@@ -41,9 +42,9 @@ name = "aggregate"
 bind_host = "100.105.4.92"
 port = 18005
 
-# Default multi-model chat entry :18009. Force-disable thinking (issue #53).
-# Caller temperature / top_p / top_k still pass through: no param_override,
-# no loop salvage, no thinking_token_budget.
+# Default multi-model chat entry :18009. Faithful forward of the caller's
+# temperature / top_p / top_k / reasoning_effort / enable_thinking: no
+# force_disable, no param_override, no loop salvage, no thinking_token_budget.
 # 18009 is served by the implicit default listener ([server].port); do not
 # bind a second [[listeners]] on it (live Guard rejects duplicate listener ports).
 
@@ -132,16 +133,11 @@ cooldown_ms = 300000
 budget_window_ms = 900000
 max_per_window = 2
 
-# Default chat path force-disables thinking. This Qwen3.8 checkpoint emits
-# untagged CoT into content when thinking is left on (issue #53).
+# Default chat path is faithful-forward: thinking passthrough (not forced),
+# no sampling override, no loop salvage.
 [upstreams.thinking]
-mode = "force_disable"
-enabled = true
-force_disable = true
-preserve_answer_budget = true
-tool_request_policy = "apply"
-no_thinking_marker_policy = "force"
-default_injection_schema = "chat_template_kwargs"
+mode = "passthrough"
+enabled = false
 
 [upstreams.param_override]
 enabled = false
@@ -150,16 +146,16 @@ enabled = false
 enabled = false
 mode = "disabled"
 
-# Single-rung ladder: keep force_disable; do not re-enable thinking on retry.
+# Single-rung neutral ladder: no retry that mutates thinking or sampling.
 # Live Guard 8adcce30 rejects unknown table [upstreams.retry]; keep ladder only.
 [[upstreams.retry.ladder]]
-name = "no-thinking-only"
-thinking_mode = "force_disable"
+name = "same-policy"
+thinking_mode = "passthrough"
 max_tokens = 50000
 preserve_answer_budget = true
 tool_request_policy = "apply"
-no_thinking_marker_policy = "force"
-default_injection_schema = "chat_template_kwargs"
+no_thinking_marker_policy = "respect_no_thinking_markers"
+default_injection_schema = "vllm_native"
 
 [[upstreams]]
 name = "qwen3-embedding-8b"
@@ -261,15 +257,11 @@ max_retention_records = 100000
 max_retention_bytes = 8589934592
 retention_days = 14
 
-# Default multi-model entry (:18009 chat). Force-disable thinking (issue #53).
+# Default multi-model entry (:18009 chat). Faithful forward: thinking
+# passthrough, no loop salvage, no sampling rewrite.
 [thinking]
-mode = "force_disable"
-enabled = true
-force_disable = true
-preserve_answer_budget = true
-tool_request_policy = "apply"
-no_thinking_marker_policy = "force"
-default_injection_schema = "chat_template_kwargs"
+mode = "passthrough"
+enabled = false
 
 [loop_guard]
 enabled = false
@@ -284,13 +276,13 @@ shielded_streaming_enabled = false
 downstream_drop_policy = "cancel"
 
 [[retry.ladder]]
-name = "no-thinking-only"
-thinking_mode = "force_disable"
+name = "same-policy"
+thinking_mode = "passthrough"
 max_tokens = 50000
 preserve_answer_budget = true
 tool_request_policy = "apply"
-no_thinking_marker_policy = "force"
-default_injection_schema = "chat_template_kwargs"
+no_thinking_marker_policy = "respect_no_thinking_markers"
+default_injection_schema = "vllm_native"
 
 [heartbeat]
 mode = "sse"

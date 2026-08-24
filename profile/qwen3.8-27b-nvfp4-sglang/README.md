@@ -17,7 +17,7 @@ uses that alias gets the Qwen3.8 generation after a later authorized cutover.
 ## Layout
 
 - `sglang-qwen38-27b.service` — systemd user unit (DSpark, NVFP4, swap-impossible).
-- `llm-guard-proxy/config.toml` — default `:18009` chat Guard config (`force_disable`).
+- `llm-guard-proxy/config.toml` — faithful-forward default chat Guard config.
 
 ## Unit contract
 
@@ -48,10 +48,11 @@ uses that alias gets the Qwen3.8 generation after a later authorized cutover.
 
 ## Guard contract
 
-The profile Guard config's default chat path (`:18009`) is **force_disable**:
-public alias kept in `match_models`, `upstream_model` =
+The profile Guard config's default chat path (`:18009`) is **faithful
+forward**: public alias kept in `match_models`, `upstream_model` =
 `abliterated-qwen-latest-27b-nvfp4`, `param_override` disabled, thinking
-forced off (`chat_template_kwargs.enable_thinking=false`; no `thinking_token_budget`), loop_guard disabled, and
-no `thinking_token_budget` injection. Caller temperature / top_p / top_k still
-pass through. This checkpoint otherwise emits untagged CoT into `content`
-(issue #53).
+passthrough (not forced), loop_guard disabled, no retry ladder that mutates
+thinking or sampling, and no `thinking_token_budget` injection. Caller
+temperature / top_p / top_k / reasoning_effort / enable_thinking are forwarded
+unchanged; a request with no thinking fields gets the SGLang default **medium**
+reasoning effort via `--sampling-defaults model`.
