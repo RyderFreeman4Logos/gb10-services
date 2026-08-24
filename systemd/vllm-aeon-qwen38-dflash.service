@@ -1,9 +1,9 @@
 # r0b0tlab DFlash2 K=8 canary on the published SM121 wheel + overlay.
 # r0b0tlab image tag: v0.27.2rc0-sm121 (repository ghcr.io/r0b0tlab/qwen38-27b-nvfp4-sm121); resolved immutable digest: sha256:5bd3f329c531da4cd5f41f2c32d4ed9527b2131b88032b737364fb582e6b775f
 # Overlay image: qwen38-27b-vllm-dflash2-sm121:0.1.1 from docker/Dockerfile.dflash2; immutable overlay digest: sha256:3bae63b93ff99690376eec892b5c52f6c8cd7cc462f70bb3bef83ef32114b53a
-# Target: /home/obj/models/r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121 @ 36f717a22990e82c54c1d48ee77c491b87825680
+# Target: /home/obj/models/orcarouter/Qwen3.8-27B-Uncensored-NVFP4 @ 1cf0e4392ac3e26cfff1727500162414719092dc
 # Draft: /home/obj/models/z-lab/Qwen3.8-27B-DFlash2 @ 50307d4c4cde6860d4eee73e2547cd786fe8e8a4
-# This is a canary of the r0b0tlab DFlash2 K=8 engine + NVFP4 checkpoint.
+# Same r0b0tlab DFlash2 K=8 engine; target swapped to OrcaRouter NVFP4 for a like-for-like decode bench.
 # Capacity note: KV≥262144 is a live receipt, not a source claim.
 [Unit]
 Description=vLLM r0b0tlab Qwen3.8-27B NVFP4 + DFlash2 K=8 (canary, v0.27.2rc0-sm121)
@@ -41,7 +41,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --cgroup-parent app.slice \
   --gpus all --ipc host \
   -p 100.105.4.92:18010:8000 \
-  -v /home/obj/models/r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121:/model:ro \
+  -v /home/obj/models/orcarouter/Qwen3.8-27B-Uncensored-NVFP4:/model:ro \
   -v /home/obj/models/z-lab/Qwen3.8-27B-DFlash2:/draft:ro \
   -e HF_HUB_OFFLINE=1 \
   -e MAX_JOBS=1 \

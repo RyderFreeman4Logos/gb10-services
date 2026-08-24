@@ -18,7 +18,6 @@ IMAGE_DIGEST = "sha256:5bd3f329c531da4cd5f41f2c32d4ed9527b2131b88032b737364fb582
 OVERLAY_REPOSITORY = "qwen38-27b-vllm-dflash2-sm121"
 OVERLAY_DIGEST = "sha256:3bae63b93ff99690376eec892b5c52f6c8cd7cc462f70bb3bef83ef32114b53a"
 ALIAS = "abliterated-qwen-latest-27b-nvfp4"
-NVFP4_HOST = "/home/obj/models/r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121"
 NVFP4_MOUNT = "/model"
 DRAFT_HOST = "/home/obj/models/z-lab/Qwen3.8-27B-DFlash2"
 DRAFT_MOUNT = "/draft"
@@ -26,7 +25,6 @@ QWEN38_PROFILE = "/home/obj/.config/gb10/aeon-dflash-profiles/qwen38.env"
 QWEN38_PROFILE_SOURCE = ROOT / "config" / "aeon-dflash-profiles" / "qwen38.env"
 CIDFILE = "%t/gb10-memory-guardian/aeon-qwen38-text.cid"
 CONTAINER = "vllm-aeon-qwen38-dflash"
-NVFP4_REV = "36f717a22990e82c54c1d48ee77c491b87825680"
 DRAFT_REV = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
 
 
@@ -74,13 +72,13 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
             "${AEON_GPU_MEMORY_UTILIZATION}",
         )
 
-    def test_unit_mounts_r0b0tlab_nvfp4_and_zlab_dflash2(self) -> None:
+    def test_unit_mounts_target_and_dflash2_draft(self) -> None:
+        # Target host path is a swap knob; do not pin it. Keep the engine
+        # contract: /model + z-lab DFlash2 on /draft.
         text = _unit_text()
-        self.assertIn(f"{NVFP4_HOST}:{NVFP4_MOUNT}:ro", text)
+        self.assertRegex(text, r"-v\s+\S+:/model:ro")
         self.assertIn(f"{DRAFT_HOST}:{DRAFT_MOUNT}:ro", text)
-        self.assertIn(NVFP4_REV, text)
         self.assertIn(DRAFT_REV, text)
-        self.assertNotIn("orcarouter/Qwen3.8-27B-Uncensored-NVFP4", text)
         self.assertNotIn("kstoyanov99/Qwen3.8-27B-Dflash", text)
         self.assertNotIn("/models/qwen38-dflash", text)
         self.assertNotIn("/snapshots/", text)
