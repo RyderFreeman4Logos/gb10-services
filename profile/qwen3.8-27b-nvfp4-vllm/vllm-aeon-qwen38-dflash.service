@@ -64,6 +64,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
     --enforce-eager \
     --enable-prefix-caching \
     --enable-chunked-prefill \
+    --scheduler-reserve-full-isl \
     --attention-backend TRITON_ATTN \
     --max-model-len 262144 \
     --gpu-memory-utilization ${AEON_GPU_MEMORY_UTILIZATION} \
