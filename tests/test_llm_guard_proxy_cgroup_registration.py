@@ -54,14 +54,16 @@ class IntegratedGuardianRegistrationTests(unittest.TestCase):
         ):
             self.assertFalse(path.exists(), path)
 
-    def fixture(self) -> tuple[tempfile.TemporaryDirectory[str], dict[str, str], Path, Path]:
+    def fixture(
+        self, cidfile_name: str = "aeon-text.cid"
+    ) -> tuple[tempfile.TemporaryDirectory[str], dict[str, str], Path, Path]:
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
         runtime = root / "runtime"
         identity = runtime / "gb10-memory-guardian"
         identity.mkdir(parents=True, mode=0o700)
         cid = "a" * 64
-        cidfile = identity / "aeon-text.cid"
+        cidfile = identity / cidfile_name
         cidfile.write_text(f"{cid}\n")
         registration = identity / "text-cgroup.v1"
         uid = os.geteuid()
@@ -123,6 +125,53 @@ class IntegratedGuardianRegistrationTests(unittest.TestCase):
         self.assertNotIn("set-property", source)
         self.assertNotIn("MemoryMax", source)
         self.assertNotIn("MemorySwapMax", source)
+
+    def test_publishes_qwen38_cidfile_with_the_same_registration_contract(self) -> None:
+        temporary, env, registration, _systemctl = self.fixture("aeon-qwen38-text.cid")
+        self.addCleanup(temporary.cleanup)
+
+        result = subprocess.run(
+            [str(PUBLISHER)],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        cid = "a" * 64
+        uid = os.geteuid()
+        scope = f"docker-{cid}.scope"
+        self.assertEqual(
+            registration.read_text(),
+            "".join(
+                (
+                    "version=1\n",
+                    f"container_id={cid}\n",
+                    f"scope={scope}\n",
+                    f"control_group=/user.slice/user-{uid}.slice/"
+                    f"user@{uid}.service/app.slice/{scope}\n",
+                )
+            ),
+        )
+
+    def test_rejects_unreviewed_cidfile_without_registration(self) -> None:
+        temporary, env, registration, _systemctl = self.fixture("hostile.cid")
+        self.addCleanup(temporary.cleanup)
+
+        result = subprocess.run(
+            [str(PUBLISHER)],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("reviewed AEON runtime path", result.stderr)
+        self.assertFalse(registration.exists())
 
     def test_waits_for_docker_to_publish_the_immutable_cidfile(self) -> None:
         temporary, env, registration, _systemctl = self.fixture()

@@ -1,0 +1,128 @@
+# Qwen3.8 NVFP4 SGLang profile (source-prepared, NOT activated).
+# Progress/capacity ledger: docs/deployment/AGENTS.md.
+# This is the next text backend behind the stable `abliterated-qwen-latest-27b-nvfp4`
+# alias. Do not enable/start here; a later authorized cutover activates it.
+[Unit]
+# SGLang image release: lmsysorg/sglang:qwen38-27b, immutable arm64 digest
+# sha256:f6c809a2ebdeea97a3732e8bc139a32c18c9fb00a6e2fd770d257d9f72466ed3
+Description=SGLang Qwen3.8-27B NVFP4 + DFlash2 (profile-selected, DFLASH)
+# Ordered after embedding/reranker readiness without strong lifecycle coupling.
+After=network.target
+After=vllm-querit-4b-reranker.service
+After=vllm-embedding.service
+Conflicts=vllm-aeon-27b.service vllm-aeon-27b-dflash.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service vllm-aeon-27b-dflash-hikv.service
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+UMask=0077
+Environment=DOCKER_HOST=unix:///run/user/1001/docker.sock
+Environment=HF_HUB_OFFLINE=1
+Environment=GB10_CGROUP_REGISTRATION_PATH=%t/gb10-memory-guardian/text-cgroup.v1
+Environment=GB10_CONTAINER_CIDFILE=%t/gb10-memory-guardian/sglang-text.cid
+# Ferries the 0.90 mem-fraction reservation through the env -i exec below.
+# The 74g leftover envelope is the UMA budget for this text service.
+# Leftover after weights+mamba+graphs goes to KV; co-resident mamba float32
+# (80 slots) still dominates, so this envelope does not guarantee multiple KV
+# windows.
+Environment=SGLANG_MEM_FRACTION=0.90
+# Swap is impossible for this unit: systemd MemorySwapMax=0 AND docker
+# memory==memory-swap (74g/74g) with swappiness 0. No swap can be created
+# even if the engine overruns its reservation.
+MemorySwapMax=0
+# 74g is the text share of (MemTotal(~121.6 GiB) - 5 GiB OS pad - emb 24g
+# - querit 18g) ~= 74.6 GiB, leaving a 5 GiB OS pad.
+# The context window remains the model max 262144; it is not a KV pool cap.
+# No max-total-tokens pool cap is set, so the leftover UMA envelope becomes
+# concurrent KV after weights+mamba+graphs rather than a parameter cap.
+MemoryMax=74G
+# No Restart= here: a future lifecycle wrapper owns restart policy. A manual
+# `systemctl --user stop` is treated by systemd as a clean deactivation.
+TimeoutStartSec=3000
+TimeoutStopSec=180
+
+ExecStartPre=/usr/bin/install -d -m 0700 %t/gb10-memory-guardian
+# Host-pinned NVFP4 weights + DFlash2 draft, mounted read-only. Both are
+# revision-locked destinations (download/prepare may still be running).
+# Server paths are the flat hf --local-dir mounts (no snapshots/<sha> subdirs).
+# Pinned hub revisions: NVFP4 @faf7945020c138c8ef864ab1644273f3158f85fa,
+# DFlash2 @50307d4c4cde6860d4eee73e2547cd786fe8e8a4.
+# cpuset 5-8,15-18 are the MiaAI text acceleration set; leave cores 9 and 19
+# for embedding/reranker.
+# SGLang's pinned image defaults sleep_on_idle=False, leaving the scheduler's
+# nonblocking receive path in a zero-timeout ppoll busy-spin when idle. Enable
+# the official IdleSleeper path: it polls tokenizer/RPC sockets with poll(1000),
+# but readiness wakes it immediately, so requests incur no fixed 1s delay.
+# Active batches stay on the normal scheduler path and do not enter the idle
+# sleeper; freeing the idle core helps co-resident embedding/reranker work
+# without changing model quality.
+ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/docker run --rm --cidfile=%t/gb10-memory-guardian/sglang-text.cid --name qwen3.8-27b-sglang \
+  --cgroup-parent app.slice \
+  --gpus all --ipc host \
+  --cpuset-cpus 5-8,15-18 \
+  --shm-size 32g \
+  -p 100.105.4.92:18010:30000 \
+  -v /home/obj/models/RadixArk/Qwen3.8-27B-NVFP4:/models/qwen38-nvfp4:ro \
+  -v /home/obj/models/z-lab/Qwen3.8-27B-DFlash2:/models/qwen38-dflash2:ro \
+  -e HF_HUB_OFFLINE=1 \
+  --memory-swappiness 0 \
+  --memory 74g \
+  --memory-swap 74g \
+  --oom-score-adj 800 \
+  lmsysorg/sglang@sha256:f6c809a2ebdeea97a3732e8bc139a32c18c9fb00a6e2fd770d257d9f72466ed3 \
+  python3 -m sglang.launch_server \
+  --sleep-on-idle \
+  --model-path /models/qwen38-nvfp4 \
+  --host 0.0.0.0 --port 30000 \
+  --served-model-name "abliterated-qwen-latest-27b-nvfp4" \
+  --trust-remote-code \
+  --mem-fraction-static 0.90 \
+  --attention-backend flashinfer \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 32768 \
+  --disable-prefill-cuda-graph \
+  --kv-cache-dtype fp8_e4m3 \
+  --mamba-ssm-dtype float32 \
+  --mamba-radix-cache-strategy extra_buffer \
+  --max-mamba-cache-size 80 \
+  --max-running-requests 16 \
+  --context-length 262144 \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path /models/qwen38-dflash2 \
+  --speculative-num-draft-tokens 8 \
+  --enable-torch-compile \
+  --torch-compile-max-bs 4 \
+  --cuda-graph-max-bs-decode 4 \
+  --num-continuous-decode-steps 2 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --sampling-defaults model
+# NVFP4 declares kv_cache_quant_algo FP8, but live --kv-cache-dtype auto
+# allocated torch.bfloat16 / 41028 tokens (it did NOT honor the fp8_e4m3
+# calibration scales). fp8_e4m3 is pinned explicitly for the 262144-token
+# DFlash2 trial. Do NOT raise KV quantization aggressiveness.
+# DFlash2 uses five mamba state slots per admitted request, so 80 slots admits 16 requests.
+# Short inputs may run 16-wide; a 262144-token request uses the model-max window
+# and extra arrivals queue. The leftover UMA envelope is not a promise of
+# multiple KV windows under co-residency: float32 mamba still dominates.
+# Keep GDN float32, fp8_e4m3, and 16-way admission unchanged.
+# Co-resident decode CUDA graphs and torch.compile cap at batch 4. The
+# graph-16 capture path failed at decode bs=10 with ~3.15GB leftover during
+# GDN Triton target_verify; graph-4 is the last known co-resident capture size.
+# max-prefill-tokens 32768 lets one ~18k compression chunk enter in a single
+# prefill step.
+# mamba-full-memory-ratio 4.21 was tuned at
+# MIAI's 0.95 and is NOT trusted at 0.72: re-derive after first boot.
+#   ponytail: ratio 4.21 untrusted at mem-fraction 0.72; re-derive post-boot.
+# mamba-ssm-dtype float32 (operator quality choice) about 2x the GDN slot cost
+# (fp32 ~153.9 MiB vs bf16 ~78.4 MiB); pool is 80 slots -> ~12.3 GiB budgeted.
+# A request with no thinking fields gets the SGLang default medium reasoning
+# effort via --sampling-defaults model (temp 1.0/top_p 0.95/top_k 20), not a
+# Guard rewrite.
+ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh chat http://100.105.4.92:18010 abliterated-qwen-latest-27b-nvfp4 --deadline 2800
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

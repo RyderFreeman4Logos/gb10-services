@@ -1,13 +1,14 @@
 [Unit]
 # Observer-only telemetry. Recovery remains exclusively owned by the Rust guardian.
 Description=Observer-only system monitor (1s target interval; measured cadence)
-After=default.target
 # Prevent systemd from ever giving up on restarts.
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/sysmon.sh
+# Production cannot inherit the explicit --test-only fixture selectors.
+UnsetEnvironment=SYSMON_LOG_DIR SYSMON_INTERVAL_SECONDS SYSMON_PROC_ROOT SYSMON_CLOCK_FILE SYSMON_MAX_SAMPLES SYSMON_TEST_MODE SYSMON_GPU_LINE
+ExecStart=/usr/bin/bash -p %h/.local/bin/sysmon.sh
 Restart=always
 RestartSec=5
 # Make OOM killer strongly prefer other processes over sysmon

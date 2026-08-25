@@ -36,9 +36,10 @@ __all__ = [
 ]
 
 EXPECTED_VERIFIER_AUTHORITY: dict[str, str] = {
+    "gb10_bounded_process.py": "248762c2fdc73fdf54914fc5a20c2292bcc90430e59523c5767409ebf0f4c230",
     "gb10_verify_embedding_profile.py": "5ddbea42ec11ab6cf8fd8a0df14d40edd6b3920d33851510274c24a5092732f4",
-    "gb10_embedding_profile_contract.py": "b266a0d9df774f4f133787ff7f69a9062b0423f27b60a8853b37bdf6894d8265",
-    "gb10_embedding_verifier_runtime.py": "599af1c802e1a0d3e942fb0b16cdfd3a66f9e928ab64eabf3fb455ec007df629",
+    "gb10_embedding_profile_contract.py": "3a20c1f1c5cce48d51b1b5bf44e8b0b45271a7ddd69c7c5f26b723a40e551a54",
+    "gb10_embedding_verifier_runtime.py": "e52242e13d6a8aaa6be9c73b4a6f2cb46bb73a01a8a8592d73ccdacbc0b35434",
 }
 NO_SWAP_KEYS = ("core", "wrapper")
 NO_SWAP_PRIVATE_FILES = {
@@ -47,8 +48,8 @@ NO_SWAP_PRIVATE_FILES = {
 }
 NO_SWAP_PRIOR_FILES = {"core": "no_swap_core.before", "wrapper": "no_swap_wrapper.before"}
 EXPECTED_NO_SWAP_SHA256 = {
-    "core": "df2f373d21ab2223eaa5c2598cca1e8347c8f7666a2520ee7fc441f0a8c78fbb",
-    "wrapper": "ecdc085021c6a7b53454844150bb3ecadfba0af3ccf77ad92f80a29b2b32d484",
+    "core": "b56d328cc8dca45d69db9d3a3603e5be22e8bbd0f7990baa6417bd0fb6791155",
+    "wrapper": "48b19f2d68470d74522bb1c66880bab1ba2f7da360074af7076a7375eb897dfb",
 }
 
 class ActivationStorageError(RuntimeError):

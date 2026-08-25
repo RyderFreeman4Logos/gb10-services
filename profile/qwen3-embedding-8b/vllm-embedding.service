@@ -1,10 +1,12 @@
 # ── Baseline (clean start 2026-07-16, emb+rr+text co-resident) ──
 # GPU: 20.3G  RSS: 3.0G  Startup: 104s  MemAvail after all 3: 26.6G
+# ── Live check 2026-08-06 (steady-state, PID 20374/5437) ──
+# GPU: 20.8G  RSS: 1.3G  (gpu-memory-util=0.15, KV 4800M, enforce-eager)
 # Config: util=0.15, pin KV 4800M, enforce-eager, max-model-len 32768
 # ─────────────────────────────────────────────────────────────────
 [Unit]
-# AEON image release: 2026-08-16-v0.27.1; immutable digest: sha256:13c0df6a321ade60507a9026b0d2963ad51f0499a228de430eeba3bb74ad7954
-Description=vLLM Qwen3-Embedding-8B (AEON v0.27.1 GB10 image, raw backend port 18012, behind llm-guard-proxy listeners 18009/18002/18005, reliability-first, 32k contract, 64 seq)
+# AEON image release: 2026-08-17-v0.27.1-slim; immutable digest: sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f
+Description=vLLM Qwen3-Embedding-8B (AEON v0.27.1-slim GB10 image, raw backend port 18012, behind llm-guard-proxy listeners 18009/18002/18005, reliability-first, 32k contract, 64 seq)
 After=network.target
 StartLimitIntervalSec=600
 StartLimitBurst=5
@@ -37,11 +39,11 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-vllm-cids/vllm-embedding.ci
   -v /home/obj/.cache/huggingface:/root/.cache/huggingface \
   -e HF_HUB_OFFLINE=1 \
   --memory-swappiness 0 \
-  --memory 128g \
-  --memory-swap 128g \
+  --memory 24g \
+  --memory-swap 24g \
   --oom-score-adj 0 \
   --entrypoint python3 \
-  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:13c0df6a321ade60507a9026b0d2963ad51f0499a228de430eeba3bb74ad7954 \
+  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f \
   /usr/local/bin/vllm serve Qwen/Qwen3-Embedding-8B \
     --host 0.0.0.0 --port 8000 \
     --served-model-name qwen3-embedding-8b Qwen/Qwen3-Embedding-8B \
@@ -52,10 +54,13 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-vllm-cids/vllm-embedding.ci
     --max-num-seqs 64 \
     --kv-cache-memory-bytes 4800M \
     --gpu-memory-utilization 0.15 --enforce-eager
-# Equal --memory 128g and --memory-swap 128g request a Docker memory cgroup
-# without imposing the obsolete 20 GiB service budget. The post-start verifier,
-# not requested Docker options, proves the exact live generation has no swap. Embedding uses
-# --enforce-eager for stable memory without a cudagraph capture peak.
+# Equal --memory 24g and --memory-swap 24g request a Docker memory cgroup that
+# bounds the engine to the 24g co-resident envelope: the engine cannot see the
+# 5 GiB OS pad that lives outside every --memory. The 32,768-token / 4,800M KV
+# quality contract is unchanged, and 24g >= observed ~20.8 GiB GPU + workspace.
+# The post-start verifier, not requested Docker options, proves the exact live
+# generation has no swap. Embedding uses --enforce-eager for stable memory
+# without a cudagraph capture peak.
 # Bind this exact Docker scope's no-swap state into the user manager, then verify it.
 ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --bind-runtime-swap-max --unit /home/obj/.config/systemd/user/vllm-embedding.service --container vllm-embedding
 ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-embedding.service --container vllm-embedding

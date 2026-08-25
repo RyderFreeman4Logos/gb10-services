@@ -76,7 +76,7 @@ attest_aeon_profile() {
 
 # Keep this owner aligned with the committed AEON unit: AUTO KV sizing must
 # remain enabled so the patched UMA headroom guard can size the pool.
-EXPECTED_AEON_MEMORY_BYTES=$((128 * 1024 * 1024 * 1024))
+EXPECTED_AEON_MEMORY_BYTES=$((74 * 1024 * 1024 * 1024))
 MIN_AVAILABLE_GIB=${GB10_MIN_AVAILABLE_GIB:-4}
 AEON_READY_ATTEMPTS=${GB10_AEON_READY_ATTEMPTS:-120}
 RERANK_READY_ATTEMPTS=${GB10_RERANK_READY_ATTEMPTS:-180}

@@ -1,0 +1,15 @@
+completed: 122
+total: 122
+completed_waves: 4
+total_waves: 4
+completed_work_units: 122
+total_work_units: 122
+elapsed_s: 1495.994799
+rate: 0.08155108567002987
+work_rate: 0.08155108567002987
+eta_s: 0.0
+active_wave: null
+work_unit: null
+config_epoch: "ffec3f1a96bd6a5741b67f6550af668574c81c726f408862a6f72a04ea4fe57e"
+pid: 1291488
+start_time: 36134346

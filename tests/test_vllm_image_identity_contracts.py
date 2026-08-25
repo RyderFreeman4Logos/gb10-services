@@ -28,14 +28,9 @@ class ImageRelease:
 
 
 CURRENT_RELEASE = ImageRelease(
-    date="2026-08-16",
-    version="v0.27.1",
-    digest="sha256:13c0df6a321ade60507a9026b0d2963ad51f0499a228de430eeba3bb74ad7954",
-)
-ROLLBACK_RELEASE = ImageRelease(
-    date="2026-07-27",
-    version="v0.26.0",
-    digest="sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7",
+    date="2026-08-17",
+    version="v0.27.1-slim",
+    digest="sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f",
 )
 PREVIOUS_RELEASE = ImageRelease(
     date="2026-07-16",
@@ -48,11 +43,6 @@ SUPERSEDED_MARKERS = (
     "0.25.0+aeon.sm121a.dflash",
     "v0.25.0",
 )
-SUPERSEDED_OPERATIONAL_MARKERS = (
-    ROLLBACK_RELEASE.tag,
-    ROLLBACK_RELEASE.digest,
-    *SUPERSEDED_MARKERS,
-)
 CURRENT_DOCS = (
     ROOT / "README.md",
     ROOT / "docs" / "deployment" / "AGENTS.md",
@@ -60,7 +50,7 @@ CURRENT_DOCS = (
 UNIT_RELEASE_ANNOTATION = re.compile(
     r"^# AEON image release: "
     r"(?P<date>\d{4}-\d{2}-\d{2})-"
-    r"(?P<version>v\d+\.\d+\.\d+); "
+    r"(?P<version>v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?); "
     r"immutable digest: (?P<digest>sha256:[0-9a-f]{64})$",
     re.MULTILINE,
 )
@@ -94,7 +84,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
     def test_operational_tree_cannot_use_superseded_image_identity(self) -> None:
         for path in _operational_files():
             text = path.read_text()
-            for marker in SUPERSEDED_OPERATIONAL_MARKERS:
+            for marker in SUPERSEDED_MARKERS:
                 with self.subTest(path=path.relative_to(ROOT), marker=marker):
                     self.assertNotIn(marker, text)
 
@@ -162,7 +152,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                 self.assertNotRegex(text, r"aeon-vllm-ultimate:[^\s\\]+")
 
     def test_aeon_compile_cache_namespace_rotates_with_the_release(self) -> None:
-        host_cache = "/home/obj/.cache/vllm-compile/aeon-qwen36-v0271-13c0df"
+        host_cache = "/home/obj/.cache/vllm-compile/aeon-qwen36-v0271-2fb855"
         container_cache = "/var/cache/vllm/aeon-qwen36-v0271"
         for unit_name in ("vllm-aeon-27b-dflash.service",):
             text = (ROOT / "systemd" / unit_name).read_text()
@@ -175,34 +165,27 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                 )
                 self.assertNotIn("aeon-qwen36-v0251-c15e2c", text)
                 self.assertNotIn("/var/cache/vllm/aeon-qwen36-v0251", text)
-                self.assertNotIn("aeon-qwen36-v0260-1aa473", text)
-                self.assertNotIn("/var/cache/vllm/aeon-qwen36-v0260", text)
 
-    def test_aeon_uses_the_v1_runner_for_native_thinking_budgets(self) -> None:
-        unit = (ROOT / "systemd" / "vllm-aeon-27b-dflash.service").read_text()
-        self.assertRegex(
-            unit,
-            re.compile(
-                r"(?m)^  -e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768 \\\n"
-                r"  -e AEON_THINKING_BUDGET_GUARD=0 \\\n"
-                r"  -e VLLM_USE_V2_MODEL_RUNNER=0 \\\n"
-                r"  --memory-swappiness 0"
-            ),
+    def test_aeon_text_pins_v2_runner_for_native_thinking_budget(self) -> None:
+        text = (ROOT / "systemd" / "vllm-aeon-27b-dflash.service").read_text()
+        self.assertIn(
+            "  -e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768 \\\n"
+            "  -e VLLM_USE_V2_MODEL_RUNNER=0 \\\n",
+            text,
         )
-        self.assertEqual(
-            re.findall(
-                r"(?m)^\s*-e (VLLM_USE_V2_MODEL_RUNNER=[^\s\\]+)\s*\\$", unit
-            ),
-            ["VLLM_USE_V2_MODEL_RUNNER=0"],
-        )
-
-        guide = (ROOT / "docs" / "deployment" / "AGENTS.md").read_text()
-        self.assertIn("`VLLM_USE_V2_MODEL_RUNNER=0`", guide)
-        self.assertIn("`thinking_token_budget`", guide)
+        for unit_name in (
+            "vllm-embedding.service",
+            "vllm-querit-4b-reranker.service",
+            "vllm-qwen3-reranker-8b.service",
+        ):
+            self.assertNotIn(
+                "-e VLLM_USE_V2_MODEL_RUNNER=0",
+                (ROOT / "systemd" / unit_name).read_text(),
+            )
 
     def test_current_docs_publish_one_coherent_release_identity(self) -> None:
         readme = (ROOT / "README.md").read_text()
-        self.assertIn("pinned AEON v0.27.1 GB10 Docker image", readme)
+        self.assertIn("pinned AEON v0.27.1-slim GB10 Docker image", readme)
         self.assertNotIn("pinned AEON v0.25 GB10 Docker image", readme)
         self.assertRegex(
             readme,
@@ -210,9 +193,6 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                 rf"friendly tag: {re.escape(IMAGE_REPOSITORY)}:"
                 rf"{re.escape(CURRENT_RELEASE.tag)}\n"
                 rf"repository digest: {re.escape(CURRENT_RELEASE.digest)}\n"
-                rf"rollback: {re.escape(IMAGE_REPOSITORY)}:"
-                rf"{re.escape(ROLLBACK_RELEASE.tag)} @ "
-                rf"{re.escape(ROLLBACK_RELEASE.digest)}\n"
                 r"rollback/superseded: .*\n"
                 rf"runtime version: {re.escape(CURRENT_RELEASE.version)}\b"
             ),
@@ -301,7 +281,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
             "gpu-memory-utilization=0.355",
             "hikv.env",
             "286,962 KV tokens",
-            "record a v0.26.0 live receipt",
+            "record a v0.27.1 live receipt",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, reference_row)

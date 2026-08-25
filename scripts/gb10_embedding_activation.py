@@ -10,20 +10,23 @@ import signal
 import stat
 import sys
 import time
+import types
 from pathlib import Path
 from typing import Any
 
 __all__ = ["ActivationInterrupted", "activate", "main"]
 
 EXPECTED_IMPORT_AUTHORITY: dict[str, str] = {
+    "gb10_bounded_process.py": "248762c2fdc73fdf54914fc5a20c2292bcc90430e59523c5767409ebf0f4c230",
     "gb10_embedding_activation_checks.py": "7e6d00538e8d952c137e5b5114fc16919f6e1bab59d6260602f989a2103f44a4",
-    "gb10_embedding_activation_config.py": "8cfe41e37a31adc2c060cd68700c304775231b62d9e8f03170f0bc371ced5de7",
-    "gb10_embedding_activation_storage.py": "4912f161e322b4d94e6732337d6d23b753b853d62ebac440462f76b23c85dd5e",
-    "gb10_embedding_profile_contract.py": "b266a0d9df774f4f133787ff7f69a9062b0423f27b60a8853b37bdf6894d8265",
-    "gb10_embedding_verifier_runtime.py": "599af1c802e1a0d3e942fb0b16cdfd3a66f9e928ab64eabf3fb455ec007df629",
+    "gb10_embedding_activation_config.py": "fd3053512ae084418efd6acbedc09d2209dcd961cd87c503cfcad275a38668c8",
+    "gb10_embedding_activation_storage.py": "52bde00502cc7493df07e373266896d59a7255a76b693b3cb0bbdfe41e5358a6",
+    "gb10_embedding_profile_contract.py": "3a20c1f1c5cce48d51b1b5bf44e8b0b45271a7ddd69c7c5f26b723a40e551a54",
+    "gb10_embedding_verifier_runtime.py": "e52242e13d6a8aaa6be9c73b4a6f2cb46bb73a01a8a8592d73ccdacbc0b35434",
     "gb10_verify_embedding_profile.py": "5ddbea42ec11ab6cf8fd8a0df14d40edd6b3920d33851510274c24a5092732f4",
 }
-def _verify_import_authority(script_directory: Path) -> None:
+def _verified_import_payloads(script_directory: Path) -> dict[str, bytes]:
+    payloads: dict[str, bytes] = {}
     for name, expected in EXPECTED_IMPORT_AUTHORITY.items():
         path = script_directory / name
         descriptor = os.open(
@@ -39,17 +42,47 @@ def _verify_import_authority(script_directory: Path) -> None:
                 or metadata.st_size > 1024 * 1024
             ):
                 raise RuntimeError(f"unsafe activation import authority: {name}")
-            digest = hashlib.sha256()
+            chunks: list[bytes] = []
+            size = 0
             while chunk := os.read(descriptor, 65536):
-                digest.update(chunk)
+                size += len(chunk)
+                if size > 1024 * 1024:
+                    raise RuntimeError(f"oversized activation import authority: {name}")
+                chunks.append(chunk)
         finally:
             os.close(descriptor)
-        if digest.hexdigest() != expected:
+        payload = b"".join(chunks)
+        if hashlib.sha256(payload).hexdigest() != expected:
             raise RuntimeError(f"activation import authority differs: {name}")
+        payloads[name] = payload
+    return payloads
+
+
+def _load_verified_module(name: str, payload: bytes, path: Path) -> None:
+    module_name = name.removesuffix(".py")
+    module = types.ModuleType(module_name)
+    module.__file__ = str(path)
+    module.__package__ = ""
+    sys.modules[module_name] = module
+    exec(compile(payload, str(path), "exec"), module.__dict__)
 
 
 _SCRIPT_DIRECTORY = Path(__file__).resolve().parent
-_verify_import_authority(_SCRIPT_DIRECTORY)
+_IMPORT_PAYLOADS = _verified_import_payloads(_SCRIPT_DIRECTORY)
+for _import_name in (
+    "gb10_bounded_process.py",
+    "gb10_embedding_profile_contract.py",
+    "gb10_embedding_verifier_runtime.py",
+    "gb10_verify_embedding_profile.py",
+    "gb10_embedding_activation_checks.py",
+    "gb10_embedding_activation_config.py",
+    "gb10_embedding_activation_storage.py",
+):
+    _load_verified_module(
+        _import_name,
+        _IMPORT_PAYLOADS[_import_name],
+        _SCRIPT_DIRECTORY / _import_name,
+    )
 sys.path.insert(0, str(_SCRIPT_DIRECTORY))
 from gb10_embedding_activation_checks import (  # noqa: E402
     RuntimeConfig,

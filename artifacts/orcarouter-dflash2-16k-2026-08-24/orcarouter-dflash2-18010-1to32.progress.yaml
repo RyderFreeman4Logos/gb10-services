@@ -1,0 +1,18 @@
+completed: 36
+total: 528
+completed_waves: 8
+total_waves: 32
+completed_work_units: 36
+total_work_units: 528
+elapsed_s: 475.84454
+rate: 0.0756549607025051
+work_rate: 0.0756549607025051
+eta_s: 6503.208717993674
+active_wave: 8
+work_unit: 9
+config_epoch: "26abbc55e7deea7d4583ec75e4c1b3b707d1b9fdc104e8a8da1291ff4e1da8a0"
+pid: 3909596
+start_time: 35367367
+failure_wave: 8
+failure_stage: "wave_acceptance"
+failure_reason: "benchmark incomplete at wave 8: wave result counts do not match the completed request set"

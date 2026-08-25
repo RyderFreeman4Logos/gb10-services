@@ -23,15 +23,15 @@ graph TD
 
 ### The 5 Core Services
 1. **vllm-aeon-27b-dflash.service**
-   Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside the pinned AEON v0.27.1 GB10 Docker image for long-context processing up to 256k tokens, with FP8 KV cache and DFlash `TRITON_ATTN` enabled.
+   Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside the pinned AEON v0.27.1-slim GB10 Docker image for long-context processing up to 256k tokens, with FP8 KV cache and DFlash `TRITON_ATTN` enabled.
 2. **vllm-embedding.service**
-   Serves BF16 `Qwen/Qwen3-Embedding-8B` with its full 4,096-dimensional output. This is the reliability-critical baseline service. The tracked source profile contracts for 32,768 tokens and 4,800 MiB explicit KV while preserving 8,192 batched tokens, 64 sequences, aliases, and quality semantics. It requests equal 128 GiB Docker memory/swap caps without imposing the obsolete 20 GiB service budget. Before readiness, its verifier binds the full Docker ID, PID, Docker `StartedAt`, `/proc` PID starttime and canonical Docker scope, scope inode, and `cgroup.events` population, then proves `HostConfig.MemorySwap == HostConfig.Memory`, `memory.swap.max == 0`, and `memory.swap.current == 0` on that unchanged generation. Its raw backend listens only on port `18012`; clients should use `llm-guard-proxy` on port `18009` or the guard-owned legacy listener `18002` with model `qwen3-embedding-8b`.
+   Serves BF16 `Qwen/Qwen3-Embedding-8B` with its full 4,096-dimensional output. This is the reliability-critical baseline service. The tracked source profile contracts for 32,768 tokens and 4,800 MiB explicit KV while preserving 8,192 batched tokens, 64 sequences, aliases, and quality semantics. It requests an equal 24g Docker memory/swap envelope (the 5 GiB OS pad lives outside every `--memory`), with the 32,768/4,800M quality contract unchanged. Before readiness, its verifier binds the full Docker ID, PID, Docker `StartedAt`, `/proc` PID starttime and canonical Docker scope, scope inode, and `cgroup.events` population, then proves `HostConfig.MemorySwap == HostConfig.Memory`, `memory.swap.max == 0`, and `memory.swap.current == 0` on that unchanged generation. Its raw backend listens only on port `18012`; clients should use `llm-guard-proxy` on port `18009` or the guard-owned legacy listener `18002` with model `qwen3-embedding-8b`.
 3. **vllm-querit-4b-reranker.service**
-   The single canonical production owner for `Querit/Querit-4B` is a BF16 vLLM pooling reranker with the `qwen3-reranker-8b` and `Qwen/Qwen3-Reranker-8B` aliases, a 32,768-token context, 4,800 MiB KV cache, and equal 18 GiB Docker memory/swap caps. Its raw backend listens on `18013` with the live-proven AEON scheduler profile (`--max-num-batched-tokens 16384` and `--max-num-seqs 32`). Every startup first binds the exact Docker generation, then runs the unit-owned strict no-swap verifier, and finally completes the bounded rerank-readiness probe; the verifier does not query the still-starting `Type=simple` service's active state. Clients should use Guard on `18009` or the restricted listener `18003`. `vllm-qwen3-reranker-8b.service` remains a disabled fallback only.
+   The single canonical production owner for `Querit/Querit-4B` is a BF16 vLLM pooling reranker with the `qwen3-reranker-8b` and `Qwen/Qwen3-Reranker-8B` aliases, a 32,768-token context, 4,800 MiB KV cache, and equal 18 GiB Docker memory/swap caps. Its raw backend listens on `18013` with the live-proven AEON scheduler profile (`--max-num-batched-tokens 16384`, `--max-num-seqs 32`, `--max-num-partial-prefills 1`, and `--max-long-partial-prefills 1`). Every startup first binds the exact Docker generation, then runs the unit-owned strict no-swap verifier, and finally completes the bounded rerank-readiness probe; the verifier does not query the still-starting `Type=simple` service's active state. Clients should use Guard on `18009` or the restricted listener `18003`. `vllm-qwen3-reranker-8b.service` remains a disabled fallback only.
 4. **llm-guard-proxy.service**
-   A Rust-based shielding gateway proxy ([llm-guard-proxy](https://github.com/RyderFreeman4Logos/llm-guard-proxy)) sitting in front of the chat, embedding, and reranker endpoints. It routes requests by `model` to named upstream profiles, manages request queues, retries, stalls, and loop guards to protect backends from runaway generations. It owns the stable entrypoint `18009`, aggregate listener `18005`, and legacy restricted listeners `18002`/`18003`; raw vLLM backends stay on `18010`/`18012`/`18013`. It is also the runtime control plane for request concurrency and the sole automatic low-memory recovery actor. Edit `config/llm-guard-proxy/config.toml` to tune limits or the hot-reloadable `[guardian]` policy without restarting vLLM.
+   A Rust-based shielding gateway proxy ([llm-guard-proxy](https://github.com/RyderFreeman4Logos/llm-guard-proxy)) sitting in front of the chat, embedding, and reranker endpoints. It routes requests by `model` to named upstream profiles, manages request queues, retries, stalls, and loop guards to protect backends from runaway generations. It owns the stable entrypoint `18009`, aggregate listener `18005`, and legacy restricted listeners `18002`/`18003`; raw vLLM backends stay on `18010`/`18012`/`18013`. It is also the runtime control plane for request concurrency and the sole automatic low-memory recovery actor. To tune limits or the `[guardian]` policy, edit `/home/obj/.config/llm-guard-proxy/config.toml`, then run `systemctl --user restart llm-guard-proxy`. The running service continues using its activation-time credential copy until restart.
 
-   Queueing belongs primarily in Guard, not in an unbounded raw model adapter. The reference profile permits four concurrent body-routing reads and queues 128 requests before model routing; after routing it allows 4 active + 64 queued AEON requests, 8 + 64 embedding requests, and 8 + 64 Querit requests. Queued requests may wait up to 30 minutes. Only the 128-slot body-routing wait is pre-body and cheap; profile queues retain request bodies, so Guard caps every request at 4 MiB. The worst-case 216 body residencies use a documented 384 MiB baseline plus 1.5× body-overhead budget (1,680 MiB), below `MemoryHigh=1792M` and `MemoryMax=2G`. Querit vLLM uses the live-proven AEON scheduler ceilings (`--max-num-batched-tokens 16384`, `--max-num-seqs 32`), while Guard's lower hot-reloadable profile limit controls actual production concurrency. AEON keeps its own GB10 scheduler ceiling (`--max-num-seqs 16`).
+   Queueing belongs primarily in Guard, not in an unbounded raw model adapter. The reference profile permits four concurrent body-routing reads and queues 128 requests before model routing; after routing it allows 4 active + 64 queued AEON requests, 8 + 64 embedding requests, and 8 + 64 Querit requests. Queued requests may wait up to 30 minutes. Only the 128-slot body-routing wait is pre-body and cheap; profile queues retain request bodies, so Guard caps every request at 4 MiB. The worst-case 216 body residencies use a documented 384 MiB baseline plus 1.5× body-overhead budget (1,680 MiB), below `MemoryHigh=1792M` and `MemoryMax=2G`. Querit vLLM uses the live-proven AEON scheduler ceilings (`--max-num-batched-tokens 16384`, `--max-num-seqs 32`), while Guard's lower profile limit controls actual production concurrency after the required proxy restart. AEON keeps its own GB10 scheduler ceiling (`--max-num-seqs 16`).
 
    The reference config enables the production guard features that are useful on
    GB10: explicit named upstream profiles, bounded generation queues with HTTP
@@ -60,10 +60,14 @@ graph TD
    A lightweight observer-only system monitor targeting a one-second interval,
    recording system load, exact Linux `MemAvailable`, temperatures, GPU metrics,
    disk I/O rates, swap-in/out, top process RSS/swap memory, and observed cadence.
-   CSV v5 appends `mem_available_mb`, `sample_cadence_ms`,
-   `sample_elapsed_ms`, and `sample_lag_ms` without reordering v4 columns. A
-   2–3 second loop overrun is recorded as such; the service does not claim a
-   guaranteed 1 Hz sampling rate and performs no recovery action.
+   CSV v6 preserves every v5 column and appends content-free `boot_id`,
+   `memory_some_avg10`, `memory_full_avg10`, `io_full_avg10`, and
+   `cpu_some_avg10`. A 2–3 second loop overrun is recorded as such; the service
+   does not claim a guaranteed 1 Hz sampling rate and performs no recovery action.
+   Production rejects inherited `SYSMON_*` fixture selectors and uses real
+   `/proc`, the real clock, and `~/log`. Only hermetic tests invoke `--test-only`;
+   boot-ID and PSI inputs are byte-bounded regular files, with hostile input
+   recorded as `N/A`.
 
 ### Integrated Guardian
 `llm-guard-proxy` owns the only automatic low-memory recovery path. The GB10
@@ -81,24 +85,26 @@ checkout owns the integrated guardian implementation and build. The retained
 `%t/gb10-memory-guardian` name is only the runtime registration directory
 shared by the proxy and text unit.
 
-### Reference Production Profile (source updated 2026-08-16)
+### Reference Production Profile (source updated 2026-08-17)
 
 The tracked source selects this friendly release and immutable repository digest
 for every AEON-backed unit. The running containers remain on their prior image
 until a separately authorized deployment changes them.
 
 ```text
-friendly tag: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-08-16-v0.27.1
-repository digest: sha256:13c0df6a321ade60507a9026b0d2963ad51f0499a228de430eeba3bb74ad7954
-rollback: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-27-v0.26.0 @ sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7
-rollback/superseded: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-14-v0.25.0 @ sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55
-runtime version: v0.27.1
+friendly tag: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-08-17-v0.27.1-slim
+repository digest: sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f
+rollback/superseded: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-08-16-v0.27.1 @ sha256:13c0df6a321ade60507a9026b0d2963ad51f0499a228de430eeba3bb74ad7954
+runtime version: v0.27.1-slim
 ```
 
-The official v0.27.1 dated friendly tag and immutable digest above are the
-source release identity. Historical v0.26.0 and v0.25.1 feature claims and
-deployment evidence remain in their dated research records and do not establish
-v0.27.1 behavior.
+The v0.27.1-slim image's `ai.aeon.vllm_base` metadata identifies vLLM
+0.27.1+aeon.sm121a.dspark with torch 2.13.0+cu130 and FlashInfer 0.6.16.post3;
+the slim rebase is 18.3GB. Its inherited OCI description still names v0.25.1,
+so the dated friendly tag and immutable digest above are the release identity;
+the stale description is not release provenance. Historical prior-generation
+feature claims and deployment evidence remain in their dated research records
+and do not establish v0.27.1 behavior.
 
 Capacity contracts and evidence:
 
@@ -110,7 +116,7 @@ AEON chat:  source max-model-len 262,144, FP8 AUTO KV at gpu-memory-utilization 
 Querit:     canonical vLLM owner, max-model-len 32,768, KV 4,800M, Docker memory 18g
 ```
 
-The committed Docker memory ceilings are AEON 128g, embedding 128g, and Querit 18g. They are independent hard ceilings, not co-resident reservations, and their sum is not a physical UMA-headroom guarantee. Every tracked vLLM unit requests `--memory-swappiness 0` with equal Docker memory/swap caps. The pinned AEON vLLM image does not support upstream `--swap-space`, so both the Querit production owner and disabled Qwen reranker fallback deliberately omit it; the production Querit systemd parent also retains `MemorySwapMax=0`. Before readiness, the generation-bound helper's `--bind-runtime-swap-max` mode records the already-zero exact Docker scope as the user manager's runtime `MemorySwapMax=0`, so `daemon-reload` replays zero; the following strict invocation still establishes `memory.max`, zero `memory.swap.max`, and zero activation-time `memory.swap.current` against the unchanged CID/PID/scope. A parent systemd service cgroup or manager property alone is not that proof. The historical 2026-07-14 live receipt records a prior 15 GiB text KV activation at 269,589 cache tokens, a 2.84% margin above one 262,144-token request, and about 31.6 GiB `MemAvailable` after its first 3,300-second attribution window; it is not the current AUTO-KV source profile. With the former 36 GiB text KV profile, stable all-three samples left only about 1.8–2.3 GiB `MemAvailable`, and the same text configuration had previously grown another 8,466 MiB. Two concurrent maximum-length requests are not supported; this is intentional under the service priority embedding > reranker > text. Use `scripts/gb10_apply_aeon_querit_profile.sh` for the reranker migration; it verifies the existing AEON and embedding no-swap generations before and after the switch and leaves text, embedding, and Guard state unchanged.
+The co-resident Docker memory envelopes are embedding 24g, Querit 18g, and text 69g, summing to 111g within `MemTotal` minus a 10 GiB OS pad that lives outside every `--memory`. Every tracked vLLM unit requests `--memory-swappiness 0` with equal Docker memory/swap caps. The pinned AEON vLLM image does not support upstream `--swap-space`, so both the Querit production owner and disabled Qwen reranker fallback deliberately omit it; the production Querit systemd parent also retains `MemorySwapMax=0`. Before readiness, the generation-bound helper's `--bind-runtime-swap-max` mode records the already-zero exact Docker scope as the user manager's runtime `MemorySwapMax=0`, so `daemon-reload` replays zero; the following strict invocation still establishes `memory.max`, zero `memory.swap.max`, and zero activation-time `memory.swap.current` against the unchanged CID/PID/scope. A parent systemd service cgroup or manager property alone is not that proof. The historical 2026-07-14 live receipt records a prior 15 GiB text KV activation at 269,589 cache tokens, a 2.84% margin above one 262,144-token request, and about 31.6 GiB `MemAvailable` after its first 3,300-second attribution window; it is not the current AUTO-KV source profile. With the former 36 GiB text KV profile, stable all-three samples left only about 1.8–2.3 GiB `MemAvailable`, and the same text configuration had previously grown another 8,466 MiB. Two concurrent maximum-length requests are not supported; this is intentional under the service priority embedding > reranker > text. Use `scripts/gb10_apply_aeon_querit_profile.sh` for the reranker migration; it verifies the existing AEON and embedding no-swap generations before and after the switch and leaves text, embedding, and Guard state unchanged.
 
 ---
 
@@ -148,6 +154,144 @@ gb10-services/
 
 ---
 
+## Resumable SGLang throughput benchmark
+
+### Dedicated 64K raw-endpoint run
+
+The tracked 64K plan runs five waves at each concurrency level
+`1,2,4,6,8,10,12,14,16` (45 waves total). It targets the raw SGLang
+OpenAI-compatible listener and served model from the TOML; do not point it at
+Guard or invent a model alias that the server does not expose. The example is
+client-only and does not change any live service configuration. Before launch,
+an explicitly authorized operator must perform the SGLang backend cutover to
+the configured raw listener and alias. This procedure does **not** activate,
+restart, or mutate any service; it only verifies the already-authorized target
+and runs the client benchmark. The preflight is fail-closed and checks the
+configured raw `/v1/models` route for the required served alias before
+`nohup` is reached.
+
+```bash
+set -euo pipefail
+repo_root="$(git rev-parse --show-toplevel)"
+run_dir="$repo_root/sglang-64k-run"
+mkdir -p "$run_dir"
+cp "$repo_root/examples/sglang-64k-concurrency-throughput.toml" "$run_dir/run.toml"
+python3 "$repo_root/scripts/sglang_6k_concurrency_throughput.py" \
+  --config "$run_dir/run.toml" --preflight
+nohup python3 "$repo_root/scripts/sglang_6k_concurrency_throughput.py" \
+  --config "$run_dir/run.toml" \
+  --state "$run_dir/run.state.json" \
+  --progress "$run_dir/run.progress.yaml" \
+  --out "$run_dir/run.json" \
+  >"$run_dir/run.log" 2>&1 &
+pid=$!
+start_time=$(awk '{print $22}' "/proc/$pid/stat")
+printf '%s %s\n' "$pid" "$start_time" >"$run_dir/run.pid-start"
+printf 'pid=%s start_time=%s\n' "$pid" "$start_time"
+```
+
+### Dedicated 64K resume
+
+Resume only the dedicated 64K run from `sglang-64k-run`; do not reuse the
+legacy 6K `sglang-run` directory or its TOML. Re-run the raw backend identity
+preflight before adopting the checkpoint, then verify the saved PID/start-time
+receipt before launching the same artifact paths:
+
+```bash
+set -euo pipefail
+repo_root="$(git rev-parse --show-toplevel)"
+run_dir="$repo_root/sglang-64k-run"
+config="$run_dir/run.toml"
+state="$run_dir/run.state.json"
+python3 "$repo_root/scripts/sglang_6k_concurrency_throughput.py" \
+  --config "$config" --preflight
+saved_pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$state")
+saved_start=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["start_time"])' "$state")
+if [ -r "/proc/$saved_pid/stat" ] && [ "$(awk '{print $22}' "/proc/$saved_pid/stat")" = "$saved_start" ]; then
+  echo "refusing resume: saved benchmark owner is still live" >&2
+  exit 1
+fi
+nohup python3 "$repo_root/scripts/sglang_6k_concurrency_throughput.py" \
+  --config "$config" \
+  --state "$state" \
+  --progress "$run_dir/run.progress.yaml" \
+  --out "$run_dir/run.json" \
+  --resume \
+  >"$run_dir/run.log" 2>&1 &
+pid=$!
+start_time=$(awk '{print $22}' "/proc/$pid/stat")
+pid_start_tmp="$run_dir/.run.pid-start.$pid.tmp"
+printf '%s %s\n' "$pid" "$start_time" >"$pid_start_tmp"
+mv -f -- "$pid_start_tmp" "$run_dir/run.pid-start"
+printf 'pid=%s start_time=%s\n' "$pid" "$start_time"
+```
+
+### Legacy 6K run
+
+Run the benchmark detached and keep its checkpoint, progress sidecar, output,
+log, and launcher identity together:
+
+```bash
+repo_root="$(git rev-parse --show-toplevel)"
+run_dir="$repo_root/sglang-run"
+mkdir -p "$run_dir"
+cp "$repo_root/examples/sglang-6k-concurrency-throughput.toml" "$run_dir/run.toml"
+nohup python3 "$repo_root/scripts/sglang_6k_concurrency_throughput.py" \
+  --config "$run_dir/run.toml" \
+  --state "$run_dir/run.state.json" \
+  --progress "$run_dir/run.progress.yaml" \
+  --out "$run_dir/run.json" \
+  >"$run_dir/run.log" 2>&1 &
+pid=$!
+start_time=$(awk '{print $22}' "/proc/$pid/stat")
+printf '%s %s\n' "$pid" "$start_time" >"$run_dir/run.pid-start"
+printf 'pid=%s start_time=%s\n' "$pid" "$start_time"
+```
+
+The `/proc/$pid/stat` value above is field 22 (the process start time), not the
+wall-clock launch time. `--wave-timeout-s` is an observational deadline: a
+slow wave is marked in the result, but running Python worker threads are not
+force-cancelled; each request retains its own timeout and retry policy. The
+`request_timeout_s` value is a monotonic total-attempt deadline covering URL
+open and every SSE read (the remaining I/O timeout is refreshed per read), and
+is recorded in each request metric. Progress `work_rate` and `eta_s` are
+weighted by request work units (the wave concurrency), not by wave count.
+
+Before resuming, verify the checkpoint's recorded PID identity so a reused PID
+cannot be mistaken for the old benchmark. A missing `/proc` entry means the old
+owner is no longer running; a present entry with a matching start time means the
+owner is still live and the resume is refused. A mismatched start time identifies
+PID reuse, so the old owner is no longer running:
+
+```bash
+repo_root="$(git rev-parse --show-toplevel)"
+run_dir="$repo_root/sglang-run"
+state="$run_dir/run.state.json"
+saved_pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$state")
+saved_start=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["start_time"])' "$state")
+if [ -r "/proc/$saved_pid/stat" ]; then
+  if [ "$(awk '{print $22}' "/proc/$saved_pid/stat")" = "$saved_start" ]; then
+    echo "refusing resume: saved benchmark owner is still live" >&2
+    exit 1
+  fi
+fi
+nohup python3 "$repo_root/scripts/sglang_6k_concurrency_throughput.py" \
+  --config "$run_dir/run.toml" \
+  --state "$state" \
+  --progress "$run_dir/run.progress.yaml" \
+  --out "$run_dir/run.json" \
+  --resume \
+  >"$run_dir/run.log" 2>&1 &
+pid=$!
+start_time=$(awk '{print $22}' "/proc/$pid/stat")
+pid_start_tmp="$run_dir/.run.pid-start.$pid.tmp"
+printf '%s %s\n' "$pid" "$start_time" >"$pid_start_tmp"
+mv -f -- "$pid_start_tmp" "$run_dir/run.pid-start"
+printf 'pid=%s start_time=%s\n' "$pid" "$start_time"
+```
+
+---
+
 ## Prerequisites & Installation
 
 ### 1. Rootless Docker
@@ -163,21 +307,80 @@ Pre-download the required model weights into `~/.cache/huggingface/` or prepare 
 * **Reranker Model**: `Querit/Querit-4B`, snapshot `7b796de30ad8dc772d6c46c75659c1341283a665`
 
 ### 3. Build llm-guard-proxy
-Build/update the proxy binary on the host machine from the reviewed main branch.
-The cached rebuild script uses a local workspace checkout plus a persistent Cargo
-target cache, so path dependencies such as `llm-guard-proxy-core` are built from
-the same commit and future GB10 updates do not recompile dependencies from
-scratch:
+Build/update the proxy binary on the host from the reviewed main branch:
 ```bash
 ~/.local/bin/llm_guard_proxy_cached_rebuild.sh
 ```
 
-The script keeps build artifacts in
-`~/.cache/cargo-target/llm-guard-proxy-main` and relinks
-`~/.local/bin/llm-guard-proxy` to the workspace-built release binary. If a
-standalone rebuild leaves the running guard process on a deleted old inode, the
-script restarts only `llm-guard-proxy.service` and smokes `/health`; it does not
-restart any vLLM backend.
+Production invocation accepts no override environment variables. With no
+arguments, the script hard-binds the canonical source, cache, installed Guard
+config/unit, service symlink, owner-only recovery state, real `/proc`, and a
+fixed tool path. Hermetic tests alone use `--test-only`; their marker cannot
+equal the production completion contract.
+
+The rebuild releases each fetch, Cargo-metadata, and Cargo-build payload only
+after its random transient user scope is proven in the exact cgroup with hard
+memory/swap/PID/CPU/file-size limits. Fetch and build intermediates live only in
+bounded bubblewrap tmpfs mounts; no writable host Cargo target or external Git
+worktree is mounted. The parent accepts one bounded canonical frame, revalidates
+the immutable Git archive or candidate, enforces a 576 MiB host-write budget with
+8 GiB free-space headroom, and publishes a content-addressed release under
+`~/.cache/cargo-target/llm-guard-proxy-main/releases/`. Receipts bind the complete
+containment policy and reviewed worker/tool authorities without persisting
+transient scope names.
+The parent retains opened memory/pids event descriptors through the worker's
+final resource fence and reads them before a failed scope can be collected, so
+nonzero status, signal/OOM, and early post-GO failures keep exact limit evidence.
+
+Before Git or build work, the script takes nonblocking `flock` authority at
+`~/.local/state/llm-guard-proxy-rebuild/lock.v1` and resolves any durable
+`transaction.v1/state.json`. It keeps content-addressed prior bytes under
+`rollback/` and archives metadata-only committed state under `receipts/<txid>/`;
+directories are owner `0700`, state/lock files are owner `0600`, and every
+phase publication uses file and directory `fsync` plus atomic rename. Initial
+publication renames one complete, tightly named sibling directory; startup
+promotes that complete form, retains an incomplete publication temp, and
+finishes an exact owner-only cleanup tombstone before proceeding. Cleanup first
+renames the complete transaction directory and never removes canonical
+`state.json` while sibling artifacts remain.
+
+The WAL records the exact prior symlink or absence, `MainPID`, `InvocationID`,
+monotonic systemd start, boot ID, `/proc/<pid>/stat` starttime, snapshot-root
+device/inode, and the exact executable identity from a held `/proc/<pid>/exe`
+file descriptor. `prestate`, `mutated`, and `committed` are the only phases.
+Snapshot cleanup reopens the exact root through an owner-held parent descriptor,
+quarantines it by atomic rename, and uses symlink-resistant FD-relative removal;
+replacement entries are preserved and keep the WAL. For an absent prior service
+link, the unchanged original runtime pathname must remain an exact, held,
+no-follow restart authority before mutation and after cleanup.
+Scratch-root deletion exchanges the exact target with a held placeholder, parks
+that placeholder in a durable reusable slot, and retains the target as its
+durable deletion record; it never resolves a validated replacement leaf through
+`rmdir`. Cleanup and recovery reuse the active write budget and held destination
+parent, including a zero-byte free-space admission before host mutation.
+All other exact-leaf retirements use one held, identity-named park under the
+cache root. Receipt, rollback, WAL, candidate, backup, temporary, and service-link
+namespaces never retain hidden parks; malformed or cross-device park state fails
+closed before the source leaf moves.
+
+Restart intent and the user-manager generation are durable before dispatch.
+Recovery cancels only a recorded job ID under that unchanged generation after
+validating its unit, restart type, and nonterminal state. Foreign jobs, manager
+generation drift, ID reuse, and the dispatch-to-record crash gap are only waited
+out within the recovery deadline; they are never adopted. Committed executable
+evidence must exactly equal the candidate identity and the held runtime before
+archival. Recovery restores and proves the exact prior executable generation and
+exits 75 before any new build. Malformed state or unprovable rollback keeps the
+WAL and blocks completion; the script never restarts a vLLM backend.
+
+The forward transaction has one 1,800-second monotonic deadline. Failure or
+stale-WAL handling receives an independent 180-second recovery deadline shared
+by direct reads/hashes, job waits, rollback, diagnostics, and tombstone cleanup.
+A durable `committed` generation is never rolled back merely because the
+terminal stdout sink fails. Only
+`LLM_GUARD_PROXY_REBUILD_COMPLETE receipt_sha256=<64hex>` is a production
+completion claim; absence of that line is not proof that a committed generation
+was rolled back.
 
 ### 4. Verify the integrated guardian
 
@@ -202,12 +405,13 @@ install -m 0755 scripts/aeon_text_stop_start.sh /home/obj/scripts/aeon_text_stop
 cp scripts/aeon_chat_ready.py ~/.local/bin/
 cp scripts/gb10_apply_aeon_querit_profile.sh ~/.local/bin/
 cp scripts/gb10_check_mem_available.sh ~/.local/bin/
-cp scripts/llm_guard_proxy_cached_rebuild.sh ~/.local/bin/
+install -m 0755 scripts/llm_guard_proxy_cached_rebuild.sh ~/.local/bin/llm_guard_proxy_cached_rebuild.sh
+install -m 0644 scripts/llm_guard_proxy_cached_rebuild.py scripts/llm_guard_proxy_scoped_worker.py \
+  scripts/gb10_bounded_process.py ~/.local/bin/
 cp scripts/llm_guard_proxy_publish_cgroup_registration.sh ~/.local/bin/
 install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py ~/.local/bin/gb10_verify_vllm_no_swap_core.py
 install -m 0755 scripts/gb10_verify_vllm_no_swap.sh ~/.local/bin/gb10_verify_vllm_no_swap.sh
 install -m 0755 scripts/gb10_lifecycle.sh ~/.local/bin/gb10_lifecycle.sh
-install -m 0755 scripts/gb10_service_ready.sh ~/.local/bin/gb10_service_ready.sh
 install -m 0755 scripts/gb10_restart_text_safe.sh ~/.local/bin/gb10_restart_text_safe.sh
 cp scripts/sysmon.sh ~/.local/bin/
 
@@ -236,7 +440,7 @@ install -m 0644 systemd/llm-guard-proxy.service \
   ~/.config/systemd/user/
 
 install -d -m 0755 ~/.config/gb10/aeon-dflash-profiles
-install -m 0644 config/aeon-dflash-profiles/baseline.env config/aeon-dflash-profiles/hikv.env \
+install -m 0644 config/aeon-dflash-profiles/baseline.env config/aeon-dflash-profiles/hikv.env config/aeon-dflash-profiles/qwen38.env \
   ~/.config/gb10/aeon-dflash-profiles/
 ln -sfn hikv.env ~/.config/gb10/aeon-dflash-profiles/active.env.new
 mv -Tf ~/.config/gb10/aeon-dflash-profiles/active.env.new ~/.config/gb10/aeon-dflash-profiles/active.env
@@ -252,9 +456,9 @@ systemctl --user enable --now sysmon.service
 
 # Model services remain independent from the proxy lifecycle.
 systemctl --user enable --now vllm-embedding.service
+systemctl --user enable --now vllm-aeon-27b-dflash.service
 systemctl --user disable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now vllm-querit-4b-reranker.service
-systemctl --user enable --now vllm-aeon-27b-dflash.service
 systemctl --user enable --now llm-guard-proxy.service
 
 ```
@@ -267,8 +471,8 @@ Neither the proxy nor text owns embedding/reranker lifecycle.
 ### Embedding 32K profile activation and rollback
 
 The tracked 32,768-token / 4,800 MiB KV profile is source-first and uses an
-equal 128 GiB Docker memory/swap caps without imposing the obsolete 20 GiB
-service budget. Its post-start verifier must prove the full immutable Docker and
+equal 24g Docker memory/swap envelope; the 5 GiB OS pad lives outside every
+`--memory`. Its post-start verifier must prove the full immutable Docker and
 `/proc` identity plus the unchanged exact Docker scope, inode, population,
 `memory.max`, `memory.swap.max`, and activation-time `memory.swap.current`
 before the unit is active. It must be activated as a
@@ -290,8 +494,8 @@ only `vllm-embedding.service`, and requires a new `InvocationID`, PID, and
 monotonic start generation. It then invokes the canonical fail-closed verifier;
 the caller cannot substitute a unit, verifier, Docker command, or evidence path.
 
-Commit requires the canonical `qwen3-embedding-8b-32k-4800M-128GiB` receipt
-profile and exact 128g memory/swap plus zero-swappiness Docker argv, current
+Commit requires the canonical `qwen3-embedding-8b-32k-4800M-24GiB` receipt
+profile and exact 24g memory/swap plus zero-swappiness Docker argv, current
 systemd/cgroup/container generation, all intended engine-process
 metrics, startup capacity of at least 32,768 tokens, exact model aliases, and
 finite 4,096-dimensional fixture vectors. The fixture proves only repeat/alias

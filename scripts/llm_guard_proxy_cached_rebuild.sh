@@ -1,245 +1,64 @@
-#!/usr/bin/env bash
-# Rebuild/update llm-guard-proxy from reviewed main while reusing a persistent
-# Cargo target cache on GB10. Run on the GB10 host as obj.
-set -Eeuo pipefail
-
-readonly PINNED_SOURCE_REPO="https://github.com/RyderFreeman4Logos/llm-guard-proxy"
-MODE="default"
-REQUESTED_SOURCE_SHA=""
-
-if (( $# > 0 )); then
-  if (( $# != 2 )) || [[ "$1" != "--install-pinned-deferred" ]]; then
-    printf 'usage: %s [--install-pinned-deferred FULL_SOURCE_SHA]\n' "$0" >&2
+#!/usr/bin/bash -p
+# Hash-pin the reviewed rebuild engine; production starts from an empty environment.
+set -euo pipefail
+umask 077
+case "$#:${1-}" in
+  0:|1:--test-only) ;;
+  *) printf 'usage: llm_guard_proxy_cached_rebuild.sh [--test-only]\n' >&2; exit 64 ;;
+esac
+script_dir="$(cd -P -- "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"; engine="$script_dir/llm_guard_proxy_cached_rebuild.py"
+expected_engine_sha256="6b8586cd7c2d04402174c6260f95c121c3fb7d54192aa29227e131d4d8ca85a4"
+if [[ -L "$engine" || ! -f "$engine" ]]; then
+  printf 'Guard rebuild engine authority is unsafe\n' >&2
+  exit 1
+fi
+exec {engine_fd}<"$engine"; read -r owner mode links size device inode < <(
+  /usr/bin/stat -Lc '%u %a %h %s %d %i' -- "/proc/$$/fd/$engine_fd"
+)
+path_identity="$(/usr/bin/stat -Lc '%d %i %s' -- "$engine")"; if [[ "$owner" != "$EUID" || "$mode" != 644 || "$links" != 1 ||
+      "$size" -gt 1048576 || "$path_identity" != "$device $inode $size" ]]; then
+  printf 'Guard rebuild engine authority metadata differs\n' >&2
+  exit 1
+fi
+engine_sha256="$(/usr/bin/sha256sum -- "/proc/$$/fd/$engine_fd")"; if [[ "${engine_sha256%% *}" != "$expected_engine_sha256" || -L "$engine" ||
+      "$(/usr/bin/stat -Lc '%d %i %s' -- "$engine")" != "$path_identity" ]]; then
+  printf 'Guard rebuild engine authority differs\n' >&2
+  exit 1
+fi
+engine_fd_path="/proc/self/fd/$engine_fd"; if (( $# == 1 )); then
+  exec /usr/bin/python3 -I -B -S "$engine_fd_path" --test-only
+fi
+if [[ -v LLM_GUARD_REBUILD_TEST_ONLY ]]; then
+  printf 'LLM_GUARD_REBUILD_TEST_ONLY requires --test-only\n' >&2
+  exit 64
+fi
+for name in CACHE_ROOT SOURCE_DIR SOURCE_REPO SOURCE_BRANCH SERVICE_BIN LOG_DIR LOG_FILE PATH \
+  LLM_GUARD_PROXY_REBUILD_GUARD_CONFIG LLM_GUARD_PROXY_REBUILD_GUARD_UNIT \
+  LLM_GUARD_PROXY_REBUILD_PROC_ROOT LLM_GUARD_PROXY_REBUILD_RECEIPT_DIR \
+  LLM_GUARD_REBUILD_TEST_CONFIG LLM_GUARD_REBUILD_TEST_MISSING_TOOL LLM_GUARD_REBUILD_TEST_FAIL_RECEIPT_STAGE LLM_GUARD_REBUILD_TEST_REPLACE_EXE_DURING_HASH LLM_GUARD_REBUILD_TEST_FORWARD_SECONDS LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS LLM_GUARD_REBUILD_TEST_CRASH_POINT LLM_GUARD_REBUILD_TEST_CRASH_MARKER XDG_RUNTIME_DIR HOME BASH_ENV ENV PYTHONPATH \
+  PYTHONHOME PYTHONSTARTUP PYTHONINSPECT; do
+  if [[ -v "$name" ]]; then
+    printf 'production rebuild override %s requires --test-only\n' "$name" >&2
     exit 64
   fi
-  [[ "$2" =~ ^[0-9a-fA-F]{40}$ ]] || {
-    printf 'FULL_SOURCE_SHA must be exactly 40 hexadecimal characters\n' >&2
-    exit 64
-  }
-  MODE="pinned-deferred"
-  REQUESTED_SOURCE_SHA="${2,,}"
+done
+python_logical=/usr/bin/python3; python_resolved=/usr/bin/python3.11; python_sha256=6d972cf21be56fe3c947ab6ba257ff8d08c342dd2714442986791bd9a6dfabfe
+if [[ "$(/usr/bin/readlink -e -- "$python_logical")" != "$python_resolved" ]]; then
+  printf 'reviewed Python resolved path differs\n' >&2
+  exit 1
 fi
-
-SOURCE_REPO="${SOURCE_REPO:-https://github.com/RyderFreeman4Logos/llm-guard-proxy}"
-SOURCE_BRANCH="${SOURCE_BRANCH:-main}"
-SOURCE_DIR="${SOURCE_DIR:-$HOME/.cache/source/llm-guard-proxy-main}"
-SERVICE_BIN="${SERVICE_BIN:-$HOME/.local/bin/llm-guard-proxy}"
-if [[ "$MODE" == "pinned-deferred" ]]; then
-  SOURCE_REPO="$PINNED_SOURCE_REPO"
-  DEFAULT_CACHE_ROOT="$HOME/.cache/cargo-target/llm-guard-proxy-$REQUESTED_SOURCE_SHA"
-else
-  DEFAULT_CACHE_ROOT="$HOME/.cache/cargo-target/llm-guard-proxy-main"
+exec {python_fd}<"$python_resolved"
+read -r python_owner python_mode python_links < <(
+  /usr/bin/stat -Lc '%u %a %h' -- "/proc/$$/fd/$python_fd"
+)
+held_python_sha="$(/usr/bin/sha256sum -- "/proc/$$/fd/$python_fd")"
+python_path_identity="$(/usr/bin/stat -Lc '%d %i %s' -- "$python_resolved")"
+python_fd_identity="$(/usr/bin/stat -Lc '%d %i %s' -- "/proc/$$/fd/$python_fd")"
+if [[ "$python_owner" != 0 || "$python_mode" != 755 || "$python_links" != 1 ||
+      "${held_python_sha%% *}" != "$python_sha256" ||
+      "$python_path_identity" != "$python_fd_identity" ]]; then
+  printf 'reviewed Python object authority differs\n' >&2
+  exit 1
 fi
-CACHE_ROOT="${CACHE_ROOT:-$DEFAULT_CACHE_ROOT}"
-LOG_DIR="${LOG_DIR:-$HOME/log}"
-RECEIPT_DIR="$HOME/.local/state/llm-guard-proxy-rebuild"
-TS="$(date +%Y%m%d-%H%M%S)"
-LOG_FILE="${LOG_FILE:-$LOG_DIR/llm_guard_proxy_cached_rebuild_${TS}.log}"
-
-export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
-
-log() { printf '[%s] %s\n' "$(date -Is)" "$*"; }
-run() { log "+ $*"; "$@"; }
-
-mkdir -p "$CACHE_ROOT" "$LOG_DIR" "$(dirname "$SOURCE_DIR")" "$HOME/.cache/source"
-chmod 700 "$CACHE_ROOT"
-# ponytail: one user-wide writer; split locks only for independent runtime paths.
-exec 9>"$HOME/.cache/source/llm-guard-proxy-rebuild.lock"
-if ! /usr/bin/flock -n 9; then
-  log "another llm-guard-proxy rebuild is already running"
-  exit 75
-fi
-if [[ "$MODE" == "pinned-deferred" ]]; then
-  CARGO_TARGET_DIR="$(mktemp -d "$CACHE_ROOT/build.XXXXXX")"
-  mkdir -p "$RECEIPT_DIR"
-  chmod 700 "$RECEIPT_DIR"
-else
-  CARGO_TARGET_DIR="$CACHE_ROOT"
-fi
-export CARGO_TARGET_DIR
-
-exec > >(tee "$LOG_FILE") 2>&1
-  log "cached llm-guard-proxy workspace rebuild starting"
-  log "mode=$MODE"
-  log "SOURCE_REPO=$SOURCE_REPO"
-  if [[ "$MODE" == "pinned-deferred" ]]; then
-    log "requested_source_sha=$REQUESTED_SOURCE_SHA"
-  else
-    log "SOURCE_BRANCH=$SOURCE_BRANCH"
-  fi
-  log "SOURCE_DIR=$SOURCE_DIR"
-  log "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
-  log "CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS"
-  run cargo --version
-  if [ ! -d "$SOURCE_DIR/.git" ]; then
-    run git clone --filter=blob:none "$SOURCE_REPO" "$SOURCE_DIR"
-  fi
-  if [[ "$MODE" == "pinned-deferred" ]]; then
-    run git -C "$SOURCE_DIR" fetch --no-tags "$SOURCE_REPO" "$REQUESTED_SOURCE_SHA"
-    FETCHED_COMMIT="$(git -C "$SOURCE_DIR" rev-parse --verify 'FETCH_HEAD^{commit}')"
-    [[ "$FETCHED_COMMIT" == "$REQUESTED_SOURCE_SHA" ]] || {
-      log "fetched source does not match requested SHA"
-      exit 65
-    }
-    run git -C "$SOURCE_DIR" checkout --detach "$FETCHED_COMMIT"
-    SOURCE_COMMIT="$(git -C "$SOURCE_DIR" rev-parse --verify 'HEAD^{commit}')"
-    [[ "$SOURCE_COMMIT" == "$REQUESTED_SOURCE_SHA" ]] || {
-      log "checked-out source does not match requested SHA"
-      exit 65
-    }
-    SOURCE_STATUS="$(git -C "$SOURCE_DIR" status --porcelain=v1 --untracked-files=all --ignored)" || {
-      log "could not verify pinned source state"
-      exit 65
-    }
-    [[ -z "$SOURCE_STATUS" ]] || {
-      log "pinned source checkout is dirty"
-      exit 65
-    }
-    BUILD_SOURCE_DIR="$(mktemp -d "$CACHE_ROOT/source.XXXXXX")"
-    log "+ git -C $SOURCE_DIR archive $SOURCE_COMMIT | tar -x -C $BUILD_SOURCE_DIR"
-    git -C "$SOURCE_DIR" archive "$SOURCE_COMMIT" | tar -x -C "$BUILD_SOURCE_DIR"
-  else
-    run git -C "$SOURCE_DIR" fetch --prune origin "$SOURCE_BRANCH"
-    run git -C "$SOURCE_DIR" checkout --detach "origin/$SOURCE_BRANCH"
-    SOURCE_COMMIT="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
-    BUILD_SOURCE_DIR="$SOURCE_DIR"
-  fi
-  log "source_commit=$SOURCE_COMMIT"
-  run nice -n 10 ionice -c3 cargo build --release -p llm-guard-proxy --features guard --manifest-path "$BUILD_SOURCE_DIR/Cargo.toml"
-  BUILD_BIN="$CARGO_TARGET_DIR/release/llm-guard-proxy"
-  run test -x "$BUILD_BIN"
-  PREVIOUS_SERVICE_TARGET=""
-  PREVIOUS_SERVICE_PRESENT=0
-  RECEIPT_FILE=""
-  PINNED_PUBLICATION_COMMITTED=0
-  if [[ "$MODE" == "pinned-deferred" ]]; then
-    if [[ -L "$SERVICE_BIN" ]]; then
-      PREVIOUS_SERVICE_TARGET="$(readlink "$SERVICE_BIN")"
-      PREVIOUS_SERVICE_PRESENT=1
-    elif [[ -e "$SERVICE_BIN" ]]; then
-      log "deferred publication requires the managed runtime path to be a symlink"
-      exit 65
-    fi
-    RECEIPT_FILE="$RECEIPT_DIR/completion-${TS}-$$-${SOURCE_COMMIT}.json"
-  fi
-  restore_previous_publication() {
-    if (( PREVIOUS_SERVICE_PRESENT )); then
-      ln -sfn "$PREVIOUS_SERVICE_TARGET" "${SERVICE_BIN}.tmp"
-      mv -Tf "${SERVICE_BIN}.tmp" "$SERVICE_BIN"
-    else
-      rm -f "$SERVICE_BIN"
-    fi
-  }
-  rollback_pinned_publication() {
-    local status="$1"
-    trap - ERR EXIT HUP INT TERM
-    set +e
-    if (( ! PINNED_PUBLICATION_COMMITTED )); then
-      rm -f -- "$RECEIPT_FILE" "${RECEIPT_FILE}.tmp."*
-      restore_previous_publication
-    fi
-    exit "$status"
-  }
-  if [[ "$MODE" == "pinned-deferred" ]]; then
-    trap 'rollback_pinned_publication $?' ERR EXIT
-    trap 'exit 129' HUP
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-  fi
-  ln -sfn "$BUILD_BIN" "${SERVICE_BIN}.tmp"
-  mv -Tf "${SERVICE_BIN}.tmp" "$SERVICE_BIN"
-  log "build_bin=$BUILD_BIN"
-  RUNTIME_RESOLVED="$(readlink -f "$SERVICE_BIN")"
-  log "service_bin_resolved=$RUNTIME_RESOLVED"
-  file "$BUILD_BIN"
-  sha256sum "$BUILD_BIN" "$SERVICE_BIN"
-  du -sh "$CACHE_ROOT" 2>/dev/null || true
-
-  if [[ "$MODE" == "pinned-deferred" ]]; then
-    read -r BUILD_SHA256 _ < <(sha256sum "$BUILD_BIN")
-    read -r RUNTIME_SHA256 _ < <(sha256sum "$SERVICE_BIN")
-    if [[ "$BUILD_SHA256" != "$RUNTIME_SHA256" ]]; then
-      log "published runtime artifact does not match the candidate"
-      rollback_pinned_publication 65
-    fi
-    if ! /usr/bin/python3 - "$RECEIPT_FILE" "$SOURCE_REPO" \
-      "$REQUESTED_SOURCE_SHA" "$SOURCE_COMMIT" "$BUILD_BIN" "$BUILD_SHA256" \
-      "$SERVICE_BIN" "$RUNTIME_RESOLVED" "$RUNTIME_SHA256" <<'PY'
-import json
-import os
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-(
-    receipt_name,
-    source_repository,
-    requested_source_sha,
-    verified_source_sha,
-    candidate_path,
-    candidate_sha256,
-    runtime_path,
-    runtime_resolved_path,
-    runtime_sha256,
-) = sys.argv[1:]
-receipt = Path(receipt_name)
-temporary = receipt.with_name(f"{receipt.name}.tmp.{os.getpid()}")
-payload = {
-    "schema_version": 1,
-    "status": "completed",
-    "completed_at": datetime.now(timezone.utc).isoformat(),
-    "source_repository": source_repository,
-    "requested_source_sha": requested_source_sha,
-    "verified_source_sha": verified_source_sha,
-    "candidate_artifact": {"path": candidate_path, "sha256": candidate_sha256},
-    "runtime_artifact": {
-        "path": runtime_path,
-        "resolved_path": runtime_resolved_path,
-        "sha256": runtime_sha256,
-    },
-    "activation": "deferred",
-    "activation_actions_performed": False,
-    "guard_activation": "deferred",
-    "vllm_activation": "not_requested",
-}
-fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-with os.fdopen(fd, "w", encoding="utf-8") as handle:
-    json.dump(payload, handle, sort_keys=True)
-    handle.write("\n")
-    handle.flush()
-    os.fsync(handle.fileno())
-os.replace(temporary, receipt)
-directory_fd = os.open(receipt.parent, os.O_RDONLY | os.O_DIRECTORY)
-try:
-    os.fsync(directory_fd)
-finally:
-    os.close(directory_fd)
-PY
-    then
-      log "completion receipt failed; restoring prior runtime publication"
-      rollback_pinned_publication 65
-    fi
-    PINNED_PUBLICATION_COMMITTED=1
-    trap - ERR EXIT HUP INT TERM
-    log "activation=deferred"
-    log "completion_receipt=$RECEIPT_FILE"
-  elif systemctl --user is-active --quiet llm-guard-proxy.service; then
-    MAIN_PID="$(systemctl --user show -p MainPID --value llm-guard-proxy.service)"
-    RUNNING_EXE="$(readlink "/proc/$MAIN_PID/exe" 2>/dev/null || true)"
-    log "running_guard_pid=$MAIN_PID"
-    log "running_guard_exe=$RUNNING_EXE"
-    if printf '%s\n' "$RUNNING_EXE" | grep -q ' (deleted)$'; then
-      log "running guard is still on an unlinked inode; restarting llm-guard-proxy.service only"
-      run systemctl --user restart llm-guard-proxy.service
-      sleep 2
-      run systemctl --user is-active llm-guard-proxy.service
-      curl -fsS -m 10 http://100.105.4.92:18009/health >/dev/null
-      NEW_PID="$(systemctl --user show -p MainPID --value llm-guard-proxy.service)"
-      log "restarted_guard_pid=$NEW_PID"
-      log "restarted_guard_exe=$(readlink "/proc/$NEW_PID/exe")"
-    fi
-  fi
-
-  log "cached llm-guard-proxy workspace rebuild complete"
-printf 'log=%s\n' "$LOG_FILE"
+exec /usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C LANG=C \
+  "/proc/self/fd/$python_fd" -I -B -S "$engine_fd_path"

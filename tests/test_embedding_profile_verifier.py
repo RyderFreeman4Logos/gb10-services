@@ -66,7 +66,7 @@ class StrictUnitParserTests(unittest.TestCase):
         canonical = UNIT.read_text()
         mutations = {
             "host short memory alias": canonical.replace(
-                "  --memory 128g \\\n", "  --memory 128g -m 24g \\\n", 1
+                "  --memory 24g \\\n", "  --memory 24g -m 24g \\\n", 1
             ),
             "host flag after image": canonical.replace(
                 "  /usr/local/bin/vllm serve",
@@ -113,6 +113,39 @@ class StrictUnitParserTests(unittest.TestCase):
 
 
 class BoundedCommandTests(unittest.TestCase):
+    def test_shared_command_supports_exact_cwd_env_and_passed_fd(self) -> None:
+        verifier = _load_verifier()
+        self.assertEqual(verifier.command.__module__, "gb10_bounded_process")
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"held-authority")
+            os.close(write_fd)
+            write_fd = -1
+            with tempfile.TemporaryDirectory() as temporary:
+                output = verifier.command(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import json,os,sys; print(json.dumps({"
+                        "'cwd':os.getcwd(),'only':os.environ.get('ONLY'),"
+                        "'hostile':os.environ.get('HOSTILE'),"
+                        "'fd':os.read(int(sys.argv[1]),64).decode()}))",
+                        str(read_fd),
+                    ],
+                    cwd=temporary,
+                    env={"LC_ALL": "C", "ONLY": "bound"},
+                    pass_fds=(read_fd,),
+                )
+            payload = json.loads(output)
+            self.assertEqual(payload["cwd"], temporary)
+            self.assertEqual(payload["only"], "bound")
+            self.assertIsNone(payload["hostile"])
+            self.assertEqual(payload["fd"], "held-authority")
+        finally:
+            os.close(read_fd)
+            if write_fd >= 0:
+                os.close(write_fd)
+
     def test_timeout_terminates_and_reaps_descendant_process_group(self) -> None:
         verifier = _load_verifier()
         with tempfile.TemporaryDirectory() as temporary:
@@ -174,6 +207,13 @@ class BoundedCommandTests(unittest.TestCase):
                 input_text="x" * (5 * 1024 * 1024),
             )
 
+    def test_success_output_must_be_strict_utf8(self) -> None:
+        verifier = _load_verifier()
+        with self.assertRaisesRegex(RuntimeError, "UTF-8"):
+            verifier.command(
+                [sys.executable, "-c", "import os; os.write(1, bytes([255]))"]
+            )
+
     def test_nonzero_parent_cannot_leave_an_orphaned_process_group(self) -> None:
         verifier = _load_verifier()
         with tempfile.TemporaryDirectory() as temporary:
@@ -222,7 +262,7 @@ class CurrentGenerationVerifierTests(unittest.TestCase):
                 self.assertEqual(receipt["verification"], "passed")
                 self.assertEqual(
                     receipt["profile"],
-                    "qwen3-embedding-8b-32k-4800M-128GiB",
+                    "qwen3-embedding-8b-32k-4800M-24GiB",
                 )
                 serialized = json.dumps(receipt, sort_keys=True)
                 self.assertNotIn(CURRENT_INVOCATION, serialized)

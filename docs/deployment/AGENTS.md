@@ -21,18 +21,17 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 
 ## Current Reference Runtime
 
-* Tracked vLLM source image for embedding, AEON chat, Querit, and the disabled vLLM reranker fallback: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-08-16-v0.27.1` (`sha256:13c0df6a321ade60507a9026b0d2963ad51f0499a228de430eeba3bb74ad7954`; runtime `v0.27.1`).
-* Rollback image retained on GB10: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-27-v0.26.0` (`sha256:1aa47363e4c9cfa0a85411c669d39b7f9fa3adb3e735ef1ca5760be3044dacd7`).
-* Older rollback/superseded image retained on GB10: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-07-14-v0.25.0` (`sha256:18c09e6b80141a530285160781f7fa720a78ef91143b3c15a65a8c9641b44e55`).
-* The v0.26.0 rollback image's OCI description inherits a stale v0.25.1 string; its dated tag plus immutable digest above remain rollback authority. Do not infer v0.27.1 feature parity or multi-Spark hardware validation from historical release notes.
+* Tracked vLLM source image for embedding, AEON chat, Querit, and the disabled vLLM reranker fallback: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-08-17-v0.27.1-slim` (`sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f`; runtime `v0.27.1-slim`).
+* Rollback/superseded fat image retained on GB10: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-08-16-v0.27.1` (`sha256:13c0df6a321ade60507a9026b0d2963ad51f0499a228de430eeba3bb74ad7954`).
+* The prior v0.25.1 AEON build's MRv2/torchcodec/TP>1 notes are historical release evidence, not v0.27.1 feature claims. The v0.27.1 OCI description may inherit a stale v0.25.1 string; use the dated tag plus immutable digest above as authority and do not infer unverified feature parity or multi-Spark hardware validation.
 * `vllm-embedding.service` tracked source contract: BF16 Qwen3-Embedding-8B with 4,096-dimensional output, `max-model-len=32768`, `max-num-batched-tokens=8192`, `max-num-seqs=64`, and `kv-cache-memory-bytes=4800M`. It requests equal 128 GiB Docker memory/swap caps without imposing the obsolete 20 GiB service budget. Its post-start verifier binds full Docker ID/PID/`StartedAt`, `/proc` starttime and canonical Docker scope, scope dev/inode, and authoritative `cgroup.events`, then re-reads the unchanged identity and proves exact `memory.max`, zero `memory.swap.max`, and zero activation-time `memory.swap.current`. The validated 5,820 MiB baseline yielded 41,376 KV tokens; 4,800 MiB projects about 34,124 tokens (4.14% above 32,768) but is not production-verified until an authorized live restart prints at least 32,768 tokens.
-* `vllm-aeon-27b-dflash.service` is the sole AEON text runtime owner: DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-seqs=16`, and `max-num-batched-tokens=4096`. It reads `/home/obj/.config/gb10/aeon-dflash-profiles/active.env`; tracked `baseline.env` selects `gpu-memory-utilization=0.355` and `hikv.env` selects `0.45`. `active.env` currently links to HiKV. Its v0.27.1 Docker env sets `VLLM_USE_V2_MODEL_RUNNER=0`: native `thinking_token_budget` requires the V1 model runner. Historical clean-start baseline capacity was 286,962 KV tokens; record a v0.26.0 live receipt before making a capacity claim. Common unit bounds are `TimeoutStartSec=3000` and readiness deadline 2800. The HiKV-named unit is only a compatibility symlink to this canonical unit, never a profile selector. Guard `readiness_deadline_ms` remains `1500000` (25 minutes) and `restart_queue` timeouts remain 600 — cold start can take 15–20 minutes. See the unit header comment for deployment constraints.
-* The v0.27.1 AEON text unit rotates compiled artifacts into `/home/obj/.cache/vllm-compile/aeon-qwen36-v0271-13c0df` (mounted as `/var/cache/vllm/aeon-qwen36-v0271`); do not reuse an older image namespace.
-* `vllm-querit-4b-reranker.service`: single canonical BF16 pooling production owner on `18013`, with a 32,768-token context, 4,800 MiB KV cache, equal 18 GiB Docker memory/swap caps, and the live-proven AEON scheduler profile `--max-num-batched-tokens 16384` and `--max-num-seqs 32`. Every startup first binds the exact Docker generation, then runs the unit-owned strict no-swap verifier, and finally completes the bounded rerank-readiness probe; the verifier does not query the still-starting `Type=simple` service's active state.
+* `vllm-aeon-27b-dflash.service` is the sole AEON text runtime owner: DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-seqs=16`, and `max-num-batched-tokens=4096`. It reads `/home/obj/.config/gb10/aeon-dflash-profiles/active.env`; tracked `baseline.env` selects `gpu-memory-utilization=0.355` and `hikv.env` selects `0.45`. `active.env` currently links to HiKV. Historical clean-start baseline capacity was 286,962 KV tokens; record a v0.27.1 live receipt before making a capacity claim. Common unit bounds are `TimeoutStartSec=3000` and readiness deadline 2800. The HiKV-named unit is only a compatibility symlink to this canonical unit, never a profile selector. Guard `readiness_deadline_ms` remains `1500000` (25 minutes) and `restart_queue` timeouts remain 600 — cold start can take 15–20 minutes. See the unit header comment for deployment constraints.
+* The v0.27.1-slim AEON text unit rotates compiled artifacts into `/home/obj/.cache/vllm-compile/aeon-qwen36-v0271-2fb855` (mounted as `/var/cache/vllm/aeon-qwen36-v0271`); the prior v0.26.0 namespace `/home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473` -> `/var/cache/vllm/aeon-qwen36-v0260` remains the rollback cache. Do not reuse the v0.25.1 `c15e2c` namespace.
+* `vllm-querit-4b-reranker.service`: single canonical BF16 pooling production owner on `18013`, with a 32,768-token context, 4,800 MiB KV cache, equal 18 GiB Docker memory/swap caps, and the live-proven AEON scheduler profile `--max-num-batched-tokens 16384`, `--max-num-seqs 32`, `--max-num-partial-prefills 1`, and `--max-long-partial-prefills 1`. Every startup first binds the exact Docker generation, then runs the unit-owned strict no-swap verifier, and finally completes the bounded rerank-readiness probe; the verifier does not query the still-starting `Type=simple` service's active state.
 * `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
 * `llm-guard-proxy` routes by request `model` to AEON chat (`aeon-ultimate`, `qwen3.6-27b-decensor-by-aeon`, `qwen3.6-27b-decensored`), embedding (`qwen3-embedding-8b`, `Qwen/Qwen3-Embedding-8B`), or reranker (`qwen3-reranker-8b`, `Qwen/Qwen3-Reranker-8B`).
 * `llm-guard-proxy` default chat (`:18009`) is force_disable with a single no-thinking rung. Opt-in legacy bounded chat (`:18014`) keeps its multi-rung ladder and `bounded_answer_from_cot`; guarded max-thinking (`:18011`) uses `truncate_cot_then_answer` for one retry-local no-thinking synthesis. The legacy 18002/18003 ports are guard-owned downstream listeners, not raw vLLM publishes.
-* `llm-guard-proxy` also hot-reloads `config.toml`. Use `[server]` to change default/chat request parallelism and per-`[[upstreams]]` `max_in_flight_requests` / `max_queued_generation_requests` to tune embedding/reranker independently without restarting vLLM, trading total throughput against single-stream latency.
+* To change `[server]` default/chat request parallelism, per-`[[upstreams]]` `max_in_flight_requests` / `max_queued_generation_requests`, or `[guardian]` policy, edit `/home/obj/.config/llm-guard-proxy/config.toml`, then run `systemctl --user restart llm-guard-proxy`. The running service continues using its activation-time credential copy until restart; this restarts only the proxy, so vLLM backends keep running.
 
 ### llm-guard-proxy Enabled Features
 
@@ -112,12 +111,13 @@ cp scripts/aeon_hang_guard.py /home/obj/scripts/
 install -m 0755 scripts/aeon_text_stop_start.sh /home/obj/scripts/aeon_text_stop_start.sh
 cp scripts/aeon_chat_ready.py /home/obj/.local/bin/
 cp scripts/gb10_check_mem_available.sh /home/obj/.local/bin/
-cp scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/
+install -m 0755 scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/llm_guard_proxy_cached_rebuild.sh
+install -m 0644 scripts/llm_guard_proxy_cached_rebuild.py scripts/llm_guard_proxy_scoped_worker.py \
+  scripts/gb10_bounded_process.py /home/obj/.local/bin/
 cp scripts/llm_guard_proxy_publish_cgroup_registration.sh /home/obj/.local/bin/
 install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py /home/obj/.local/bin/gb10_verify_vllm_no_swap_core.py
 install -m 0755 scripts/gb10_verify_vllm_no_swap.sh /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh
 install -m 0755 scripts/gb10_lifecycle.sh /home/obj/.local/bin/gb10_lifecycle.sh
-install -m 0755 scripts/gb10_service_ready.sh /home/obj/.local/bin/gb10_service_ready.sh
 install -m 0755 scripts/gb10_restart_text_safe.sh /home/obj/.local/bin/gb10_restart_text_safe.sh
 cp scripts/sysmon.sh /home/obj/.local/bin/
 
@@ -139,20 +139,81 @@ cp config/llm-guard-proxy/config.toml /home/obj/.config/llm-guard-proxy/config.t
 
 ### 3. Build llm-guard-proxy
 ```bash
-# Build/update the reviewed main branch from a local workspace checkout with a
-# persistent Cargo target cache. The script uses CARGO_BUILD_JOBS=1 and
-# ionice/nice so rebuilds are safer while the GB10 vLLM stack is resident.
+# Build/update the reviewed main branch through verified hard-contained scopes.
+# Production accepts no environment overrides.
 /home/obj/.local/bin/llm_guard_proxy_cached_rebuild.sh
 ```
 
-The cached rebuild script keeps Cargo build artifacts under
-`/home/obj/.cache/cargo-target/llm-guard-proxy-main`, then atomically relinks
-`/home/obj/.local/bin/llm-guard-proxy` to the workspace-built release binary.
-It explicitly builds with Cargo feature `guard`; production must not inherit the
-package's empty default feature set.
-If the running guard process still points at a deleted old inode after a
-standalone rebuild, the script restarts only `llm-guard-proxy.service` and
-smokes `/health`; it does not restart any vLLM backend.
+Production invocation accepts no override environment variables. With no
+arguments, the cached rebuild hard-binds the canonical repository/branch,
+source/cache paths, installed config/unit, service symlink, owner-only recovery
+state, real `/proc`, and fixed tool path. `--test-only` is exclusively for
+hermetic tests and cannot emit the production completion contract.
+
+The script gates each fetch, Cargo-metadata, and Cargo-build payload behind a
+random transient user scope whose exact cgroup membership and effective hard
+memory/swap/PID/CPU limits are verified before GO. Bubblewrap keeps Git objects,
+Cargo target output, and temporary files in bounded tmpfs mounts; no writable
+host target or external Git worktree is mounted. The parent accepts bounded
+canonical frames, revalidates the immutable Git archive or candidate, applies one
+576 MiB host-write budget with 8 GiB free-space headroom, and cleans the exact
+process group, scope, and verified descendants on failure. Metadata-only
+receipts bind the complete containment policy and reviewed worker/tool authorities,
+but never persist transient scope names.
+The parent keeps opened memory/pids event descriptors through the worker's final
+resource fence and reads them before a failed scope is collected, preserving
+exact limit evidence for nonzero status, signal/OOM, and early post-GO failure.
+
+Before any link mutation it snapshots and validates exact prior symlink or
+absence plus `MainPID`, `InvocationID`, monotonic start, boot ID, and
+`/proc/<pid>/stat` starttime. It hashes/stats/build-ID-checks one held
+`/proc/<pid>/exe` file descriptor, then proves the current proc entry still names
+that object and generation at publication. Same-content replacement, PID reuse,
+exec drift, and systemd generation drift fail closed.
+
+The owner-`0700` state root
+`/home/obj/.local/state/llm-guard-proxy-rebuild/` contains `lock.v1`, active
+`transaction.v1/state.json`, content-addressed `rollback/`, and committed
+`receipts/<txid>/state.json`. The only WAL phases are `prestate`, `mutated`, and
+`committed`; owner-`0600` state publication is ordered by write, file `fsync`,
+atomic rename, and directory `fsync`. Initial publication atomically renames one
+complete, tightly named sibling directory. Startup promotes only that complete
+form, retains an incomplete publication temp, and finishes exact owner-only
+cleanup tombstones. Transaction cleanup renames the whole directory before
+FD-relative removal; it never unlinks canonical state while siblings remain.
+
+The WAL binds the snapshot-root device/inode. Cleanup opens that exact root
+relative to a held owner-safe parent, quarantines it atomically, and uses the
+stdlib symlink-resistant FD-relative walker; a replacement symlink, directory,
+or leaf is preserved and the WAL remains. If the prior service link was absent,
+the original runtime pathname must be a held no-follow exact executable before
+forward mutation, remains the rollback restart pathname, and is re-proved after
+link absence and cleanup are restored.
+Scratch cleanup exchanges the exact target with a held placeholder, parks the
+placeholder in a durable reusable slot, and retains the target as its durable
+deletion record; it never removes a validated replacement leaf by name. Cleanup
+and recovery reuse the active write budget and held destination parent, with a
+zero-byte free-space admission before any host mutation.
+All other exact-leaf retirements use one held, identity-named park under the
+cache root. Receipt, rollback, WAL, candidate, backup, temporary, and service-link
+namespaces never retain hidden parks; malformed or cross-device park state fails
+closed before the source leaf moves.
+
+Cutover and every external command share one 1,800-second forward deadline.
+Failure or stale-WAL recovery gets a fresh 180 seconds shared by direct
+reads/hashes, job waits, rollback, diagnostics, and cleanup. Restart intent and
+the user-manager generation are durable before dispatch. Recovery cancels only
+a recorded Guard restart job ID whose unit/type/state remain exact under that
+unchanged generation. Foreign jobs, generation drift, ID reuse, and the
+dispatch-to-record gap are waited out within the deadline and are never adopted.
+Committed executable evidence must exactly equal the candidate identity and
+held runtime before archival. Successful recovery exits 75 before a new build.
+An unsafe WAL or unprovable exact prior generation is retained and blocks
+completion; operators must preserve it for diagnosis.
+The script never restarts a vLLM backend. A durable `committed` generation is
+not rolled back for a later stdout failure. The only production success claim is
+`LLM_GUARD_PROXY_REBUILD_COMPLETE receipt_sha256=<64hex>`; marker absence alone
+does not imply rollback.
 
 ### 4. Verify the integrated guardian profile
 
@@ -192,11 +253,11 @@ systemctl --user enable --now sysmon.service
 
 # Start model services and the proxy independently.
 systemctl --user enable --now vllm-embedding.service
+systemctl --user enable --now vllm-aeon-27b-dflash.service
 # To select baseline for a future authorized stop/start, atomically repoint
 # active.env to baseline.env; keep the canonical systemd unit enabled.
 systemctl --user disable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now vllm-querit-4b-reranker.service
-systemctl --user enable --now vllm-aeon-27b-dflash.service
 systemctl --user enable --now llm-guard-proxy.service
 ```
 
@@ -383,9 +444,15 @@ systemctl --user status vllm-embedding vllm-aeon-27b-dflash vllm-querit-4b-reran
 
 ### Retrieve System Resource Log (sysmon output)
 ```bash
-# View last 20 samples from 1Hz monitor
+# View the last 20 target-interval samples and their measured cadence
 tail -n 20 ~/log/sysmon_$(date +%Y-%m-%d).csv
 ```
+
+The production unit uses `UnsetEnvironment=` for every `SYSMON_*` fixture
+selector and invokes the script without arguments, which hard-binds real `/proc`,
+the real clock, and `~/log`. `--test-only` is solely for hermetic source tests;
+bounded boot-ID/PSI readers degrade non-regular, symlinked, oversized,
+nonterminated, duplicate, missing, or malformed input to `N/A`.
 
 ### View Live Service logs
 ```bash
@@ -426,24 +493,26 @@ curl -s -X POST http://100.105.4.92:18009/v1/rerank \
   -d '{"model":"qwen3-reranker-8b","query":"hello","documents":["hello world","goodbye"]}'
 ```
 
-### Hot-reload Chat Parallelism
+### Restart Guard for Chat Parallelism
 
-To tune throughput versus single-stream latency without restarting the slow AEON
-vLLM backend, edit `/home/obj/.config/llm-guard-proxy/config.toml` and adjust:
+To tune throughput versus single-stream latency, edit
+`/home/obj/.config/llm-guard-proxy/config.toml`, then run
+`systemctl --user restart llm-guard-proxy` after adjusting:
 
 ```toml
 max_in_flight_requests = 8
 max_queued_generation_requests = 8
 ```
 
-The running Rust proxy hot-reloads the config file. Restarting vLLM is not
-required for these proxy-only queue/concurrency changes.
+The running proxy continues using its activation-time credential copy until
+restart. This command restarts only `llm-guard-proxy`; vLLM backends keep
+running.
 
 ---
 
 ## Troubleshooting & Recovery
 
-### 0. Historical v0.25.1 FlashInfer JIT Compilation (not current v0.27.1 guidance)
+### 0. Historical v0.25.1 FlashInfer JIT Compilation (not v0.27.1-slim guidance)
 
 The historical v0.25.1 image (`sha256:c15e2c4b...`) used FlashInfer 0.6.13 which required JIT
 compilation of 30+ CUTLASS FP4 GEMM kernels on first startup. Without `MAX_JOBS=1`,
@@ -451,14 +520,14 @@ ninja compiles in parallel → multiple nvcc/cc1plus procs exhaust UMA → kerne
 → `ninja: build stopped` → `RuntimeError` exit 1.
 
 **This was the #1 cause of text startup failures on v0.25.x; it is historical
-evidence, not a v0.27.1 readiness diagnosis.**
+evidence, not a v0.27.1-slim readiness diagnosis.**
 
-The tracked text unit retains `MAX_JOBS=1` + `CMAKE_BUILD_PARALLEL_LEVEL=1` to
-serialize compilation. The container itself is ephemeral (`--rm`). The v0.26.0
-unit bound a host compile cache at
-`/home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473` into the container
-cache path; v0.27.1 uses the image-scoped namespace documented above. This
-retained v0.25.1 observation does not establish v0.27.1's HIGH-KV
+The tracked text units retain `MAX_JOBS=1` + `CMAKE_BUILD_PARALLEL_LEVEL=1` to
+serialize compilation. The container itself is ephemeral (`--rm`), but both text
+units bind-mount a host compile cache at
+`/home/obj/.cache/vllm-compile/aeon-qwen36-v0271-2fb855` into the container
+cache path, so host-side JIT/compile artifacts persist across container recycles.
+This retained v0.25.1 observation does not establish v0.27.1-slim's HIGH-KV
 compilation/profiling latency. The integrated guardian remains active and enforces
 the configured 5 GiB `MemAvailable` threshold during startup; serialized
 compilation is pressure reduction, not an exemption from that guard.

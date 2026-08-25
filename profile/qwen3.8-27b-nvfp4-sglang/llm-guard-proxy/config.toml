@@ -1,0 +1,301 @@
+# Qwen3.8 NVFP4 SGLang profile Guard config (source-prepared, NOT live).
+# Live Guard still reads /home/obj/.config/llm-guard-proxy/config.toml.
+# Derived from the production Guard file; the DEFAULT chat path (:18009)
+# applies fill-if-absent sampling/thinking defaults (caller fields win). Requires
+# llm-guard-proxy #245. Do not copy this file onto live Guard until #245
+# is deployed (unknown keys fail closed).
+[server]
+bind_host = "100.105.4.92"
+port = 18009
+max_in_flight_requests = 32
+max_queued_generation_requests = 32
+generation_queue_timeout_ms = 1800000
+generation_queue_full_status = 429
+generation_queue_retry_after_secs = 10
+max_control_plane_in_flight_requests = 128
+max_request_body_bytes = 4194304
+
+[guardian]
+enabled = true
+target_label = "aeon-text"
+mem_threshold_gib = 5
+kill_action = "cgroup-kill"
+poll_interval_secs = 3
+registration_file = "text-cgroup.v1"
+reserve_mib = 64
+retry_interval_secs = 5
+cgroup_root = "/sys/fs/cgroup"
+
+[[listeners]]
+name = "embedding-legacy"
+bind_host = "100.105.4.92"
+port = 18002
+allowed_upstreams = ["qwen3-embedding-8b"]
+
+[[listeners]]
+name = "reranker-legacy"
+bind_host = "100.105.4.92"
+port = 18003
+allowed_upstreams = ["qwen3-reranker-8b"]
+
+[[listeners]]
+name = "aggregate"
+bind_host = "100.105.4.92"
+port = 18005
+
+# Default multi-model chat entry :18009. Fill-if-absent defaults only;
+# caller temperature / top_p / top_k / reasoning_effort / enable_thinking
+# win. No force_disable, no force_thinking, no loop salvage, no
+# thinking_token_budget. 18009 is the implicit default listener
+# ([server].port); do not bind a second [[listeners]] on it.
+
+[upstream]
+base_url = "http://100.105.4.92:18010/v1"
+request_timeout_ms = 1800000
+
+[upstream.hot_restart]
+enabled = true
+probe_max_tokens = 1
+probe_interval_secs = 5
+probe_timeout_secs = 600
+
+[upstream.stall]
+enabled = true
+first_chunk_timeout_ms = 600000
+idle_timeout_ms = 300000
+recovery_timeout_ms = 300000
+recovery_cooldown_ms = 300000
+recovery_budget_window_ms = 900000
+recovery_max_per_window = 2
+
+[upstream.local_recovery]
+enabled = false
+restart_command = ["/home/obj/scripts/aeon_text_stop_start.sh"]
+restart_timeout_ms = 300000
+readiness_endpoint = "/v1/chat/completions"
+readiness_request_timeout_ms = 30000
+readiness_deadline_ms = 1500000
+readiness_interval_ms = 5000
+max_attempts_per_request = 1
+cooldown_ms = 300000
+budget_window_ms = 900000
+max_per_window = 2
+
+[upstream.stuck_watchdog]
+enabled = true
+check_interval_secs = 30
+detection_window_secs = 180
+min_output_progress_units_in_window = 1
+
+[upstream.restart_queue]
+enabled = true
+queue_deadline_secs = 600
+restart_timeout_secs = 600
+
+[upstream.metadata]
+discovery_enabled = true
+enrich_responses = true
+refresh_interval_secs = 60
+input_token_safety_margin = 512
+
+# Default chat upstream behind the stable public alias. The engine serves this
+# name (see the SGLang unit served-model-name). No request mutation.
+[[upstreams]]
+name = "qwen3.8-sglang-default-chat"
+base_url = "http://100.105.4.92:18010/v1"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
+match_models = ["abliterated-qwen-latest-27b-nvfp4", "qwen3.8-27b-sglang", "qwen3.6-27b-decensor-by-aeon", "qwen3.6-27b-decensored", "aeon-ultimate"]
+request_timeout_ms = 1800000
+max_in_flight_requests = 32
+max_queued_generation_requests = 32
+
+[upstreams.metadata]
+discovery_enabled = true
+enrich_responses = true
+refresh_interval_secs = 60
+input_token_safety_margin = 512
+
+[upstreams.hot_restart]
+enabled = true
+probe_max_tokens = 1
+probe_interval_secs = 5
+probe_timeout_secs = 600
+
+[upstreams.local_recovery]
+enabled = false
+restart_command = ["/home/obj/scripts/aeon_text_stop_start.sh"]
+restart_timeout_ms = 300000
+readiness_endpoint = "/v1/chat/completions"
+readiness_request_timeout_ms = 30000
+readiness_deadline_ms = 1500000
+readiness_interval_ms = 5000
+max_attempts_per_request = 1
+cooldown_ms = 300000
+budget_window_ms = 900000
+max_per_window = 2
+
+# Default chat: thinking passthrough (not forced). Sampling/thinking
+# defaults are fill-if-absent only (llm-guard-proxy #245). Do not emit
+# thinking_token_budget to this vLLM backend.
+[upstreams.thinking]
+mode = "passthrough"
+enabled = false
+
+[upstreams.param_override]
+enabled = true
+mode = "fill_if_absent"
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+max_tokens = 50000
+reasoning_effort = "medium"
+
+[upstreams.loop_guard]
+enabled = false
+mode = "disabled"
+
+# Single-rung neutral ladder: no retry that mutates thinking or sampling.
+# Live Guard 8adcce30 rejects unknown table [upstreams.retry]; keep ladder only.
+[[upstreams.retry.ladder]]
+name = "same-policy"
+thinking_mode = "passthrough"
+max_tokens = 50000
+preserve_answer_budget = true
+tool_request_policy = "apply"
+no_thinking_marker_policy = "respect_no_thinking_markers"
+
+[[upstreams]]
+name = "qwen3-embedding-8b"
+base_url = "http://100.105.4.92:18012/v1"
+match_models = ["qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B"]
+request_timeout_ms = 1800000
+max_in_flight_requests = 8
+max_queued_generation_requests = 64
+
+[upstreams.metadata]
+discovery_enabled = true
+enrich_responses = true
+refresh_interval_secs = 60
+input_token_safety_margin = 512
+
+[upstreams.hot_restart]
+enabled = false
+
+[upstreams.thinking]
+mode = "passthrough"
+enabled = false
+
+[upstreams.param_override]
+enabled = false
+
+[[upstreams]]
+name = "qwen3-reranker-8b"
+base_url = "http://100.105.4.92:18013/v1"
+match_models = ["qwen3-reranker-8b", "Qwen/Qwen3-Reranker-8B"]
+request_timeout_ms = 1800000
+max_in_flight_requests = 8
+max_queued_generation_requests = 64
+
+[upstreams.metadata]
+discovery_enabled = true
+enrich_responses = true
+refresh_interval_secs = 60
+input_token_safety_margin = 512
+
+[upstreams.hot_restart]
+enabled = false
+
+[upstreams.thinking]
+mode = "passthrough"
+enabled = false
+
+[upstreams.param_override]
+enabled = false
+
+[shielding]
+enabled = true
+
+[observability]
+enabled = true
+sqlite_path = "/home/obj/.local/state/llm-guard-proxy/observability.sqlite3"
+capture_raw_payloads = false
+metrics_enabled = true
+health_upstream_probe_enabled = true
+health_upstream_probe_timeout_ms = 2000
+debug_summary_enabled = true
+debug_summary_max_records = 20
+
+[observability.retention]
+max_bytes = 1073741824
+prune_to_bytes = 805306368
+max_records = 100000
+prune_to_records = 80000
+
+[evidence]
+enabled = true
+include_raw_payloads = false
+include_request_headers = true
+sqlite_path = "/home/obj/.local/state/llm-guard-proxy-evidence/evidence.sqlite3"
+blob_cache_dir = "/home/obj/.cache/llm-guard-proxy-evidence/blobs"
+max_bytes = 10737418240
+prune_to_bytes = 8589934592
+max_records = 200000
+prune_to_records = 160000
+
+[evidence.shadow]
+enabled = true
+keep_looping_attempt_running = true
+parallel_downgrade_attempts = true
+max_shadow_attempts_per_request = 4
+max_global_shadow_in_flight = 2
+shadow_attempt_timeout_ms = 7200000
+
+[evidence.shadow.paired_comparison]
+enabled = false
+variants = ["no-thinking"]
+include_raw_input = false
+include_raw_output = false
+include_raw_reasoning = false
+sample_rate = 1.0
+max_raw_input_bytes = 131072
+max_raw_output_bytes = 131072
+max_raw_reasoning_bytes = 131072
+max_retention_records = 100000
+max_retention_bytes = 8589934592
+retention_days = 14
+
+# Default multi-model entry (:18009 chat). Faithful forward: thinking
+# passthrough, no loop salvage, no sampling rewrite.
+[thinking]
+mode = "passthrough"
+enabled = false
+
+[loop_guard]
+enabled = false
+mode = "disabled"
+
+[retry]
+enabled = true
+max_attempts = 1
+request_deadline_ms = 1200000
+anti_loop_hint_enabled = false
+shielded_streaming_enabled = false
+downstream_drop_policy = "cancel"
+
+[[retry.ladder]]
+name = "same-policy"
+thinking_mode = "passthrough"
+max_tokens = 50000
+preserve_answer_budget = true
+tool_request_policy = "apply"
+no_thinking_marker_policy = "respect_no_thinking_markers"
+
+[heartbeat]
+mode = "sse"
+interval_secs = 15
+
+[cloudflare]
+enabled = true
