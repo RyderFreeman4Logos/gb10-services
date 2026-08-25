@@ -1,0 +1,17 @@
+[run]
+provider = "openai"
+model_id = "abliterated-qwen-latest-27b-nvfp4"
+endpoint = "http://100.105.4.92:18010/v1"
+
+[execution]
+concurrencies = [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+min_prompt_tokens = 16000
+max_tokens = 256
+
+[resources]
+client_workers = 32
+request_timeout_s = 1800.0
+wave_timeout_s = 3600.0
+max_attempts = 5
+backoff_initial_s = 1.0
+backoff_max_s = 30.0

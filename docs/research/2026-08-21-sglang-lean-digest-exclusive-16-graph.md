@@ -114,5 +114,6 @@ Future canary for a release: same 18k/1400 ladder on the frozen exclusive argv, 
 - Source unit + tests updated; focused 29/29; hook commit `0b3ebaa`.
 - Exclusive start PID `1635702`. KV 1,166,643 before HTTP ready. Graph/compile capture delayed `/v1` until healthcheck `OK`.
 - 2026-08-21 06:25 PDT: this diary opened. Exclusive 18k/1400 ladder launched in `/home/obj/sglang-lean-digest-exclusive-16graph-2026-08-21` (harness PID `2309814`, start_time `49339857`, config_epoch `03d4c5fe1ab27f597f999eb3130c2e69a0b6ac0cfad9dc56e2f1edb2df22301a`). Baseline artifacts stay. Host `MemAvailable` at launch ~1.18 GiB.
+- 2026-08-21 06:41 PDT: operator requested descending `c` (warmup + fail-fast). Ascending exclusive harness SIGTERM'd at 19/80 (`c≈4`), artifacts kept. New run `/home/obj/sglang-lean-digest-exclusive-16to1-2026-08-21` (PID `2695830`, start_time `49420471`, config_epoch `8c9dc7e7db97bd3fa33ac7b3a845d5aae1c933baf8d7a51f54d52e9967bacb06`) starts at `c=16`. Same SGLang PID `1635702`. `MemAvailable` ~0.68 GiB at launch.
 
 Do not paste prompts, completions, SSE, headers, or credentials into this file. Aggregate token/timing/status only.

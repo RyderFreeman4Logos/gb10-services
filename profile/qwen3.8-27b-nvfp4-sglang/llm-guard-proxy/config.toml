@@ -143,7 +143,7 @@ enabled = false
 
 [upstreams.param_override]
 enabled = true
-fill_if_absent = true
+mode = "fill_if_absent"
 temperature = 1.0
 top_p = 0.95
 top_k = 20
@@ -152,7 +152,6 @@ presence_penalty = 0.0
 repetition_penalty = 1.0
 max_tokens = 50000
 reasoning_effort = "medium"
-thinking_budget = 32768
 
 [upstreams.loop_guard]
 enabled = false
@@ -167,7 +166,6 @@ max_tokens = 50000
 preserve_answer_budget = true
 tool_request_policy = "apply"
 no_thinking_marker_policy = "respect_no_thinking_markers"
-default_injection_schema = "vllm_native"
 
 [[upstreams]]
 name = "qwen3-embedding-8b"
@@ -294,7 +292,6 @@ max_tokens = 50000
 preserve_answer_budget = true
 tool_request_policy = "apply"
 no_thinking_marker_policy = "respect_no_thinking_markers"
-default_injection_schema = "vllm_native"
 
 [heartbeat]
 mode = "sse"

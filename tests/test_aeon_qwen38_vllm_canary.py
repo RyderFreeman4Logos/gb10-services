@@ -54,6 +54,12 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
     def test_qwen38_unit_exists(self) -> None:
         self.assertTrue(UNIT.is_file(), f"missing canary unit {UNIT}")
 
+    def test_profile_symlink_points_at_canonical_unit(self) -> None:
+        link = ROOT / "profile" / "qwen3.8-27b-nvfp4-vllm" / UNIT.name
+        self.assertTrue(link.is_symlink(), f"missing profile symlink {link}")
+        self.assertEqual(link.readlink().as_posix(), "../../systemd/vllm-aeon-qwen38-dflash.service")
+        self.assertEqual(link.resolve(), UNIT.resolve())
+
     def test_qwen38_unit_uses_its_own_053_profile(self) -> None:
         text = _unit_text()
         self.assertTrue(QWEN38_PROFILE_SOURCE.is_file())
@@ -139,7 +145,8 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
             _option_value(argv, "--gpu-memory-utilization"),
             "${AEON_GPU_MEMORY_UTILIZATION}",
         )
-        self.assertEqual(_option_value(argv, "--tool-call-parser"), "qwen3_xml")
+        self.assertEqual(_option_value(argv, "--reasoning-parser"), "qwen3")
+        self.assertEqual(_option_value(argv, "--tool-call-parser"), "qwen3_coder")
         self.assertIn("--enable-auto-tool-choice", argv)
         self.assertIn("--enforce-eager", argv)
         self.assertIn("--no-enable-flashinfer-autotune", argv)
