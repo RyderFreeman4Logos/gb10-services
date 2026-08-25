@@ -17,11 +17,11 @@ from test_embedding_service_contracts import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-QUERIT_UNIT = ROOT / "systemd" / "vllm-querit-4b-reranker.service"
-AEON_UNIT = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
+QUERIT_UNIT = ROOT / "profile" / "querit-4b-reranker" / "vllm-querit-4b-reranker.service"
+AEON_UNIT = ROOT / "profile" / "qwen3.6-27b-decensor-by-aeon" / "vllm-aeon-27b-dflash.service"
 AEON_PROFILE = ROOT / "config" / "aeon-dflash-profiles" / "active.env"
-GUARD_UNIT = ROOT / "systemd" / "llm-guard-proxy.service"
-LEGACY_UNIT = ROOT / "systemd" / "vllm-qwen3-reranker-8b.service"
+GUARD_UNIT = ROOT / "profile" / "llm-guard-proxy" / "llm-guard-proxy.service"
+LEGACY_UNIT = ROOT / "profile" / "qwen3-reranker-8b" / "vllm-qwen3-reranker-8b.service"
 MEMORY_GATE = ROOT / "scripts" / "gb10_check_mem_available.sh"
 CONFIG = ROOT / "config" / "llm-guard-proxy" / "config.toml"
 README = ROOT / "README.md"

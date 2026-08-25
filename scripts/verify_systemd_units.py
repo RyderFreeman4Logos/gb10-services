@@ -13,7 +13,7 @@ __all__ = ["main"]
 
 
 ROOT = Path(__file__).resolve().parents[1]
-UNIT_SOURCE = ROOT / "systemd"
+UNIT_SOURCE = ROOT / "profile"
 TARGET_ROOT = ROOT / "target"
 EXEC_DIRECTIVES = (
     "ExecCondition=",
@@ -40,7 +40,7 @@ def _rewrite_exec(line: str, stub: Path) -> str:
 
 
 def main() -> int:
-    units = sorted(UNIT_SOURCE.glob("*.service"))
+    units = sorted(UNIT_SOURCE.glob("*/*.service"))
     if not units:
         raise SystemExit("no tracked systemd user services found")
 

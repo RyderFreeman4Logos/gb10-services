@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 UNIT = "vllm-embedding.service"
 ACTIVATOR = ROOT / "scripts" / "gb10_activate_embedding_profile.sh"
 ACTIVATION_ENGINE = ROOT / "scripts" / "gb10_embedding_activation.py"
-CANONICAL_UNIT = ROOT / "systemd" / UNIT
+CANONICAL_UNIT = ROOT / "profile" / "qwen3-embedding-8b" / UNIT
 MODELS = ("qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B")
 NEIGHBORS = (
     "vllm-aeon-27b-dflash.service",

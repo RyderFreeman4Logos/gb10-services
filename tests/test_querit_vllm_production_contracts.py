@@ -6,9 +6,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PRODUCTION_UNIT = ROOT / "systemd" / "vllm-querit-4b-reranker.service"
+PRODUCTION_UNIT = ROOT / "profile" / "querit-4b-reranker" / "vllm-querit-4b-reranker.service"
 LEGACY_TRANSFORMERS_UNIT = ROOT / "systemd" / "querit-4b-reranker.service"
-LEGACY_QWEN_UNIT = ROOT / "systemd" / "vllm-qwen3-reranker-8b.service"
+LEGACY_QWEN_UNIT = ROOT / "profile" / "qwen3-reranker-8b" / "vllm-qwen3-reranker-8b.service"
 README = ROOT / "README.md"
 DEPLOYMENT_AGENTS = ROOT / "docs" / "deployment" / "AGENTS.md"
 MODEL_DIR = "/home/obj/models/querit-4b-vllm"

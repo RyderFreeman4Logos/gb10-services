@@ -10,6 +10,24 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE_REPOSITORY = "ghcr.io/aeon-7/aeon-vllm-ultimate"
+UNIT_PATHS = {
+    "vllm-aeon-27b-dflash.service": ROOT
+    / "profile"
+    / "qwen3.6-27b-decensor-by-aeon"
+    / "vllm-aeon-27b-dflash.service",
+    "vllm-embedding.service": ROOT
+    / "profile"
+    / "qwen3-embedding-8b"
+    / "vllm-embedding.service",
+    "vllm-querit-4b-reranker.service": ROOT
+    / "profile"
+    / "querit-4b-reranker"
+    / "vllm-querit-4b-reranker.service",
+    "vllm-qwen3-reranker-8b.service": ROOT
+    / "profile"
+    / "qwen3-reranker-8b"
+    / "vllm-qwen3-reranker-8b.service",
+}
 
 
 @dataclass(frozen=True)
@@ -58,7 +76,7 @@ UNIT_RELEASE_ANNOTATION = re.compile(
 
 def _operational_files() -> list[Path]:
     files: list[Path] = []
-    for directory in (ROOT / "scripts", ROOT / "systemd", ROOT / "tests"):
+    for directory in (ROOT / "scripts", ROOT / "profile", ROOT / "tests"):
         files.extend(
             path
             for path in directory.rglob("*")
@@ -117,9 +135,11 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         self.assertIn("- version family: v0.25.1", text_history)
 
     def test_every_aeon_unit_binds_version_label_and_digest_to_one_release(self) -> None:
-        units = sorted((ROOT / "systemd").glob("*.service"))
+        units = sorted((ROOT / "profile").glob("*/*.service"))
         aeon_units = [
-            path for path in units if not path.is_symlink() and "aeon-vllm-ultimate" in path.read_text()
+            path
+            for path in units
+            if not path.is_symlink() and "aeon-vllm-ultimate" in path.read_text()
         ]
         self.assertEqual(
             {path.name for path in aeon_units},
@@ -155,7 +175,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         host_cache = "/home/obj/.cache/vllm-compile/aeon-qwen36-v0271-2fb855"
         container_cache = "/var/cache/vllm/aeon-qwen36-v0271"
         for unit_name in ("vllm-aeon-27b-dflash.service",):
-            text = (ROOT / "systemd" / unit_name).read_text()
+            text = UNIT_PATHS[unit_name].read_text()
             with self.subTest(unit=unit_name):
                 self.assertIn(f"ExecStartPre=/usr/bin/install -d -m 0700 {host_cache}", text)
                 self.assertIn(f"-v {host_cache}:{container_cache}", text)
@@ -167,7 +187,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                 self.assertNotIn("/var/cache/vllm/aeon-qwen36-v0251", text)
 
     def test_aeon_text_pins_v2_runner_for_native_thinking_budget(self) -> None:
-        text = (ROOT / "systemd" / "vllm-aeon-27b-dflash.service").read_text()
+        text = UNIT_PATHS["vllm-aeon-27b-dflash.service"].read_text()
         self.assertIn(
             "  -e AEON_DEFAULT_THINKING_TOKEN_BUDGET=32768 \\\n"
             "  -e VLLM_USE_V2_MODEL_RUNNER=0 \\\n",
@@ -180,7 +200,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         ):
             self.assertNotIn(
                 "-e VLLM_USE_V2_MODEL_RUNNER=0",
-                (ROOT / "systemd" / unit_name).read_text(),
+                UNIT_PATHS[unit_name].read_text(),
             )
 
     def test_current_docs_publish_one_coherent_release_identity(self) -> None:
@@ -216,7 +236,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
             self.assertIn("active.env", document)
 
     def test_aeon_tracked_runtime_profile_matches_deployment_reference(self) -> None:
-        unit = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
+        unit = UNIT_PATHS["vllm-aeon-27b-dflash.service"]
         unit_text = unit.read_text()
         unit_lines = unit_text.splitlines()
         start = next(

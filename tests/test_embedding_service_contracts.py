@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-EMBEDDING_UNIT = ROOT / "systemd" / "vllm-embedding.service"
+EMBEDDING_UNIT = ROOT / "profile" / "qwen3-embedding-8b" / "vllm-embedding.service"
 README = ROOT / "README.md"
 AGENT_PLAYBOOK = ROOT / "docs" / "deployment" / "AGENTS.md"
 EMBEDDING_IMAGE = (

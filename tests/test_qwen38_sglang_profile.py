@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PROFILE_DIR = ROOT / "profile" / "qwen3.8-27b-nvfp4-sglang"
 ALIAS = ROOT / "profile" / "abliterated-qwen-latest-27b-nvfp4"
 UNIT = PROFILE_DIR / "sglang-qwen38-27b.service"
-QUERIT_UNIT = ROOT / "systemd" / "vllm-querit-4b-reranker.service"
+QUERIT_UNIT = ROOT / "profile" / "querit-4b-reranker" / "vllm-querit-4b-reranker.service"
 GUARD = PROFILE_DIR / "llm-guard-proxy" / "config.toml"
 
 # Exact immutable arm64 image digest built for the DFlash2 trial.
@@ -351,10 +351,14 @@ class Qwen38GuardContractTests(unittest.TestCase):
     def test_param_override_fill_if_absent_defaults(self):
         # First [upstreams.param_override] is default chat; caller-wins fill.
         self.assertIn("[upstreams.param_override]", self.text)
-        section_end = self.text.index("[upstreams.loop_guard]", self.text.index("[upstreams.param_override]"))
-        block = self.text[self.text.index("[upstreams.param_override]"):section_end]
-        self.assertTrue(re.search(r"enabled\s*=\s*true", block), "param_override must be enabled")
-        self.assertRegex(block, r"fill_if_absent\s*=\s*true")
+        section_end = self.text.index(
+            "[upstreams.loop_guard]", self.text.index("[upstreams.param_override]")
+        )
+        block = self.text[self.text.index("[upstreams.param_override]") : section_end]
+        self.assertTrue(
+            re.search(r"enabled\s*=\s*true", block), "param_override must be enabled"
+        )
+        self.assertRegex(block, r'mode\s*=\s*"fill_if_absent"')
         default_chat = next(
             profile
             for profile in self.config["upstreams"]
@@ -362,7 +366,7 @@ class Qwen38GuardContractTests(unittest.TestCase):
         )
         override = default_chat["param_override"]
         self.assertTrue(override["enabled"])
-        self.assertTrue(override["fill_if_absent"])
+        self.assertEqual(override["mode"], "fill_if_absent")
         self.assertEqual(override["temperature"], 1.0)
         self.assertEqual(override["top_p"], 0.95)
         self.assertEqual(override["top_k"], 20)
@@ -371,7 +375,7 @@ class Qwen38GuardContractTests(unittest.TestCase):
         self.assertEqual(override["repetition_penalty"], 1.0)
         self.assertEqual(override["max_tokens"], 50000)
         self.assertEqual(override["reasoning_effort"], "medium")
-        self.assertEqual(override["thinking_budget"], 32768)
+        self.assertNotIn("thinking_budget", override)
         self.assertNotIn("thinking_token_budget", block)
         self.assertNotIn("force_disable", block)
         self.assertNotIn("force_thinking", block)
