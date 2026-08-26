@@ -20,8 +20,8 @@ EXPECTED_IMPORT_AUTHORITY: dict[str, str] = {
     "gb10_bounded_process.py": "248762c2fdc73fdf54914fc5a20c2292bcc90430e59523c5767409ebf0f4c230",
     "gb10_embedding_activation_checks.py": "7e6d00538e8d952c137e5b5114fc16919f6e1bab59d6260602f989a2103f44a4",
     "gb10_embedding_activation_config.py": "fd3053512ae084418efd6acbedc09d2209dcd961cd87c503cfcad275a38668c8",
-    "gb10_embedding_activation_storage.py": "52bde00502cc7493df07e373266896d59a7255a76b693b3cb0bbdfe41e5358a6",
-    "gb10_embedding_profile_contract.py": "3a20c1f1c5cce48d51b1b5bf44e8b0b45271a7ddd69c7c5f26b723a40e551a54",
+    "gb10_embedding_activation_storage.py": "3dd2f6504bd08e781421ac4f072b222f321299c2e73ac4fe7334c8dc24270333",
+    "gb10_embedding_profile_contract.py": "77a3b044c7020ac67a516dbb29ea5e978aa56663cd1c010b62b4cd7cfcd996d7",
     "gb10_embedding_verifier_runtime.py": "e52242e13d6a8aaa6be9c73b4a6f2cb46bb73a01a8a8592d73ccdacbc0b35434",
     "gb10_verify_embedding_profile.py": "5ddbea42ec11ab6cf8fd8a0df14d40edd6b3920d33851510274c24a5092732f4",
 }
