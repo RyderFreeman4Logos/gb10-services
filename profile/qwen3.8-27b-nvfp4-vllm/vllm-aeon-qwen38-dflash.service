@@ -51,7 +51,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --memory-swap 70g \
   --oom-score-adj 800 \
   --entrypoint python3 \
-  qwen38-27b-vllm-dflash2-sm121@sha256:3bae63b93ff99690376eec892b5c52f6c8cd7cc462f70bb3bef83ef32114b53a \
+  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee \
   /usr/local/bin/vllm \
   serve \
     --model /model \
