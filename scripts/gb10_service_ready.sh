@@ -68,13 +68,15 @@ while [ $(( $(date +%s) - START_EPOCH )) -lt "$DEADLINE" ]; do
     chat)
       resp=$(curl -fsS --max-time "$PROBE_TIMEOUT" \
         -H 'Content-Type: application/json' \
-        -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"OK\"}],\"max_tokens\":2,\"temperature\":0}" \
+        -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"OK\"}],\"max_tokens\":2,\"temperature\":0,\"chat_template_kwargs\":{\"enable_thinking\":false}}" \
         "$BASE_URL/v1/chat/completions" 2>/dev/null || true)
-      # Check we got a choices array with content
+      # Reasoning models can put tokens in reasoning_* with empty content.
       if echo "$resp" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
-assert d['choices'][0]['message']['content'], 'empty content'
+msg = d['choices'][0]['message']
+text = msg.get('content') or msg.get('reasoning_content') or msg.get('reasoning')
+assert text, 'empty content'
 " 2>/dev/null; then
         PROBE_OK=true
         break
