@@ -1,12 +1,12 @@
-# SuperQwen3.8 NVFP4 + DFlash2 n=7 on the AEON omni image.
-# DFlash2 drafter: /home/obj/models/z-lab/Qwen3.8-27B-DFlash2 (mounted at /drafter:ro).
+# SuperQwen3.8 NVFP4 + in-checkpoint MTP K=5 on AEON omni.
+# Image: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-08-24-v0.27.1-omni @ sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee
 # Target: /home/obj/models/Jiunsong/SuperQwen3.8-27b-abliterated-NVFP4-DGX-Spark (sealed SHA256SUMS.json)
-# The SuperQwen3.8 target remains the sealed NVFP4 checkpoint; DFlash2 supplies speculation.
+# Speculative method qwen3_5_mtp is the official SuperQwen3.8 MTP name (fine-tuned checkpoint; DFlash2 is not compatible).
 # Sampling defaults come from the model generation_config (temperature=1.0, top_p=0.95, top_k=20; min_p/presence_penalty/repetition_penalty stay 0/0/1).
 # Chat template defaults enable_thinking=true and reasoning_effort=medium (low/medium/xhigh via chat_template_kwargs).
 # Capacity note: KV≥262144 is a live receipt, not a source claim.
 [Unit]
-Description=vLLM SuperQwen3.8-27B NVFP4 + DFlash2 n=7 (prefix cache off)
+Description=vLLM SuperQwen3.8-27B NVFP4 + MTP K=5 (prefix cache on)
 # Start after co-resident services are ordered, without requiring either one.
 After=network.target
 After=vllm-querit-4b-reranker.service
@@ -42,9 +42,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --gpus all --ipc host \
   -p 100.105.4.92:18010:8000 \
   -v /home/obj/models/Jiunsong/SuperQwen3.8-27b-abliterated-NVFP4-DGX-Spark:/model:ro \
-  -v /home/obj/models/z-lab/Qwen3.8-27B-DFlash2:/drafter:ro \
   -e HF_HUB_OFFLINE=1 \
-  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e MAX_JOBS=1 \
   -e CMAKE_BUILD_PARALLEL_LEVEL=1 \
   -e VLLM_USE_V2_MODEL_RUNNER=1 \
@@ -60,10 +58,11 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
     --host 0.0.0.0 --port 8000 \
     --served-model-name "abliterated-qwen-latest-27b-nvfp4" \
     --trust-remote-code \
-    --kv-cache-dtype fp8_e4m3 \
+    --kv-cache-dtype fp8 \
     --mamba-cache-dtype float32 \
     --mamba-ssm-cache-dtype float32 \
-    --no-enable-prefix-caching \
+    --enforce-eager \
+    --enable-prefix-caching \
     --enable-chunked-prefill \
     --scheduler-reserve-full-isl \
     --attention-backend TRITON_ATTN \
@@ -72,12 +71,11 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \
-    --compilation-config "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}" \
-    --speculative-config "{\"method\":\"dflash\",\"model\":\"/drafter\",\"num_speculative_tokens\":7,\"attention_backend\":\"TRITON_ATTN\"}" \
+    --speculative-config "{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":5,\"attention_backend\":\"TRITON_ATTN\"}" \
     --no-enable-flashinfer-autotune \
     --kernel-config.enable_jit_warmup=false \
     --kernel-config.enable_cutedsl_warmup=false
-# Official SuperQwen3.8 recipe: DFlash2 n=7 with the z-lab drafter. SGLang profile remains a separate reference.
+# Official SuperQwen3.8 recipe: in-checkpoint MTP K=5 + prefix cache. SGLang profile remains a separate reference.
 # No live KV>=262144 receipt is implied by this source unit.
 ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock AEON_GPU_MEMORY_UTILIZATION=${AEON_GPU_MEMORY_UTILIZATION} /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --bind-runtime-swap-max --unit /home/obj/.config/systemd/user/vllm-aeon-qwen38-dflash.service --container vllm-aeon-qwen38-dflash
 ExecStartPost=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST=unix:///run/user/1001/docker.sock AEON_GPU_MEMORY_UTILIZATION=${AEON_GPU_MEMORY_UTILIZATION} /usr/bin/bash --noprofile --norc /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh --unit /home/obj/.config/systemd/user/vllm-aeon-qwen38-dflash.service --container vllm-aeon-qwen38-dflash
