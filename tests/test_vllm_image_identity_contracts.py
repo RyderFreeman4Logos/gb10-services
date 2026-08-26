@@ -50,6 +50,16 @@ CURRENT_RELEASE = ImageRelease(
     version="v0.27.1-slim",
     digest="sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f",
 )
+OMNI_RELEASE = ImageRelease(
+    date="2026-08-24",
+    version="v0.27.1-omni",
+    digest="sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee",
+)
+OMNI_UNITS = {
+    "vllm-embedding.service",
+    "vllm-querit-4b-reranker.service",
+    "vllm-aeon-qwen38-dflash.service",
+}
 PREVIOUS_RELEASE = ImageRelease(
     date="2026-07-16",
     version="v0.25.1",
@@ -146,6 +156,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
             {
                 "vllm-aeon-27b-dflash.service",
                 "vllm-embedding.service",
+                "vllm-aeon-qwen38-dflash.service",
                 "vllm-qwen3-reranker-8b.service",
                 "vllm-querit-4b-reranker.service",
             },
@@ -154,13 +165,21 @@ class VllmImageIdentityContractTests(unittest.TestCase):
             text = path.read_text()
             with self.subTest(path=path.relative_to(ROOT)):
                 annotations = _release_annotations(text)
-                self.assertEqual(annotations, [CURRENT_RELEASE])
+                expected_annotations = (
+                    []
+                    if path.name == "vllm-aeon-qwen38-dflash.service"
+                    else [CURRENT_RELEASE]
+                )
+                self.assertEqual(annotations, expected_annotations)
+                expected_release = (
+                    OMNI_RELEASE if path.name in OMNI_UNITS else CURRENT_RELEASE
+                )
                 self.assertEqual(
                     re.findall(
                         rf"{re.escape(IMAGE_REPOSITORY)}@sha256:[0-9a-f]{{64}}",
                         text,
                     ),
-                    [CURRENT_RELEASE.image_reference],
+                    [expected_release.image_reference],
                 )
                 descriptions = [
                     line
@@ -168,7 +187,8 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                     if line.startswith("Description=")
                 ]
                 self.assertEqual(len(descriptions), 1)
-                self.assertIn(CURRENT_RELEASE.version, descriptions[0])
+                if path.name != "vllm-aeon-qwen38-dflash.service":
+                    self.assertIn(CURRENT_RELEASE.version, descriptions[0])
                 self.assertNotRegex(text, r"aeon-vllm-ultimate:[^\s\\]+")
 
     def test_aeon_compile_cache_namespace_rotates_with_the_release(self) -> None:
@@ -220,8 +240,8 @@ class VllmImageIdentityContractTests(unittest.TestCase):
 
         guide = (ROOT / "docs" / "deployment" / "AGENTS.md").read_text()
         self.assertIn(
-            f"`{IMAGE_REPOSITORY}:{CURRENT_RELEASE.tag}` "
-            f"(`{CURRENT_RELEASE.digest}`; runtime `{CURRENT_RELEASE.version}`)",
+            f"`{IMAGE_REPOSITORY}:{OMNI_RELEASE.tag}` "
+            f"(`{OMNI_RELEASE.digest}`; runtime `{OMNI_RELEASE.version}`)",
             guide,
         )
 
