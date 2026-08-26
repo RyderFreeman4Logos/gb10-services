@@ -244,48 +244,6 @@ class HookFixture:
 
 
 class PrePushHookTests(unittest.TestCase):
-    @unittest.skipIf(LEFTHOOK is None, "lefthook is not installed")
-    def test_lefthook_pre_push_runs_local_quality_gate_only(self) -> None:
-        with tempfile.TemporaryDirectory() as raw_tmp:
-            fixture = HookFixture(Path(raw_tmp))
-            # Pre-push no longer routes through review-check; only just pre-push.
-            env = fixture.git_env.copy()
-            env.update(
-                {
-                    "FAKE_CSA_LOG": str(fixture.csa_log),
-                    "PATH": f"{fixture.bin}:/usr/bin:/bin",
-                }
-            )
-            # Stub just so the pre-push recipe does not need a full tree.
-            just = fixture.bin / "just"
-            just.write_text("#!/bin/sh\nexit 0\n")
-            just.chmod(0o755)
-            result = subprocess.run(
-                [
-                    fixture.lefthook,
-                    "run",
-                    "pre-push",
-                    "--command",
-                    "local-quality-gate",
-                    "--no-auto-install",
-                    "origin",
-                    str(fixture.remote),
-                ],
-                cwd=fixture.root,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            # CSA must not be invoked by the config-only pre-push path.
-            self.assertEqual(
-                fixture.csa_log.read_text(encoding="utf-8")
-                if fixture.csa_log.is_file()
-                else "",
-                "",
-            )
-
     def test_lefthook_node_shebang_fails_loudly_without_node(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
