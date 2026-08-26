@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 
@@ -63,19 +64,29 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
         self.assertIn(SGLANG_UNIT.name, conflicts)
         self.assertIn(QWEN36_UNIT_NAME, conflicts)
 
-    def test_unit_uses_in_checkpoint_mtp_and_prefix_cache(self) -> None:
+    def test_unit_uses_dflash2_drafter_and_disables_prefix_cache(self) -> None:
         text = UNIT.read_text()
         argv = _logical_argv(text, "ExecStart")[0]
         runtime = _runtime_argv(text)
         spec = runtime[runtime.index("--speculative-config") + 1]
-        self.assertIn("qwen3_5_mtp", spec)
-        self.assertIn('"num_speculative_tokens":5', spec.replace(" ", ""))
-        self.assertNotIn("dflash", spec)
-        self.assertNotIn("/draft", text)
-        self.assertIn("--enable-prefix-caching", runtime)
-        self.assertNotIn("--no-enable-prefix-caching", runtime)
+        self.assertEqual(
+            json.loads(spec),
+            {
+                "method": "dflash",
+                "model": "/drafter",
+                "num_speculative_tokens": 7,
+                "attention_backend": "TRITON_ATTN",
+            },
+        )
+        self.assertIn("/home/obj/models/z-lab/Qwen3.8-27B-DFlash2:/drafter:ro", text)
+        self.assertIn("--no-enable-prefix-caching", runtime)
+        self.assertNotIn("--enable-prefix-caching", runtime)
         self.assertEqual(argv[argv.index("--attention-backend") + 1], "TRITON_ATTN")
         self.assertIn("--enable-chunked-prefill", runtime)
+        self.assertEqual(runtime[runtime.index("--kv-cache-dtype") + 1], "fp8_e4m3")
+        self.assertNotIn("--enforce-eager", runtime)
+        compilation = runtime[runtime.index("--compilation-config") + 1]
+        self.assertEqual(json.loads(compilation)["cudagraph_mode"], "FULL_AND_PIECEWISE")
 
 
 if __name__ == "__main__":
