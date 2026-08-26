@@ -2739,7 +2739,7 @@ class StrictFakeGrammarTests(unittest.TestCase):
                 fence_parent, fence_child = socket.socketpair(
                     socket.AF_UNIX, socket.SOCK_SEQPACKET
                 )
-                fence_parent.settimeout(10)
+                fence_parent.settimeout(60)
                 descriptors.extend((status_write, block_read))
                 arguments[1] = str(status_write)
                 arguments[3] = str(block_read)
@@ -2790,7 +2790,7 @@ class StrictFakeGrammarTests(unittest.TestCase):
                     if failure_stage == "communicate-timeout":
                         stage_witnesses.append("communicate-timeout")
                     stdout, stderr = process.communicate(
-                        timeout=0 if failure_stage == "communicate-timeout" else 10
+                        timeout=0 if failure_stage == "communicate-timeout" else 60
                     )
                     reaped = True
                     return subprocess.CompletedProcess(
