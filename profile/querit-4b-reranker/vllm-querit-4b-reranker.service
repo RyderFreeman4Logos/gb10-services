@@ -1,12 +1,12 @@
 # Live memory (2026-08-06, PID 23710/5429): GPU 14.7G, RSS 1.3G.
 # Docker cap: --memory 18g (leaves ~3.3G headroom for KV cache growth).
-# Canonical Querit-4B vLLM pooling reranker (AEON v0.27.1-slim, raw Tailnet :18013).
+# Canonical Querit-4B vLLM pooling reranker (AEON v0.27.1-omni, raw Tailnet :18013).
 # The llm-guard-proxy adapter on :18009/:18003 forwards rerank requests to
 # this backend; clients (CodeSeek, mempal, verbatim) see a DeepInfra-compatible
 # contract through the adapter.
 [Unit]
-# AEON image release: 2026-08-17-v0.27.1-slim; immutable digest: sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f
-Description=Canonical Querit-4B vLLM pooling reranker (AEON v0.27.1-slim, raw Tailnet :18013)
+# AEON image release: 2026-08-24-v0.27.1-omni; immutable digest: sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee
+Description=Canonical Querit-4B vLLM pooling reranker (AEON v0.27.1-omni, raw Tailnet :18013)
 After=network.target
 After=vllm-embedding.service
 Conflicts=vllm-qwen3-reranker-8b.service
@@ -61,8 +61,6 @@ ExecStart=/usr/bin/docker run --rm --cidfile=%t/gb10-vllm-cids/vllm-querit-4b-re
     --max-num-batched-tokens 16384 \
     --max-num-seqs 32 \
     --enable-chunked-prefill \
-    --max-num-partial-prefills 1 \
-    --max-long-partial-prefills 1 \
     --long-prefill-token-threshold 8192 \
     --enforce-eager \
     --chat-template /home/obj/models/querit-4b-vllm/querit-rerank.jinja

@@ -97,8 +97,6 @@ def _docker_host_and_vllm_options(unit: str) -> tuple[list[str], dict[str, list[
         "--max-num-batched-tokens": 1,
         "--max-num-seqs": 1,
         "--enable-chunked-prefill": 0,
-        "--max-num-partial-prefills": 1,
-        "--max-long-partial-prefills": 1,
         "--long-prefill-token-threshold": 1,
         "--enforce-eager": 0,
         "--chat-template": 1,
@@ -148,7 +146,6 @@ class QueritVllmProductionContractTests(unittest.TestCase):
                 "--cpu-offload-gb": ["0"],
                 "--max-num-batched-tokens": ["16384"], "--max-num-seqs": ["32"],
                 "--enable-chunked-prefill": [],
-                "--max-num-partial-prefills": ["1"], "--max-long-partial-prefills": ["1"],
                 "--long-prefill-token-threshold": ["8192"], "--enforce-eager": [],
                 "--chat-template": [f"{MODEL_DIR}/querit-rerank.jinja"],
             },
@@ -199,16 +196,12 @@ class QueritVllmProductionContractTests(unittest.TestCase):
             for option in (
                 "--max-num-batched-tokens",
                 "--max-num-seqs",
-                "--max-num-partial-prefills",
-                "--max-long-partial-prefills",
             )
         }
         expected_counts = {
             README: {
                 "--max-num-batched-tokens": 2,
                 "--max-num-seqs": 2,
-                "--max-num-partial-prefills": 1,
-                "--max-long-partial-prefills": 1,
             },
             DEPLOYMENT_AGENTS: {option: 1 for option in scheduler_literals},
         }

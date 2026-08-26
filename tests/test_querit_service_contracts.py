@@ -219,10 +219,8 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertIn("MemorySwapMax=0", unit)
         self.assertIn("--max-num-batched-tokens 16384", unit)
         self.assertIn("--max-num-seqs 32", unit)
-        self.assertIn("--max-num-partial-prefills 1", unit)
-        self.assertIn("--max-long-partial-prefills 1", unit)
-        self.assertNotIn("--max-num-partial-prefills 64", unit)
-        self.assertNotIn("--max-long-partial-prefills 64", unit)
+        self.assertNotIn("--max-num-partial-prefills", unit)
+        self.assertNotIn("--max-long-partial-prefills", unit)
         self.assertIn("gb10_service_ready.sh rerank", unit)
         timeout = re.search(r"^TimeoutStartSec=(\d+)$", unit, re.MULTILINE)
         if timeout is None:
