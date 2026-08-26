@@ -15,7 +15,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "sysmon.sh"
-UNIT = ROOT / "systemd" / "sysmon.service"
+UNIT = ROOT / "profile" / "sysmon" / "sysmon.service"
 
 V4_COLUMNS = (
     "timestamp,load_1m,load_5m,load_15m,mem_used_mb,mem_total_mb,"

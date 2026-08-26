@@ -15,7 +15,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 profile = importlib.import_module("gb10_embedding_profile_contract")
-UNIT = ROOT / "systemd" / "vllm-embedding.service"
+UNIT = ROOT / "profile" / "qwen3-embedding-8b" / "vllm-embedding.service"
 IMAGE = (
     "ghcr.io/aeon-7/aeon-vllm-ultimate@"
     "sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f"

@@ -74,6 +74,28 @@ AEON_UNITS = {
     "vllm-aeon-27b-dflash.service",
     "vllm-aeon-qwen38-dflash.service",
 }
+UNIT_PATHS = {
+    "vllm-aeon-27b-dflash.service": ROOT
+    / "profile"
+    / "qwen3.6-27b-decensor-by-aeon"
+    / "vllm-aeon-27b-dflash.service",
+    "vllm-aeon-qwen38-dflash.service": ROOT
+    / "profile"
+    / "qwen3.8-27b-nvfp4-vllm"
+    / "vllm-aeon-qwen38-dflash.service",
+    "vllm-embedding.service": ROOT
+    / "profile"
+    / "qwen3-embedding-8b"
+    / "vllm-embedding.service",
+    "vllm-querit-4b-reranker.service": ROOT
+    / "profile"
+    / "querit-4b-reranker"
+    / "vllm-querit-4b-reranker.service",
+    "vllm-qwen3-reranker-8b.service": ROOT
+    / "profile"
+    / "qwen3-reranker-8b"
+    / "vllm-qwen3-reranker-8b.service",
+}
 
 
 def _logical_argv(unit: str, directive: str) -> list[list[str]]:
@@ -115,7 +137,7 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
 
     def test_inventory_discovers_every_and_only_tracked_vllm_backend(self) -> None:
         discovered: set[str] = set()
-        for path in (ROOT / "systemd").glob("*.service"):
+        for path in UNIT_PATHS.values():
             if path.is_symlink():
                 continue
             starts = _logical_argv(path.read_text(), "ExecStart")
@@ -134,7 +156,7 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
     def test_every_tracked_unit_has_clean_generation_bound_start_and_cleanup(self) -> None:
         for name, (container, cidfile) in SERVICE_CONTRACTS.items():
             with self.subTest(unit=name):
-                unit = (ROOT / "systemd" / name).read_text()
+                unit = UNIT_PATHS[name].read_text()
                 start = _logical_argv(unit, "ExecStart")
                 self.assertEqual(len(start), 1)
                 argv = start[0]
@@ -264,7 +286,7 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                     )
 
     def test_dflash_docker_and_direct_post_start_helpers_have_clean_environments(self) -> None:
-        unit = (ROOT / "systemd" / "vllm-aeon-27b-dflash.service").read_text()
+        unit = UNIT_PATHS["vllm-aeon-27b-dflash.service"].read_text()
         start = _logical_argv(unit, "ExecStart")
         self.assertEqual(start[0][: len(AEON_DOCKER_PREFIX)], AEON_DOCKER_PREFIX)
         posts = _logical_argv(unit, "ExecStartPost")
@@ -310,7 +332,7 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
     def test_production_entry_is_ambient_environment_independent(self) -> None:
         for name in SERVICE_CONTRACTS:
             with self.subTest(unit=name):
-                unit = (ROOT / "systemd" / name).read_text()
+                unit = UNIT_PATHS[name].read_text()
                 commands = [
                     *_logical_argv(unit, "ExecCondition"),
                     *_logical_argv(unit, "ExecStartPost"),

@@ -22,7 +22,12 @@ from test_embedding_service_contracts import (
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOYER = ROOT / "scripts" / "gb10_apply_aeon_querit_profile.sh"
-AEON_UNIT = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
+AEON_UNIT = (
+    ROOT
+    / "profile"
+    / "qwen3.6-27b-decensor-by-aeon"
+    / "vllm-aeon-27b-dflash.service"
+)
 GIB = 1024 * 1024 * 1024
 
 

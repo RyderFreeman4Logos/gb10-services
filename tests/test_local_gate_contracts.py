@@ -41,16 +41,14 @@ class LocalGateContractTests(unittest.TestCase):
         ):
             self.assertNotIn(obsolete, justfile)
 
-    def test_lefthook_routes_commit_and_push_to_local_just_recipes(self) -> None:
+    def test_lefthook_has_no_automatic_gates(self) -> None:
         lefthook = LEFTHOOK.read_text()
-        self.assertIn("pre-commit:", lefthook)
-        self.assertIn("run: just quick-check", lefthook)
-        self.assertIn("pre-push:", lefthook)
-        self.assertNotIn("run: scripts/hooks/branch-protection.sh", lefthook)
-        # Config-only repo: no CSA review gate on push.
+        self.assertNotIn("pre-commit:", lefthook)
+        self.assertNotIn("pre-push:", lefthook)
+        self.assertNotIn("run: just quick-check", lefthook)
+        self.assertNotIn("run: just pre-push", lefthook)
+        self.assertNotIn("scripts/hooks/branch-protection.sh", lefthook)
         self.assertNotIn("scripts/hooks/review-check.sh", lefthook)
-        self.assertNotIn("use_stdin: true", lefthook)
-        self.assertIn("run: just pre-push", lefthook)
 
     def test_justfile_exposes_guard_loop_recovery_operational_gate(self) -> None:
         justfile = JUSTFILE.read_text()

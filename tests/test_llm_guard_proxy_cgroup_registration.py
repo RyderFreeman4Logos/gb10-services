@@ -13,8 +13,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PUBLISHER = ROOT / "scripts" / "llm_guard_proxy_publish_cgroup_registration.sh"
 CONFIG = ROOT / "config" / "llm-guard-proxy" / "config.toml"
-TEXT_UNIT = ROOT / "systemd" / "vllm-aeon-27b-dflash.service"
-PROXY_UNIT = ROOT / "systemd" / "llm-guard-proxy.service"
+TEXT_UNIT = (
+    ROOT
+    / "profile"
+    / "qwen3.6-27b-decensor-by-aeon"
+    / "vllm-aeon-27b-dflash.service"
+)
+PROXY_UNIT = ROOT / "profile" / "llm-guard-proxy" / "llm-guard-proxy.service"
 
 
 class IntegratedGuardianRegistrationTests(unittest.TestCase):

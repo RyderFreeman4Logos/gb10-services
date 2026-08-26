@@ -6,10 +6,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SYSTEMD = ROOT / "systemd"
 PROFILE_DIR = ROOT / "config" / "aeon-dflash-profiles"
-UNIT = SYSTEMD / "vllm-aeon-27b-dflash.service"
-ALIAS = SYSTEMD / "vllm-aeon-27b-dflash-hikv.service"
+PROFILE_UNITS = ROOT / "profile" / "qwen3.6-27b-decensor-by-aeon"
+UNIT = PROFILE_UNITS / "vllm-aeon-27b-dflash.service"
+ALIAS = PROFILE_UNITS / "vllm-aeon-27b-dflash-hikv.service"
 INSTALLED_ACTIVE_PROFILE = "/home/obj/.config/gb10/aeon-dflash-profiles/active.env"
 PROFILE_VALUES = {
     "baseline.env": "0.355",
@@ -56,7 +56,7 @@ class DflashEnvironmentProfileContractTests(unittest.TestCase):
 
         regular_dflash_units = [
             path
-            for path in SYSTEMD.glob("vllm-aeon-27b-dflash*.service")
+            for path in PROFILE_UNITS.glob("vllm-aeon-27b-dflash*.service")
             if not path.is_symlink()
         ]
         self.assertEqual(regular_dflash_units, [UNIT])

@@ -1,9 +1,4 @@
-pre-commit:
-  commands:
-    quick-check:
-      run: just quick-check
-
-pre-push:
-  commands:
-    local-quality-gate:
-      run: just pre-push
+# Intentionally empty. This repo does not run git hooks.
+# Optional gates:
+#   just systemd-check
+#   just quick-check

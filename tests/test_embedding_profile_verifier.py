@@ -17,7 +17,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 VERIFIER_PATH = ROOT / "scripts" / "gb10_verify_embedding_profile.py"
-UNIT = ROOT / "systemd" / "vllm-embedding.service"
+UNIT = ROOT / "profile" / "qwen3-embedding-8b" / "vllm-embedding.service"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from embedding_profile_fixtures import (  # noqa: E402
     CONTAINER_ID,
