@@ -10,8 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 UNIT = ROOT / "profile" / "qwen3.8-27b-nvfp4-vllm" / "vllm-aeon-qwen38-dflash.service"
 QWEN36_UNIT_NAME = "vllm-aeon-27b-dflash.service"
 SGLANG_UNIT = ROOT / "profile" / "qwen3.8-27b-nvfp4-sglang" / "sglang-qwen38-27b.service"
-OVERLAY_REPOSITORY = "qwen38-27b-vllm-dflash2-sm121"
-OVERLAY_DIGEST = "sha256:3bae63b93ff99690376eec892b5c52f6c8cd7cc462f70bb3bef83ef32114b53a"
+IMAGE_REPOSITORY = "ghcr.io/aeon-7/aeon-vllm-ultimate"
+IMAGE_DIGEST = "sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee"
 CONTAINER = "vllm-aeon-qwen38-dflash"
 CIDFILE = "%t/gb10-memory-guardian/aeon-qwen38-text.cid"
 
@@ -28,14 +28,14 @@ class AeonQwen38CanaryUnitContractTests(unittest.TestCase):
     def test_qwen38_unit_exists(self) -> None:
         self.assertTrue(UNIT.is_file(), f"missing canary unit {UNIT}")
 
-    def test_unit_pins_the_live_overlay_image_digest(self) -> None:
+    def test_unit_pins_the_live_aeon_omni_image_digest(self) -> None:
         argv = _logical_argv(UNIT.read_text(), "ExecStart")[0]
         pins = [
             token
             for token in argv
-            if token.startswith(f"{OVERLAY_REPOSITORY}@sha256:")
+            if token.startswith(f"{IMAGE_REPOSITORY}@sha256:")
         ]
-        self.assertEqual(pins, [f"{OVERLAY_REPOSITORY}@{OVERLAY_DIGEST}"])
+        self.assertEqual(pins, [f"{IMAGE_REPOSITORY}@{IMAGE_DIGEST}"])
 
     def test_unit_keeps_qwen_tool_parser_flags(self) -> None:
         argv = _runtime_argv(UNIT.read_text())

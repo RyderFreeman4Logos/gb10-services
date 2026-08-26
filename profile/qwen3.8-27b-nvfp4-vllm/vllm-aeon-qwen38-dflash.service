@@ -1,7 +1,7 @@
-# SuperQwen3.8 NVFP4 + in-checkpoint MTP K=5 on the published SM121 overlay.
-# Overlay image: qwen38-27b-vllm-dflash2-sm121:0.1.1; immutable overlay digest: sha256:3bae63b93ff99690376eec892b5c52f6c8cd7cc462f70bb3bef83ef32114b53a
+# SuperQwen3.8 NVFP4 + in-checkpoint MTP K=5 on AEON omni.
+# Image: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-08-24-v0.27.1-omni @ sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee
 # Target: /home/obj/models/Jiunsong/SuperQwen3.8-27b-abliterated-NVFP4-DGX-Spark (sealed SHA256SUMS.json)
-# Speculative method qwen3_5_mtp is the official SuperQwen3.8 MTP name (HF class Qwen3_5ForConditionalGeneration).
+# Speculative method qwen3_5_mtp is the official SuperQwen3.8 MTP name (fine-tuned checkpoint; DFlash2 is not compatible).
 # Sampling defaults come from the model generation_config (temperature=1.0, top_p=0.95, top_k=20; min_p/presence_penalty/repetition_penalty stay 0/0/1).
 # Chat template defaults enable_thinking=true and reasoning_effort=medium (low/medium/xhigh via chat_template_kwargs).
 # Capacity note: KV≥262144 is a live receipt, not a source claim.
@@ -51,7 +51,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --memory-swap 70g \
   --oom-score-adj 800 \
   --entrypoint python3 \
-  qwen38-27b-vllm-dflash2-sm121@sha256:3bae63b93ff99690376eec892b5c52f6c8cd7cc462f70bb3bef83ef32114b53a \
+  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee \
   /usr/local/bin/vllm \
   serve \
     --model /model \

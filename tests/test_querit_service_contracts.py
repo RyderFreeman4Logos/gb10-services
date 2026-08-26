@@ -39,9 +39,9 @@ _RECEIPT = _live_receipt()
 IMAGE_DIGEST = (
     "sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f"
 )
-# Querit pins the source-selected v0.27.1-slim offline transformers runtime image.
+# Querit pins the AEON v0.27.1 omni offline transformers runtime image.
 QUERIT_IMAGE_DIGEST = (
-    "sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f"
+    "sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee"
 )
 MODEL_SNAPSHOT = "7b796de30ad8dc772d6c46c75659c1341283a665"
 SHORT_GENERATION_REQUEST_TOKENS = 8_192
@@ -219,10 +219,8 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertIn("MemorySwapMax=0", unit)
         self.assertIn("--max-num-batched-tokens 16384", unit)
         self.assertIn("--max-num-seqs 32", unit)
-        self.assertIn("--max-num-partial-prefills 1", unit)
-        self.assertIn("--max-long-partial-prefills 1", unit)
-        self.assertNotIn("--max-num-partial-prefills 64", unit)
-        self.assertNotIn("--max-long-partial-prefills 64", unit)
+        self.assertNotIn("--max-num-partial-prefills", unit)
+        self.assertNotIn("--max-long-partial-prefills", unit)
         self.assertIn("gb10_service_ready.sh rerank", unit)
         timeout = re.search(r"^TimeoutStartSec=(\d+)$", unit, re.MULTILINE)
         if timeout is None:
