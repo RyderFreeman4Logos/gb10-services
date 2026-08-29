@@ -413,7 +413,9 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertEqual(
             default_chat["match_models"],
             [
+                "aeon",
                 "aeon-ultimate",
+                "abliterated-qwen-latest-27b-nvfp4",
                 "qwen3.6-27b-decensor-by-aeon",
                 "qwen3.6-27b-decensored",
                 "qwen3.6-27b-nvfp4-fast-nothinking",
