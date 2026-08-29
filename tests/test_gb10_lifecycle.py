@@ -20,6 +20,7 @@ PRODUCTION_STATE = "/home/obj/.local/state/gb10-lifecycle"
 UNIT = "vllm-aeon-27b-dflash.service"
 HIKV_UNIT = "vllm-aeon-27b-dflash-hikv.service"
 QWEN38_UNIT = "vllm-aeon-qwen38-dflash.service"
+ULTIMATE_UNIT = "vllm-aeon-ultimate-uncensored-nvfp4.service"
 
 
 class LifecycleAuditScriptTests(unittest.TestCase):
@@ -510,6 +511,22 @@ class LifecycleAuditScriptTests(unittest.TestCase):
             "actor=test-operator reason=approved-maintenance outcome=accepted "
             "reset_failed=false",
             audit,
+        )
+
+    def test_ultimate_unit_is_accepted_for_audited_lifecycle(self) -> None:
+        result = self.execute(
+            "start",
+            "--unit",
+            ULTIMATE_UNIT,
+            "--actor",
+            "test-operator",
+            "--reason",
+            "approved-maintenance",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            self.systemctl_log.read_text(), f"--user start --no-block {ULTIMATE_UNIT}\n"
         )
 
     def test_restart_is_rejected_so_restarts_are_explicit_stop_start_operations(self) -> None:
