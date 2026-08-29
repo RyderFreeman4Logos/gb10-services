@@ -357,6 +357,38 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_ultimate_profile_authority_uses_dedicated_value(self) -> None:
+        profile = self.profile_dir / "aeon-ultimate-uncensored-nvfp4.env"
+        profile.write_text("AEON_GPU_MEMORY_UTILIZATION=0.545\n")
+        unit = self.root / "vllm-aeon-ultimate-uncensored-nvfp4.service"
+        literal = [
+            "/usr/local/bin/vllm",
+            "serve",
+            "model",
+            "--gpu-memory-utilization",
+            "${AEON_GPU_MEMORY_UTILIZATION}",
+        ]
+        self._write_unit(
+            unit,
+            "vllm-test",
+            str(self.cidfiles["vllm-test"]),
+            application=literal,
+            environment_files=(
+                "/home/obj/.config/gb10/aeon-dflash-profiles/aeon-ultimate-uncensored-nvfp4.env",
+            ),
+        )
+        rendered = [
+            "0.545" if token == literal[-1] else token for token in literal
+        ]
+        payload = self._inspect("vllm-test", command=rendered)
+        result = self._run(
+            units=(unit,),
+            profile_value="0.545",
+            ultimate_profile_path=profile,
+            inspect_sequences={"vllm-test": [payload]},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_resolves_only_the_canonical_dflash_profile_variable(self) -> None:
         profile = "/home/obj/.config/gb10/aeon-dflash-profiles/active.env"
         literal = [

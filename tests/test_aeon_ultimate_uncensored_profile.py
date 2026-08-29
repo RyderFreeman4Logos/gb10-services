@@ -48,11 +48,7 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
     def test_profile_files_and_memory_profile(self) -> None:
         self.assertTrue(PROFILE.is_dir())
         self.assertTrue(UNIT.is_file())
-        self.assertEqual(
-            ENV.read_text(),
-            "# AEON Ultimate Uncensored NVFP4 on GB10; sized for the 72G text cgroup.\n"
-            "AEON_GPU_MEMORY_UTILIZATION=0.545\n",
-        )
+        self.assertEqual(ENV.read_text(), "AEON_GPU_MEMORY_UTILIZATION=0.545\n")
 
     def test_unit_uses_pinned_image_model_and_draft_mounts(self) -> None:
         unit = _unit_text()
