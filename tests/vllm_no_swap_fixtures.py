@@ -300,6 +300,7 @@ class VllmNoSwapFixture(unittest.TestCase):
         memory_swap_readback: str | None = None,
         docker_mode: str = "verify",
         qwen_profile_path: Path | None = None,
+        ultimate_profile_path: Path | None = None,
     ) -> dict[str, str]:
         environment = {
             "DOCKER_HOST": f"unix:///run/user/{os.getuid()}/docker.sock",
@@ -344,6 +345,10 @@ class VllmNoSwapFixture(unittest.TestCase):
             environment["GB10_VLLM_NO_SWAP_QWEN38_PROFILE_PATH"] = str(
                 qwen_profile_path
             )
+        if ultimate_profile_path is not None:
+            environment["GB10_VLLM_NO_SWAP_ULTIMATE_PROFILE_PATH"] = str(
+                ultimate_profile_path
+            )
         return environment
 
     def select_profile(self, target: str) -> None:
@@ -369,6 +374,7 @@ class VllmNoSwapFixture(unittest.TestCase):
         profile_value: str | None = None,
         profile_path: Path | None = None,
         qwen_profile_path: Path | None = None,
+        ultimate_profile_path: Path | None = None,
         bind_runtime_swap_max: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         environment = self._test_environment(
@@ -380,6 +386,7 @@ class VllmNoSwapFixture(unittest.TestCase):
             set_property_fail=set_property_fail,
             memory_swap_readback=memory_swap_readback,
             qwen_profile_path=qwen_profile_path,
+            ultimate_profile_path=ultimate_profile_path,
         )
         if profile_value is not None:
             environment["AEON_GPU_MEMORY_UTILIZATION"] = profile_value
