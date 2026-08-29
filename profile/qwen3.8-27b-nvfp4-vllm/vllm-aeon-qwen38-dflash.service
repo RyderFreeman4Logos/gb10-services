@@ -1,5 +1,5 @@
 # SuperQwen3.8 NVFP4 + in-checkpoint MTP K=5 on AEON omni.
-# Image: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-08-24-v0.27.1-omni @ sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee
+# Image digest: sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee
 # Target: /home/obj/models/Jiunsong/SuperQwen3.8-27b-abliterated-NVFP4-DGX-Spark (sealed SHA256SUMS.json)
 # Speculative method qwen3_5_mtp is the official SuperQwen3.8 MTP name (fine-tuned checkpoint; DFlash2 is not compatible).
 # Sampling defaults come from the model generation_config (temperature=1.0, top_p=0.95, top_k=20; min_p/presence_penalty/repetition_penalty stay 0/0/1).
@@ -11,7 +11,7 @@ Description=vLLM SuperQwen3.8-27B NVFP4 + MTP K=5 (prefix cache on)
 After=network.target
 After=vllm-querit-4b-reranker.service
 After=vllm-embedding.service
-Conflicts=sglang-qwen38-27b.service vllm-aeon-27b.service vllm-aeon-27b-dflash.service vllm-aeon-27b-dflash-hikv.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service
+Conflicts=sglang-qwen38-27b.service vllm-aeon-27b.service vllm-aeon-27b-dflash.service vllm-aeon-27b-dflash-hikv.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service vllm-aeon-ultimate-uncensored-nvfp4.service
 StartLimitIntervalSec=600
 StartLimitBurst=3
 
