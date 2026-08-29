@@ -53,7 +53,7 @@ SERVICE_CONTRACTS = {
     ),
     "vllm-aeon-ultimate-uncensored-nvfp4.service": (
         "vllm-aeon-ultimate-uncensored-nvfp4",
-        "%t/gb10-memory-guardian/aeon-ultimate-uncensored-nvfp4-text.cid",
+        "%t/gb10-memory-guardian/aeon-text.cid",
     ),
     "vllm-embedding.service": (
         "vllm-embedding",
