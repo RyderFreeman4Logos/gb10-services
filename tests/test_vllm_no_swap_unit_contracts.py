@@ -51,6 +51,10 @@ SERVICE_CONTRACTS = {
         "vllm-aeon-qwen38-dflash",
         "%t/gb10-memory-guardian/aeon-qwen38-text.cid",
     ),
+    "vllm-aeon-ultimate-uncensored-nvfp4.service": (
+        "vllm-aeon-ultimate-uncensored-nvfp4",
+        "%t/gb10-memory-guardian/aeon-ultimate-uncensored-nvfp4-text.cid",
+    ),
     "vllm-embedding.service": (
         "vllm-embedding",
         "%t/gb10-vllm-cids/vllm-embedding.cid",
@@ -70,9 +74,11 @@ DFLASH_CLEANUP_CONTAINERS = (
     "vllm-aeon-27b-dflash",
 )
 QWEN38_CLEANUP_CONTAINERS = ("vllm-aeon-qwen38-dflash",)
+ULTIMATE_CLEANUP_CONTAINERS = ("vllm-aeon-ultimate-uncensored-nvfp4",)
 AEON_UNITS = {
     "vllm-aeon-27b-dflash.service",
     "vllm-aeon-qwen38-dflash.service",
+    "vllm-aeon-ultimate-uncensored-nvfp4.service",
 }
 UNIT_PATHS = {
     "vllm-aeon-27b-dflash.service": ROOT
@@ -83,6 +89,10 @@ UNIT_PATHS = {
     / "profile"
     / "qwen3.8-27b-nvfp4-vllm"
     / "vllm-aeon-qwen38-dflash.service",
+    "vllm-aeon-ultimate-uncensored-nvfp4.service": ROOT
+    / "profile"
+    / "aeon-ultimate-uncensored-nvfp4"
+    / "vllm-aeon-ultimate-uncensored-nvfp4.service",
     "vllm-embedding.service": ROOT
     / "profile"
     / "qwen3-embedding-8b"
@@ -196,7 +206,11 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                 expected_memory_swap_max = (
                     ["0"]
                     if name
-                    in {"vllm-aeon-qwen38-dflash.service", "vllm-querit-4b-reranker.service"}
+                    in {
+                        "vllm-aeon-qwen38-dflash.service",
+                        "vllm-aeon-ultimate-uncensored-nvfp4.service",
+                        "vllm-querit-4b-reranker.service",
+                    }
                     else []
                 )
                 self.assertEqual(
@@ -252,6 +266,8 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                     if name == "vllm-aeon-27b-dflash.service"
                     else QWEN38_CLEANUP_CONTAINERS
                     if name == "vllm-aeon-qwen38-dflash.service"
+                    else ULTIMATE_CLEANUP_CONTAINERS
+                    if name == "vllm-aeon-ultimate-uncensored-nvfp4.service"
                     else (container,)
                 )
                 for cleanup_container in cleanup_containers:

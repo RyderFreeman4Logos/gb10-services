@@ -59,6 +59,7 @@ OMNI_UNITS = {
     "vllm-embedding.service",
     "vllm-querit-4b-reranker.service",
     "vllm-aeon-qwen38-dflash.service",
+    "vllm-aeon-ultimate-uncensored-nvfp4.service",
 }
 PREVIOUS_RELEASE = ImageRelease(
     date="2026-07-16",
@@ -157,6 +158,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                 "vllm-aeon-27b-dflash.service",
                 "vllm-embedding.service",
                 "vllm-aeon-qwen38-dflash.service",
+                "vllm-aeon-ultimate-uncensored-nvfp4.service",
                 "vllm-qwen3-reranker-8b.service",
                 "vllm-querit-4b-reranker.service",
             },
@@ -168,6 +170,12 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                 expected_annotations = (
                     []
                     if path.name == "vllm-aeon-qwen38-dflash.service"
+                    else [OMNI_RELEASE]
+                    if path.name
+                    in {
+                        "vllm-aeon-ultimate-uncensored-nvfp4.service",
+                        "vllm-querit-4b-reranker.service",
+                    }
                     else [CURRENT_RELEASE]
                 )
                 self.assertEqual(annotations, expected_annotations)
@@ -187,7 +195,11 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                     if line.startswith("Description=")
                 ]
                 self.assertEqual(len(descriptions), 1)
-                if path.name != "vllm-aeon-qwen38-dflash.service":
+                if path.name not in {
+                    "vllm-aeon-qwen38-dflash.service",
+                    "vllm-aeon-ultimate-uncensored-nvfp4.service",
+                    "vllm-querit-4b-reranker.service",
+                }:
                     self.assertIn(CURRENT_RELEASE.version, descriptions[0])
                 self.assertNotRegex(text, r"aeon-vllm-ultimate:[^\s\\]+")
 
