@@ -90,7 +90,7 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
         self.assertIn("--no-enable-prefix-caching", argv)
         self.assertNotIn("--max-num-seqs", argv)
         self.assertNotIn("--enable-prefix-caching", argv)
-        self.assertNotIn("--enforce-eager", argv)
+        self.assertIn("--enforce-eager", argv)
         self.assertNotIn("--scheduler-reserve-full-isl", argv)
         self.assertNotIn("VLLM_ALLOW_LONG_MAX_MODEL_LEN", unit)
         self.assertNotIn("--hf-overrides", argv)
