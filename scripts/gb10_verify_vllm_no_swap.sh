@@ -65,7 +65,7 @@ fi
 
 
 CORE_BASENAME=gb10_verify_vllm_no_swap_core.py
-EXPECTED_CORE_SHA256=30a7b302ee697cf50ba2e9d215aaafee3d82d89c80f7d64cb9f3363d35d87ad4
+EXPECTED_CORE_SHA256=eea66e3d46a31fa47e71434b505056a4aaed146011f28ade3021455386c85a98
 
 /usr/bin/python3 -I - \
     "${BASH_SOURCE[0]}" \
