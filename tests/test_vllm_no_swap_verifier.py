@@ -359,7 +359,7 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
 
     def test_ultimate_profile_authority_uses_dedicated_value(self) -> None:
         profile = self.profile_dir / "aeon-ultimate-uncensored-nvfp4.env"
-        profile.write_text("AEON_GPU_MEMORY_UTILIZATION=0.46\n")
+        profile.write_text("AEON_GPU_MEMORY_UTILIZATION=0.515\n")
         unit = self.root / "vllm-aeon-ultimate-uncensored-nvfp4.service"
         literal = [
             "/usr/local/bin/vllm",
@@ -378,12 +378,12 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
             ),
         )
         rendered = [
-            "0.46" if token == literal[-1] else token for token in literal
+            "0.515" if token == literal[-1] else token for token in literal
         ]
         payload = self._inspect("vllm-test", command=rendered)
         result = self._run(
             units=(unit,),
-            profile_value="0.46",
+            profile_value="0.515",
             ultimate_profile_path=profile,
             inspect_sequences={"vllm-test": [payload]},
         )
