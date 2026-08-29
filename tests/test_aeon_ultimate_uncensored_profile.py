@@ -165,6 +165,52 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
         ):
             self.assertIn(required, docs)
 
+    def test_forced_alias_profiles_are_exact(self) -> None:
+        config = tomllib.loads(GUARD_CONFIG.read_text())
+        self.assertEqual(
+            config.get("forced_model_alias_profiles"),
+            [
+                {
+                    "alias": "abliterated-qwen-latest-27b-nvfp4-none",
+                    "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
+                    "thinking_mode": "force_disable",
+                    "output_cap": 16384,
+                    "temperature": 0.7,
+                    "top_p": 0.80,
+                    "top_k": 20,
+                    "min_p": 0.0,
+                    "presence_penalty": 1.5,
+                    "repetition_penalty": 1.0,
+                },
+                {
+                    "alias": "abliterated-qwen-latest-27b-nvfp4-low",
+                    "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
+                    "thinking_mode": "force_thinking",
+                    "thinking_budget": 65536,
+                    "output_cap": 16384,
+                    "temperature": 1.0,
+                    "top_p": 0.95,
+                    "top_k": 20,
+                    "min_p": 0.0,
+                    "presence_penalty": 0.0,
+                    "repetition_penalty": 1.0,
+                },
+                {
+                    "alias": "abliterated-qwen-latest-27b-nvfp4-medium",
+                    "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
+                    "thinking_mode": "force_thinking",
+                    "thinking_budget": 65536,
+                    "output_cap": 16384,
+                    "temperature": 1.0,
+                    "top_p": 0.95,
+                    "top_k": 20,
+                    "min_p": 0.0,
+                    "presence_penalty": 0.0,
+                    "repetition_penalty": 1.0,
+                },
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
