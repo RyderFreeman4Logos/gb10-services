@@ -55,6 +55,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
     --trust-remote-code \
     --quantization compressed-tensors \
     --kv-cache-dtype fp8 \
+    --enforce-eager \
     --enable-chunked-prefill \
     --no-enable-prefix-caching \
     --attention-backend TRITON_ATTN \
