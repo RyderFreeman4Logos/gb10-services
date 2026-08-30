@@ -40,7 +40,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   -e HF_HUB_OFFLINE=1 \
   -e MAX_JOBS=1 \
   -e CMAKE_BUILD_PARALLEL_LEVEL=1 \
-  -e VLLM_USE_V2_MODEL_RUNNER=1 \
+  -e VLLM_USE_V2_MODEL_RUNNER=0 \
   --memory-swappiness 0 \
   --memory 72g \
   --memory-swap 72g \
