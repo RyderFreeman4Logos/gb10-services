@@ -66,6 +66,7 @@ upstream_profile = "aeon-raw-max"
 [upstream]
 base_url = "http://100.105.4.92:18010/v1"
 request_timeout_ms = 1800000
+reserved_ingress_model_ids = ["abliterated-qwen-latest-27b-nvfp4", "aeon", "aeon-ultimate"]
 
 [upstream.hot_restart]
 enabled = true
