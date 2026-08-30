@@ -61,12 +61,13 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
     --attention-backend TRITON_ATTN \
     --max-model-len 262144 \
     --max-num-batched-tokens 8192 \
+    --max-num-seqs 32 \
     --gpu-memory-utilization ${AEON_GPU_MEMORY_UTILIZATION} \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \
     --override-generation-config "{\"temperature\":0.6,\"top_p\":0.95,\"top_k\":20,\"repetition_penalty\":1.05}" \
-    --speculative-config "{\"method\":\"dflash\",\"model\":\"/draft\",\"num_speculative_tokens\":7,\"attention_backend\":\"TRITON_ATTN\"}" \
+    --speculative-config "{\"method\":\"dflash\",\"model\":\"/draft\",\"num_speculative_tokens\":7,\"num_speculative_tokens_per_batch_size\":[[1,3,7],[4,6,3],[7,1000,1]],\"attention_backend\":\"TRITON_ATTN\"}" \
     --no-enable-flashinfer-autotune \
     --kernel-config.enable_jit_warmup=false \
     --kernel-config.enable_cutedsl_warmup=false

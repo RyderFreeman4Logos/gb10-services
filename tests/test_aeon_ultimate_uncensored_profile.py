@@ -94,7 +94,7 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
         self.assertEqual(_option_value(argv, "--max-num-batched-tokens"), "8192")
         self.assertIn("--enable-chunked-prefill", argv)
         self.assertIn("--no-enable-prefix-caching", argv)
-        self.assertNotIn("--max-num-seqs", argv)
+        self.assertEqual(_option_value(argv, "--max-num-seqs"), "32")
         self.assertNotIn("--enable-prefix-caching", argv)
         self.assertIn("--enforce-eager", argv)
         self.assertNotIn("--scheduler-reserve-full-isl", argv)
@@ -119,13 +119,10 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
     def test_unit_uses_dflash2_n7_and_production_aliases(self) -> None:
         unit = _unit_text()
         argv = _argv()
-        spec = json.loads(_option_value(argv, "--speculative-config"))
-        self.assertEqual(spec, {
-            "method": "dflash",
-            "model": "/draft",
-            "num_speculative_tokens": 7,
-            "attention_backend": "TRITON_ATTN",
-        })
+        self.assertEqual(
+            _option_value(argv, "--speculative-config"),
+            '{"method":"dflash","model":"/draft","num_speculative_tokens":7,"num_speculative_tokens_per_batch_size":[[1,3,7],[4,6,3],[7,1000,1]],"attention_backend":"TRITON_ATTN"}',
+        )
         self.assertEqual(
             set(argv[argv.index("--served-model-name") + 1 : argv.index("--served-model-name") + 4]),
             BACKEND_ALIASES,
