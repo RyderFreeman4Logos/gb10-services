@@ -153,7 +153,8 @@ class LocalGateContractTests(unittest.TestCase):
 
     def test_active_guard_docs_require_restart_after_config_edits(self) -> None:
         restart_instruction = (
-            "edit `/home/obj/.config/llm-guard-proxy/config.toml`, then run "
+            "edit the profile-owned source `profile/aeon-ultimate-uncensored-nvfp4/llm-guard-proxy/config.toml`, "
+            "copy it to `/home/obj/.config/llm-guard-proxy/config.toml`, then run "
             "`systemctl --user restart llm-guard-proxy`"
         )
         for path in ACTIVE_GUARD_DOCS:

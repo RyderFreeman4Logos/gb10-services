@@ -23,7 +23,7 @@ AEON_PROFILE = ROOT / "config" / "aeon-dflash-profiles" / "active.env"
 GUARD_UNIT = ROOT / "profile" / "llm-guard-proxy" / "llm-guard-proxy.service"
 LEGACY_UNIT = ROOT / "profile" / "qwen3-reranker-8b" / "vllm-qwen3-reranker-8b.service"
 MEMORY_GATE = ROOT / "scripts" / "gb10_check_mem_available.sh"
-CONFIG = ROOT / "config" / "llm-guard-proxy" / "config.toml"
+CONFIG = ROOT / "profile" / "aeon-ultimate-uncensored-nvfp4" / "llm-guard-proxy" / "config.toml"
 README = ROOT / "README.md"
 
 LIVE_RECEIPT = ROOT / "docs" / "evidence" / "2026-07-14-aeon-15g-live-receipt.json"
@@ -413,12 +413,9 @@ class QueritServiceContractTests(unittest.TestCase):
         self.assertEqual(
             default_chat["match_models"],
             [
-                "aeon",
-                "aeon-ultimate",
-                "abliterated-qwen-latest-27b-nvfp4",
-                "qwen3.6-27b-decensor-by-aeon",
-                "qwen3.6-27b-decensored",
-                "qwen3.6-27b-nvfp4-fast-nothinking",
+                "abliterated-qwen-latest-27b-none",
+                "abliterated-qwen-latest-27b-low",
+                "abliterated-qwen-latest-27b-medium",
             ],
         )
         self.assertEqual(default_chat["upstream_model"], "aeon-ultimate")
