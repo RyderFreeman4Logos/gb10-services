@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import tomllib
 import unittest
@@ -55,6 +56,12 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
         self.assertTrue(PROFILE.is_dir())
         self.assertTrue(UNIT.is_file())
         self.assertEqual(ENV.read_text(), "AEON_GPU_MEMORY_UTILIZATION=0.515\n")
+
+    def test_live_latest_profile_alias_points_here(self) -> None:
+        alias = ROOT / "profile/abliterated-qwen-latest-27b"
+        self.assertTrue(alias.is_symlink(), "latest profile alias must be a symlink")
+        self.assertEqual(os.readlink(alias), "aeon-ultimate-uncensored-nvfp4")
+        self.assertFalse((ROOT / "profile/abliterated-qwen-latest-27b-nvfp4").exists())
 
     def test_unit_uses_pinned_image_model_and_draft_mounts(self) -> None:
         unit = _unit_text()

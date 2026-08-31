@@ -1,8 +1,8 @@
 # Qwen3.8-27B NVFP4 SGLang profile
 
-Source-prepared next text backend, **not activated**. The stable alias
-`profile/abliterated-qwen-latest-27b-nvfp4` resolves here so every caller that
-uses that alias gets the Qwen3.8 generation after a later authorized cutover.
+Source-prepared next text backend, **not activated**. The live latest
+profile alias is `profile/abliterated-qwen-latest-27b` → AEON Ultimate.
+This directory is not that alias.
 
 ## Status
 

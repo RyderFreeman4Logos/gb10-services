@@ -1,14 +1,13 @@
 """Focused contract tests for the Qwen3.8 NVFP4 SGLang profile.
 
 The profile is source-prepared only (not activated). These tests pin the
-contract the profile must satisfy so a model swap behind the stable
-`abliterated-qwen-latest-27b-nvfp4` alias cannot silently drift.
+SGLang unit/Guard contract so a later authorized cutover cannot silently
+drift. The live latest profile alias is AEON Ultimate, not this directory.
 
 Run (no pipe):
     python3 -m unittest discover -s tests -p 'test_qwen38_sglang_profile.py' -v
 """
 
-import os
 import re
 import tomllib
 import unittest
@@ -16,7 +15,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE_DIR = ROOT / "profile" / "qwen3.8-27b-nvfp4-sglang"
-ALIAS = ROOT / "profile" / "abliterated-qwen-latest-27b-nvfp4"
 UNIT = PROFILE_DIR / "sglang-qwen38-27b.service"
 QUERIT_UNIT = ROOT / "profile" / "querit-4b-reranker" / "vllm-querit-4b-reranker.service"
 GUARD = PROFILE_DIR / "llm-guard-proxy" / "config.toml"
@@ -64,12 +62,10 @@ class Qwen38ProfileLayoutTests(unittest.TestCase):
     def test_profile_directory_exists(self):
         self.assertTrue(PROFILE_DIR.is_dir(), f"missing profile dir {PROFILE_DIR}")
 
-    def test_stable_alias_retargeted_to_new_profile(self):
-        self.assertTrue(ALIAS.is_symlink(), "stable alias must be a symlink")
-        self.assertEqual(
-            os.readlink(ALIAS),
-            "qwen3.8-27b-nvfp4-sglang",
-            "stable alias must resolve to the new Qwen3.8 SGLang profile",
+    def test_source_prepared_profile_is_not_live_latest_alias(self):
+        self.assertFalse(
+            (ROOT / "profile" / "abliterated-qwen-latest-27b-nvfp4").exists(),
+            "live latest alias must not still point at the source-prepared SGLang profile",
         )
 
     def test_unit_and_guard_config_exist(self):
