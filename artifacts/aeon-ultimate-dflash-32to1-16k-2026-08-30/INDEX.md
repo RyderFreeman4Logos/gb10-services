@@ -1,4 +1,4 @@
-# AEON Ultimate DFlash 32-to-1 Throughput Sweep
+# AEON Ultimate DFlash 32-to-1 Client-Observed Throughput Sweep
 
 ## Run identity and invariants
 
@@ -27,7 +27,7 @@
 
 ## Wave metrics
 
-| Concurrency | n_ok | n_fail | n_finish_length | wave_wall_s | aggregate prompt tok/s | aggregate decode tok/s | completion tokens |
+| Concurrency | n_ok | n_fail | n_finish_length | wave_wall_s | client-observed aggregate prompt tok/s | client-observed aggregate decode tok/s | completion tokens |
 |---:|---:|---:|---:|---:|---:|---:|---:|
 | 32 | 32 | 0 | 21 | 573.838210 | 899.758836 | 10.410600 | 5974 |
 | 31 | 31 | 0 | 20 | 546.877067 | 914.647971 | 10.695274 | 5849 |
@@ -64,5 +64,6 @@
 
 ## Throughput notes
 
-- **Best aggregate decode throughput:** concurrency `5`, `13.489697` tok/s (wave completion tokens `1280`).
-- **Materially low-throughput waves (descriptive only):** using the reproducible rule `aggregate decode tok/s <= 50% of the 9.969191 tok/s median` (cutoff `4.984596`), concurrency values `[9, 1]` qualify. No cause is inferred or claimed.
+- **Best client-observed aggregate decode throughput:** concurrency `5`, `13.489697` tok/s (wave completion tokens `1280`).
+- **Materially low-throughput waves (descriptive only):** using the reproducible rule `client-observed aggregate decode tok/s <= 50% of the 9.969191 tok/s median` (cutoff `4.984596`), concurrency values `[9, 1]` qualify. No cause is inferred or claimed.
+- These harness-derived rates are client-observed aggregates, not server, GPU, or model throughput claims.
