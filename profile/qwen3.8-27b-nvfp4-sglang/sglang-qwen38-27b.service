@@ -120,7 +120,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
 # A request with no thinking fields gets the SGLang default medium reasoning
 # effort via --sampling-defaults model (temp 1.0/top_p 0.95/top_k 20), not a
 # Guard rewrite.
-ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh chat http://100.105.4.92:18010 abliterated-qwen-latest-27b-nvfp4 --deadline 2800
+ExecStartPost=/home/obj/.local/bin/gb10_service_ready.sh chat http://100.105.4.92:18010 abliterated-qwen-latest-27b-nvfp4 --deadline 2800 --unit %n --container qwen3.8-27b-sglang
 StandardOutput=journal
 StandardError=journal
 

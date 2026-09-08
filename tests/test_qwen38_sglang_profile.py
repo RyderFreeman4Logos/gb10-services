@@ -49,7 +49,8 @@ class ModelStartupOrderingContractTests(unittest.TestCase):
             sglang,
             r"(?m)^ExecStartPost=.*gb10_service_ready\.sh chat "
             r"http://100\.105\.4\.92:18010 "
-            r"abliterated-qwen-latest-27b-nvfp4 --deadline \d+$",
+            r"abliterated-qwen-latest-27b-nvfp4 --deadline \d+ "
+            r"--unit %n --container qwen3\.8-27b-sglang$",
         )
         for unit in (querit, sglang):
             self.assertNotRegex(

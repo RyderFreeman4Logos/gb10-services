@@ -7,6 +7,7 @@
 #
 # Usage:
 #   gb10_service_ready.sh <kind> <url> <model> [--models-url URL] [--deadline SECS]
+#     [--unit UNIT --container CONTAINER]
 #
 # kind:   chat | embedding | rerank
 # url:    base URL (e.g. http://100.105.4.92:18010)
@@ -24,14 +25,24 @@ MODELS_URL="$BASE_URL/v1/models"
 DEADLINE=2200
 PROBE_INTERVAL=5
 PROBE_TIMEOUT=30
+UNIT=""
+CONTAINER=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --models-url)   MODELS_URL="$2"; shift 2;;
     --deadline)     DEADLINE="$2"; shift 2;;
+    --unit)         UNIT="$2"; shift 2;;
+    --container)    CONTAINER="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; shift;;
   esac
 done
+
+if { [ -n "$UNIT" ] && [ -z "$CONTAINER" ]; } ||
+   { [ -z "$UNIT" ] && [ -n "$CONTAINER" ]; }; then
+  echo "--unit and --container must be specified together" >&2
+  exit 1
+fi
 
 START_EPOCH=$(date +%s)
 
@@ -41,11 +52,36 @@ log() {
   echo "[gb10_ready +${elapsed}s] $*"
 }
 
+owner_alive() {
+  [ -z "$UNIT" ] && return 0
+
+  local main_pid inspect main_pid_ok=true inspect_ok=true
+  main_pid=$(systemctl --user show --property=MainPID --value "$UNIT" 2>&1) || main_pid_ok=false
+  inspect=$(docker inspect --format 'running={{.State.Running}} pid={{.State.Pid}} oom_killed={{.State.OOMKilled}} exit_code={{.State.ExitCode}} error={{json .State.Error}} started_at={{.State.StartedAt}} finished_at={{.State.FinishedAt}}' "$CONTAINER" 2>&1) || inspect_ok=false
+
+  if [ "$main_pid_ok" = false ] || ! [[ "$main_pid" =~ ^[0-9]+$ ]] ||
+     [ "$main_pid" -le 1 ]; then
+    log "OWNER EXITED: unit=$UNIT MainPID=${main_pid:-unknown}"
+  elif [ "$inspect_ok" = true ] && [[ "$inspect" == running=true\ * ]]; then
+    return 0
+  else
+    log "OWNER EXITED: unit=$UNIT MainPID=$main_pid container=$CONTAINER"
+  fi
+
+  if [ "$inspect_ok" = true ]; then
+    log "OWNER EVIDENCE: container=$CONTAINER $inspect"
+  else
+    log "OWNER EVIDENCE: container=$CONTAINER inspect_failed=$inspect"
+  fi
+  return 1
+}
+
 log "waiting for $KIND models at $MODELS_URL (deadline ${DEADLINE}s)..."
 
 # Phase 1: poll /v1/models
 MODELS_READY=false
 while [ $(( $(date +%s) - START_EPOCH )) -lt "$DEADLINE" ]; do
+  owner_alive || exit 1
   if curl -fsS --max-time "$PROBE_TIMEOUT" "$MODELS_URL" >/dev/null 2>&1; then
     MODELS_READY=true
     break
@@ -64,6 +100,7 @@ log "$KIND models endpoint up"
 # Phase 2: functional inference probe
 PROBE_OK=false
 while [ $(( $(date +%s) - START_EPOCH )) -lt "$DEADLINE" ]; do
+  owner_alive || exit 1
   case "$KIND" in
     chat)
       resp=$(curl -fsS --max-time "$PROBE_TIMEOUT" \
