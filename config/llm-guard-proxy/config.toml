@@ -136,12 +136,12 @@ upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_thinking"
 thinking_budget = 65536
 output_cap = 16384
-temperature = 1.0
+temperature = 0.6
 top_p = 0.95
 top_k = 20
 min_p = 0.0
 presence_penalty = 0.0
-repetition_penalty = 1.0
+repetition_penalty = 1.05
 
 [[forced_model_alias_profiles]]
 alias = "abliterated-qwen-latest-27b-nvfp4-medium"
@@ -149,12 +149,12 @@ upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_thinking"
 thinking_budget = 65536
 output_cap = 16384
-temperature = 1.0
+temperature = 0.6
 top_p = 0.95
 top_k = 20
 min_p = 0.0
 presence_penalty = 0.0
-repetition_penalty = 1.0
+repetition_penalty = 1.05
 
 # Chat aliases for the multi-model default listener (:18009/:18005) live ONLY on
 # this profile. Forced experimental listeners use schema-required reserved
