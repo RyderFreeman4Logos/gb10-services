@@ -166,6 +166,117 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
                         )
 
     @staticmethod
+    def _write_stub_launcher(root: Path, marker: Path) -> Path:
+        engine = root / REBUILD_ENGINE.name
+        engine.write_text(
+            "import json\n"
+            "import os\n"
+            "import sys\n"
+            f"with open({str(marker)!r}, \"w\") as stream:\n"
+            "    json.dump({\"argv\": sys.argv[1:], \"env\": dict(os.environ)}, stream)\n"
+        )
+        engine.chmod(0o644)
+        engine_sha256 = hashlib.sha256(engine.read_bytes()).hexdigest()
+        launcher = root / REBUILD_SCRIPT.name
+        launcher.write_text(
+            re.sub(
+                r'^expected_engine_sha256=\"[0-9a-f]{64}\"$',
+                f'expected_engine_sha256=\"{engine_sha256}\"',
+                REBUILD_SCRIPT.read_text(),
+                flags=re.MULTILINE,
+            )
+        )
+        launcher.chmod(0o755)
+        return launcher
+
+    def test_direct_production_entry_reaches_engine_with_fixed_environment(self) -> None:
+        ambient_environments = (
+            {},
+            {
+                "HOME": "/caller-home",
+                "PATH": "/caller-path",
+                "LC_ALL": "en_US.UTF-8",
+                "LANG": "fr_FR.UTF-8",
+            },
+        )
+        for ambient in ambient_environments:
+            with self.subTest(ambient=ambient), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                marker = root / "engine-environment.json"
+                launcher = self._write_stub_launcher(root, marker)
+                result = subprocess.run(
+                    [str(launcher)],
+                    cwd=root,
+                    env=ambient,
+                    text=True,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, self.output(result))
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, "")
+                observed = json.loads(marker.read_text())
+                self.assertEqual(observed["argv"], [])
+                self.assertEqual(
+                    {
+                        name: observed["env"][name]
+                        for name in ("HOME", "PATH", "LC_ALL", "LANG")
+                    },
+                    {
+                        "HOME": "/home/obj",
+                        "PATH": "/usr/bin:/bin",
+                        "LC_ALL": "C",
+                        "LANG": "C",
+                    },
+                )
+
+    def test_production_rejects_source_cache_service_and_test_authority_overrides(
+        self,
+    ) -> None:
+        authorities = (
+            "SOURCE_REPO",
+            "SOURCE_BRANCH",
+            "SOURCE_DIR",
+            "CACHE_ROOT",
+            "SERVICE_BIN",
+            "LLM_GUARD_PROXY_REBUILD_GUARD_CONFIG",
+            "LLM_GUARD_PROXY_REBUILD_GUARD_UNIT",
+            "LLM_GUARD_PROXY_REBUILD_PROC_ROOT",
+            "LLM_GUARD_PROXY_REBUILD_RECEIPT_DIR",
+            "LLM_GUARD_REBUILD_TEST_CONFIG",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "engine-ran"
+            launcher = self._write_stub_launcher(root, marker)
+            for name in authorities:
+                with self.subTest(name=name):
+                    marker.unlink(missing_ok=True)
+                    result = subprocess.run(
+                        [str(launcher)],
+                        cwd=root,
+                        env={
+                            "HOME": "/caller-home",
+                            "PATH": "/caller-path",
+                            "LC_ALL": "en_US.UTF-8",
+                            "LANG": "fr_FR.UTF-8",
+                            name: "/caller-controlled-authority",
+                        },
+                        text=True,
+                        capture_output=True,
+                        timeout=5,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 64, self.output(result))
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(
+                        result.stderr,
+                        f"production rebuild override {name} requires --test-only\n",
+                    )
+                    self.assertFalse(marker.exists())
+
+    @staticmethod
     def output(result: subprocess.CompletedProcess[str]) -> str:
         return result.stdout + result.stderr
 
