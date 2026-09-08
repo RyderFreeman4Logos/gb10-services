@@ -589,7 +589,9 @@ class EmbeddingDeploymentContractTests(unittest.TestCase):
                     f"invalid documented install command: {line}"
                 ) from error
             for token in argv[3:-1]:
-                if token.startswith("systemd/") and token.endswith(".service"):
+                if token.startswith(("systemd/", "profile/llm-guard-proxy/")) and token.endswith(
+                    ".service"
+                ):
                     installed.add(Path(token).name)
         return installed
 

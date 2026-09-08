@@ -508,8 +508,19 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
 
     def test_production_source_pins_canonical_tools_and_bwrap_shape(self) -> None:
         source = ENGINE.read_text()
-        self.assertIn("https://github.com/NousResearch/llm-guard-proxy.git", source)
-        self.assertNotIn("RyderFreeman4Logos/llm-guard-proxy", source)
+        self.assertIn(
+            'source_repo = "https://github.com/RyderFreeman4Logos/llm-guard-proxy.git"',
+            source,
+        )
+        self.assertNotIn("https://github.com/NousResearch/llm-guard-proxy.git", source)
+        self.assertIn('source_branch = "main"', source)
+        self.assertIn('source_ref = "refs/heads/main"', source)
+        guard_unit_source = "profile/llm-guard-proxy/llm-guard-proxy.service"
+        stale_guard_unit_source = "systemd/llm-guard-proxy.service"
+        for document in (ROOT / "README.md", ROOT / "docs/deployment/AGENTS.md"):
+            text = document.read_text()
+            self.assertIn(guard_unit_source, text)
+            self.assertNotIn(stale_guard_unit_source, text)
         for required in (
             "/usr/bin/bwrap",
             "--unshare-user",
