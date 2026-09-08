@@ -15,9 +15,9 @@ PROFILE_GUARD_CONFIG = (
     ROOT / "profile/aeon-ultimate-uncensored-nvfp4/llm-guard-proxy/config.toml"
 )
 PUBLIC_ALIASES = [
-    "abliterated-qwen-latest-27b-nvfp4-none",
-    "abliterated-qwen-latest-27b-nvfp4-low",
-    "abliterated-qwen-latest-27b-nvfp4-medium",
+    "abliterated-qwen-latest-27b-none",
+    "abliterated-qwen-latest-27b-low",
+    "abliterated-qwen-latest-27b-medium",
 ]
 RESERVED_INGRESS_MODEL_IDS = [
     "abliterated-qwen-latest-27b-nvfp4",
@@ -25,14 +25,14 @@ RESERVED_INGRESS_MODEL_IDS = [
     "aeon-ultimate",
 ]
 STALE_PUBLIC_ALIASES = {
-    "abliterated-qwen-latest-27b-none",
-    "abliterated-qwen-latest-27b-low",
-    "abliterated-qwen-latest-27b-medium",
+    "abliterated-qwen-latest-27b-nvfp4-none",
+    "abliterated-qwen-latest-27b-nvfp4-low",
+    "abliterated-qwen-latest-27b-nvfp4-medium",
 }
 CANONICAL_UPSTREAM = "abliterated-qwen-latest-27b-nvfp4"
 FORCED_ALIAS_PROFILES = [
     {
-        "alias": "abliterated-qwen-latest-27b-nvfp4-none",
+        "alias": "abliterated-qwen-latest-27b-none",
         "upstream_model": CANONICAL_UPSTREAM,
         "thinking_mode": "force_disable",
         "output_cap": 16384,
@@ -44,7 +44,7 @@ FORCED_ALIAS_PROFILES = [
         "repetition_penalty": 1.0,
     },
     {
-        "alias": "abliterated-qwen-latest-27b-nvfp4-low",
+        "alias": "abliterated-qwen-latest-27b-low",
         "upstream_model": CANONICAL_UPSTREAM,
         "thinking_mode": "force_thinking",
         "thinking_budget": 65536,
@@ -57,7 +57,7 @@ FORCED_ALIAS_PROFILES = [
         "repetition_penalty": 1.05,
     },
     {
-        "alias": "abliterated-qwen-latest-27b-nvfp4-medium",
+        "alias": "abliterated-qwen-latest-27b-medium",
         "upstream_model": CANONICAL_UPSTREAM,
         "thinking_mode": "force_thinking",
         "thinking_budget": 65536,
@@ -169,7 +169,7 @@ class GuardNvfp4AliasPreflightTests(unittest.TestCase):
             ),
             "stale-alias": lambda candidate: candidate["forced_model_alias_profiles"][
                 0
-            ].__setitem__("alias", "abliterated-qwen-latest-27b-none"),
+            ].__setitem__("alias", "abliterated-qwen-latest-27b-nvfp4-none"),
             "wrong-temperature": lambda candidate: candidate[
                 "forced_model_alias_profiles"
             ][0].__setitem__("temperature", 0.8),
@@ -180,9 +180,9 @@ class GuardNvfp4AliasPreflightTests(unittest.TestCase):
             ).__setitem__(
                 "match_models",
                 [
-                    "abliterated-qwen-latest-27b-none",
-                    "abliterated-qwen-latest-27b-low",
-                    "abliterated-qwen-latest-27b-medium",
+                    "abliterated-qwen-latest-27b-nvfp4-none",
+                    "abliterated-qwen-latest-27b-nvfp4-low",
+                    "abliterated-qwen-latest-27b-nvfp4-medium",
                 ],
             ),
             "wrong-upstream-model": lambda candidate: next(

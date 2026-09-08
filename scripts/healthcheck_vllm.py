@@ -13,7 +13,7 @@ Usage:
 
 .env format (place in project root or CWD):
   HEALTHCHECK_CHAT_URL=http://100.105.4.92:18009
-  HEALTHCHECK_CHAT_MODEL=abliterated-qwen-latest-27b-nvfp4-none
+  HEALTHCHECK_CHAT_MODEL=abliterated-qwen-latest-27b-none
   HEALTHCHECK_CHAT_MAX_TOKENS=16
   HEALTHCHECK_EMBEDDING_URL=http://100.105.4.92:18002
   HEALTHCHECK_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-8B
@@ -38,7 +38,7 @@ from pathlib import Path
 BUILTIN_DEFAULTS: dict[str, dict[str, str | int]] = {
     "chat": {
         "url": "http://100.105.4.92:18009",
-        "model": "abliterated-qwen-latest-27b-nvfp4-none",
+        "model": "abliterated-qwen-latest-27b-none",
         "max_tokens": 16,
     },
     "embedding": {
