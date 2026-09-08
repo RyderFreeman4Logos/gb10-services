@@ -47,6 +47,7 @@ FORCED_ALIAS_PROFILES = [
         "alias": "abliterated-qwen-latest-27b-low",
         "upstream_model": CANONICAL_UPSTREAM,
         "thinking_mode": "force_thinking",
+        "reasoning_effort": "low",
         "thinking_budget": 65536,
         "output_cap": 16384,
         "temperature": 0.6,
@@ -60,6 +61,7 @@ FORCED_ALIAS_PROFILES = [
         "alias": "abliterated-qwen-latest-27b-medium",
         "upstream_model": CANONICAL_UPSTREAM,
         "thinking_mode": "force_thinking",
+        "reasoning_effort": "medium",
         "thinking_budget": 65536,
         "output_cap": 16384,
         "temperature": 0.6,
@@ -173,6 +175,9 @@ class GuardNvfp4AliasPreflightTests(unittest.TestCase):
             "wrong-temperature": lambda candidate: candidate[
                 "forced_model_alias_profiles"
             ][0].__setitem__("temperature", 0.8),
+            "missing-reasoning-effort": lambda candidate: candidate[
+                "forced_model_alias_profiles"
+            ][1].pop("reasoning_effort", None),
             "stale-routing": lambda candidate: next(
                 upstream
                 for upstream in candidate["upstreams"]

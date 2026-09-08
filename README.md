@@ -432,7 +432,7 @@ cp config/llm-guard-proxy/config.toml ~/.config/llm-guard-proxy/config.toml
 ### Step 2: Install Systemd Services
 ```bash
 mkdir -p ~/.config/systemd/user/
-install -m 0644 systemd/llm-guard-proxy.service \
+install -m 0644 profile/llm-guard-proxy/llm-guard-proxy.service \
   systemd/vllm-querit-4b-reranker.service systemd/sysmon.service \
   systemd/vllm-aeon-27b-dflash.service \
   systemd/vllm-embedding.service \

@@ -854,7 +854,7 @@ if not test_only:
         )
         raise SystemExit(64)
     home = Path("/home/obj")
-    source_repo = "https://github.com/NousResearch/llm-guard-proxy.git"
+    source_repo = "https://github.com/RyderFreeman4Logos/llm-guard-proxy.git"
     source_branch = "main"
     source_ref = "refs/heads/main"
     fetch_protocol = "https"

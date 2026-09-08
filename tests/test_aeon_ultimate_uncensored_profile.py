@@ -219,6 +219,7 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
                     "alias": "abliterated-qwen-latest-27b-low",
                     "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
                     "thinking_mode": "force_thinking",
+                    "reasoning_effort": "low",
                     "thinking_budget": 65536,
                     "output_cap": 16384,
                     "temperature": 0.6,
@@ -232,6 +233,7 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
                     "alias": "abliterated-qwen-latest-27b-medium",
                     "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
                     "thinking_mode": "force_thinking",
+                    "reasoning_effort": "medium",
                     "thinking_budget": 65536,
                     "output_cap": 16384,
                     "temperature": 0.6,
@@ -249,6 +251,9 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
         none_profile, low_profile, medium_profile = profiles
         self.assertEqual(none_profile["output_cap"], 16384)
         self.assertNotIn("thinking_budget", none_profile)
+        self.assertNotIn("reasoning_effort", none_profile)
+        self.assertEqual(low_profile.get("reasoning_effort"), "low")
+        self.assertEqual(medium_profile.get("reasoning_effort"), "medium")
         for profile in (low_profile, medium_profile):
             self.assertEqual(profile["thinking_budget"], 65536)
             self.assertEqual(profile["output_cap"], 16384)
