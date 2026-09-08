@@ -20,9 +20,9 @@ GUARD_CONFIG = PROFILE / "llm-guard-proxy/config.toml"
 SHARED_GUARD_CONFIG = ROOT / "config/llm-guard-proxy/config.toml"
 DEPLOYMENT_GUIDANCE = ROOT / "docs/deployment/AGENTS.md"
 PUBLIC_GUARD_ALIASES = {
-    "abliterated-qwen-latest-27b-none",
-    "abliterated-qwen-latest-27b-low",
-    "abliterated-qwen-latest-27b-medium",
+    "abliterated-qwen-latest-27b-nvfp4-none",
+    "abliterated-qwen-latest-27b-nvfp4-low",
+    "abliterated-qwen-latest-27b-nvfp4-medium",
 }
 BACKEND_ALIASES = {
     "aeon",
@@ -204,7 +204,7 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
             config.get("forced_model_alias_profiles"),
             [
                 {
-                    "alias": "abliterated-qwen-latest-27b-none",
+                    "alias": "abliterated-qwen-latest-27b-nvfp4-none",
                     "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
                     "thinking_mode": "force_disable",
                     "output_cap": 16384,
@@ -216,7 +216,7 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
                     "repetition_penalty": 1.0,
                 },
                 {
-                    "alias": "abliterated-qwen-latest-27b-low",
+                    "alias": "abliterated-qwen-latest-27b-nvfp4-low",
                     "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
                     "thinking_mode": "force_thinking",
                     "thinking_budget": 65536,
@@ -229,7 +229,7 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
                     "repetition_penalty": 1.0,
                 },
                 {
-                    "alias": "abliterated-qwen-latest-27b-medium",
+                    "alias": "abliterated-qwen-latest-27b-nvfp4-medium",
                     "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
                     "thinking_mode": "force_thinking",
                     "thinking_budget": 65536,
