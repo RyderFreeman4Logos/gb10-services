@@ -195,6 +195,7 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
             {
                 "HOME": "/caller-home",
                 "PATH": "/caller-path",
+                "XDG_RUNTIME_DIR": "/caller-runtime",
                 "LC_ALL": "en_US.UTF-8",
                 "LANG": "fr_FR.UTF-8",
             },
@@ -230,6 +231,7 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
                         "LANG": "C",
                     },
                 )
+                self.assertNotIn("XDG_RUNTIME_DIR", observed["env"])
 
     def test_production_rejects_source_cache_service_and_test_authority_overrides(
         self,
