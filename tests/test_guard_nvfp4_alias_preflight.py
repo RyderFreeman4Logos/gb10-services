@@ -170,6 +170,9 @@ class GuardNvfp4AliasPreflightTests(unittest.TestCase):
             "stale-alias": lambda candidate: candidate["forced_model_alias_profiles"][
                 0
             ].__setitem__("alias", "abliterated-qwen-latest-27b-none"),
+            "wrong-temperature": lambda candidate: candidate[
+                "forced_model_alias_profiles"
+            ][0].__setitem__("temperature", 0.8),
             "stale-routing": lambda candidate: next(
                 upstream
                 for upstream in candidate["upstreams"]
@@ -182,6 +185,11 @@ class GuardNvfp4AliasPreflightTests(unittest.TestCase):
                     "abliterated-qwen-latest-27b-medium",
                 ],
             ),
+            "wrong-upstream-model": lambda candidate: next(
+                upstream
+                for upstream in candidate["upstreams"]
+                if upstream["name"] == "aeon-default-no-think"
+            ).__setitem__("upstream_model", "wrong-target"),
         }
         for label, mutate in cases.items():
             with self.subTest(mutation=label):
