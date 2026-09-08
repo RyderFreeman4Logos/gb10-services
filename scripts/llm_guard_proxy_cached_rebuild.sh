@@ -42,7 +42,7 @@ for name in CACHE_ROOT SOURCE_DIR SOURCE_REPO SOURCE_BRANCH SERVICE_BIN LOG_DIR 
     exit 64
   fi
 done
-python_logical=/usr/bin/python3; python_resolved=/usr/bin/python3.11; python_sha256=6d972cf21be56fe3c947ab6ba257ff8d08c342dd2714442986791bd9a6dfabfe
+python_logical=/usr/bin/python3; python_resolved=/usr/bin/python3.12; python_sha256=a7d56a8a764faf7bbf5c164055a48fd072be52287bdeb523a9e07b2042f4e7e1
 if [[ "$(/usr/bin/readlink -e -- "$python_logical")" != "$python_resolved" ]]; then
   printf 'reviewed Python resolved path differs\n' >&2
   exit 1

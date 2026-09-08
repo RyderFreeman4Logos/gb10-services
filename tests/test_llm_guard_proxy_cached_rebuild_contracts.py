@@ -24,6 +24,9 @@ README = ROOT / "README.md"
 DEPLOYMENT_GUIDE = ROOT / "docs" / "deployment" / "AGENTS.md"
 PRODUCTION_COMPLETE = "LLM_GUARD_PROXY_REBUILD_COMPLETE"
 TEST_COMPLETE = "LLM_GUARD_PROXY_REBUILD_TEST_ONLY_COMPLETE"
+GB10_PYTHON_LOGICAL = "/usr/bin/python3"
+GB10_PYTHON_RESOLVED = "/usr/bin/python3.12"
+GB10_PYTHON_SHA256 = "a7d56a8a764faf7bbf5c164055a48fd072be52287bdeb523a9e07b2042f4e7e1"
 
 
 class GuardProductionFeatureContractTests(unittest.TestCase):
@@ -98,6 +101,21 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
         )
         self.assertIn("class RebuildError", engine)
 
+    def test_launcher_pins_exact_gb10_python_authority(self) -> None:
+        launcher = REBUILD_SCRIPT.read_text()
+        match = re.search(
+            r"^python_logical=(\S+); python_resolved=(\S+); "
+            r"python_sha256=([0-9a-f]{64})$",
+            launcher,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(match, "launcher Python authority is missing")
+        assert match is not None
+        self.assertEqual(
+            match.groups(),
+            (GB10_PYTHON_LOGICAL, GB10_PYTHON_RESOLVED, GB10_PYTHON_SHA256),
+        )
+
     def test_launcher_rejects_invalid_argv_before_engine_execution(self) -> None:
         usage = "usage: llm_guard_proxy_cached_rebuild.sh [--test-only]\n"
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -117,12 +135,8 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
                 REBUILD_SCRIPT.read_text(),
                 flags=re.MULTILINE,
             )
-            launcher.write_text(
-                launcher_text.replace(
-                    '"$python_owner" != 0',
-                    f'"$python_owner" != {os.stat("/usr/bin/python3.11").st_uid}',
-                )
-            )
+            launcher_text = self._adapt_launcher_for_local_python(launcher_text)
+            launcher.write_text(launcher_text)
             launcher.chmod(0o755)
             cases: tuple[tuple[tuple[str, ...], int, list[str] | None], ...] = (
                 ((), 0, []),
@@ -166,7 +180,20 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
                         )
 
     @staticmethod
-    def _write_stub_launcher(root: Path, marker: Path) -> Path:
+    def _adapt_launcher_for_local_python(launcher_text: str) -> str:
+        local_python = Path("/usr/bin/python3").resolve(strict=True)
+        local_authority = (
+            f"python_resolved={local_python}; "
+            f"python_sha256={hashlib.sha256(local_python.read_bytes()).hexdigest()}"
+        )
+        production_authority = (
+            f"python_resolved={GB10_PYTHON_RESOLVED}; "
+            f"python_sha256={GB10_PYTHON_SHA256}"
+        )
+        return launcher_text.replace(production_authority, local_authority, 1)
+
+    @classmethod
+    def _write_stub_launcher(cls, root: Path, marker: Path) -> Path:
         engine = root / REBUILD_ENGINE.name
         engine.write_text(
             "import json\n"
@@ -178,14 +205,13 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
         engine.chmod(0o644)
         engine_sha256 = hashlib.sha256(engine.read_bytes()).hexdigest()
         launcher = root / REBUILD_SCRIPT.name
-        launcher.write_text(
-            re.sub(
-                r'^expected_engine_sha256=\"[0-9a-f]{64}\"$',
-                f'expected_engine_sha256=\"{engine_sha256}\"',
-                REBUILD_SCRIPT.read_text(),
-                flags=re.MULTILINE,
-            )
+        launcher_text = re.sub(
+            r'^expected_engine_sha256=\"[0-9a-f]{64}\"$',
+            f'expected_engine_sha256=\"{engine_sha256}\"',
+            REBUILD_SCRIPT.read_text(),
+            flags=re.MULTILINE,
         )
+        launcher.write_text(cls._adapt_launcher_for_local_python(launcher_text))
         launcher.chmod(0o755)
         return launcher
 
