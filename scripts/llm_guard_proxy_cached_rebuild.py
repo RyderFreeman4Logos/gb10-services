@@ -88,6 +88,17 @@ GIT_OBJECT_BYTES = 64 * 1024 * 1024
 HOST_WRITE_BUDGET_BYTES = 576 * 1024 * 1024
 HOST_FREE_FLOOR_BYTES = 8 * 1024 * 1024 * 1024
 BUILD_MEMORY_MIN_BYTES = 16 * 1024 * 1024 * 1024
+_DIRECTORY_AUTHORITY_PARENT_DEPTH = {
+    "gcc closure": 3,
+    "sysroot runtime": 1,
+}
+_DIRECTORY_AUTHORITY_DANGLING_LINKS = {
+    (
+        "sysroot runtime",
+        "qt-default/qtchooser/default.conf",
+        "../../../../share/qtchooser/qt5-aarch64-linux-gnu.conf",
+    ),
+}
 
 SCRATCH_MARKER = ".gb10-rebuild-scratch.v1"
 SCRATCH_DELETE_PREFIX = ".gb10-rebuild-scratch-delete.v1."
@@ -452,6 +463,65 @@ class FileAuthority:
         os.close(self.descriptor)
 
 
+@dataclass(frozen=True)
+class DirectoryLedger:
+    content_sha256: str
+    metadata_sha256: str
+    files: int
+    bytes: int
+
+
+@dataclass
+class DirectoryAuthority:
+    name: str
+    path: Path
+    descriptor: int
+    metadata: tuple[int, int, int, int, int]
+    ledger: DirectoryLedger
+
+    def verify(self) -> None:
+        held = os.fstat(self.descriptor)
+        try:
+            current = os.stat(self.path, follow_symlinks=False)
+        except OSError as error:
+            raise RebuildError(f"directory authority changed: {self.name}") from error
+        fields = (
+            held.st_dev,
+            held.st_ino,
+            held.st_mode,
+            held.st_mtime_ns,
+            held.st_ctime_ns,
+        )
+        current_fields = (
+            current.st_dev,
+            current.st_ino,
+            current.st_mode,
+            current.st_mtime_ns,
+            current.st_ctime_ns,
+        )
+        if fields != self.metadata or current_fields != self.metadata:
+            fail(f"directory authority changed: {self.name}")
+        if _directory_ledger(self.descriptor, self.name, self.path) != self.ledger:
+            fail(f"directory authority ledger changed: {self.name}")
+
+    def receipt(self) -> dict[str, object]:
+        return {
+            "path": str(self.path),
+            "device": self.metadata[0],
+            "inode": self.metadata[1],
+            "mode": stat.S_IMODE(self.metadata[2]),
+            "mtime_ns": self.metadata[3],
+            "ctime_ns": self.metadata[4],
+            "content_sha256": self.ledger.content_sha256,
+            "metadata_sha256": self.ledger.metadata_sha256,
+            "file_count": self.ledger.files,
+            "byte_count": self.ledger.bytes,
+        }
+
+    def close(self) -> None:
+        os.close(self.descriptor)
+
+
 def _file_fields(info: os.stat_result) -> tuple[int, ...]:
     return (
         info.st_dev,
@@ -527,6 +597,185 @@ def _sha256_fd(
             fail(f"{label} exceeded byte bound")
         digest.update(chunk)
     return digest.hexdigest()
+
+
+def _directory_authority_link_roots(
+    label: str, root_path: Path
+) -> tuple[Path, ...]:
+    roots = [root_path]
+    depth = _DIRECTORY_AUTHORITY_PARENT_DEPTH.get(label)
+    if depth is not None:
+        roots.append(root_path.parents[depth])
+    return tuple(roots)
+
+
+def _verify_directory_authority_symlink(
+    label: str, root_path: Path, relative: str, target: str
+) -> None:
+    roots = _directory_authority_link_roots(label, root_path)
+    link_path = Path(posixpath.join(root_path.as_posix(), relative))
+    current = Path(
+        target
+        if target.startswith("/")
+        else posixpath.normpath(posixpath.join(link_path.parent.as_posix(), target))
+    )
+    seen: set[Path] = set()
+    for _ in range(64):
+        if not any(current == root or root in current.parents for root in roots):
+            fail(f"unsafe symlink in directory authority: {label}")
+        try:
+            info = os.lstat(current)
+        except OSError:
+            if (label, relative, target) in _DIRECTORY_AUTHORITY_DANGLING_LINKS:
+                return
+            fail(f"unsafe symlink in directory authority: {label}")
+        if stat.S_ISLNK(info.st_mode):
+            if current in seen:
+                fail(f"unsafe symlink in directory authority: {label}")
+            seen.add(current)
+            next_target = os.readlink(current)
+            current = Path(
+                next_target
+                if next_target.startswith("/")
+                else posixpath.normpath(
+                    posixpath.join(current.parent.as_posix(), next_target)
+                )
+            )
+            continue
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+            fail(f"unsafe symlink in directory authority: {label}")
+        if info.st_uid not in {0, os.geteuid()} or info.st_mode & 0o022:
+            fail(f"unsafe symlink in directory authority: {label}")
+        return
+    fail(f"unsafe symlink in directory authority: {label}")
+
+
+def _directory_ledger(
+    root_fd: int, label: str, root_path: Path
+) -> DirectoryLedger:
+    content = hashlib.sha256()
+    metadata_digest = hashlib.sha256()
+    file_count = 0
+    byte_count = 0
+
+    def visit(directory_fd: int, prefix: str) -> None:
+        nonlocal file_count, byte_count
+        _deadline_checkpoint("directory-authority")
+        names = sorted(os.listdir(directory_fd))
+        if len(names) > 100_000:
+            fail(f"directory entry bound exceeded: {label}")
+        for name in names:
+            _deadline_checkpoint("directory-authority")
+            if not name or name in {".", ".."} or "/" in name or "\x00" in name:
+                fail(f"unsafe directory entry: {label}")
+            try:
+                name.encode("utf-8", errors="strict")
+            except UnicodeEncodeError as error:
+                raise RebuildError(f"non-UTF-8 directory entry: {label}") from error
+            relative = f"{prefix}/{name}" if prefix else name
+            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            mode = stat.S_IMODE(info.st_mode)
+            metadata_digest.update(
+                f"{relative}\0{info.st_dev}\0{info.st_ino}\0{info.st_mode}\0"
+                f"{info.st_size}\0{info.st_mtime_ns}\0{info.st_ctime_ns}\n".encode()
+            )
+            if stat.S_ISDIR(info.st_mode):
+                child = os.open(
+                    name,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_CLOEXEC
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+                try:
+                    visit(child, relative)
+                finally:
+                    os.close(child)
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                target = os.readlink(name, dir_fd=directory_fd)
+                _verify_directory_authority_symlink(label, root_path, relative, target)
+                content.update(f"L\0{relative}\0{mode:o}\0{target}\n".encode())
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                fail(f"unsupported object in directory authority: {label}")
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+            try:
+                before = os.fstat(descriptor)
+                digest = _sha256_fd(
+                    descriptor, 8 * 1024 * 1024 * 1024, f"{label}/{relative}"
+                )
+                after = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ):
+                fail(f"file changed during directory ledger: {label}")
+            file_count += 1
+            byte_count += info.st_size
+            if file_count > 100_000 or byte_count > 8 * 1024 * 1024 * 1024:
+                fail(f"directory authority bound exceeded: {label}")
+            content.update(
+                f"F\0{relative}\0{mode:o}\0{info.st_size}\0{digest}\n".encode()
+            )
+
+    fresh_root = os.open(
+        ".",
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=root_fd,
+    )
+    try:
+        visit(fresh_root, "")
+    finally:
+        os.close(fresh_root)
+    return DirectoryLedger(
+        content.hexdigest(), metadata_digest.hexdigest(), file_count, byte_count
+    )
+
+
+def _open_directory_authority(name: str, path: Path) -> DirectoryAuthority:
+    if not path.is_absolute():
+        fail(f"directory authority is not absolute: {name}")
+    _reject_symlink_ancestors(path)
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o002:
+            fail(f"unsafe directory authority: {name}")
+        metadata = (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+        authority = DirectoryAuthority(
+            name, path, descriptor, metadata, _directory_ledger(descriptor, name, path)
+        )
+        authority.verify()
+        return authority
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _runtime_python_authority() -> dict[str, object]:
@@ -1007,6 +1256,7 @@ def run_build_phase(
     env: dict[str, str],
     budget: HostWriteBudget,
     target: Path,
+    pass_fds: tuple[int, ...],
 ) -> bytes:
     deadline = operation_deadline
     if deadline is None:
@@ -1016,7 +1266,7 @@ def run_build_phase(
         fail("transaction scoped-command deadline exhausted")
     log("+ " + shlex.join(arguments))
     try:
-        return run_scoped_direct(
+        output = run_scoped_direct(
             arguments,
             _scope_policy(phase),
             python=sys.executable,
@@ -1029,11 +1279,13 @@ def run_build_phase(
             timeout=available,
             deadline=deadline,
             env=env,
-            pass_fds=_tool_fds(),
+            pass_fds=tuple(sorted(set(_tool_fds() + pass_fds))),
             max_output_bytes=16 * 1024 * 1024 if phase == "metadata" else 4 * 1024 * 1024,
             cleanup_reserve=min(8.0, max(2.0, available / 2)),
             progress=lambda: budget.account_tree(target, BUILD_TMP_BYTES, "Cargo target"),
         )
+        budget.account_tree(target, BUILD_TMP_BYTES, "Cargo target")
+        return output
     except RuntimeError as error:
         reason = _bounded_primary_error(error)
         if any(token in reason for token in ("deadline", "exhausted", "budget")):
@@ -2035,6 +2287,7 @@ def _extract_archive(
 class SourceBundle:
     root: Path
     source: Path
+    source_authority: DirectoryAuthority
     config_sha256: str
     commit: str
     tree: str
@@ -2044,10 +2297,11 @@ class SourceBundle:
     byte_count: int
 
     def verify(self) -> None:
+        self.source_authority.verify()
         _verify_all_tools()
 
     def close(self) -> None:
-        return None
+        self.source_authority.close()
 
 
 def _direct_git(
@@ -2098,22 +2352,30 @@ def prepare_canonical_source(snapshot_root: Path, budget: HostWriteBudget) -> So
     budget.write_new(archive_path, archive, 0o400)
     tree_ledger = _extract_archive(archive_path, source, commit, entries, budget)
     config_digest = sha256_bytes(json.dumps({"protocol": fetch_protocol, "source_ref": source_ref}, sort_keys=True, separators=(",", ":")).encode("ascii"))
-    bundle = SourceBundle(snapshot_root, source, config_digest, commit, tree, sha256_bytes(archive), tree_ledger, len(entries), sum(entry.size for entry in entries))
-    bundle.verify()
-    return bundle
+    source_authority = _open_directory_authority("canonical source", source)
+    bundle = SourceBundle(snapshot_root, source, source_authority, config_digest, commit, tree, sha256_bytes(archive), tree_ledger, len(entries), sum(entry.size for entry in entries))
+    try:
+        bundle.verify()
+        return bundle
+    except BaseException:
+        bundle.close()
+        raise
 
 
-def _cargo_environment(source: SourceBundle, target: Path) -> dict[str, str]:
-    del source
+def _cargo_environment(
+    source: SourceBundle,
+    target: Path,
+    authorities: dict[str, DirectoryAuthority],
+) -> dict[str, str]:
     return {
         **child_env,
-        "HOME": str(home),
-        "PATH": f"{toolchain_root / 'bin'}:/usr/bin:/bin",
-        "CARGO_HOME": str(registry_cache.parents[2]),
+        "HOME": str(source.root),
+        "PATH": "",
+        "CARGO_HOME": f"/proc/self/fd/{authorities['cargo_home'].descriptor}",
         "CARGO_TARGET_DIR": str(target),
         "CARGO_NET_OFFLINE": "true",
         "CARGO_TERM_COLOR": "never",
-        "RUSTC": str(toolchain_root / "bin" / "rustc"),
+        "RUSTC": require_tool("rustc"),
         "CARGO_BUILD_TARGET": TARGET_TRIPLE,
         "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER": require_tool("cc"),
         "AR_aarch64_unknown_linux_gnu": require_tool("ar"),
@@ -2122,15 +2384,20 @@ def _cargo_environment(source: SourceBundle, target: Path) -> dict[str, str]:
     }
 
 
-def _cargo_command(source: SourceBundle, phase: str) -> tuple[list[str], dict[str, str], Path]:
+def _cargo_command(
+    source: SourceBundle,
+    phase: str,
+    authorities: dict[str, DirectoryAuthority],
+) -> tuple[list[str], dict[str, str], Path]:
     target = source.root / "target"
     target.mkdir(mode=0o700, exist_ok=True)
     cargo = require_tool("cargo")
+    manifest = f"/proc/self/fd/{source.source_authority.descriptor}/Cargo.toml"
     if phase == "metadata":
-        arguments = [cargo, "metadata", "--locked", "--offline", "--format-version=1", "--manifest-path", str(source.source / "Cargo.toml")]
+        arguments = [cargo, "metadata", "--locked", "--offline", "--format-version=1", "--manifest-path", manifest]
     else:
-        arguments = [cargo, "build", "--release", "--locked", "--offline", "--target", TARGET_TRIPLE, "--manifest-path", str(source.source / "Cargo.toml"), "--package", "llm-guard-proxy", "--no-default-features", "--features", "guard"]
-    return arguments, _cargo_environment(source, target), target
+        arguments = [cargo, "build", "--release", "--locked", "--offline", "--target", TARGET_TRIPLE, "--manifest-path", manifest, "--package", "llm-guard-proxy", "--no-default-features", "--features", "guard"]
+    return arguments, _cargo_environment(source, target, authorities), target
 
 
 def _validate_metadata(payload: str, source_root: str, target_root: str) -> str:
@@ -2280,7 +2547,27 @@ def _build_contract_sha256() -> str:
             phase: _scope_policy(phase).contract()
             for phase in ("metadata", "build")
         },
-        "direct_build": {"target": TARGET_TRIPLE},
+        "direct_build": {
+            "target": TARGET_TRIPLE,
+            "cargo": "held-file-fd",
+            "rustc": "held-file-fd",
+            "manifest": "held-source-dirfd",
+            "directory_authorities": [
+                "canonical_source",
+                "cargo_home",
+                "gcc_closure",
+                "registry_cache",
+                "registry_index",
+                "sysroot_include",
+                "sysroot_runtime",
+                "target_rustlib",
+                "toolchain",
+            ],
+            "write_limits": {
+                "cargo_target_bytes": BUILD_TMP_BYTES,
+                "git_object_bytes": GIT_OBJECT_BYTES,
+            },
+        },
         "tool_sha256": {
             name: held.identity.sha256 for name, held in sorted(held_tools.items())
         },
@@ -2381,27 +2668,93 @@ def _open_built_candidate(path: Path) -> tuple[FileAuthority, bytes]:
 
 
 def build_candidate(source: SourceBundle, budget: HostWriteBudget) -> BuildBundle:
-    metadata_command, metadata_env, target = _cargo_command(source, "metadata")
-    metadata_frame = run_build_phase(
-        "metadata", metadata_command, env=metadata_env, budget=budget, target=target
+    cargo_home = registry_cache.parents[2]
+    if registry_index.parents[2] != cargo_home:
+        fail("Cargo home authority is inconsistent")
+    paths = (
+        ("toolchain", toolchain_root),
+        ("cargo_home", cargo_home),
+        ("registry_cache", registry_cache),
+        ("registry_index", registry_index),
+        ("gcc_closure", gcc_root),
+        ("sysroot_runtime", sysroot_lib),
+        ("sysroot_include", sysroot_include),
+        ("target_rustlib", target_rustlib),
     )
-    metadata_closure = _validate_metadata(
-        metadata_frame.decode("utf-8", errors="strict"), str(source.source), str(target)
-    )
-    build_command, build_env, target = _cargo_command(source, "build")
-    run_build_phase(
-        "build", build_command, env=build_env, budget=budget, target=target
-    )
-    candidate_path = target / TARGET_TRIPLE / "release" / "llm-guard-proxy"
-    built_authority, candidate_data = _open_built_candidate(candidate_path)
+    authorities: dict[str, DirectoryAuthority] = {}
     try:
-        header = {"kind": "build", "payload_sha256": sha256_bytes(candidate_data), "payload_size": len(candidate_data), "schema": 1}
-        candidate, identity, elf, authority = _publish_candidate(source, header, candidate_data, budget)
-        built_authority.verify()
+        for name, path in paths:
+            authorities[name] = _open_directory_authority(name.replace("_", " "), path)
+        all_authorities = {"canonical_source": source.source_authority, **authorities}
+        pass_fds = tuple(value.descriptor for value in all_authorities.values())
+
+        source.verify()
+        for value in authorities.values():
+            value.verify()
+        metadata_command, metadata_env, target = _cargo_command(
+            source, "metadata", authorities
+        )
+        metadata_frame = run_build_phase(
+            "metadata",
+            metadata_command,
+            env=metadata_env,
+            budget=budget,
+            target=target,
+            pass_fds=pass_fds,
+        )
+        source.verify()
+        for value in authorities.values():
+            value.verify()
+        metadata_closure = _validate_metadata(
+            metadata_frame.decode("utf-8", errors="strict"),
+            str(source.source),
+            str(target),
+        )
+        build_command, build_env, target = _cargo_command(
+            source, "build", authorities
+        )
+        run_build_phase(
+            "build",
+            build_command,
+            env=build_env,
+            budget=budget,
+            target=target,
+            pass_fds=pass_fds,
+        )
+        source.verify()
+        for value in authorities.values():
+            value.verify()
+        candidate_path = target / TARGET_TRIPLE / "release" / "llm-guard-proxy"
+        built_authority, candidate_data = _open_built_candidate(candidate_path)
+        try:
+            header = {"kind": "build", "payload_sha256": sha256_bytes(candidate_data), "payload_size": len(candidate_data), "schema": 1}
+            candidate, identity, elf, authority = _publish_candidate(source, header, candidate_data, budget)
+            built_authority.verify()
+        finally:
+            built_authority.close()
+        inputs = {
+            "source": str(source.source),
+            "target": str(target),
+            "cargo_argv": build_command[1:],
+            "rustc_exec": held_tools["rustc"].identity.sha256,
+            "tool_sha256": {name: tool.identity.sha256 for name, tool in sorted(held_tools.items())},
+            "directory_authorities": {
+                name: value.receipt() for name, value in sorted(all_authorities.items())
+            },
+            "write_contract": {
+                "limits": {
+                    "cargo_target_bytes": BUILD_TMP_BYTES,
+                    "git_object_bytes": GIT_OBJECT_BYTES,
+                    "host_write_bytes": HOST_WRITE_BUDGET_BYTES,
+                },
+                "cargo_target_bytes": budget._external_tree_bytes.get(target, 0),
+                "git_object_bytes": budget._external_tree_bytes.get(source.root / "git", 0),
+            },
+        }
+        return BuildBundle(candidate, identity, elf, metadata_closure, _build_contract_sha256(), inputs, authority)
     finally:
-        built_authority.close()
-    inputs = {"source": str(source.source), "target": str(target), "cargo_argv": build_command[1:], "tool_sha256": {name: tool.identity.sha256 for name, tool in sorted(held_tools.items())}}
-    return BuildBundle(candidate, identity, elf, metadata_closure, _build_contract_sha256(), inputs, authority)
+        for value in reversed(tuple(authorities.values())):
+            value.close()
 
 
 def _validate_reviewed_tool_versions(cargo: bytes, rustc: bytes) -> None:
@@ -4451,6 +4804,39 @@ def _validate_tool_receipt(value: object, label: str) -> None:
     _strict_hex(payload["sha256"], f"{label}.sha256")
 
 
+def _validate_directory_receipt(value: object, label: str) -> None:
+    payload = _exact_keys(
+        value,
+        {
+            "path",
+            "device",
+            "inode",
+            "mode",
+            "mtime_ns",
+            "ctime_ns",
+            "content_sha256",
+            "metadata_sha256",
+            "file_count",
+            "byte_count",
+        },
+        label,
+    )
+    if not isinstance(payload["path"], str) or not _safe_absolute(payload["path"]):
+        fail(f"{label}.path is unsafe")
+    for key in (
+        "device",
+        "inode",
+        "mode",
+        "mtime_ns",
+        "ctime_ns",
+        "file_count",
+        "byte_count",
+    ):
+        _strict_int(payload[key], f"{label}.{key}")
+    _strict_hex(payload["content_sha256"], f"{label}.content_sha256")
+    _strict_hex(payload["metadata_sha256"], f"{label}.metadata_sha256")
+
+
 def _validate_authorities(value: object) -> dict[str, Any]:
     payload = _exact_keys(
         value,
@@ -4515,7 +4901,10 @@ def _validate_authorities(value: object) -> dict[str, Any]:
             "source",
             "target",
             "cargo_argv",
+            "rustc_exec",
             "tool_sha256",
+            "directory_authorities",
+            "write_contract",
         }
         or sha256_bytes(
             json.dumps(
@@ -4528,6 +4917,53 @@ def _validate_authorities(value: object) -> dict[str, Any]:
         != payload["build_inputs_sha256"]
     ):
         fail("build input ledger differs")
+    directory_authorities = build_inputs["directory_authorities"]
+    expected_directories = {
+        "canonical_source",
+        "cargo_home",
+        "gcc_closure",
+        "registry_cache",
+        "registry_index",
+        "sysroot_include",
+        "sysroot_runtime",
+        "target_rustlib",
+        "toolchain",
+    }
+    if not isinstance(directory_authorities, dict) or set(directory_authorities) != expected_directories:
+        fail("build directory authority closure differs")
+    for name, receipt in directory_authorities.items():
+        _validate_directory_receipt(receipt, f"build_inputs.directory_authorities.{name}")
+    tool_sha256 = build_inputs["tool_sha256"]
+    if not isinstance(tool_sha256, dict) or set(tool_sha256) != TOOL_NAMES:
+        fail("build tool authority closure differs")
+    for name, digest in tool_sha256.items():
+        _strict_hex(digest, f"build_inputs.tool_sha256.{name}")
+    _strict_hex(build_inputs["rustc_exec"], "build_inputs.rustc_exec")
+    if build_inputs["rustc_exec"] != tool_sha256["rustc"]:
+        fail("build rustc execution authority differs")
+    write_contract = _exact_keys(
+        build_inputs["write_contract"],
+        {"limits", "cargo_target_bytes", "git_object_bytes"},
+        "build_inputs.write_contract",
+    )
+    if write_contract["limits"] != {
+        "cargo_target_bytes": BUILD_TMP_BYTES,
+        "git_object_bytes": GIT_OBJECT_BYTES,
+        "host_write_bytes": HOST_WRITE_BUDGET_BYTES,
+    }:
+        fail("build write limit contract differs")
+    cargo_bytes = _strict_int(
+        write_contract["cargo_target_bytes"],
+        "build_inputs.write_contract.cargo_target_bytes",
+    )
+    git_bytes = _strict_int(
+        write_contract["git_object_bytes"],
+        "build_inputs.write_contract.git_object_bytes",
+    )
+    if cargo_bytes > BUILD_TMP_BYTES or git_bytes > GIT_OBJECT_BYTES:
+        fail("build write receipt exceeded contract")
+    if held_tools and payload["direct_build_contract_sha256"] != _build_contract_sha256():
+        fail("direct build contract differs")
     _strict_int(
         payload["source_file_count"], "authorities.source_file_count", minimum=1
     )
@@ -4925,6 +5361,8 @@ def _assert_fixed_authorities(wal: dict[str, Any]) -> None:
     ):
         fail("installed Guard config or unit differs from transaction authority")
     _verify_all_tools()
+    if authorities["direct_build_contract_sha256"] != _build_contract_sha256():
+        fail("direct build contract differs from transaction authority")
     for name, held in held_tools.items():
         if held.receipt() != authorities["tool_authorities"][name]:
             fail(f"held tool differs from transaction authority: {name}")

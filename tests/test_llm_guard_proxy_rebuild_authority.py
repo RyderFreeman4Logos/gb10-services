@@ -613,6 +613,56 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                 self.assertEqual(fixture.reload_state()["restart_calls"], 0)
 
 
+    def test_direct_build_revalidates_canonical_source_after_cargo(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(mutate_source_during_cargo=True)
+            before = os.readlink(fixture.service_bin)
+            result = fixture.run(timeout=20)
+            output = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("directory authority ledger changed: canonical source", output)
+            self.assertEqual(os.readlink(fixture.service_bin), before)
+            self.assertEqual(fixture.reload_state()["restart_calls"], 0)
+            self.assertFalse(
+                fixture.receipt_dir.joinpath("transaction.v1", "state.json").exists()
+            )
+
+    def test_direct_build_records_revalidated_input_authorities_and_write_contract(self) -> None:
+        with RebuildFixture() as fixture:
+            result = fixture.run(timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            receipt = json.loads(fixture.receipt_paths()[0].read_text())
+            inputs = receipt["authorities"]["build_inputs"]
+            self.assertIn("directory_authorities", inputs)
+            self.assertEqual(
+                set(inputs["directory_authorities"]),
+                {
+                    "canonical_source",
+                    "cargo_home",
+                    "gcc_closure",
+                    "registry_cache",
+                    "registry_index",
+                    "sysroot_include",
+                    "sysroot_runtime",
+                    "target_rustlib",
+                    "toolchain",
+                },
+            )
+            self.assertEqual(
+                inputs["write_contract"]["limits"],
+                {
+                    "cargo_target_bytes": 512 * 1024 * 1024,
+                    "git_object_bytes": 64 * 1024 * 1024,
+                    "host_write_bytes": 576 * 1024 * 1024,
+                },
+            )
+            self.assertGreater(inputs["write_contract"]["cargo_target_bytes"], 0)
+            self.assertGreater(inputs["write_contract"]["git_object_bytes"], 0)
+            self.assertEqual(
+                inputs["rustc_exec"],
+                receipt["authorities"]["tool_authorities"]["rustc"]["sha256"],
+            )
+
     def test_direct_cargo_build_is_pinned_and_does_not_need_bwrap(self) -> None:
         source = ENGINE.read_text()
         self.assertNotIn("bwrap", source)
@@ -621,7 +671,8 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             '"build", "--release", "--locked", "--offline", "--target", TARGET_TRIPLE',
             source,
         )
-        self.assertIn('"--manifest-path", str(source.source / "Cargo.toml")', source)
+        self.assertIn('manifest = f"/proc/self/fd/{source.source_authority.descriptor}/Cargo.toml"', source)
+        self.assertIn('"RUSTC": require_tool("rustc")', source)
         self.assertIn('"--package", "llm-guard-proxy", "--no-default-features", "--features", "guard"', source)
 
 

@@ -44,8 +44,9 @@ class RebuildFixture:
         self.target_rustlib = (
             self.toolchain_root / "lib/rustlib/aarch64-unknown-linux-gnu"
         )
-        self.registry_cache = self.root / "registry-cache"
-        self.registry_index = self.root / "registry-index"
+        self.cargo_home = self.root / "cargo-home"
+        self.registry_cache = self.cargo_home / "registry" / "cache" / "fixture"
+        self.registry_index = self.cargo_home / "registry" / "index" / "fixture"
         self.gcc_root = self.root / "gcc-root"
         self.sysroot_lib = self.root / "sysroot-lib"
         self.sysroot_include = self.root / "sysroot-include"
@@ -1343,12 +1344,12 @@ elif name == "cargo":
         print("host: " + state["cargo_host"])
     elif args and args[0] == "metadata":
         manifest = Path(args[args.index("--manifest-path") + 1])
-        source_root = str(manifest.parent)
+        source_root = str(manifest.resolve().parent)
         package_id = f"path+file://{source_root}#llm-guard-proxy@0.1.0"
         print(json.dumps({
             "packages": [{
                 "id": package_id,
-                "manifest_path": str(manifest),
+                "manifest_path": str(manifest.resolve()),
                 "source": None,
                 "dependencies": [],
             }],
