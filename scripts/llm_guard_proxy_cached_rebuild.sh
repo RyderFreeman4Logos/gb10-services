@@ -7,7 +7,7 @@ case "$#:${1-}" in
   *) printf 'usage: llm_guard_proxy_cached_rebuild.sh [--test-only]\n' >&2; exit 64 ;;
 esac
 script_dir="$(cd -P -- "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"; engine="$script_dir/llm_guard_proxy_cached_rebuild.py"
-expected_engine_sha256="9322c9f513bfe7ea854ce643b904642ac89ac42050a527ef42d10c8853408d60"
+expected_engine_sha256="45b0eca6a47b114fc6956e30901282ac84ce82b6b00ba6f878f2ddc666749529"
 if [[ -L "$engine" || ! -f "$engine" ]]; then
   printf 'Guard rebuild engine authority is unsafe\n' >&2
   exit 1

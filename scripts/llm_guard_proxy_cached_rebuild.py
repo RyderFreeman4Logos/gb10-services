@@ -2298,6 +2298,24 @@ def _publish_candidate(
     return candidate, identity, elf, candidate_file
 
 
+def _open_built_candidate(path: Path) -> tuple[FileAuthority, bytes]:
+    authority = _open_file_authority(
+        "Cargo build candidate",
+        path,
+        expected_mode=0o755,
+        max_bytes=MAX_EXECUTABLE_BYTES,
+    )
+    try:
+        payload = _read_fd_limited(
+            authority.descriptor, MAX_EXECUTABLE_BYTES, authority.label
+        )
+        authority.verify()
+        return authority, payload
+    except BaseException:
+        authority.close()
+        raise
+
+
 def build_candidate(source: SourceBundle, budget: HostWriteBudget) -> BuildBundle:
     metadata_command, metadata_env, target = _cargo_command(source, "metadata")
     metadata_frame = execute_scoped("metadata", metadata_command, env=metadata_env)
@@ -2307,9 +2325,13 @@ def build_candidate(source: SourceBundle, budget: HostWriteBudget) -> BuildBundl
     build_command, build_env, target = _cargo_command(source, "build")
     execute_scoped("build", build_command, env=build_env)
     candidate_path = target / TARGET_TRIPLE / "release" / "llm-guard-proxy"
-    candidate_data = candidate_path.read_bytes()
-    header = {"kind": "build", "payload_sha256": sha256_bytes(candidate_data), "payload_size": len(candidate_data), "schema": 1}
-    candidate, identity, elf, authority = _publish_candidate(source, header, candidate_data, budget)
+    built_authority, candidate_data = _open_built_candidate(candidate_path)
+    try:
+        header = {"kind": "build", "payload_sha256": sha256_bytes(candidate_data), "payload_size": len(candidate_data), "schema": 1}
+        candidate, identity, elf, authority = _publish_candidate(source, header, candidate_data, budget)
+        built_authority.verify()
+    finally:
+        built_authority.close()
     inputs = {"source": str(source.source), "target": str(target), "cargo_argv": build_command[1:], "tool_sha256": {name: tool.identity.sha256 for name, tool in sorted(held_tools.items())}}
     return BuildBundle(candidate, identity, elf, metadata_closure, _build_contract_sha256(), inputs, authority)
 

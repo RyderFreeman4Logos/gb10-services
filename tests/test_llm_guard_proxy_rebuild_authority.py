@@ -423,6 +423,40 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
 
 
 
+    def test_built_candidate_open_rejects_special_or_oversized_files_within_deadline(
+        self,
+    ) -> None:
+        with RebuildFixture() as fixture, patch.dict(os.environ, fixture.env, clear=False):
+            old_argv = sys.argv[:]
+            try:
+                sys.argv = [str(ENGINE), "--test-only"]
+                engine = _load(ENGINE, "built_candidate_open_test")
+            finally:
+                sys.argv = old_argv
+
+            regular = fixture.root / "candidate-regular"
+            regular.write_bytes(b"candidate")
+            regular.chmod(0o755)
+            link = fixture.root / "candidate-link"
+            link.symlink_to(regular)
+            fifo = fixture.root / "candidate-fifo"
+            os.mkfifo(fifo, 0o700)
+            oversized = fixture.root / "candidate-oversized"
+            with oversized.open("wb") as stream:
+                stream.truncate(engine.MAX_EXECUTABLE_BYTES + 1)
+            oversized.chmod(0o755)
+
+            engine.operation_deadline = time.monotonic() + 1
+            for path in (link, fifo, oversized):
+                started = time.monotonic()
+                with self.subTest(path=path.name), self.assertRaises(engine.RebuildError):
+                    engine._open_built_candidate(path)
+                self.assertLess(time.monotonic() - started, 0.5)
+
+            engine.operation_deadline = time.monotonic() - 1
+            with self.assertRaisesRegex(engine.RebuildError, "read deadline exhausted"):
+                engine._open_built_candidate(regular)
+
     def test_candidate_path_swap_after_fd_check_is_rejected(self) -> None:
         with RebuildFixture() as fixture:
             fixture.set_state(candidate_path_swap=True)
