@@ -135,6 +135,138 @@ def _terminate_reap_group(
 
 
 class GuardCanonicalAuthorityTests(unittest.TestCase):
+    def test_production_tool_specs_pin_complete_gb10_authority(self) -> None:
+        old_handlers = {
+            number: signal.getsignal(number)
+            for number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+        }
+        try:
+            with patch.object(sys, "argv", [str(ENGINE)]):
+                engine = _load(ENGINE, "complete_production_tool_authority")
+        finally:
+            for number, handler in old_handlers.items():
+                signal.signal(number, handler)
+
+        root_executables = {
+            "ar": (
+                "/usr/bin/aarch64-linux-gnu-ar",
+                "f4583a612510e038dbc1ae8afb5eae5f0445c435bdd7c4c28e78acc7e757d2b1",
+            ),
+            "as": (
+                "/usr/bin/aarch64-linux-gnu-as",
+                "1ffda50efb6d91b6b05ef933aced099595c36577594c0296c91161f2d13db374",
+            ),
+            "bwrap": (
+                "/usr/bin/bwrap",
+                "ae27935781511400c65ebcc0b4669775d602f46251b8707c947a1ac1b160c1c8",
+            ),
+            "cc": (
+                "/usr/bin/aarch64-linux-gnu-gcc-13",
+                "a20520ee21543f243d40636a9181a142c45ecd989de31ab86b99a8ea5ada870d",
+            ),
+            "curl": (
+                "/usr/bin/curl",
+                "67054bcf748d42e1bf4b2a0eb4ba768e37dde8681313a64edd2f343c5d17a0ac",
+            ),
+            "git": (
+                "/usr/bin/git",
+                "aa6540695d076182256dd6e96c8b302e4d56381e3000bbfd5c71bbdfe94a4942",
+            ),
+            "git_remote_https": (
+                "/usr/lib/git-core/git-remote-http",
+                "8ebf256cd802e7af7ea0e91f67deed42c207737bd43c8e94070ed342bf55938d",
+            ),
+            "ionice": (
+                "/usr/bin/ionice",
+                "5853dfc5b2513284f4e837b837aa5c05747ef98b9ce150cb0ba096b2ede6fa4b",
+            ),
+            "ld": (
+                "/usr/bin/aarch64-linux-gnu-ld.bfd",
+                "1e4d3369b76845fa8e099b83513bf28f6f722e046f9b2cde1378c9e27f96d19c",
+            ),
+            "nice": (
+                "/usr/bin/nice",
+                "0746d1600af7606b356e98974e05a26ce8db22e7c99df5bf4613d06128a3e566",
+            ),
+            "prlimit": (
+                "/usr/bin/prlimit",
+                "2a479939c95a886fb8b52244381639816f8cf1f68eee713a9227d0c5d257c805",
+            ),
+            "python": (
+                "/usr/bin/python3.12",
+                "a7d56a8a764faf7bbf5c164055a48fd072be52287bdeb523a9e07b2042f4e7e1",
+            ),
+            "readelf": (
+                "/usr/bin/aarch64-linux-gnu-readelf",
+                "6bca2bbd23b072db9e9a19ae0e65cf7b7c15c08a3c2cf01dd56453e1ac9340b1",
+            ),
+            "systemctl": (
+                "/usr/bin/systemctl",
+                "1bf2f1e98c533b0313a78143ffcda2690116d90d76816dc7b74df79c4767aa95",
+            ),
+            "systemd_run": (
+                "/usr/bin/systemd-run",
+                "0253595d482ea0aa9c4bf2e58080e9615bc59a51e29dbe1cebd14145b92bd8fc",
+            ),
+        }
+        root_data = {
+            "ca_cert": (
+                "/etc/ssl/certs/ca-certificates.crt",
+                "6602a85a36afc2e51c66a0df5ae3d383c5b7c2fed93339ccef7d37e01faf09e8",
+            ),
+            "hosts": (
+                "/etc/hosts",
+                "3c2e57459d0663b68ff68f174b73511d57aafe73bfadca6355bdf80187a2918a",
+            ),
+            "nsswitch": (
+                "/etc/nsswitch.conf",
+                "0b955d14e07f12048c0eb69d9bf1a2c693636014d5007381286b2163fbeac8b8",
+            ),
+        }
+        user_objects = {
+            "cargo": (
+                "/home/obj/.rustup/toolchains/1.96.0-aarch64-unknown-linux-gnu/bin/cargo",
+                0o755,
+                "7db170801729d4775347548ed5970b459844fc2f6b20798efb96f444b5b94fc3",
+            ),
+            "rustc": (
+                "/home/obj/.rustup/toolchains/1.96.0-aarch64-unknown-linux-gnu/bin/rustc",
+                0o755,
+                "2425682b7dd432769e2600eb2b3ea5113a00d37f41a754598f2af2e56e4fa2fe",
+            ),
+            "scoped_worker": (
+                "/home/obj/.local/bin/llm_guard_proxy_scoped_worker.py",
+                0o644,
+                "b764a30e5586059849b364c364c61688df40f20962c55e81e5b3a6a8874426af",
+            ),
+        }
+        expected = {
+            name: engine.ToolSpec(path, path, 0, 0, 0o755, digest)
+            for name, (path, digest) in root_executables.items()
+        }
+        expected.update(
+            {
+                name: engine.ToolSpec(path, path, 0, 0, 0o644, digest)
+                for name, (path, digest) in root_data.items()
+            }
+        )
+        expected["resolv_conf"] = engine.ToolSpec(
+            "/run/systemd/resolve/stub-resolv.conf",
+            "/run/systemd/resolve/stub-resolv.conf",
+            992,
+            992,
+            0o644,
+            "dc1495fcea40128057c4bfd1fa765c9c153011c3a6d26ca4d24bca81561e5934",
+        )
+        expected.update(
+            {
+                name: engine.ToolSpec(path, path, 1001, 1001, mode, digest)
+                for name, (path, mode, digest) in user_objects.items()
+            }
+        )
+        self.assertEqual(engine.TOOL_NAMES, set(expected))
+        self.assertEqual(engine._production_tool_specs(), expected)
+
     def test_engine_load_rejects_archive_mode_then_uses_exact_sibling_authority(
         self,
     ) -> None:

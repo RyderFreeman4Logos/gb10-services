@@ -654,11 +654,11 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
     return {
         "systemd_run": root(
             "/usr/bin/systemd-run",
-            "20886766c7aec37baf11daba7974cba999eedec181d15ac1e269cbd122d0a2f8",
+            "0253595d482ea0aa9c4bf2e58080e9615bc59a51e29dbe1cebd14145b92bd8fc",
         ),
         "prlimit": root(
             "/usr/bin/prlimit",
-            "663634070079386b7401ccc9fb92522ec3ece10f07f84a83fe96ec3ecb0bc74b",
+            "2a479939c95a886fb8b52244381639816f8cf1f68eee713a9227d0c5d257c805",
         ),
         "python": root(
             "/usr/bin/python3.12",
@@ -674,43 +674,46 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
         ),
         "ca_cert": root(
             "/etc/ssl/certs/ca-certificates.crt",
-            "b543499f6fde79f360c7c9da22b74d33230563dad47cd287d8bbb50e2132418b",
+            "6602a85a36afc2e51c66a0df5ae3d383c5b7c2fed93339ccef7d37e01faf09e8",
             mode=0o644,
         ),
-        "resolv_conf": root(
-            "/etc/resolv.conf",
-            "ccc451bf09f40aa94d6ff7bc68d662473c6d5c8d815d111f9a02a12e65a814ce",
-            mode=0o644,
+        "resolv_conf": ToolSpec(
+            "/run/systemd/resolve/stub-resolv.conf",
+            "/run/systemd/resolve/stub-resolv.conf",
+            992,
+            992,
+            0o644,
+            "dc1495fcea40128057c4bfd1fa765c9c153011c3a6d26ca4d24bca81561e5934",
         ),
         "nsswitch": root(
             "/etc/nsswitch.conf",
-            "cf4b86500454b477d4a15e93f28d3cda0ec4bd3649967cf5c2678a18f521993c",
+            "0b955d14e07f12048c0eb69d9bf1a2c693636014d5007381286b2163fbeac8b8",
             mode=0o644,
         ),
         "hosts": root(
             "/etc/hosts",
-            "ac9b3caaa1e5d78e40bef1be61989425d9aa57869ba6005472ff9c9b4ef50fc3",
+            "3c2e57459d0663b68ff68f174b73511d57aafe73bfadca6355bdf80187a2918a",
             mode=0o644,
         ),
         "git": root(
             "/usr/bin/git",
-            "2540879925a6881e3877ff7e3330746ba3027b04edf16a3a12dccd1644c4f32d",
+            "aa6540695d076182256dd6e96c8b302e4d56381e3000bbfd5c71bbdfe94a4942",
         ),
         "git_remote_https": root(
             "/usr/lib/git-core/git-remote-http",
-            "4d3b7807ab261652ae6ae4340e5331c8ce2c6d27a58bbed69e90c175e436adc3",
+            "8ebf256cd802e7af7ea0e91f67deed42c207737bd43c8e94070ed342bf55938d",
         ),
         "bwrap": root(
             "/usr/bin/bwrap",
-            "85580dd52ed366ece8844e90fa75ac7c4de8802963071344e123221fb9f6f11e",
+            "ae27935781511400c65ebcc0b4669775d602f46251b8707c947a1ac1b160c1c8",
         ),
         "systemctl": root(
             "/usr/bin/systemctl",
-            "93d45f7967f1ae04409dccb3e0730dcc84fe6aecbe33aae5d5df158f4de0012c",
+            "1bf2f1e98c533b0313a78143ffcda2690116d90d76816dc7b74df79c4767aa95",
         ),
         "curl": root(
             "/usr/bin/curl",
-            "27125f0331490b7fbf4da11f2bd913ce1b94e071367b2fa8e535ce8c5526e29c",
+            "67054bcf748d42e1bf4b2a0eb4ba768e37dde8681313a64edd2f343c5d17a0ac",
         ),
         "readelf": root(
             "/usr/bin/aarch64-linux-gnu-readelf",
@@ -718,11 +721,11 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
         ),
         "nice": root(
             "/usr/bin/nice",
-            "144ba2794c120a0347058d48081c9c13c2afe4321f1b44318538616295273060",
+            "0746d1600af7606b356e98974e05a26ce8db22e7c99df5bf4613d06128a3e566",
         ),
         "ionice": root(
             "/usr/bin/ionice",
-            "02ccf10cc32df4c1a13bb1a7f4406a9752c3216c13e02527b58109c79b48f516",
+            "5853dfc5b2513284f4e837b837aa5c05747ef98b9ce150cb0ba096b2ede6fa4b",
         ),
         "cargo": ToolSpec(
             f"{toolchain}/bin/cargo",
