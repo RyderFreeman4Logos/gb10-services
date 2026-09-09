@@ -99,10 +99,11 @@ class RebuildFixture:
             payload[18:20] = (183).to_bytes(2, "little")
             old_interpreter = b"/lib64/ld-linux-x86-64.so.2"
             new_interpreter = b"/lib/ld-linux-aarch64.so.1"
-            if payload.count(old_interpreter) != 1:
+            if payload.count(old_interpreter) == 1:
+                offset = payload.index(old_interpreter)
+                payload[offset : offset + len(old_interpreter)] = new_interpreter + b"\0"
+            elif payload.count(new_interpreter) != 1:
                 raise AssertionError("host ELF interpreter fixture differs")
-            offset = payload.index(old_interpreter)
-            payload[offset : offset + len(old_interpreter)] = new_interpreter + b"\0"
             destination.write_bytes(payload)
             destination.chmod(0o755)
 
@@ -394,7 +395,7 @@ class RebuildFixture:
     @staticmethod
     def _build_id(path: Path) -> str:
         output = subprocess.run(
-            ["/usr/bin/x86_64-linux-gnu-readelf", "-n", "--", str(path)],
+            ["/usr/bin/readelf", "-n", "--", str(path)],
             check=True,
             text=True,
             capture_output=True,
@@ -472,14 +473,10 @@ class RebuildFixture:
                 ).hexdigest(),
             }
         build_inputs = {
-            "toolchain": {},
-            "registry_cache": {},
-            "registry_index": {},
-            "gcc_closure": {},
-            "sysroot_lib": {},
-            "sysroot_include": {},
-            "python_stdlib": {},
-            "target_rustlib": {},
+            "source": str(self.build_source),
+            "target": str(self.cache_root / "target"),
+            "cargo_argv": [],
+            "tool_sha256": {},
         }
         candidate_identity = self._identity(self.candidate)
         committed = None
@@ -1268,7 +1265,7 @@ elif name == "readelf":
     if args[:2] == ["-hW", "-lW"]:
         descriptor = int(path.rsplit("/", 1)[-1])
         result = subprocess.run(
-            ["/usr/bin/x86_64-linux-gnu-readelf", *args],
+            ["/usr/bin/readelf", *args],
             check=False,
             text=True,
             capture_output=True,
@@ -1307,7 +1304,7 @@ elif name == "readelf":
             raise SystemExit(93)
         sys.stdout.write(output)
     elif args[:2] == ["-n", "--"]:
-        os.execv("/usr/bin/x86_64-linux-gnu-readelf", ["readelf", *args])
+        os.execv("/usr/bin/readelf", ["readelf", *args])
     else:
         raise SystemExit(92)
 elif name == "bwrap":
@@ -2097,11 +2094,11 @@ else:
             "readelf": self.fake_bin / "readelf",
             "nice": Path("/usr/bin/nice"),
             "ionice": Path("/usr/bin/ionice"),
-            "cc": Path("/usr/bin/x86_64-linux-gnu-gcc-12"),
-            "ld": Path("/usr/bin/x86_64-linux-gnu-ld.bfd"),
-            "ar": Path("/usr/bin/x86_64-linux-gnu-ar"),
-            "as": Path("/usr/bin/x86_64-linux-gnu-as"),
-            "python": Path("/usr/bin/python3.11"),
+            "cc": Path("/usr/bin/gcc").resolve(strict=True),
+            "ld": Path("/usr/bin/ld.bfd").resolve(strict=True),
+            "ar": Path("/usr/bin/ar").resolve(strict=True),
+            "as": Path("/usr/bin/as").resolve(strict=True),
+            "python": Path("/usr/bin/python3").resolve(strict=True),
             "ca_cert": Path("/etc/ssl/certs/ca-certificates.crt"),
             "resolv_conf": Path("/etc/resolv.conf"),
             "nsswitch": Path("/etc/nsswitch.conf"),

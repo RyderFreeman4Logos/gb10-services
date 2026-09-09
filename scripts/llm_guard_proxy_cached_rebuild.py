@@ -4403,14 +4403,10 @@ def _validate_authorities(value: object) -> dict[str, Any]:
         not isinstance(build_inputs, dict)
         or set(build_inputs)
         != {
-            "toolchain",
-            "registry_cache",
-            "registry_index",
-            "gcc_closure",
-            "sysroot_lib",
-            "sysroot_include",
-            "python_stdlib",
-            "target_rustlib",
+            "source",
+            "target",
+            "cargo_argv",
+            "tool_sha256",
         }
         or sha256_bytes(
             json.dumps(
