@@ -68,7 +68,8 @@ class RebuildFixture:
         self.prior = self.root / "prior-llm-guard-proxy"
         self.wrong_hash = self.root / "wrong-hash-llm-guard-proxy"
         self.same_hash_other_inode = self.root / "same-hash-other-inode"
-        self.build_source = Path("/usr/bin/true")
+        self.build_source = self.root / "aarch64-elf-fixture"
+        self.alternate_build_source = self.root / "alternate-aarch64-elf-fixture"
 
         for directory in (
             self.home,
@@ -90,6 +91,21 @@ class RebuildFixture:
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
+        for source, destination in (
+            (Path("/usr/bin/true"), self.build_source),
+            (Path("/usr/bin/false"), self.alternate_build_source),
+        ):
+            payload = bytearray(source.read_bytes())
+            payload[18:20] = (183).to_bytes(2, "little")
+            old_interpreter = b"/lib64/ld-linux-x86-64.so.2"
+            new_interpreter = b"/lib/ld-linux-aarch64.so.1"
+            if payload.count(old_interpreter) != 1:
+                raise AssertionError("host ELF interpreter fixture differs")
+            offset = payload.index(old_interpreter)
+            payload[offset : offset + len(old_interpreter)] = new_interpreter + b"\0"
+            destination.write_bytes(payload)
+            destination.chmod(0o755)
+
         self._init_remote()
         (self.gcc_root / "cc1").write_text("sealed cc1\n")
         (self.target_rustlib / "libstd.rlib").write_text("sealed target rustlib\n")
@@ -106,8 +122,8 @@ class RebuildFixture:
             / "llm-guard-proxy"
         )
 
-        shutil.copyfile("/usr/bin/false", self.prior)
-        shutil.copyfile("/usr/bin/false", self.wrong_hash)
+        shutil.copyfile(self.alternate_build_source, self.prior)
+        shutil.copyfile(self.alternate_build_source, self.wrong_hash)
         shutil.copyfile(self.build_source, self.same_hash_other_inode)
         for binary in (self.prior, self.wrong_hash, self.same_hash_other_inode):
             binary.chmod(0o755)
@@ -143,6 +159,7 @@ class RebuildFixture:
             "replace_bwrap_during_use": False,
             "rename_source_mount": False,
             "artifact_mode": "",
+            "build_source_override": "",
             "candidate_path_swap": False,
             "build_finished": False,
             "jobs": {},
@@ -166,8 +183,7 @@ class RebuildFixture:
             "cargo_host": "aarch64-unknown-linux-gnu",
             "rustc_host": "aarch64-unknown-linux-gnu",
             "rustc_release": "1.96.0",
-            "candidate_elf_machine": "AArch64",
-            "candidate_elf_interpreter": "/lib/ld-linux-aarch64.so.1",
+            "candidate_elf_output_mode": "",
             "scope_failure": "",
             "scope_status_mode": "canonical",
             "scope_frame_mode": "",
@@ -200,6 +216,7 @@ class RebuildFixture:
         self.env = {
             "CACHE_ROOT": str(self.cache_root),
             "FIXTURE_BUILD_SOURCE": str(self.build_source),
+            "FIXTURE_ALTERNATE_BUILD_SOURCE": str(self.alternate_build_source),
             "GUARD_TEST_CGROUP_ROOT": str(self.cgroup_root),
             "GUARD_TEST_BWRAP_AUTHORITY": str(self.bwrap_authority_config),
             "GUARD_TEST_STATE": str(self.state_path),
@@ -1228,8 +1245,46 @@ elif name == "rustc":
 elif name == "readelf":
     path = args[-1]
     if args[:2] == ["-hW", "-lW"]:
-        print("  Machine:                           " + state["candidate_elf_machine"])
-        print("      [Requesting program interpreter: " + state["candidate_elf_interpreter"] + "]")
+        descriptor = int(path.rsplit("/", 1)[-1])
+        result = subprocess.run(
+            ["/usr/bin/x86_64-linux-gnu-readelf", *args],
+            check=False,
+            text=True,
+            capture_output=True,
+            pass_fds=(descriptor,),
+        )
+        if result.returncode:
+            sys.stderr.write(result.stderr)
+            raise SystemExit(result.returncode)
+        output = result.stdout
+        mode = state.get("candidate_elf_output_mode", "")
+        machine = re.compile(r"(?m)^\s*Machine:.*$")
+        interpreter = re.compile(r"(?m)^\s*\[Requesting program interpreter:.*$")
+        if mode == "wrong-machine":
+            output = machine.sub("  Machine: Advanced Micro Devices X86-64", output)
+        elif mode == "missing-machine":
+            output = machine.sub("", output)
+        elif mode == "multiple-machine":
+            output += "  Machine: AArch64\n"
+        elif mode == "malformed-machine":
+            output = machine.sub("  Machine AArch64", output)
+        elif mode == "wrong-interpreter":
+            output = interpreter.sub(
+                "      [Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]",
+                output,
+            )
+        elif mode == "missing-interpreter":
+            output = interpreter.sub("", output)
+        elif mode == "multiple-interpreter":
+            output += "      [Requesting program interpreter: /lib/ld-linux-aarch64.so.1]\n"
+        elif mode == "malformed-interpreter":
+            output = interpreter.sub(
+                "      [Requesting program interpreter /lib/ld-linux-aarch64.so.1]",
+                output,
+            )
+        elif mode:
+            raise SystemExit(93)
+        sys.stdout.write(output)
     elif args[:2] == ["-n", "--"]:
         os.execv("/usr/bin/x86_64-linux-gnu-readelf", ["readelf", *args])
     else:
@@ -1380,11 +1435,9 @@ elif name == "bwrap":
                 if state.get("mutate_gcc_closure_during_build"):
                     (Path(os.environ["GCC_ROOT"]) / "cc1").write_text("mutated cc1\n")
                 source_file = Path(os.environ["SOURCE_REPO"]) / "llm-guard-proxy" / "src" / "main.rs"
-                selected = (
-                    Path("/usr/bin/false")
-                    if "alternate" in source_file.read_text()
-                    else Path(os.environ["FIXTURE_BUILD_SOURCE"])
-                )
+                selected = Path(state.get("build_source_override") or os.environ["FIXTURE_BUILD_SOURCE"])
+                if "alternate" in source_file.read_text():
+                    selected = Path(os.environ["FIXTURE_ALTERNATE_BUILD_SOURCE"])
                 artifact = (
                     b"not-an-elf\n"
                     if state.get("scope_build_payload") == "invalid-elf"
@@ -1905,7 +1958,12 @@ elif name == "systemctl":
         target = Path(os.readlink(link))
         if not target.is_absolute():
             target = link.parent / target
-        if str(target) == os.environ["EXPECTED_CANDIDATE"]:
+        expected_candidate = Path(os.environ["EXPECTED_CANDIDATE"])
+        is_expected_candidate = str(target) == str(expected_candidate) or (
+            target.parent == expected_candidate.parent
+            and target.name.startswith(f".{expected_candidate.name}.bound.")
+        )
+        if is_expected_candidate:
             mode = state.get("candidate_restart_mode", "exact")
             if mode == "wrong-hash":
                 target = Path(os.environ["WRONG_HASH_TARGET"])
@@ -2126,6 +2184,7 @@ else:
             "BWRAP_LOGICAL_PATH": str(self.fake_bin / "bwrap"),
             "EXPECTED_CANDIDATE": str(self.candidate),
             "FIXTURE_BUILD_SOURCE": str(self.build_source),
+            "FIXTURE_ALTERNATE_BUILD_SOURCE": str(self.alternate_build_source),
             "GUARD_TEST_BWRAP_AUTHORITY": str(self.bwrap_authority_config),
             "GUARD_TEST_STATE": str(self.state_path),
             "GUARD_TEST_TOOL_LOG": str(self.tool_log),
@@ -2206,7 +2265,7 @@ else:
         cwd: Path = ROOT,
     ) -> subprocess.CompletedProcess[str]:
         command, env = self._run_arguments(test_only, extra_env)
-        return subprocess.run(
+        result = subprocess.run(
             command,
             cwd=cwd,
             env=env,
@@ -2215,6 +2274,16 @@ else:
             timeout=timeout,
             check=False,
         )
+        if self.service_bin.is_symlink():
+            published = Path(os.readlink(self.service_bin))
+            try:
+                published.relative_to(self.cache_root / "releases")
+            except ValueError:
+                pass
+            else:
+                self.candidate = published
+                self.env["EXPECTED_CANDIDATE"] = str(published)
+        return result
 
     def calls(self) -> str:
         return self.tool_log.read_text() if self.tool_log.exists() else ""

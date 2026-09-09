@@ -456,10 +456,10 @@ class GuardRebuildRecoveryTests(unittest.TestCase):
             state_path = self.transaction_state(fixture)
             self.assertTrue(state_path.exists(), output)
             self.assertEqual(json.loads(state_path.read_text())["phase"], "mutated")
-            self.assertEqual(
-                fixture.reload_state()["running_target"], str(fixture.candidate)
-            )
             blocked = json.loads(state_path.read_text())
+            self.assertEqual(
+                fixture.reload_state()["running_target"], blocked["candidate"]["path"]
+            )
             self.assertEqual(
                 os.readlink(fixture.service_bin), blocked["prior"]["running_link"]
             )

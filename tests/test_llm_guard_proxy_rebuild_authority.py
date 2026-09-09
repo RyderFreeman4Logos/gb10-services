@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -387,6 +388,36 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             self.assertEqual(os.readlink(fixture.service_bin), before)
             self.assertEqual(fixture.reload_state()["restart_calls"], 0)
 
+    def test_last_pre_wal_candidate_replacement_has_no_wal_link_or_restart(self) -> None:
+        with RebuildFixture() as fixture:
+            before = os.readlink(fixture.service_bin)
+            marker = fixture.root / "candidate-pre-wal"
+            resume = fixture.root / "candidate-pre-wal-resume"
+            process = fixture.popen(
+                extra_env={
+                    "LLM_GUARD_REBUILD_TEST_CRASH_POINT": "candidate-pre-wal",
+                    "LLM_GUARD_REBUILD_TEST_CRASH_MARKER": str(marker),
+                    "LLM_GUARD_REBUILD_TEST_RESUME_MARKER": str(resume),
+                }
+            )
+            try:
+                self.assertTrue(_wait_for_path(marker, process), "pre-WAL boundary not reached")
+                os.replace(fixture.wrong_hash, fixture.candidate)
+                resume.touch()
+                stdout, stderr = process.communicate(timeout=20)
+            finally:
+                if process.poll() is None:
+                    _kill_group(process)
+            output = stdout + stderr
+            self.assertNotEqual(process.returncode, 0, output)
+            self.assertIn("candidate executable authority changed", output)
+            self.assertNotIn("test boundary prestate-fsynced", output)
+            self.assertEqual(os.readlink(fixture.service_bin), before)
+            self.assertEqual(fixture.reload_state()["restart_calls"], 0)
+            self.assertFalse(
+                fixture.receipt_dir.joinpath("transaction.v1", "state.json").exists()
+            )
+
     def test_forbidden_tree_and_path_dependency_classes_fail_pre_cutover(self) -> None:
         cases = {
             "symlink": lambda fixture: (fixture.remote / "host-link").symlink_to(
@@ -479,7 +510,7 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                 fixture.remote, "add", "--", str(source.relative_to(fixture.remote))
             )
             self._git(fixture.remote, "commit", "-m", "alternate artifact")
-            false_sha = hashlib.sha256(Path("/usr/bin/false").read_bytes()).hexdigest()
+            false_sha = hashlib.sha256(fixture.alternate_build_source.read_bytes()).hexdigest()
             self.assertNotEqual(false_sha, fixture.binary_sha256)
             fixture.binary_sha256 = false_sha
             self._refresh_fixture_source_identity(fixture)
@@ -508,12 +539,18 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
 
     def test_wrong_candidate_elf_machine_or_loader_fails_before_mutation(self) -> None:
         cases = (
-            ("candidate_elf_machine", "Advanced Micro Devices X86-64", "machine"),
-            ("candidate_elf_interpreter", "/lib64/ld-linux-x86-64.so.2", "interpreter"),
+            ("wrong-machine", "machine"),
+            ("missing-machine", "machine"),
+            ("multiple-machine", "machine"),
+            ("malformed-machine", "machine"),
+            ("wrong-interpreter", "interpreter"),
+            ("missing-interpreter", "interpreter"),
+            ("multiple-interpreter", "interpreter"),
+            ("malformed-interpreter", "interpreter"),
         )
-        for key, value, diagnostic in cases:
-            with self.subTest(key=key), RebuildFixture() as fixture:
-                fixture.set_state(**{key: value})
+        for mode, diagnostic in cases:
+            with self.subTest(mode=mode), RebuildFixture() as fixture:
+                fixture.set_state(candidate_elf_output_mode=mode)
                 before = os.readlink(fixture.service_bin)
                 result = fixture.run()
                 output = result.stdout + result.stderr
@@ -525,6 +562,17 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                     fixture.receipt_dir.joinpath("transaction.v1", "state.json").exists()
                 )
                 fixture.assert_no_backend_lifecycle(self)
+
+    def test_candidate_elf_facts_are_derived_from_passed_bytes(self) -> None:
+        with RebuildFixture() as fixture:
+            before = os.readlink(fixture.service_bin)
+            fixture.set_state(build_source_override="/usr/bin/false")
+            result = fixture.run()
+            output = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("candidate ELF machine differs", output)
+            self.assertEqual(os.readlink(fixture.service_bin), before)
+            self.assertEqual(fixture.reload_state()["restart_calls"], 0)
 
     def test_production_source_pins_native_gb10_aarch64_authority(self) -> None:
         source = ENGINE.read_text()
@@ -952,6 +1000,138 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                 os.close(descriptor)
             for descriptor in reversed(list(held.values())):
                 os.close(descriptor)
+
+    @unittest.skipUnless(
+        os.environ.get("JUST_NO_DOTENV") == "true" and os.uname().machine == "aarch64",
+        "production Cargo sandbox requires a repository Just gate on native GB10 AArch64",
+    )
+    def test_production_cargo_sandbox_runs_pinned_worker_and_emits_aarch64(self) -> None:
+        old_argv = sys.argv[:]
+        old_handlers = {
+            number: signal.getsignal(number)
+            for number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+        }
+        try:
+            sys.argv = [str(ENGINE)]
+            engine = _load(ENGINE, "native_production_cargo_sandbox")
+        finally:
+            sys.argv = old_argv
+            for number, handler in old_handlers.items():
+                signal.signal(number, handler)
+
+        authorities = []
+        source_bundle = None
+        parent, child = socket.socketpair()
+        try:
+            setattr(engine, "operation_deadline", time.monotonic() + 1800)
+            engine._open_all_tools()
+            production_worker = engine._production_tool_specs()["scoped_worker"]
+            self.assertEqual(
+                engine.held_tools["scoped_worker"].identity.sha256,
+                production_worker.sha256,
+            )
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / "source"
+                crate = source / "llm-guard-proxy"
+                (crate / "src").mkdir(parents=True)
+                (crate / "Cargo.toml").write_text(
+                    "[package]\nname='llm-guard-proxy'\nversion='0.0.0'\nedition='2021'\n"
+                    "[features]\nguard=[]\n"
+                )
+                (crate / "src" / "main.rs").write_text("fn main() {}\n")
+                (source / "Cargo.toml").write_text(
+                    "[workspace]\nmembers=['llm-guard-proxy']\nresolver='2'\n"
+                )
+                (source / "Cargo.lock").write_text(
+                    'version = 4\n\n[[package]]\nname = "llm-guard-proxy"\nversion = "0.0.0"\n'
+                )
+                source_bundle = engine.SourceBundle(
+                    root,
+                    source,
+                    engine._open_directory_authority("canonical source", source),
+                    engine._open_directory_authority("sysroot runtime", engine.sysroot_lib),
+                    engine._open_directory_authority("Python stdlib", engine.python_stdlib),
+                    "0" * 64,
+                    "1" * 40,
+                    "2" * 40,
+                    "3" * 64,
+                    "4" * 64,
+                    4,
+                    sum(path.stat().st_size for path in source.glob("**/*") if path.is_file()),
+                )
+                for name, path in (
+                    ("toolchain", engine.toolchain_root),
+                    ("target rustlib", engine.target_rustlib),
+                    ("registry cache", engine.registry_cache),
+                    ("registry index", engine.registry_index),
+                    ("gcc closure", engine.gcc_root),
+                    ("sysroot include", engine.sysroot_include),
+                ):
+                    authorities.append(engine._open_directory_authority(name, path))
+                command, descriptors = engine._cargo_sandbox(
+                    source_bundle,
+                    authorities[0],
+                    authorities[1],
+                    authorities[2],
+                    authorities[3],
+                    authorities[4],
+                    authorities[5],
+                    "build",
+                )
+
+                fence_error = []
+
+                def satisfy_fence() -> None:
+                    try:
+                        self.assertEqual(parent.recv(1), b"R")
+                        parent.sendall(b"G")
+                    except BaseException as error:  # noqa: BLE001 - joined below.
+                        fence_error.append(error)
+
+                fence = threading.Thread(target=satisfy_fence)
+                fence.start()
+                result = subprocess.run(
+                    command,
+                    stdin=child.fileno(),
+                    capture_output=True,
+                    timeout=1800,
+                    pass_fds=tuple(sorted(set(engine._tool_fds() + descriptors))),
+                    env=engine.child_env,
+                )
+                fence.join(timeout=5)
+                self.assertFalse(fence.is_alive())
+                self.assertEqual(fence_error, [])
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                header, payload = engine._decode_frame(
+                    result.stdout, "build", engine.MAX_EXECUTABLE_BYTES
+                )
+                self.assertEqual(header["payload_sha256"], hashlib.sha256(payload).hexdigest())
+                emitted = root / "emitted-llm-guard-proxy"
+                emitted.write_bytes(payload)
+                emitted.chmod(0o755)
+                descriptor = os.open(emitted, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+                try:
+                    self.assertEqual(
+                        engine.candidate_elf_authority(descriptor),
+                        {
+                            "machine": "AArch64",
+                            "interpreter": "/lib/ld-linux-aarch64.so.1",
+                        },
+                    )
+                finally:
+                    os.close(descriptor)
+        finally:
+            child.close()
+            parent.close()
+            if source_bundle is not None:
+                source_bundle.close()
+            for authority in reversed(authorities):
+                authority.close()
+            for held_tool in reversed(list(engine.held_tools.values())):
+                held_tool.close()
+            engine.held_tools.clear()
+            setattr(engine, "operation_deadline", None)
 
 
 class ScopedWorkerGenerationAuthorityTests(unittest.TestCase):

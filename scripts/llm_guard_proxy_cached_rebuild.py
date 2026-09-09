@@ -167,6 +167,7 @@ TEST_OVERRIDES = (
     "LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS",
     "LLM_GUARD_REBUILD_TEST_CRASH_POINT",
     "LLM_GUARD_REBUILD_TEST_CRASH_MARKER",
+    "LLM_GUARD_REBUILD_TEST_RESUME_MARKER",
     "LLM_GUARD_REBUILD_TEST_DELAY_STAGE",
     "LLM_GUARD_REBUILD_TEST_DELAY_SECONDS",
 )
@@ -2763,6 +2764,57 @@ class BuildBundle:
     sandbox_contract_sha256: str
     inputs: dict[str, object]
     authority: FileAuthority
+
+
+def _bind_candidate_namespace(bundle: BuildBundle, budget: HostWriteBudget) -> None:
+    authority = bundle.authority
+    original = bundle.identity
+    parent_fd = budget.held_directory(authority.path.parent)
+    bound = authority.path.with_name(
+        f".{authority.path.name}.bound.{secrets.token_hex(16)}"
+    )
+    try:
+        budget.move_leaf(
+            parent_fd,
+            authority.path.name,
+            parent_fd,
+            bound.name,
+            expected=(original.device, original.inode),
+        )
+    except BaseException as error:
+        raise RebuildError("candidate executable authority changed") from error
+    authority.path = bound
+    authority.fields = _file_fields(os.fstat(authority.descriptor))
+    authority.verify()
+    identity = fd_identity(authority.descriptor)
+    elf = candidate_elf_authority(authority.descriptor)
+    if (
+        (
+            identity.device,
+            identity.inode,
+            identity.size,
+            identity.sha256,
+            identity.build_id,
+            identity.mode,
+            identity.uid,
+            identity.nlink,
+        )
+        != (
+            original.device,
+            original.inode,
+            original.size,
+            original.sha256,
+            original.build_id,
+            original.mode,
+            original.uid,
+            original.nlink,
+        )
+        or elf != bundle.elf
+    ):
+        fail("candidate executable authority changed during namespace binding")
+    bundle.candidate = bound
+    bundle.identity = identity
+    bundle.elf = elf
 
 
 def _containment_contract_sha256() -> str:
@@ -5390,6 +5442,8 @@ def persist_phase(
 
 
 def _test_boundary(name: str) -> None:
+    if test_only:
+        log(f"test boundary {name}")
     if not test_only or os.environ.get("LLM_GUARD_REBUILD_TEST_CRASH_POINT") != name:
         return
     marker_text = os.environ.get("LLM_GUARD_REBUILD_TEST_CRASH_MARKER", "")
@@ -5411,6 +5465,15 @@ def _test_boundary(name: str) -> None:
     finally:
         os.close(descriptor)
     fsync_directory(marker.parent)
+    resume_text = os.environ.get("LLM_GUARD_REBUILD_TEST_RESUME_MARKER", "")
+    if resume_text:
+        if not _safe_absolute(resume_text):
+            fail("test-only resume boundary lacks a safe marker")
+        resume = Path(resume_text)
+        while not resume.exists():
+            _deadline_checkpoint("test-boundary")
+            time.sleep(0.01)
+        return
     while True:
         signal.pause()
 
@@ -5615,7 +5678,11 @@ def restart_guard(
 ) -> tuple[Generation, int]:
     _require_same_manager(wal)
     prove_no_manager_job()
+    if candidate_authority is not None and candidate_authority.path == Path(running_link):
+        candidate_authority.verify()
     _set_restart_intent(wal, budget, True)
+    if candidate_authority is not None and candidate_authority.path == Path(running_link):
+        candidate_authority.verify()
     execute(
         [
             require_tool("systemctl"),
@@ -6311,6 +6378,10 @@ def run_transaction() -> int:
         if rustc_identity_initial != capture_tool("rustc", "-vV"):
             fail("rustc toolchain identity changed before cutover")
         candidate_authority.verify()
+        _test_boundary("candidate-pre-wal")
+        _bind_candidate_namespace(build_bundle, write_budget)
+        candidate = build_bundle.candidate
+        candidate_identity = build_bundle.identity
         if query_manager_generation() != manager_generation:
             fail("user manager generation changed before cutover")
 
@@ -6360,14 +6431,18 @@ def run_transaction() -> int:
             candidate_identity,
             authorities,
         )
+        candidate_authority.verify()
         persist_wal(wal, write_budget, initial=True)
         _test_boundary("prestate-fsynced")
+        candidate_authority.verify()
         persist_phase(wal, "mutated", write_budget)
         _test_boundary("mutated-fsynced")
 
+        candidate_authority.verify()
         if not service_link_matches(str(candidate)):
             set_service_link(str(candidate), write_budget)
         _test_boundary("link-renamed")
+        candidate_authority.verify()
         needs_restart = (
             prestate.executable.device,
             prestate.executable.inode,
