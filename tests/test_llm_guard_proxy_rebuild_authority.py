@@ -663,6 +663,115 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                 receipt["authorities"]["tool_authorities"]["rustc"]["sha256"],
             )
 
+    @unittest.skipUnless(
+        os.uname().machine == "aarch64"
+        and os.environ.get("GB10_NATIVE_AARCH64_REAL_CARGO") == "1",
+        "requires explicit native GB10 AArch64 Cargo selector",
+    )
+    def test_native_aarch64_direct_cargo_build_produces_candidate(self) -> None:
+        marker = "gb10-native-direct-cargo-production-path"
+        with RebuildFixture() as fixture:
+            main = fixture.remote / "llm-guard-proxy" / "src" / "main.rs"
+            main.write_text(f'fn main() {{ println!("{marker}"); }}\n')
+            self._git(fixture.remote, "add", "--", str(main.relative_to(fixture.remote)))
+            self._git(fixture.remote, "commit", "-m", "native Cargo artifact")
+            self._refresh_fixture_source_identity(fixture)
+
+            command, env = fixture._run_arguments(True, None)
+            config = json.loads(fixture.authority_config.read_text())
+            config.update(
+                {
+                    "toolchain_root": "/home/obj/.rustup/toolchains/1.96.0-aarch64-unknown-linux-gnu",
+                    "target_rustlib": "/home/obj/.rustup/toolchains/1.96.0-aarch64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu",
+                    "registry_cache": "/home/obj/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f",
+                    "registry_index": "/home/obj/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f",
+                    "gcc_root": "/usr/lib/gcc/aarch64-linux-gnu/13",
+                    "sysroot_lib": "/usr/lib/aarch64-linux-gnu",
+                    "sysroot_include": "/usr/include",
+                }
+            )
+            real_tools = {
+                "cargo": Path(config["toolchain_root"]) / "bin/cargo",
+                "rustc": Path(config["toolchain_root"]) / "bin/rustc",
+                "cc": Path("/usr/bin/aarch64-linux-gnu-gcc-13"),
+                "ar": Path("/usr/bin/aarch64-linux-gnu-ar"),
+                "readelf": Path("/usr/bin/aarch64-linux-gnu-readelf"),
+            }
+            for name, path in real_tools.items():
+                resolved = path.resolve(strict=True)
+                info = resolved.stat()
+                config["tools"][name] = {
+                    "logical": str(path),
+                    "resolved": str(resolved),
+                    "uid": info.st_uid,
+                    "gid": info.st_gid,
+                    "mode": stat.S_IMODE(info.st_mode),
+                    "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+                }
+            fixture.authority_config.write_text(json.dumps(config, sort_keys=True))
+            fixture.authority_config.chmod(0o600)
+
+            process = subprocess.Popen(
+                command,
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                stdout, stderr = process.communicate(timeout=600)
+            finally:
+                if process.poll() is None:
+                    stdout, stderr = _kill_group(process)
+            output = stdout + stderr
+            self.assertEqual(process.returncode, 0, output)
+
+            receipt = json.loads(fixture.receipt_paths()[0].read_text())
+            candidate = Path(receipt["candidate"]["path"])
+            payload = candidate.read_bytes()
+            self.assertIn(marker.encode(), payload)
+            self.assertEqual(
+                hashlib.sha256(payload).hexdigest(),
+                receipt["candidate"]["identity"]["sha256"],
+            )
+            header = subprocess.run(
+                [str(real_tools["readelf"]), "-hW", str(candidate)],
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout
+            self.assertIn("Machine:", header)
+            self.assertIn("AArch64", header)
+            argv = receipt["authorities"]["build_inputs"]["cargo_argv"]
+            self.assertEqual(
+                argv[:6],
+                [
+                    "build",
+                    "--release",
+                    "--locked",
+                    "--offline",
+                    "--target",
+                    "aarch64-unknown-linux-gnu",
+                ],
+            )
+            self.assertEqual(
+                argv[8:],
+                [
+                    "--package",
+                    "llm-guard-proxy",
+                    "--no-default-features",
+                    "--features",
+                    "guard",
+                ],
+            )
+            self.assertEqual(
+                receipt["authorities"]["tool_authorities"]["cargo"]["resolved_path"],
+                str(real_tools["cargo"].resolve(strict=True)),
+            )
+            fixture.assert_no_backend_lifecycle(self)
+
     def test_direct_cargo_build_is_pinned_and_does_not_need_bwrap(self) -> None:
         source = ENGINE.read_text()
         self.assertNotIn("bwrap", source)
