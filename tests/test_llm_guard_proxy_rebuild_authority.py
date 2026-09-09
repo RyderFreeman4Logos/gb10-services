@@ -144,6 +144,9 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             (usr / "lib" / "libreoffice" / "program").mkdir(parents=True)
             (usr / "share" / "qtchooser").mkdir(parents=True)
             (sysroot / "qt-default" / "qtchooser").mkdir(parents=True)
+            (usr / "lib" / "libreoffice" / "program" / "libuno_sal.so.3").write_text(
+                "uno\\n"
+            )
             (sysroot / "libuno_sal.so.3").symlink_to(
                 "../libreoffice/program/libuno_sal.so.3"
             )
@@ -167,6 +170,116 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                         "unsafe symlink in directory authority: sysroot runtime",
                     ):
                         engine._open_directory_authority("sysroot runtime", sysroot)
+
+    def test_directory_authority_accepts_observed_layouts_and_rejects_unsafe_links(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            usr = root / "usr"
+            gcc = usr / "lib" / "gcc" / "aarch64-linux-gnu" / "13"
+            runtime = usr / "lib" / "aarch64-linux-gnu"
+            include = usr / "include"
+            python = usr / "lib" / "python3.12"
+            (usr / "lib" / "libreoffice" / "program").mkdir(parents=True)
+            (usr / "libexec" / "gcc" / "aarch64-linux-gnu" / "13").mkdir(
+                parents=True
+            )
+            (usr / "share" / "qtchooser").mkdir(parents=True)
+            gcc.mkdir(parents=True)
+            (usr / "lib" / "aarch64-linux-gnu" / "libstdc++.so.6").parent.mkdir(
+                parents=True
+            )
+            (usr / "lib" / "aarch64-linux-gnu" / "libstdc++.so.6").write_text(
+                "libstdc++\\n"
+            )
+            (usr / "lib" / "libreoffice" / "program" / "libuno_sal.so.3").write_text(
+                "uno\\n"
+            )
+            (usr / "libexec" / "gcc" / "aarch64-linux-gnu" / "13" / "plugin.so").write_text(
+                "plugin\\n"
+            )
+            (usr / "share" / "qtchooser" / "qt5-aarch64-linux-gnu.conf").write_text(
+                "qt\\n"
+            )
+            (gcc / "libstdc++.so").symlink_to(
+                "../../../aarch64-linux-gnu/libstdc++.so.6"
+            )
+            (gcc / "liblto_plugin.so").symlink_to(
+                "../../../../libexec/gcc/aarch64-linux-gnu/13/plugin.so"
+            )
+            (include / "curses.h").parent.mkdir(parents=True)
+            (include / "curses.h").write_text("curses\\n")
+            (include / "ncursesw").mkdir()
+            (include / "ncursesw" / "curses.h").symlink_to("../curses.h")
+            runtime.mkdir(parents=True, exist_ok=True)
+            (runtime / "libuno_sal.so.3").symlink_to(
+                "../libreoffice/program/libuno_sal.so.3"
+            )
+            (runtime / "qt-default" / "qtchooser").mkdir(parents=True)
+            (runtime / "qt-default" / "qtchooser" / "default.conf").symlink_to(
+                "../../../../share/qtchooser/qt5-aarch64-linux-gnu.conf"
+            )
+            python.mkdir(parents=True, exist_ok=True)
+            (usr / "lib" / "aarch64-linux-gnu" / "libpython3.12.so.1").write_text(
+                "python\\n"
+            )
+            (python / "config-3.12-aarch64-linux-gnu").mkdir()
+            (
+                python / "config-3.12-aarch64-linux-gnu" / "libpython3.12.so"
+            ).symlink_to("../../aarch64-linux-gnu/libpython3.12.so.1")
+            (python / "sitecustomize.py").symlink_to(
+                "/etc/python3.12/sitecustomize.py"
+            )
+            with patch.object(sys, "argv", [str(ENGINE)]):
+                engine = _load(ENGINE, "directory_authority_symlink_matrix")
+
+            for name, path in (
+                ("gcc closure", gcc),
+                ("sysroot include", include),
+                ("sysroot runtime", runtime),
+                ("Python stdlib", python),
+            ):
+                with self.subTest(legitimate=name):
+                    authority = engine._open_directory_authority(name, path)
+                    authority.close()
+
+            cases = (
+                ("escape", gcc, "../../../../../etc/passwd"),
+                ("dangling", gcc, "missing-target"),
+                ("cycle-a", gcc, "cycle-b"),
+            )
+            (gcc / "cycle-b").symlink_to("cycle-a")
+            for name, path, target in cases:
+                with self.subTest(rejected=name):
+                    link = path / name
+                    link.symlink_to(target)
+                    with self.assertRaisesRegex(
+                        engine.RebuildError,
+                        "unsafe symlink in directory authority: gcc closure",
+                    ):
+                        engine._open_directory_authority(
+                            "gcc closure" if path == gcc else name, path
+                        )
+
+            unsafe_target = usr / "lib" / "aarch64-linux-gnu" / "unsafe.so"
+            unsafe_target.write_text("unsafe\\n")
+            unsafe_target.chmod(0o666)
+            (gcc / "unsafe.so").symlink_to(
+                "../../../aarch64-linux-gnu/unsafe.so"
+            )
+            with self.assertRaisesRegex(
+                engine.RebuildError,
+                "unsafe symlink in directory authority: gcc closure",
+            ):
+                engine._open_directory_authority("gcc closure", gcc)
+
+            gcc.chmod(0o777)
+            with self.assertRaisesRegex(
+                engine.RebuildError,
+                "unsafe directory authority: gcc closure",
+            ):
+                engine._open_directory_authority("gcc closure", gcc)
 
     def test_production_tool_specs_pin_complete_gb10_authority(self) -> None:
         old_handlers = {

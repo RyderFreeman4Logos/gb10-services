@@ -1224,6 +1224,78 @@ class DirectoryAuthority:
         os.close(self.descriptor)
 
 
+_DIRECTORY_AUTHORITY_PARENT_DEPTH = {
+    "gcc closure": 3,
+    "sandbox runtime libraries": 1,
+    "sysroot runtime": 1,
+    "Python stdlib": 1,
+    "sandbox Python standard library": 1,
+}
+_DIRECTORY_AUTHORITY_DANGLING_LINKS = {
+    (
+        "sysroot runtime",
+        "qt-default/qtchooser/default.conf",
+        "../../../../share/qtchooser/qt5-aarch64-linux-gnu.conf",
+    ),
+}
+_DIRECTORY_AUTHORITY_PYTHON_SITE = "/etc/python3.12/sitecustomize.py"
+
+
+def _directory_authority_link_roots(label: str, root_path: Path) -> tuple[Path, ...]:
+    roots = [root_path]
+    depth = _DIRECTORY_AUTHORITY_PARENT_DEPTH.get(label)
+    if depth is not None:
+        roots.append(root_path.parents[depth])
+    if label in {"Python stdlib", "sandbox Python standard library"}:
+        roots.append(Path(root_path.anchor) / "etc" / "python3.12")
+    return tuple(roots)
+
+
+def _verify_directory_authority_symlink(
+    label: str, root_path: Path, relative: str, target: str
+) -> None:
+    roots = _directory_authority_link_roots(label, root_path)
+    link_path = Path(posixpath.join(root_path.as_posix(), relative))
+    current = Path(
+        target
+        if target.startswith("/")
+        else posixpath.normpath(posixpath.join(link_path.parent.as_posix(), target))
+    )
+    seen: set[Path] = set()
+    for _ in range(64):
+        if not any(current == root or root in current.parents for root in roots):
+            fail(f"unsafe symlink in directory authority: {label}")
+        try:
+            info = os.lstat(current)
+        except OSError:
+            if (label, relative, target) in _DIRECTORY_AUTHORITY_DANGLING_LINKS or (
+                label in {"Python stdlib", "sandbox Python standard library"}
+                and relative == "sitecustomize.py"
+                and target == _DIRECTORY_AUTHORITY_PYTHON_SITE
+            ):
+                return
+            fail(f"unsafe symlink in directory authority: {label}")
+        if stat.S_ISLNK(info.st_mode):
+            if current in seen:
+                fail(f"unsafe symlink in directory authority: {label}")
+            seen.add(current)
+            next_target = os.readlink(current)
+            current = Path(
+                next_target
+                if next_target.startswith("/")
+                else posixpath.normpath(
+                    posixpath.join(current.parent.as_posix(), next_target)
+                )
+            )
+            continue
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+            fail(f"unsafe symlink in directory authority: {label}")
+        if info.st_uid not in {0, os.geteuid()} or info.st_mode & 0o022:
+            fail(f"unsafe symlink in directory authority: {label}")
+        return
+    fail(f"unsafe symlink in directory authority: {label}")
+
+
 def _directory_ledger(root_fd: int, label: str, root_path: Path) -> DirectoryLedger:
     content = hashlib.sha256()
     metadata_digest = hashlib.sha256()
@@ -1265,30 +1337,7 @@ def _directory_ledger(root_fd: int, label: str, root_path: Path) -> DirectoryLed
                 continue
             if stat.S_ISLNK(info.st_mode):
                 target = os.readlink(name, dir_fd=directory_fd)
-                parts = PurePosixPath(target).parts
-                authorized_external = label == "sandbox Python standard library" and (
-                    (
-                        relative == "sitecustomize.py"
-                        and target == "/etc/python3.12/sitecustomize.py"
-                    )
-                    or (
-                        relative
-                        == "config-3.12-aarch64-linux-gnu/libpython3.12.so"
-                        and target == "../../aarch64-linux-gnu/libpython3.12.so.1"
-                    )
-                )
-                if label == "sysroot runtime" and not target.startswith("/"):
-                    # Debian's AArch64 sysroot links into bounded siblings under /usr.
-                    link_path = posixpath.join(root_path.as_posix(), relative)
-                    resolved = posixpath.normpath(
-                        posixpath.join(posixpath.dirname(link_path), target)
-                    )
-                    allowed_root = root_path.parent.parent.as_posix()
-                    authorized_external = resolved == allowed_root or resolved.startswith(
-                        f"{allowed_root}/"
-                    )
-                if (target.startswith("/") or ".." in parts) and not authorized_external:
-                    fail(f"unsafe symlink in directory authority: {label}")
+                _verify_directory_authority_symlink(label, root_path, relative, target)
                 content.update(f"L\0{relative}\0{mode:o}\0{target}\n".encode())
                 continue
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
