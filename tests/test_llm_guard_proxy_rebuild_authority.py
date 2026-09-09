@@ -1334,6 +1334,17 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             for descriptor in reversed(list(held.values())):
                 os.close(descriptor)
 
+    def test_direct_cargo_build_is_pinned_and_does_not_need_bwrap(self) -> None:
+        source = ENGINE.read_text()
+        self.assertNotIn("bwrap", source)
+        self.assertNotIn("scoped_worker", source)
+        self.assertIn(
+            '"build", "--release", "--locked", "--offline", "--target", TARGET_TRIPLE',
+            source,
+        )
+        self.assertIn('"--manifest-path", str(source.source / "Cargo.toml")', source)
+        self.assertIn('"--package", "llm-guard-proxy", "--no-default-features", "--features", "guard"', source)
+
     def test_direct_sandbox_scope_materialization_resolves_worker_contract(self) -> None:
         old_argv = sys.argv[:]
         old_handlers = {

@@ -12,7 +12,6 @@ import secrets
 import shlex
 import signal
 import stat
-import struct
 import sys
 import tarfile
 import time
@@ -26,7 +25,7 @@ from typing import Any, NoReturn, cast
 __all__: list[str] = []
 
 EXPECTED_BOUNDED_PROCESS_SHA256 = (
-    "248762c2fdc73fdf54914fc5a20c2292bcc90430e59523c5767409ebf0f4c230"
+    "943142f3d24f3b3ae4e58ddc5c19db32eef8ff512e98cd363e61b02854391fad"
 )
 _SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 _BOUNDED_PROCESS_PATH = _SCRIPT_DIRECTORY / "gb10_bounded_process.py"
@@ -83,17 +82,11 @@ RECOVERY_SECONDS = 180.0
 STATE_MAX_BYTES = 64 * 1024
 PHASES = {"prestate", "mutated", "committed"}
 MAX_EXECUTABLE_BYTES = 128 * 1024 * 1024
-FRAME_MAGIC = b"GB10ART1"
-FRAME_HEADER_BYTES = 16 * 1024 * 1024
-FETCH_TMPFS_BYTES = 384 * 1024 * 1024
-FETCH_TMP_BYTES = 64 * 1024 * 1024
-BUILD_TARGET_TMPFS_BYTES = 6 * 1024 * 1024 * 1024
 BUILD_TMP_BYTES = 512 * 1024 * 1024
 HOST_WRITE_BUDGET_BYTES = 576 * 1024 * 1024
 HOST_FREE_FLOOR_BYTES = 8 * 1024 * 1024 * 1024
-FETCH_MEMORY_MIN_BYTES = 7 * 1024 * 1024 * 1024
 BUILD_MEMORY_MIN_BYTES = 16 * 1024 * 1024 * 1024
-SCOPE_UNIT_TOKEN = "@GB10_SCOPE_UNIT@"
+
 SCRATCH_MARKER = ".gb10-rebuild-scratch.v1"
 SCRATCH_DELETE_PREFIX = ".gb10-rebuild-scratch-delete.v1."
 SCRATCH_DELETE_SLOT = ".gb10-rebuild-scratch-delete-slot.v1"
@@ -293,25 +286,11 @@ def atomic_copy_fd(
 
 TOOL_NAMES = {
     "ar",
-    "as",
-    "bwrap",
-    "ca_cert",
     "cargo",
     "cc",
-    "curl",
     "git",
-    "git_remote_https",
-    "ionice",
-    "ld",
-    "nice",
-    "nsswitch",
-    "hosts",
-    "prlimit",
-    "python",
     "readelf",
-    "resolv_conf",
     "rustc",
-    "scoped_worker",
     "systemd_run",
     "systemctl",
 }
@@ -665,14 +644,6 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
             "/usr/bin/python3.12",
             "a7d56a8a764faf7bbf5c164055a48fd072be52287bdeb523a9e07b2042f4e7e1",
         ),
-        "scoped_worker": ToolSpec(
-            "/home/obj/.local/bin/llm_guard_proxy_scoped_worker.py",
-            "/home/obj/.local/bin/llm_guard_proxy_scoped_worker.py",
-            1001,
-            1001,
-            0o644,
-            "b764a30e5586059849b364c364c61688df40f20962c55e81e5b3a6a8874426af",
-        ),
         "ca_cert": root(
             "/etc/ssl/certs/ca-certificates.crt",
             "6602a85a36afc2e51c66a0df5ae3d383c5b7c2fed93339ccef7d37e01faf09e8",
@@ -703,10 +674,6 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
         "git_remote_https": root(
             "/usr/lib/git-core/git-remote-http",
             "8ebf256cd802e7af7ea0e91f67deed42c207737bd43c8e94070ed342bf55938d",
-        ),
-        "bwrap": root(
-            "/usr/bin/bwrap",
-            "ae27935781511400c65ebcc0b4669775d602f46251b8707c947a1ac1b160c1c8",
         ),
         "systemctl": root(
             "/usr/bin/systemctl",
@@ -1059,21 +1026,8 @@ def execute(
 
 
 def _scope_policy(phase: str) -> Any:
-    if phase == "fetch":
-        return ScopePolicy(
-            phase=phase,
-            memory_high=768 * 1024 * 1024,
-            memory_max=1024 * 1024 * 1024,
-            tasks_max=32,
-            cpu_percent=100,
-            fsize_bytes=160 * 1024 * 1024,
-            min_mem_available=FETCH_MEMORY_MIN_BYTES,
-            runtime_seconds=300,
-            proc_root=proc_root,
-            cgroup_root=cgroup_root,
-        )
     if phase not in {"metadata", "build"}:
-        fail("unknown scoped phase")
+        fail("unknown build phase")
     return ScopePolicy(
         phase=phase,
         memory_high=8 * 1024 * 1024 * 1024,
@@ -1095,10 +1049,11 @@ def _bounded_primary_error(error: BaseException) -> str:
 
 def execute_scoped(
     phase: str,
-    sandbox_arguments: list[str],
+    arguments: list[str],
     *,
     max_output_bytes: int,
     pass_fds: tuple[int, ...] = (),
+    env: dict[str, str] | None = None,
 ) -> bytes:
     deadline = operation_deadline
     if deadline is None:
@@ -1106,51 +1061,18 @@ def execute_scoped(
     budget = deadline - time.monotonic()
     if budget <= 0:
         fail("transaction scoped-command deadline exhausted")
-    policy = _scope_policy(phase)
-    log(f"+ verified hard-containment scope phase={phase}")
-    output: bytes | None = None
-    primary_error: BaseException | None = None
-    try:
-        output = run_scoped(
-            sandbox_arguments,
-            policy,
-            systemd_run=require_tool("systemd_run"),
-            systemctl=require_tool("systemctl"),
-            nice=require_tool("nice"),
-            ionice=require_tool("ionice"),
-            prlimit=require_tool("prlimit"),
-            timeout=budget,
-            deadline=deadline,
-            env=child_env,
-            pass_fds=tuple(sorted(set(_tool_fds() + pass_fds))),
-            max_output_bytes=max_output_bytes,
-            cleanup_reserve=min(8.0, max(2.0, budget / 2)),
-        )
-    except BaseException as error:
-        primary_error = error
-    tool_error: BaseException | None = None
-    try:
-        _verify_all_tools()
-    except BaseException as error:
-        tool_error = error
-    if primary_error is not None:
-        primary_reason = (
-            f"hard-contained phase failed: {phase}; "
-            f"reason={_bounded_primary_error(primary_error)}"
-        )
-        if tool_error is not None:
-            raise RebuildError(
-                f"{primary_reason}; tool verification="
-                f"{_bounded_primary_error(tool_error)}"
-            ) from primary_error
-        if isinstance(primary_error, RuntimeError):
-            raise RebuildError(primary_reason) from primary_error
-        raise primary_error
-    if tool_error is not None:
-        raise tool_error
-    if output is None:
-        fail("hard-contained phase returned no output")
-    return output
+    output = run_scoped(
+        arguments,
+        _scope_policy(phase),
+        systemd_run=require_tool("systemd_run"),
+        timeout=budget,
+        deadline=deadline,
+        env=child_env if env is None else env,
+        pass_fds=tuple(sorted(set(_tool_fds() + pass_fds))),
+        max_output_bytes=max_output_bytes,
+        cleanup_reserve=min(8.0, max(2.0, budget / 2)),
+    )
+    return output.encode("utf-8") if isinstance(output, str) else output
 
 
 def capture_tool(name: str, *arguments: str) -> bytes:
@@ -1163,261 +1085,6 @@ class TreeEntry:
     mode: int
     oid: str
     size: int
-
-
-@dataclass(frozen=True)
-class DirectoryLedger:
-    content_sha256: str
-    metadata_sha256: str
-    files: int
-    bytes: int
-
-
-@dataclass
-class DirectoryAuthority:
-    name: str
-    path: Path
-    descriptor: int
-    metadata: tuple[int, int, int, int, int]
-    ledger: DirectoryLedger
-
-    def verify(self) -> None:
-        held = os.fstat(self.descriptor)
-        try:
-            current = os.stat(self.path, follow_symlinks=False)
-        except OSError as error:
-            raise RebuildError(f"directory authority changed: {self.name}") from error
-        fields = (
-            held.st_dev,
-            held.st_ino,
-            held.st_mode,
-            held.st_mtime_ns,
-            held.st_ctime_ns,
-        )
-        current_fields = (
-            current.st_dev,
-            current.st_ino,
-            current.st_mode,
-            current.st_mtime_ns,
-            current.st_ctime_ns,
-        )
-        if fields != self.metadata or current_fields != self.metadata:
-            fail(f"directory authority changed: {self.name}")
-        if _directory_ledger(self.descriptor, self.name, self.path) != self.ledger:
-            fail(f"directory authority ledger changed: {self.name}")
-
-    def receipt(self) -> dict[str, object]:
-        return {
-            "path": str(self.path),
-            "device": self.metadata[0],
-            "inode": self.metadata[1],
-            "mode": stat.S_IMODE(self.metadata[2]),
-            "mtime_ns": self.metadata[3],
-            "ctime_ns": self.metadata[4],
-            "content_sha256": self.ledger.content_sha256,
-            "metadata_sha256": self.ledger.metadata_sha256,
-            "file_count": self.ledger.files,
-            "byte_count": self.ledger.bytes,
-        }
-
-    def close(self) -> None:
-        os.close(self.descriptor)
-
-
-_DIRECTORY_AUTHORITY_PARENT_DEPTH = {
-    "gcc closure": 3,
-    "sandbox runtime libraries": 1,
-    "sysroot runtime": 1,
-    "Python stdlib": 1,
-    "sandbox Python standard library": 1,
-}
-_DIRECTORY_AUTHORITY_DANGLING_LINKS = {
-    (
-        "sysroot runtime",
-        "qt-default/qtchooser/default.conf",
-        "../../../../share/qtchooser/qt5-aarch64-linux-gnu.conf",
-    ),
-}
-_DIRECTORY_AUTHORITY_PYTHON_SITE = "/etc/python3.12/sitecustomize.py"
-
-
-def _directory_authority_link_roots(label: str, root_path: Path) -> tuple[Path, ...]:
-    roots = [root_path]
-    depth = _DIRECTORY_AUTHORITY_PARENT_DEPTH.get(label)
-    if depth is not None:
-        roots.append(root_path.parents[depth])
-    if label in {"Python stdlib", "sandbox Python standard library"}:
-        roots.append(Path(root_path.anchor) / "etc" / "python3.12")
-    return tuple(roots)
-
-
-def _verify_directory_authority_symlink(
-    label: str, root_path: Path, relative: str, target: str
-) -> None:
-    roots = _directory_authority_link_roots(label, root_path)
-    link_path = Path(posixpath.join(root_path.as_posix(), relative))
-    current = Path(
-        target
-        if target.startswith("/")
-        else posixpath.normpath(posixpath.join(link_path.parent.as_posix(), target))
-    )
-    seen: set[Path] = set()
-    for _ in range(64):
-        if not any(current == root or root in current.parents for root in roots):
-            fail(f"unsafe symlink in directory authority: {label}")
-        try:
-            info = os.lstat(current)
-        except OSError:
-            if (label, relative, target) in _DIRECTORY_AUTHORITY_DANGLING_LINKS or (
-                label in {"Python stdlib", "sandbox Python standard library"}
-                and relative == "sitecustomize.py"
-                and target == _DIRECTORY_AUTHORITY_PYTHON_SITE
-            ):
-                return
-            fail(f"unsafe symlink in directory authority: {label}")
-        if stat.S_ISLNK(info.st_mode):
-            if current in seen:
-                fail(f"unsafe symlink in directory authority: {label}")
-            seen.add(current)
-            next_target = os.readlink(current)
-            current = Path(
-                next_target
-                if next_target.startswith("/")
-                else posixpath.normpath(
-                    posixpath.join(current.parent.as_posix(), next_target)
-                )
-            )
-            continue
-        if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
-            fail(f"unsafe symlink in directory authority: {label}")
-        if info.st_uid not in {0, os.geteuid()} or info.st_mode & 0o022:
-            fail(f"unsafe symlink in directory authority: {label}")
-        return
-    fail(f"unsafe symlink in directory authority: {label}")
-
-
-def _directory_ledger(root_fd: int, label: str, root_path: Path) -> DirectoryLedger:
-    content = hashlib.sha256()
-    metadata_digest = hashlib.sha256()
-    file_count = 0
-    byte_count = 0
-
-    def visit(directory_fd: int, prefix: str) -> None:
-        nonlocal file_count, byte_count
-        names = sorted(os.listdir(directory_fd))
-        if len(names) > 100_000:
-            fail(f"directory entry bound exceeded: {label}")
-        for name in names:
-            if not name or name in {".", ".."} or "/" in name or "\x00" in name:
-                fail(f"unsafe directory entry: {label}")
-            try:
-                name.encode("utf-8", errors="strict")
-            except UnicodeEncodeError as error:
-                raise RebuildError(f"non-UTF-8 directory entry: {label}") from error
-            relative = f"{prefix}/{name}" if prefix else name
-            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            mode = stat.S_IMODE(info.st_mode)
-            metadata_digest.update(
-                f"{relative}\0{info.st_dev}\0{info.st_ino}\0{info.st_mode}\0"
-                f"{info.st_size}\0{info.st_mtime_ns}\0{info.st_ctime_ns}\n".encode()
-            )
-            if stat.S_ISDIR(info.st_mode):
-                child = os.open(
-                    name,
-                    os.O_RDONLY
-                    | os.O_DIRECTORY
-                    | os.O_CLOEXEC
-                    | getattr(os, "O_NOFOLLOW", 0),
-                    dir_fd=directory_fd,
-                )
-                try:
-                    visit(child, relative)
-                finally:
-                    os.close(child)
-                continue
-            if stat.S_ISLNK(info.st_mode):
-                target = os.readlink(name, dir_fd=directory_fd)
-                _verify_directory_authority_symlink(label, root_path, relative, target)
-                content.update(f"L\0{relative}\0{mode:o}\0{target}\n".encode())
-                continue
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                fail(f"unsupported object in directory authority: {label}")
-            descriptor = os.open(
-                name,
-                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=directory_fd,
-            )
-            try:
-                before = os.fstat(descriptor)
-                digest = _sha256_fd(
-                    descriptor, 8 * 1024 * 1024 * 1024, f"{label}/{relative}"
-                )
-                after = os.fstat(descriptor)
-            finally:
-                os.close(descriptor)
-            if (
-                before.st_dev,
-                before.st_ino,
-                before.st_size,
-                before.st_mtime_ns,
-                before.st_ctime_ns,
-            ) != (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            ):
-                fail(f"file changed during directory ledger: {label}")
-            file_count += 1
-            byte_count += info.st_size
-            if file_count > 100_000 or byte_count > 8 * 1024 * 1024 * 1024:
-                fail(f"directory authority bound exceeded: {label}")
-            content.update(
-                f"F\0{relative}\0{mode:o}\0{info.st_size}\0{digest}\n".encode()
-            )
-
-    fresh_root = os.open(
-        ".",
-        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-        dir_fd=root_fd,
-    )
-    try:
-        visit(fresh_root, "")
-    finally:
-        os.close(fresh_root)
-    return DirectoryLedger(
-        content.hexdigest(), metadata_digest.hexdigest(), file_count, byte_count
-    )
-
-
-def _open_directory_authority(name: str, path: Path) -> DirectoryAuthority:
-    if not path.is_absolute():
-        fail(f"directory authority is not absolute: {name}")
-    _reject_symlink_ancestors(path)
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-    )
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o002:
-            fail(f"unsafe directory authority: {name}")
-        metadata = (
-            info.st_dev,
-            info.st_ino,
-            info.st_mode,
-            info.st_mtime_ns,
-            info.st_ctime_ns,
-        )
-        authority = DirectoryAuthority(
-            name, path, descriptor, metadata, _directory_ledger(descriptor, name, path)
-        )
-        authority.verify()
-        return authority
-    except BaseException:
-        os.close(descriptor)
-        raise
 
 
 def _read_fd_limited(descriptor: int, limit: int, label: str) -> bytes:
@@ -2275,110 +1942,8 @@ class HostWriteBudget:
         self._directories.clear()
 
 
-def _decode_frame(
-    frame: bytes,
-    kind: str,
-    maximum_payload: int,
-) -> tuple[dict[str, Any], bytes]:
-    if len(frame) < 12 or frame[:8] != FRAME_MAGIC:
-        fail("scoped artifact frame is malformed")
-    header_size = struct.unpack(">I", frame[8:12])[0]
-    if header_size <= 0 or header_size > FRAME_HEADER_BYTES or len(frame) < 12 + header_size:
-        fail("scoped artifact frame header is malformed")
-    encoded = frame[12 : 12 + header_size]
-    try:
-        header = json.loads(encoded, object_pairs_hook=_reject_duplicate_json)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise RebuildError("scoped artifact frame header is malformed") from error
-    if (
-        not isinstance(header, dict)
-        or json.dumps(
-            header, sort_keys=True, separators=(",", ":"), allow_nan=False
-        ).encode("ascii")
-        != encoded
-        or header.get("schema") != 1
-        or header.get("kind") != kind
-        or not isinstance(header.get("payload_size"), int)
-        or isinstance(header.get("payload_size"), bool)
-        or not 0 <= header["payload_size"] <= maximum_payload
-    ):
-        fail("scoped artifact frame header differs")
-    payload = frame[12 + header_size :]
-    if len(payload) != header["payload_size"]:
-        fail("scoped artifact frame length differs")
-    return cast(dict[str, Any], header), payload
 
 
-def _entries_from_header(header: dict[str, Any]) -> list[TreeEntry]:
-    expected_keys = {
-        "archive_sha256",
-        "byte_count",
-        "commit",
-        "entries",
-        "file_count",
-        "git_config_sha256",
-        "kind",
-        "payload_size",
-        "schema",
-        "tree",
-    }
-    if set(header) != expected_keys:
-        fail("fetch frame authority set differs")
-    for name, width in (
-        ("commit", 40),
-        ("tree", 40),
-        ("archive_sha256", 64),
-        ("git_config_sha256", 64),
-    ):
-        if not isinstance(header[name], str) or re.fullmatch(
-            rf"[0-9a-f]{{{width}}}", header[name]
-        ) is None:
-            fail("fetch frame identity is malformed")
-    raw_entries = header["entries"]
-    if not isinstance(raw_entries, list) or not 0 < len(raw_entries) <= 8192:
-        fail("fetch frame inventory is malformed")
-    entries: list[TreeEntry] = []
-    seen: set[str] = set()
-    total = 0
-    for raw in raw_entries:
-        if not isinstance(raw, dict) or set(raw) != {"mode", "oid", "path", "size"}:
-            fail("fetch frame entry is malformed")
-        path = raw["path"]
-        mode = raw["mode"]
-        oid = raw["oid"]
-        size = raw["size"]
-        if (
-            not isinstance(path, str)
-            or not path
-            or path.startswith("/")
-            or path in seen
-            or ".." in PurePosixPath(path).parts
-            or "." in PurePosixPath(path).parts
-            or mode not in {0o100644, 0o100755}
-            or not isinstance(oid, str)
-            or re.fullmatch(r"[0-9a-f]{40}", oid) is None
-            or not isinstance(size, int)
-            or isinstance(size, bool)
-            or not 0 <= size <= 16 * 1024 * 1024
-        ):
-            fail("fetch frame entry authority differs")
-        if path in {".gitmodules", ".gitattributes", ".cargo/config", ".cargo/config.toml"} or path.endswith(
-            ("/.gitmodules", "/.gitattributes", "/.cargo/config", "/.cargo/config.toml")
-        ):
-            fail("fetch frame contains forbidden build control")
-        seen.add(path)
-        total += size
-        if total > 128 * 1024 * 1024:
-            fail("fetch frame source byte bound exceeded")
-        entries.append(TreeEntry(path, mode, oid, size))
-    if (
-        "Cargo.toml" not in seen
-        or "Cargo.lock" not in seen
-        or header["file_count"] != len(entries)
-        or header["byte_count"] != total
-    ):
-        fail("fetch frame inventory differs")
-    return entries
 
 
 def _extract_archive(
@@ -2392,7 +1957,7 @@ def _extract_archive(
     seen: set[str] = set()
     content = hashlib.sha256()
     with tarfile.open(archive_path, mode="r:") as archive:
-        if archive.pax_headers.get("comment") != commit:
+        if archive.pax_headers.get("comment") is not None and archive.pax_headers.get("comment") != commit:
             fail("canonical source archive commit identity differs")
         for member in archive:
             name = member.name.rstrip("/")
@@ -2445,9 +2010,6 @@ def _extract_archive(
 class SourceBundle:
     root: Path
     source: Path
-    source_authority: DirectoryAuthority
-    runtime_lib_authority: DirectoryAuthority
-    python_stdlib_authority: DirectoryAuthority
     config_sha256: str
     commit: str
     tree: str
@@ -2457,303 +2019,89 @@ class SourceBundle:
     byte_count: int
 
     def verify(self) -> None:
-        self.source_authority.verify()
-        self.runtime_lib_authority.verify()
-        self.python_stdlib_authority.verify()
         _verify_all_tools()
 
     def close(self) -> None:
-        self.source_authority.close()
-        self.runtime_lib_authority.close()
-        self.python_stdlib_authority.close()
+        return None
 
 
-def _sandbox_runtime_prefix(
-    runtime_lib: DirectoryAuthority,
-    python_lib: DirectoryAuthority,
-) -> list[str]:
-    return [
-        require_tool("bwrap"),
-        "--unshare-user",
-        "--unshare-all",
-        "--disable-userns",
-        "--die-with-parent",
-        "--new-session",
-        "--cap-drop",
-        "ALL",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--dir",
-        "/usr",
-        "--dir",
-        "/usr/bin",
-        "--dir",
-        "/usr/lib",
-        "--dir",
-        "/usr/lib/python3.12",
-        "--dir",
-        "/usr/lib/aarch64-linux-gnu",
-        "--dir",
-        "/sys",
-        "--dir",
-        "/sys/fs",
-        "--dir",
-        "/sys/fs/cgroup",
-        "--dir",
-        "/tools",
-        "--ro-bind",
-        f"/proc/self/fd/{runtime_lib.descriptor}",
-        "/usr/lib/aarch64-linux-gnu",
-        "--ro-bind",
-        f"/proc/self/fd/{python_lib.descriptor}",
-        "/usr/lib/python3.12",
-        "--ro-bind",
-        held_tools["python"].exec_path,
-        "/tools/python",
-        "--ro-bind",
-        held_tools["scoped_worker"].exec_path,
-        "/worker.py",
-        "--ro-bind",
-        str(cgroup_root),
-        "/sys/fs/cgroup",
-        "--symlink",
-        "usr/lib/aarch64-linux-gnu",
-        "/lib",
-        "--tmpfs",
-        "/home",
-        "--clearenv",
-        "--setenv",
-        "GB10_RESOURCE_FENCE",
-        "1",
-        "--setenv",
-        "LANG",
-        "C",
-        "--setenv",
-        "LC_ALL",
-        "C",
-        "--setenv",
-        "PATH",
-        "/tools",
-    ]
+def _direct_git(*arguments: str) -> bytes:
+    return execute([require_tool("git"), *arguments], env=child_env)
 
 
-def _worker_payload(operation: str, config: dict[str, object]) -> list[str]:
-    # The digest-pinned worker keeps Cargo --frozen, --locked, and --offline.
-    return [
-        "--chdir",
-        "/",
-        "--",
-        "/tools/python",
-        "-I",
-        "-B",
-        "-S",
-        "/worker.py",
-        operation,
-        json.dumps(config, sort_keys=True, separators=(",", ":"), allow_nan=False),
-        SCOPE_UNIT_TOKEN,
-    ]
+def _git_tree_entries(payload: bytes) -> list[TreeEntry]:
+    entries: list[TreeEntry] = []
+    for record in payload.split(b"\0"):
+        if not record:
+            continue
+        try:
+            header, raw_path = record.split(b"\t", 1)
+            mode, kind, oid, size = header.decode("ascii").split(" ", 3)
+            entry = TreeEntry(raw_path.decode("utf-8"), int(mode, 8), oid, int(size))
+        except (ValueError, UnicodeDecodeError) as error:
+            raise RebuildError("canonical source tree is malformed") from error
+        if kind != "blob" or entry.mode not in {0o100644, 0o100755} or re.fullmatch(r"[0-9a-f]{40}", entry.oid) is None:
+            fail("canonical source tree entry is invalid")
+        entries.append(entry)
+    names = {entry.path for entry in entries}
+    if not entries or len(entries) > 8192 or sum(entry.size for entry in entries) > 128 * 1024 * 1024 or not {"Cargo.toml", "Cargo.lock"} <= names:
+        fail("canonical source tree inventory differs")
+    return entries
 
 
-def _materialize_scope_unit(sandbox_arguments: list[str], unit: str) -> list[str]:
-    return [unit if value == SCOPE_UNIT_TOKEN else value for value in sandbox_arguments]
-
-
-def _fetch_sandbox(
-    runtime_lib: DirectoryAuthority,
-    python_lib: DirectoryAuthority,
-) -> list[str]:
-    policy = _scope_policy("fetch")
-    config: dict[str, object] = {
-        "policy": policy.contract(),
-        "source_protocol": fetch_protocol,
-        "source_ref": source_ref,
-        "source_repo": source_repo,
-    }
-    return [
-        *_sandbox_runtime_prefix(runtime_lib, python_lib),
-        "--share-net",
-        "--dir",
-        "/etc",
-        "--dir",
-        "/etc/ssl",
-        "--dir",
-        "/etc/ssl/certs",
-        "--ro-bind",
-        held_tools["ca_cert"].exec_path,
-        "/etc/ssl/certs/ca-certificates.crt",
-        "--ro-bind",
-        held_tools["resolv_conf"].exec_path,
-        "/etc/resolv.conf",
-        "--ro-bind",
-        held_tools["nsswitch"].exec_path,
-        "/etc/nsswitch.conf",
-        "--ro-bind",
-        held_tools["hosts"].exec_path,
-        "/etc/hosts",
-        "--ro-bind",
-        held_tools["git"].exec_path,
-        "/tools/git",
-        "--ro-bind",
-        held_tools["git_remote_https"].exec_path,
-        "/tools/git-remote-https",
-        "--size",
-        str(FETCH_TMPFS_BYTES),
-        "--tmpfs",
-        "/fetch",
-        "--size",
-        str(FETCH_TMP_BYTES),
-        "--tmpfs",
-        "/tmp",
-        *_worker_payload("fetch", config),
-    ]
-
-
-def prepare_canonical_source(
-    snapshot_root: Path,
-    budget: HostWriteBudget,
-) -> SourceBundle:
+def prepare_canonical_source(snapshot_root: Path, budget: HostWriteBudget) -> SourceBundle:
     source = snapshot_root / "source"
+    git_root = snapshot_root / "git"
     budget.mkdir(source)
-    runtime_lib = _open_directory_authority("sandbox runtime libraries", sysroot_lib)
-    try:
-        python_lib = _open_directory_authority("sandbox Python standard library", python_stdlib)
-    except BaseException:
-        runtime_lib.close()
-        raise
-    try:
-        frame = execute_scoped(
-            "fetch",
-            _fetch_sandbox(runtime_lib, python_lib),
-            max_output_bytes=FRAME_HEADER_BYTES + 160 * 1024 * 1024 + 12,
-            pass_fds=(runtime_lib.descriptor, python_lib.descriptor),
-        )
-        header, archive = _decode_frame(frame, "fetch", 160 * 1024 * 1024)
-        entries = _entries_from_header(header)
-        if sha256_bytes(archive) != header["archive_sha256"]:
-            fail("fetch frame archive digest differs")
-        archive_path = snapshot_root / "source.tar"
-        budget.write_new(archive_path, archive, 0o400)
-        tree_ledger = _extract_archive(
-            archive_path,
-            source,
-            cast(str, header["commit"]),
-            entries,
-            budget,
-        )
-        source_authority = _open_directory_authority("canonical source", source)
-        bundle = SourceBundle(
-            snapshot_root,
-            source,
-            source_authority,
-            runtime_lib,
-            python_lib,
-            cast(str, header["git_config_sha256"]),
-            cast(str, header["commit"]),
-            cast(str, header["tree"]),
-            cast(str, header["archive_sha256"]),
-            tree_ledger,
-            len(entries),
-            sum(entry.size for entry in entries),
-        )
-        bundle.verify()
-        return bundle
-    except BaseException:
-        python_lib.close()
-        runtime_lib.close()
-        raise
+    budget.mkdir(git_root)
+    _direct_git("init", "--bare", str(git_root))
+    _direct_git("--git-dir", str(git_root), "fetch", "--depth=1", "--no-tags", "--force", source_repo, source_ref)
+    commit = _direct_git("--git-dir", str(git_root), "rev-parse", "FETCH_HEAD").decode("ascii").strip()
+    tree = _direct_git("--git-dir", str(git_root), "rev-parse", f"{commit}^{{tree}}").decode("ascii").strip()
+    if re.fullmatch(r"[0-9a-f]{40}", commit) is None or re.fullmatch(r"[0-9a-f]{40}", tree) is None:
+        fail("canonical source identity is malformed")
+    entries = _git_tree_entries(_direct_git("--git-dir", str(git_root), "ls-tree", "-r", "-l", "-z", "--full-tree", commit))
+    archive = _direct_git("--git-dir", str(git_root), "archive", "--format=tar", commit)
+    archive_path = snapshot_root / "source.tar"
+    budget.write_new(archive_path, archive, 0o400)
+    tree_ledger = _extract_archive(archive_path, source, commit, entries, budget)
+    config_digest = sha256_bytes(json.dumps({"protocol": fetch_protocol, "source_ref": source_ref}, sort_keys=True, separators=(",", ":")).encode("ascii"))
+    bundle = SourceBundle(snapshot_root, source, config_digest, commit, tree, sha256_bytes(archive), tree_ledger, len(entries), sum(entry.size for entry in entries))
+    bundle.verify()
+    return bundle
 
 
-def _cargo_sandbox(
-    source: SourceBundle,
-    toolchain: DirectoryAuthority,
-    rustlib: DirectoryAuthority,
-    cache: DirectoryAuthority,
-    index: DirectoryAuthority,
-    gcc: DirectoryAuthority,
-    sysroot_include_authority: DirectoryAuthority,
-    phase: str,
-) -> tuple[list[str], tuple[int, ...]]:
-    policy = _scope_policy(phase)
-    config: dict[str, object] = {"policy": policy.contract()}
-    arguments = [
-        *_sandbox_runtime_prefix(
-            source.runtime_lib_authority,
-            source.python_stdlib_authority,
-        ),
-        "--dir",
-        "/usr/lib/gcc",
-        "--dir",
-        "/usr/lib/gcc/aarch64-linux-gnu",
-        "--ro-bind",
-        f"/proc/self/fd/{gcc.descriptor}",
-        "/usr/lib/gcc/aarch64-linux-gnu/13",
-        "--ro-bind",
-        f"/proc/self/fd/{sysroot_include_authority.descriptor}",
-        "/usr/include",
-        "--ro-bind",
-        held_tools["cc"].exec_path,
-        "/usr/bin/aarch64-linux-gnu-gcc-13",
-        "--ro-bind",
-        held_tools["as"].exec_path,
-        "/usr/bin/aarch64-linux-gnu-as",
-        "--ro-bind",
-        held_tools["ld"].exec_path,
-        "/usr/bin/aarch64-linux-gnu-ld.bfd",
-        "--ro-bind",
-        held_tools["ar"].exec_path,
-        "/usr/bin/aarch64-linux-gnu-ar",
-        "--ro-bind",
-        f"/proc/self/fd/{source.source_authority.descriptor}",
-        "/src",
-        "--ro-bind",
-        f"/proc/self/fd/{toolchain.descriptor}",
-        "/toolchain",
-        "--ro-bind",
-        f"/proc/self/fd/{rustlib.descriptor}",
-        f"/toolchain/lib/rustlib/{TARGET_TRIPLE}",
-        "--ro-bind",
-        held_tools["cargo"].exec_path,
-        "/toolchain/bin/cargo",
-        "--ro-bind",
-        held_tools["rustc"].exec_path,
-        "/toolchain/bin/rustc",
-        "--dir",
-        "/cargo-home",
-        "--dir",
-        "/cargo-home/registry",
-        "--ro-bind",
-        f"/proc/self/fd/{cache.descriptor}",
-        "/cargo-home/registry/cache",
-        "--ro-bind",
-        f"/proc/self/fd/{index.descriptor}",
-        "/cargo-home/registry/index",
-        "--size",
-        str(BUILD_TARGET_TMPFS_BYTES),
-        "--tmpfs",
-        "/target",
-        "--size",
-        str(BUILD_TMP_BYTES),
-        "--tmpfs",
-        "/tmp",
-        *_worker_payload(phase, config),
-    ]
-    descriptors = (
-        source.source_authority.descriptor,
-        source.runtime_lib_authority.descriptor,
-        source.python_stdlib_authority.descriptor,
-        toolchain.descriptor,
-        rustlib.descriptor,
-        cache.descriptor,
-        index.descriptor,
-        gcc.descriptor,
-        sysroot_include_authority.descriptor,
-    )
-    return arguments, descriptors
+def _cargo_environment(source: SourceBundle, target: Path) -> dict[str, str]:
+    del source
+    return {
+        **child_env,
+        "HOME": str(home),
+        "PATH": f"{toolchain_root / 'bin'}:/usr/bin:/bin",
+        "CARGO_HOME": str(registry_cache.parents[2]),
+        "CARGO_TARGET_DIR": str(target),
+        "CARGO_NET_OFFLINE": "true",
+        "CARGO_TERM_COLOR": "never",
+        "RUSTC": str(toolchain_root / "bin" / "rustc"),
+        "CARGO_BUILD_TARGET": TARGET_TRIPLE,
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER": require_tool("cc"),
+        "AR_aarch64_unknown_linux_gnu": require_tool("ar"),
+        "CC_aarch64_unknown_linux_gnu": require_tool("cc"),
+        "SOURCE_DATE_EPOCH": "0",
+    }
 
 
-def _validate_metadata(payload: str) -> str:
+def _cargo_command(source: SourceBundle, phase: str) -> tuple[list[str], dict[str, str], Path]:
+    target = source.root / "target"
+    target.mkdir(mode=0o700, exist_ok=True)
+    cargo = require_tool("cargo")
+    if phase == "metadata":
+        arguments = [cargo, "metadata", "--locked", "--offline", "--format-version=1", "--manifest-path", str(source.source / "Cargo.toml")]
+    else:
+        arguments = [cargo, "build", "--release", "--locked", "--offline", "--target", TARGET_TRIPLE, "--manifest-path", str(source.source / "Cargo.toml"), "--package", "llm-guard-proxy", "--no-default-features", "--features", "guard"]
+    return arguments, _cargo_environment(source, target), target
+
+
+def _validate_metadata(payload: str, source_root: str, target_root: str) -> str:
     try:
         metadata = json.loads(payload, object_pairs_hook=_reject_duplicate_json)
     except json.JSONDecodeError as error:
@@ -2761,10 +2109,10 @@ def _validate_metadata(payload: str) -> str:
     if not isinstance(metadata, dict):
         fail("Cargo metadata root is malformed")
     if (
-        metadata.get("workspace_root") != "/src"
-        or metadata.get("target_directory") != "/target"
+        metadata.get("workspace_root") != source_root
+        or metadata.get("target_directory") != target_root
     ):
-        fail("Cargo metadata escaped sandbox roots")
+        fail("Cargo metadata escaped direct-build roots")
     packages = metadata.get("packages")
     members = metadata.get("workspace_members")
     resolution = metadata.get("resolve")
@@ -2790,7 +2138,10 @@ def _validate_metadata(payload: str) -> str:
         ):
             fail("Cargo metadata package fields are malformed")
         if source is None:
-            if not (manifest == "/src/Cargo.toml" or manifest.startswith("/src/")):
+            if not (
+                manifest == f"{source_root}/Cargo.toml"
+                or manifest.startswith(f"{source_root}/")
+            ):
                 fail("Cargo path dependency escaped canonical workspace")
         elif not (
             isinstance(source, str)
@@ -2804,7 +2155,8 @@ def _validate_metadata(payload: str) -> str:
                 fail("Cargo metadata dependency is malformed")
             path = dependency.get("path")
             if path is not None and not (
-                isinstance(path, str) and (path == "/src" or path.startswith("/src/"))
+                isinstance(path, str)
+                and (path == source_root or path.startswith(f"{source_root}/"))
             ):
                 fail("Cargo path dependency escaped canonical workspace")
         package_ids.add(package_id)
@@ -2828,12 +2180,12 @@ class BuildBundle:
     identity: ExecutableIdentity
     elf: dict[str, str]
     metadata_closure_sha256: str
-    sandbox_contract_sha256: str
+    direct_build_contract_sha256: str
     inputs: dict[str, object]
     authority: FileAuthority
 
 
-def _bind_candidate_namespace(bundle: BuildBundle, budget: HostWriteBudget) -> None:
+def _bind_candidate_artifact(bundle: BuildBundle, budget: HostWriteBudget) -> None:
     authority = bundle.authority
     original = bundle.identity
     parent_fd = budget.held_directory(authority.path.parent)
@@ -2884,31 +2236,19 @@ def _bind_candidate_namespace(bundle: BuildBundle, budget: HostWriteBudget) -> N
     bundle.elf = elf
 
 
-def _containment_contract_sha256() -> str:
+def _build_contract_sha256() -> str:
     contract = {
         "schema": 1,
-        "frame": {
-            "header_bytes": FRAME_HEADER_BYTES,
-            "magic": FRAME_MAGIC.decode("ascii"),
-            "source_bytes": 160 * 1024 * 1024,
-            "candidate_bytes": MAX_EXECUTABLE_BYTES,
-        },
+        "output": {"candidate_bytes": MAX_EXECUTABLE_BYTES},
         "host": {
             "free_floor_bytes": HOST_FREE_FLOOR_BYTES,
             "write_budget_bytes": HOST_WRITE_BUDGET_BYTES,
         },
         "scope": {
             phase: _scope_policy(phase).contract()
-            for phase in ("fetch", "metadata", "build")
+            for phase in ("metadata", "build")
         },
-        "sandbox": {
-            "build_target_tmpfs_bytes": BUILD_TARGET_TMPFS_BYTES,
-            "build_tmp_bytes": BUILD_TMP_BYTES,
-            "fetch_tmpfs_bytes": FETCH_TMPFS_BYTES,
-            "fetch_tmp_bytes": FETCH_TMP_BYTES,
-            "network": {"fetch": "shared", "metadata": "isolated", "build": "isolated"},
-            "writable_host_mounts": [],
-        },
+        "direct_build": {"target": TARGET_TRIPLE},
         "tool_sha256": {
             name: held.identity.sha256 for name, held in sorted(held_tools.items())
         },
@@ -2990,90 +2330,20 @@ def _publish_candidate(
     return candidate, identity, elf, candidate_file
 
 
-def build_sandboxed_candidate(
-    source: SourceBundle,
-    budget: HostWriteBudget,
-) -> BuildBundle:
-    authorities = [
-        _open_directory_authority("toolchain", toolchain_root),
-        _open_directory_authority("registry cache", registry_cache),
-        _open_directory_authority("registry index", registry_index),
-        _open_directory_authority("gcc closure", gcc_root),
-        _open_directory_authority("sysroot include", sysroot_include),
-        _open_directory_authority("target rustlib", target_rustlib),
-    ]
-    try:
-        metadata_command, metadata_fds = _cargo_sandbox(
-            source,
-            authorities[0],
-            authorities[5],
-            authorities[1],
-            authorities[2],
-            authorities[3],
-            authorities[4],
-            "metadata",
-        )
-        metadata_frame = execute_scoped(
-            "metadata",
-            metadata_command,
-            max_output_bytes=FRAME_HEADER_BYTES + 16 * 1024 * 1024 + 12,
-            pass_fds=metadata_fds,
-        )
-        metadata_header, metadata_payload = _decode_frame(
-            metadata_frame, "metadata", 16 * 1024 * 1024
-        )
-        if set(metadata_header) != {"kind", "payload_size", "schema"}:
-            fail("metadata frame authority set differs")
-        try:
-            metadata_text = metadata_payload.decode("utf-8", errors="strict")
-        except UnicodeDecodeError as error:
-            raise RebuildError("Cargo metadata frame is not UTF-8") from error
-        metadata_closure = _validate_metadata(metadata_text)
-
-        build_command, build_fds = _cargo_sandbox(
-            source,
-            authorities[0],
-            authorities[5],
-            authorities[1],
-            authorities[2],
-            authorities[3],
-            authorities[4],
-            "build",
-        )
-        build_frame = execute_scoped(
-            "build",
-            build_command,
-            max_output_bytes=FRAME_HEADER_BYTES + MAX_EXECUTABLE_BYTES + 12,
-            pass_fds=build_fds,
-        )
-        build_header, candidate_payload = _decode_frame(
-            build_frame, "build", MAX_EXECUTABLE_BYTES
-        )
-        candidate, candidate_identity, candidate_elf, candidate_file = _publish_candidate(
-            source, build_header, candidate_payload, budget
-        )
-        source.verify()
-        for authority in authorities:
-            authority.verify()
-        _verify_all_tools()
-        inputs: dict[str, object] = {
-            authority.name.replace(" ", "_"): authority.receipt()
-            for authority in authorities
-        }
-        inputs["sysroot_lib"] = source.runtime_lib_authority.receipt()
-        inputs["python_stdlib"] = source.python_stdlib_authority.receipt()
-        return BuildBundle(
-            candidate,
-            candidate_identity,
-            candidate_elf,
-            metadata_closure,
-            _containment_contract_sha256(),
-            inputs,
-            candidate_file,
-        )
-    finally:
-        for authority in reversed(authorities):
-            authority.close()
+def build_candidate(source: SourceBundle, budget: HostWriteBudget) -> BuildBundle:
+    metadata_command, metadata_env, target = _cargo_command(source, "metadata")
+    metadata_frame = execute_scoped("metadata", metadata_command, env=metadata_env, max_output_bytes=16 * 1024 * 1024)
+    metadata_closure = _validate_metadata(
+        metadata_frame.decode("utf-8", errors="strict"), str(source.source), str(target)
+    )
+    build_command, build_env, target = _cargo_command(source, "build")
+    execute_scoped("build", build_command, env=build_env, max_output_bytes=16 * 1024 * 1024)
+    candidate_path = target / TARGET_TRIPLE / "release" / "llm-guard-proxy"
+    candidate_data = candidate_path.read_bytes()
+    header = {"kind": "build", "payload_sha256": sha256_bytes(candidate_data), "payload_size": len(candidate_data), "schema": 1}
+    candidate, identity, elf, authority = _publish_candidate(source, header, candidate_data, budget)
+    inputs = {"source": str(source.source), "target": str(target), "cargo_argv": build_command[1:], "tool_sha256": {name: tool.identity.sha256 for name, tool in sorted(held_tools.items())}}
+    return BuildBundle(candidate, identity, elf, metadata_closure, _build_contract_sha256(), inputs, authority)
 
 
 def _validate_reviewed_tool_versions(cargo: bytes, rustc: bytes) -> None:
@@ -5137,7 +4407,7 @@ def _validate_authorities(value: object) -> dict[str, Any]:
             "source_byte_count",
             "git_config_sha256",
             "metadata_closure_sha256",
-            "sandbox_contract_sha256",
+            "direct_build_contract_sha256",
             "build_inputs",
             "build_inputs_sha256",
             "cargo_identity_sha256",
@@ -5170,7 +4440,7 @@ def _validate_authorities(value: object) -> dict[str, Any]:
         "snapshot_content_sha256",
         "git_config_sha256",
         "metadata_closure_sha256",
-        "sandbox_contract_sha256",
+        "direct_build_contract_sha256",
         "build_inputs_sha256",
         "cargo_identity_sha256",
         "rustc_identity_sha256",
@@ -6373,7 +5643,7 @@ def run_transaction() -> int:
         operation_deadline = time.monotonic() + _test_deadline(
             "LLM_GUARD_REBUILD_TEST_RECOVERY_SECONDS", RECOVERY_SECONDS
         )
-        recovered_namespace = _prepare_transaction_namespace(write_budget)
+        recovered_transaction = _prepare_transaction_namespace(write_budget)
         stale = load_wal()
         if stale is not None:
             authorities = cast(dict[str, Any], stale["authorities"])
@@ -6402,7 +5672,7 @@ def run_transaction() -> int:
                 fail("candidate architecture differs from transaction authority")
             recover_stale_transaction(stale, write_budget)
             return 75
-        if recovered_namespace:
+        if recovered_transaction:
             print(f"{RECOVERY_COMPLETE} phase=cleanup txid=unknown", flush=True)
             return 75
 
@@ -6427,7 +5697,7 @@ def run_transaction() -> int:
         prove_no_manager_job()
         snapshot_root, snapshot_root_identity = create_snapshot_root(write_budget)
         source_bundle = prepare_canonical_source(snapshot_root, write_budget)
-        build_bundle = build_sandboxed_candidate(source_bundle, write_budget)
+        build_bundle = build_candidate(source_bundle, write_budget)
         candidate_authority = build_bundle.authority
         candidate = build_bundle.candidate
         candidate_identity = build_bundle.identity
@@ -6446,7 +5716,7 @@ def run_transaction() -> int:
             fail("rustc toolchain identity changed before cutover")
         candidate_authority.verify()
         _test_boundary("candidate-pre-wal")
-        _bind_candidate_namespace(build_bundle, write_budget)
+        _bind_candidate_artifact(build_bundle, write_budget)
         candidate = build_bundle.candidate
         candidate_identity = build_bundle.identity
         if query_manager_generation() != manager_generation:
@@ -6467,7 +5737,7 @@ def run_transaction() -> int:
             "source_byte_count": source_bundle.byte_count,
             "git_config_sha256": source_bundle.config_sha256,
             "metadata_closure_sha256": build_bundle.metadata_closure_sha256,
-            "sandbox_contract_sha256": build_bundle.sandbox_contract_sha256,
+            "direct_build_contract_sha256": build_bundle.direct_build_contract_sha256,
             "build_inputs_sha256": sha256_bytes(
                 json.dumps(
                     build_bundle.inputs,
