@@ -854,6 +854,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             wrapper.write_bytes(ACTIVATOR.read_bytes())
             wrapper.chmod(0o755)
             engine.write_bytes(ACTIVATION_ENGINE.read_bytes())
+            engine.chmod(0o644)
             replacement.write_text(
                 f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
                 "raise SystemExit(88)\n"
