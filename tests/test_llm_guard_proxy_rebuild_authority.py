@@ -146,6 +146,7 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             "cc": ("/usr/bin/aarch64-linux-gnu-gcc-13", "a20520ee21543f243d40636a9181a142c45ecd989de31ab86b99a8ea5ada870d"),
             "curl": ("/usr/bin/curl", "67054bcf748d42e1bf4b2a0eb4ba768e37dde8681313a64edd2f343c5d17a0ac"),
             "git": ("/usr/bin/git", "aa6540695d076182256dd6e96c8b302e4d56381e3000bbfd5c71bbdfe94a4942"),
+            "ld": ("/usr/bin/aarch64-linux-gnu-ld.bfd", "1e4d3369b76845fa8e099b83513bf28f6f722e046f9b2cde1378c9e27f96d19c"),
             "readelf": ("/usr/bin/aarch64-linux-gnu-readelf", "6bca2bbd23b072db9e9a19ae0e65cf7b7c15c08a3c2cf01dd56453e1ac9340b1"),
             "rustc": ("/home/obj/.rustup/toolchains/1.96.0-aarch64-unknown-linux-gnu/bin/rustc", "2425682b7dd432769e2600eb2b3ea5113a00d37f41a754598f2af2e56e4fa2fe"),
             "systemctl": ("/usr/bin/systemctl", "1bf2f1e98c533b0313a78143ffcda2690116d90d76816dc7b74df79c4767aa95"),
@@ -641,6 +642,7 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                     "canonical_source",
                     "cargo_home",
                     "gcc_closure",
+                    "linker_tools",
                     "registry_cache",
                     "registry_index",
                     "sysroot_include",
@@ -662,6 +664,20 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             self.assertEqual(
                 inputs["rustc_exec"],
                 receipt["authorities"]["tool_authorities"]["rustc"]["sha256"],
+            )
+
+    def test_direct_build_provides_held_linker_to_collect2(self) -> None:
+        with RebuildFixture() as fixture:
+            result = fixture.run(timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            state = fixture.reload_state()
+            self.assertTrue(state["held_ld_consumed"])
+            self.assertFalse(state["ambient_usr_consumed"])
+            receipt = json.loads(fixture.receipt_paths()[0].read_text())
+            self.assertIn("ld", receipt["authorities"]["tool_authorities"])
+            self.assertIn(
+                "linker_tools",
+                receipt["authorities"]["build_inputs"]["directory_authorities"],
             )
 
     @unittest.skipUnless(

@@ -303,6 +303,7 @@ TOOL_NAMES = {
     "cc",
     "curl",
     "git",
+    "ld",
     "readelf",
     "rustc",
     "systemd_run",
@@ -923,6 +924,10 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
         "cc": root(
             "/usr/bin/aarch64-linux-gnu-gcc-13",
             "a20520ee21543f243d40636a9181a142c45ecd989de31ab86b99a8ea5ada870d",
+        ),
+        "ld": root(
+            "/usr/bin/aarch64-linux-gnu-ld.bfd",
+            "1e4d3369b76845fa8e099b83513bf28f6f722e046f9b2cde1378c9e27f96d19c",
         ),
         "ar": root(
             "/usr/bin/aarch64-linux-gnu-ar",
@@ -2369,7 +2374,7 @@ def _cargo_environment(
     return {
         **child_env,
         "HOME": str(source.root),
-        "PATH": "",
+        "PATH": f"/proc/self/fd/{authorities['linker_tools'].descriptor}",
         "CARGO_HOME": f"/proc/self/fd/{authorities['cargo_home'].descriptor}",
         "CARGO_TARGET_DIR": str(target),
         "CARGO_NET_OFFLINE": "true",
@@ -2565,6 +2570,7 @@ def _build_contract_sha256() -> str:
                 "canonical_source",
                 "cargo_home",
                 "gcc_closure",
+                "linker_tools",
                 "registry_cache",
                 "registry_index",
                 "sysroot_include",
@@ -2680,9 +2686,24 @@ def build_candidate(source: SourceBundle, budget: HostWriteBudget) -> BuildBundl
     cargo_home = registry_cache.parents[2]
     if registry_index.parents[2] != cargo_home:
         fail("Cargo home authority is inconsistent")
+    linker_tools = source.root / "linker-tools"
+    budget.ensure_private_directory(linker_tools)
+    linker = linker_tools / "ld"
+    held_tools["ld"].verify()
+    budget.copy_fd(held_tools["ld"].descriptor, linker, 0o500)
+    linker_copy = _open_file_authority(
+        "linker executable", linker, expected_mode=0o500, max_bytes=MAX_EXECUTABLE_BYTES
+    )
+    try:
+        if linker_copy.sha256 != held_tools["ld"].identity.sha256:
+            fail("linker executable copy differs")
+    finally:
+        linker_copy.close()
+    held_tools["ld"].verify()
     paths = (
         ("toolchain", toolchain_root),
         ("cargo_home", cargo_home),
+        ("linker_tools", linker_tools),
         ("registry_cache", registry_cache),
         ("registry_index", registry_index),
         ("gcc_closure", gcc_root),
@@ -4932,6 +4953,7 @@ def _validate_authorities(value: object) -> dict[str, Any]:
         "canonical_source",
         "cargo_home",
         "gcc_closure",
+        "linker_tools",
         "registry_cache",
         "registry_index",
         "sysroot_include",

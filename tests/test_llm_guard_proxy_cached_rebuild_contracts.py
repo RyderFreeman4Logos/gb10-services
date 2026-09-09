@@ -384,6 +384,7 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
                     "cc",
                     "curl",
                     "git",
+                    "ld",
                     "readelf",
                     "rustc",
                     "systemd_run",

@@ -493,6 +493,7 @@ class RebuildFixture:
                     "canonical_source",
                     "cargo_home",
                     "gcc_closure",
+                    "linker_tools",
                     "registry_cache",
                     "registry_index",
                     "sysroot_include",
@@ -553,6 +554,7 @@ class RebuildFixture:
                     "canonical_source",
                     "cargo_home",
                     "gcc_closure",
+                    "linker_tools",
                     "registry_cache",
                     "registry_index",
                     "sysroot_include",
@@ -1456,6 +1458,27 @@ elif name == "cargo":
         }, sort_keys=True, separators=(",", ":")))
     elif args and args[0] == "build":
         manifest = Path(args[args.index("--manifest-path") + 1])
+        linker_path = os.environ.get("PATH", "")
+        linker_match = re.fullmatch(r"/proc/self/fd/([1-9][0-9]*)", linker_path)
+        linker = Path(linker_path) / "ld"
+        linker_spec = authority["bwrap_authorities"][
+            "/usr/bin/aarch64-linux-gnu-ld.bfd"
+        ]
+        try:
+            linker_info = linker.stat(follow_symlinks=False)
+            state["held_ld_consumed"] = (
+                linker_match is not None
+                and stat.S_ISREG(linker_info.st_mode)
+                and stat.S_IMODE(linker_info.st_mode) == 0o500
+                and linker_info.st_nlink == 1
+                and linker_info.st_size == linker_spec["size"]
+                and hashlib.sha256(linker.read_bytes()).hexdigest()
+                == linker_spec["sha256"]
+            )
+        except OSError:
+            state["held_ld_consumed"] = False
+        state["ambient_usr_consumed"] = linker_path in {"/usr/bin", "/bin"}
+        save()
         if state.get("scope_build_exit"):
             sys.stderr.write(state.get("scope_build_stderr", ""))
             raise SystemExit(state["scope_build_exit"])
@@ -2462,7 +2485,7 @@ else:
             "toolchain_root": str(self.toolchain_root),
             "target_rustlib": str(self.target_rustlib),
             "tools": {name: tools[name] for name in {
-                "ar", "cargo", "cc", "curl", "git", "readelf", "rustc",
+                "ar", "cargo", "cc", "curl", "git", "ld", "readelf", "rustc",
                 "systemd_run", "systemctl",
             }},
         }
