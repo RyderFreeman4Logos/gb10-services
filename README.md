@@ -327,9 +327,9 @@ and proves quiescence so descendants cannot survive cleanup.
 Git runs through its held executable descriptor and writes only inside the
 transaction snapshot; its object store is accounted against a 64 MiB cap.
 Cargo and rustc execute through held file descriptors with the manifest rooted
-at the held canonical-source directory. Recursive ledgers are checked before
-and after Cargo for the source, Cargo home and registry, toolchain and target
-rustlib, GCC closure, and sysroot include/runtime directories. Cargo target
+at the held canonical-source directory. The canonical source is an immutable Git archive;
+recursive ledgers are checked before and after Cargo for the source, Cargo home and registry,
+toolchain and target rustlib, GCC closure, and sysroot include/runtime directories. Cargo target
 writes are accounted against a 512 MiB cap within the aggregate 576 MiB host
 write budget and 8 GiB free-space floor.
 

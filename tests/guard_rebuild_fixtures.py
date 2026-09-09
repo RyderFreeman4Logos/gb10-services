@@ -473,12 +473,105 @@ class RebuildFixture:
                     Path(spec["logical"]).read_bytes()
                 ).hexdigest(),
             }
+        directory_authorities = {
+            name: {
+                "path": str(self.root / f"directory-{name}"),
+                "device": 1,
+                "inode": index,
+                "mode": 0o755,
+                "mtime_ns": 1,
+                "ctime_ns": 1,
+                "content_sha256": "b" * 64,
+                "metadata_sha256": "c" * 64,
+                "file_count": 1,
+                "byte_count": 1,
+            }
+            for index, name in enumerate(
+                (
+                    "canonical_source",
+                    "cargo_home",
+                    "gcc_closure",
+                    "registry_cache",
+                    "registry_index",
+                    "sysroot_include",
+                    "sysroot_runtime",
+                    "target_rustlib",
+                    "toolchain",
+                ),
+                start=1,
+            )
+        }
+        tool_sha256 = {
+            name: authority["sha256"]
+            for name, authority in tool_authorities.items()
+        }
         build_inputs = {
             "source": str(self.build_source),
             "target": str(self.cache_root / "target"),
             "cargo_argv": [],
-            "tool_sha256": {},
+            "rustc_exec": tool_sha256["rustc"],
+            "tool_sha256": tool_sha256,
+            "directory_authorities": directory_authorities,
+            "write_contract": {
+                "limits": {
+                    "cargo_target_bytes": 512 * 1024 * 1024,
+                    "git_object_bytes": 64 * 1024 * 1024,
+                    "host_write_bytes": 576 * 1024 * 1024,
+                },
+                "cargo_target_bytes": 512 * 1024 * 1024,
+                "git_object_bytes": 64 * 1024 * 1024,
+            },
         }
+        direct_build_contract = {
+            "schema": 1,
+            "output": {"candidate_bytes": 128 * 1024 * 1024},
+            "host": {
+                "free_floor_bytes": 8 * 1024 * 1024 * 1024,
+                "write_budget_bytes": 576 * 1024 * 1024,
+            },
+            "scope": {
+                phase: {
+                    "cpu_percent": 200,
+                    "fsize_bytes": 128 * 1024 * 1024,
+                    "memory_high": 8 * 1024 * 1024 * 1024,
+                    "memory_max": 10 * 1024 * 1024 * 1024,
+                    "min_mem_available": 16 * 1024 * 1024 * 1024,
+                    "phase": phase,
+                    "runtime_seconds": runtime,
+                    "tasks_max": 768,
+                }
+                for phase, runtime in (("metadata", 300), ("build", 1800))
+            },
+            "direct_build": {
+                "target": "aarch64-unknown-linux-gnu",
+                "cargo": "held-file-fd",
+                "rustc": "held-file-fd",
+                "manifest": "held-source-dirfd",
+                "directory_authorities": [
+                    "canonical_source",
+                    "cargo_home",
+                    "gcc_closure",
+                    "registry_cache",
+                    "registry_index",
+                    "sysroot_include",
+                    "sysroot_runtime",
+                    "target_rustlib",
+                    "toolchain",
+                ],
+                "write_limits": {
+                    "cargo_target_bytes": 512 * 1024 * 1024,
+                    "git_object_bytes": 64 * 1024 * 1024,
+                },
+            },
+            "tool_sha256": {
+                name: tool_sha256[name] for name in sorted(tool_sha256)
+            },
+        }
+        direct_build_contract_sha256 = hashlib.sha256(
+            json.dumps(
+                direct_build_contract, sort_keys=True, separators=(",", ":")
+            ).encode("ascii")
+        ).hexdigest()
         candidate_identity = self._identity(self.candidate)
         committed = None
         if phase == "committed":
@@ -544,7 +637,7 @@ class RebuildFixture:
                 "source_byte_count": 1,
                 "git_config_sha256": "5" * 64,
                 "metadata_closure_sha256": "6" * 64,
-                "direct_build_contract_sha256": "7" * 64,
+                "direct_build_contract_sha256": direct_build_contract_sha256,
                 "build_inputs": build_inputs,
                 "build_inputs_sha256": hashlib.sha256(
                     json.dumps(
@@ -670,6 +763,7 @@ def valid_systemd_run(values):
             and payload[1].startswith("/proc/self/fd/")
             and payload[2] == "--direct-scope-child"
             and payload[6] == "--"
+            and re.fullmatch(r"/proc/self/fd/[1-9][0-9]*", payload[7]) is not None
         )
     if (
         len(values) < 8

@@ -425,8 +425,8 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
             self.assertEqual(len(scope_lines), 2)
             for line in scope_lines:
                 self.assertIn("--scope", line)
-                self.assertIn("--property MemorySwapMax=0", line)
-                self.assertIn("--property KillMode=control-group", line)
+                self.assertRegex(line, r"--property(?:=| )MemorySwapMax=0")
+                self.assertRegex(line, r"--property(?:=| )KillMode=control-group")
             self.assertNotIn(str(fixture.source_dir), build_line)
             self.assertFalse(fixture.source_dir.exists())
             fixture.assert_no_backend_lifecycle(self)

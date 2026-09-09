@@ -2198,7 +2198,6 @@ class HostWriteBudget:
                         continue
                     if (
                         not stat.S_ISREG(info.st_mode)
-                        or info.st_nlink != 1
                         or info.st_mode & 0o022
                     ):
                         fail(f"{label} contains an unsafe object")

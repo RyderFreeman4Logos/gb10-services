@@ -235,6 +235,7 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                 "os.close=close; sys.argv=[engine,'--test-only']\n"
                 "try: runpy.run_path(engine,run_name='guard_import_test')\n"
                 "except BaseException: pass\n"
+                "if not done: os.replace(replacement,helper); open(swapped,'w').close()\n"
             )
             result = subprocess.run(
                 [
@@ -2124,7 +2125,8 @@ class StrictFakeGrammarTests(unittest.TestCase):
             reordered[5], reordered[6] = reordered[6], reordered[5]
             cases["reordered-properties"] = reordered
             wrong_target = valid.copy()
-            wrong_target[25] = "/tmp/foreign-bwrap"
+            separator = len(valid) - 1 - valid[::-1].index("--")
+            wrong_target[separator + 1] = "/tmp/foreign-command"
             cases["wrong-target"] = wrong_target
             for name, arguments in cases.items():
                 with self.subTest(name=name):
