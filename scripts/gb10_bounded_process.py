@@ -9,12 +9,19 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["ScopePolicy", "command", "remaining", "scoped_command"]
+__all__ = [
+    "ScopePolicy",
+    "command",
+    "remaining",
+    "scoped_command",
+    "scoped_direct_command",
+]
 
 _MAX_STREAM_BYTES = 4 * 1024 * 1024
 _READ_BYTES = 64 * 1024
@@ -977,22 +984,28 @@ def scoped_command(
     pass_fds: Sequence[int],
     max_output_bytes: int,
     cleanup_reserve: float = 4.0,
+    progress: Callable[[], None] | None = None,
+    _direct: bool = False,
 ) -> bytes:
-    """Run one bwrap payload only after its exact user scope is proven."""
+    """Run one payload only after its exact user scope is proven."""
 
     if (
         not sandbox_arguments
+        or (_direct and len(sandbox_arguments) < 3)
         or timeout <= 0
         or cleanup_reserve <= 0
         or max_output_bytes <= 0
         or max_output_bytes > 192 * 1024 * 1024
     ):
         raise BoundedProcessError("invalid scoped command")
-    try:
-        unshare_all = sandbox_arguments.index("--unshare-all")
-        proc_mount = sandbox_arguments.index("--proc")
-    except ValueError as error:
-        raise BoundedProcessError("invalid scoped namespace policy") from error
+    if _direct:
+        unshare_all = proc_mount = -1
+    else:
+        try:
+            unshare_all = sandbox_arguments.index("--unshare-all")
+            proc_mount = sandbox_arguments.index("--proc")
+        except ValueError as error:
+            raise BoundedProcessError("invalid scoped namespace policy") from error
     weaker_unshares = {
         "--unshare-cgroup",
         "--unshare-ipc",
@@ -1006,7 +1019,7 @@ def scoped_command(
         if list(sandbox_arguments[index : index + 3])
         == ["--setenv", "GB10_RESOURCE_FENCE", "1"]
     ]
-    if (
+    if not _direct and (
         sandbox_arguments.count("--unshare-user") != 1
         or sandbox_arguments.count("--unshare-all") != 1
         or sandbox_arguments.count("--proc") != 1
@@ -1031,7 +1044,7 @@ def scoped_command(
     if work_deadline <= started:
         raise BoundedProcessError("insufficient scoped command budget")
 
-    namespace_keys = {
+    namespace_keys = set() if _direct else {
         "cgroup-namespace",
         "ipc-namespace",
         "mnt-namespace",
@@ -1048,20 +1061,33 @@ def scoped_command(
     block_read, block_write = os.pipe2(os.O_CLOEXEC)
     fence_parent, fence_child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     fence_parent.setblocking(False)
-    sandbox = [
-        sandbox[0],
-        "--json-status-fd",
-        str(status_write),
-        "--block-fd",
-        str(block_read),
-        *sandbox[1:],
-    ]
+    sandbox = (
+        [
+            sandbox[0],
+            sandbox[1],
+            "--direct-scope-child",
+            str(status_write),
+            str(block_read),
+            unit,
+            "--",
+            *sandbox[2:],
+        ]
+        if _direct
+        else [
+            sandbox[0],
+            "--json-status-fd",
+            str(status_write),
+            "--block-fd",
+            str(block_read),
+            *sandbox[1:],
+        ]
+    )
     arguments = [
         systemd_run,
         "--user",
         "--scope",
         "--quiet",
-        "--collect",
+        *([] if _direct else ["--collect"]),
         f"--unit={unit}",
         f"--property=MemoryHigh={policy.memory_high}",
         f"--property=MemoryMax={policy.memory_max}",
@@ -1073,16 +1099,23 @@ def scoped_command(
         "--property=SendSIGKILL=yes",
         "--property=OOMPolicy=kill",
         f"--property=RuntimeMaxSec={policy.runtime_seconds}",
+        *([f"--property=LimitFSIZE={policy.fsize_bytes}"] if _direct else []),
         "--",
-        nice,
-        "-n",
-        "10",
-        ionice,
-        "-c",
-        "3",
-        prlimit,
-        f"--fsize={policy.fsize_bytes}:{policy.fsize_bytes}",
-        "--",
+        *(
+            []
+            if _direct
+            else [
+                nice,
+                "-n",
+                "10",
+                ionice,
+                "-c",
+                "3",
+                prlimit,
+                f"--fsize={policy.fsize_bytes}:{policy.fsize_bytes}",
+                "--",
+            ]
+        ),
         *sandbox,
     ]
     inherited = tuple(sorted(set((*pass_fds, status_write, block_read))))
@@ -1176,6 +1209,8 @@ def scoped_command(
 
         while True:
             tree.scan()
+            if progress is not None:
+                progress()
             _drain_once(
                 selector,
                 streams,
@@ -1280,14 +1315,16 @@ def scoped_command(
         if process.returncode != 0:
             raise BoundedProcessError("scoped payload failed")
         rows = _status_rows(captures["status"], complete=True)
-        if len(rows) != 2:
+        if len(rows) != (1 if _direct else 2):
             raise BoundedProcessError("scope exit status is invalid")
-        exit_code = rows[1].get("exit-code")
-        if (
-            rows[0] != ready_row
-            or set(rows[1]) != {"exit-code"}
-            or type(exit_code) is not int
-            or exit_code != 0
+        exit_code = 0 if _direct else rows[1].get("exit-code")
+        if rows[0] != ready_row or (
+            not _direct
+            and (
+                set(rows[1]) != {"exit-code"}
+                or type(exit_code) is not int
+                or exit_code != 0
+            )
         ):
             raise BoundedProcessError("scope exit status is invalid")
         if not _scope_quiescent(
@@ -1405,6 +1442,82 @@ def scoped_command(
             cgroup.close()
 
 
+def scoped_direct_command(
+    arguments: Sequence[str],
+    policy: ScopePolicy,
+    *,
+    python: str,
+    module_fd: int,
+    systemd_run: str,
+    systemctl: str,
+    nice: str,
+    ionice: str,
+    prlimit: str,
+    timeout: float,
+    deadline: float,
+    env: Mapping[str, str],
+    pass_fds: Sequence[int],
+    max_output_bytes: int,
+    cleanup_reserve: float = 4.0,
+    progress: Callable[[], None] | None = None,
+) -> bytes:
+    """Run an exact command directly after cgroup authority is proven."""
+
+    if module_fd < 0:
+        raise BoundedProcessError("invalid bounded-process module authority")
+    return scoped_command(
+        [python, f"/proc/self/fd/{module_fd}", *arguments],
+        policy,
+        systemd_run=systemd_run,
+        systemctl=systemctl,
+        nice=nice,
+        ionice=ionice,
+        prlimit=prlimit,
+        timeout=timeout,
+        deadline=deadline,
+        env=env,
+        pass_fds=tuple((*pass_fds, module_fd)),
+        max_output_bytes=max_output_bytes,
+        cleanup_reserve=cleanup_reserve,
+        progress=progress,
+        _direct=True,
+    )
+
+
+def _direct_scope_child(arguments: Sequence[str]) -> None:
+    if len(arguments) < 5 or arguments[3] != "--":
+        raise BoundedProcessError("invalid direct scope child")
+    try:
+        status_fd, block_fd = (int(arguments[0]), int(arguments[1]))
+    except ValueError as error:
+        raise BoundedProcessError("invalid direct scope child descriptors") from error
+    unit = arguments[2]
+    command_arguments = list(arguments[4:])
+    if (
+        status_fd <= 2
+        or block_fd <= 2
+        or status_fd == block_fd
+        or not command_arguments
+        or not unit.startswith("llm-guard-rebuild-")
+        or not unit.endswith(".scope")
+        or Path(unit).name != unit
+    ):
+        raise BoundedProcessError("invalid direct scope child authority")
+    payload = json.dumps(
+        {"child-pid": os.getpid()},
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("ascii") + b"\n"
+    if os.write(status_fd, payload) != len(payload):
+        raise BoundedProcessError("direct scope child status write failed")
+    os.close(status_fd)
+    if os.read(block_fd, 2) != b"G":
+        raise BoundedProcessError("direct scope child release failed")
+    os.close(block_fd)
+    os.execvpe(command_arguments[0], command_arguments, os.environ)
+
+
 def command(
     arguments: Sequence[str],
     timeout: float = 20,
@@ -1415,6 +1528,7 @@ def command(
     env: Mapping[str, str] | None = None,
     pass_fds: Sequence[int] = (),
     cleanup_reserve: float = 2.0,
+    progress: Callable[[], None] | None = None,
 ) -> str:
     """Run one complete process tree with capped concurrent output and hard cleanup."""
 
@@ -1482,6 +1596,8 @@ def command(
                     process.stdin.close()
                 if input_offset >= len(input_payload) and not process.stdin.closed:
                     process.stdin.close()
+            if progress is not None:
+                progress()
             tree.scan()
             _drain_once(
                 selector,
@@ -1559,3 +1675,9 @@ def command(
         raise BoundedProcessError(
             f"command stdout is not valid UTF-8: {arguments[0]}"
         ) from error
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] != "--direct-scope-child":
+        raise SystemExit(64)
+    _direct_scope_child(sys.argv[2:])

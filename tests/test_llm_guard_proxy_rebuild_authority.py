@@ -629,6 +629,36 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
 
 class SharedBoundedScopeAuthorityTests(unittest.TestCase):
 
+    def test_direct_command_mode_reuses_scope_authority_and_cleanup(self) -> None:
+        bounded = _load(BOUNDED, "bounded_direct_scope_test")
+        direct = bounded.scoped_direct_command
+
+        def code_names(code: types.CodeType) -> set[str]:
+            return set(code.co_names).union(
+                *(code_names(value) for value in code.co_consts if isinstance(value, types.CodeType))
+            )
+
+        names = code_names(direct.__code__) | code_names(bounded.scoped_command.__code__)
+        self.assertIn("_verify_scope", names)
+        self.assertIn("_scope_resource_events", names)
+        self.assertIn("_scope_signal", names)
+        self.assertIn("_scope_quiescent", names)
+
+        source = ENGINE.read_text()
+        self.assertNotIn("def execute_scoped(", source)
+        self.assertIn("run_scoped_direct(", source)
+
+    def test_direct_command_mode_rejects_unproven_scope_before_cargo(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(scope_failure="property-readback")
+            result = fixture.run(timeout=20)
+            output = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("scope controller value is not exact", output)
+            self.assertNotIn("cargo metadata", fixture.calls())
+            self.assertNotIn("cargo build", fixture.calls())
+            self.assertEqual(fixture.reload_state()["restart_calls"], 0)
+
     def test_scope_pins_writable_nofollow_cgroup_kill(self) -> None:
         bounded = _load(BOUNDED, "bounded_cgroup_kill_test")
         with tempfile.TemporaryDirectory() as temporary:
@@ -1305,6 +1335,35 @@ class CrashSafeHostWriteTests(unittest.TestCase):
             self.assertTrue(
                 (fixture.cache_root / ".gb10-rebuild-scratch-delete-slot.v1").is_dir()
             )
+
+    def test_write_budget_accounts_external_git_and_cargo_trees(self) -> None:
+        with RebuildFixture() as fixture, patch.dict(os.environ, fixture.env, clear=False):
+            old_argv = sys.argv[:]
+            try:
+                sys.argv = [str(ENGINE), "--test-only"]
+                engine = _load(ENGINE, "external_write_budget_test")
+            finally:
+                sys.argv = old_argv
+
+            fixture.cache_root.mkdir(mode=0o700)
+            target = fixture.cache_root / "target"
+            target.mkdir(mode=0o700)
+            (target / "one").write_bytes(b"123")
+            (target / "two").write_bytes(b"45")
+            budget = engine.HostWriteBudget(fixture.cache_root)
+            setattr(
+                engine,
+                "test_free_bytes",
+                engine.HOST_FREE_FLOOR_BYTES + engine.HOST_WRITE_BUDGET_BYTES,
+            )
+            try:
+                self.assertEqual(budget.account_tree(target, 5, "Cargo target"), 5)
+                self.assertEqual(budget.used, 5)
+                (target / "three").write_bytes(b"6")
+                with self.assertRaisesRegex(engine.RebuildError, "Cargo target byte bound"):
+                    budget.account_tree(target, 5, "Cargo target")
+            finally:
+                budget.close()
 
     def test_write_budget_tracks_actual_destination_device(self) -> None:
         with RebuildFixture() as fixture:

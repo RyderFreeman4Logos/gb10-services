@@ -25,7 +25,7 @@ from typing import Any, NoReturn, cast
 __all__: list[str] = []
 
 EXPECTED_BOUNDED_PROCESS_SHA256 = (
-    "248762c2fdc73fdf54914fc5a20c2292bcc90430e59523c5767409ebf0f4c230"
+    "29ea5c77074d2d37ed906e5d78f9ea8ef998c37a5cc221af4135f6209a581bc4"
 )
 _SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 _BOUNDED_PROCESS_PATH = _SCRIPT_DIRECTORY / "gb10_bounded_process.py"
@@ -50,8 +50,9 @@ try:
         if _bounded_size > 1024 * 1024:
             raise RuntimeError("Guard bounded-process import authority is oversized")
         _bounded_chunks.append(_bounded_chunk)
-finally:
+except BaseException:
     os.close(_bounded_fd)
+    raise
 _bounded_payload = b"".join(_bounded_chunks)
 if hashlib.sha256(_bounded_payload).hexdigest() != EXPECTED_BOUNDED_PROCESS_SHA256:
     raise RuntimeError("Guard bounded-process import authority differs")
@@ -64,6 +65,7 @@ exec(
     _bounded_module.__dict__,
 )
 run_bounded = _bounded_module.command
+run_scoped_direct = _bounded_module.scoped_direct_command
 ScopePolicy = _bounded_module.ScopePolicy
 
 UNIT = "llm-guard-proxy.service"
@@ -82,6 +84,7 @@ STATE_MAX_BYTES = 64 * 1024
 PHASES = {"prestate", "mutated", "committed"}
 MAX_EXECUTABLE_BYTES = 128 * 1024 * 1024
 BUILD_TMP_BYTES = 512 * 1024 * 1024
+GIT_OBJECT_BYTES = 64 * 1024 * 1024
 HOST_WRITE_BUDGET_BYTES = 576 * 1024 * 1024
 HOST_FREE_FLOOR_BYTES = 8 * 1024 * 1024 * 1024
 BUILD_MEMORY_MIN_BYTES = 16 * 1024 * 1024 * 1024
@@ -941,6 +944,7 @@ def execute(
     pass_fds: tuple[int, ...] = (),
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
+    progress: Callable[[], None] | None = None,
 ) -> bytes:
     del capture
     deadline = operation_deadline
@@ -961,6 +965,7 @@ def execute(
             env=child_env if env is None else env,
             pass_fds=effective_fds,
             cleanup_reserve=min(5.0, max(0.0, budget / 2)),
+            progress=progress,
         )
         return output.encode("utf-8")
     except RuntimeError as error:
@@ -995,52 +1000,47 @@ def _bounded_primary_error(error: BaseException) -> str:
     return "".join(character if character.isprintable() else "?" for character in line)[:512]
 
 
-def execute_scoped(
+def run_build_phase(
     phase: str,
     arguments: list[str],
     *,
-    pass_fds: tuple[int, ...] = (),
-    env: dict[str, str] | None = None,
+    env: dict[str, str],
+    budget: HostWriteBudget,
+    target: Path,
 ) -> bytes:
     deadline = operation_deadline
     if deadline is None:
         fail("scoped command invoked without a transaction deadline")
-    budget = deadline - time.monotonic()
-    if budget <= 0:
+    available = deadline - time.monotonic()
+    if available <= 0:
         fail("transaction scoped-command deadline exhausted")
-    policy = _scope_policy(phase)
-    launcher = [
-        require_tool("systemd_run"),
-        "--user",
-        "--scope",
-        "--quiet",
-        "--collect",
-        f"--unit=llm-guard-rebuild-{phase}-{os.getpid()}-{time.monotonic_ns()}.scope",
-    ]
-    for value in (
-        f"MemoryHigh={policy.memory_high}",
-        f"MemoryMax={policy.memory_max}",
-        "MemorySwapMax=0",
-        f"TasksMax={policy.tasks_max}",
-        f"CPUQuota={policy.cpu_percent}%",
-        "CPUQuotaPeriodSec=100ms",
-        "KillMode=control-group",
-        "SendSIGKILL=yes",
-        "OOMPolicy=kill",
-        f"RuntimeMaxSec={policy.runtime_seconds}",
-        f"LimitFSIZE={policy.fsize_bytes}",
-    ):
-        launcher.extend(("--property", value))
-    launcher.extend(("--", *arguments))
-    output = run_bounded(
-        launcher,
-        timeout=budget,
-        deadline=deadline,
-        env=child_env if env is None else env,
-        pass_fds=tuple(sorted(set(_tool_fds() + pass_fds))),
-        cleanup_reserve=min(8.0, max(2.0, budget / 2)),
-    )
-    return output.encode("utf-8") if isinstance(output, str) else output
+    log("+ " + shlex.join(arguments))
+    try:
+        return run_scoped_direct(
+            arguments,
+            _scope_policy(phase),
+            python=sys.executable,
+            module_fd=_bounded_fd,
+            systemd_run=require_tool("systemd_run"),
+            systemctl=require_tool("systemctl"),
+            nice="",
+            ionice="",
+            prlimit="",
+            timeout=available,
+            deadline=deadline,
+            env=env,
+            pass_fds=_tool_fds(),
+            max_output_bytes=16 * 1024 * 1024 if phase == "metadata" else 4 * 1024 * 1024,
+            cleanup_reserve=min(8.0, max(2.0, available / 2)),
+            progress=lambda: budget.account_tree(target, BUILD_TMP_BYTES, "Cargo target"),
+        )
+    except RuntimeError as error:
+        reason = _bounded_primary_error(error)
+        if any(token in reason for token in ("deadline", "exhausted", "budget")):
+            fail("transaction scoped-command deadline exhausted")
+        raise RebuildError(reason) from error
+    finally:
+        _verify_all_tools()
 
 
 def capture_tool(name: str, *arguments: str) -> bytes:
@@ -1188,6 +1188,7 @@ class HostWriteBudget:
     used: int = 0
     used_by_device: dict[int, int] = field(default_factory=dict)
     _directories: dict[Path, int] = field(default_factory=dict, init=False, repr=False)
+    _external_tree_bytes: dict[Path, int] = field(default_factory=dict, init=False, repr=False)
 
     @staticmethod
     def _absolute(path: Path) -> Path:
@@ -1904,6 +1905,62 @@ class HostWriteBudget:
             if close_descriptor:
                 os.close(descriptor)
 
+    def account_tree(self, path: Path, limit: int, label: str) -> int:
+        path = self._absolute(path)
+        root_fd = self._safe_parent(path, create=False)
+        root = os.fstat(root_fd)
+        total = 0
+        entries = 0
+
+        def visit(directory_fd: int) -> None:
+            nonlocal total, entries
+            os.lseek(directory_fd, 0, os.SEEK_SET)
+            with os.scandir(directory_fd) as children:
+                for entry in children:
+                    _deadline_checkpoint("host-write-accounting")
+                    entries += 1
+                    if entries > 100_000:
+                        fail(f"{label} entry bound exceeded")
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    if info.st_dev != root.st_dev or info.st_uid != os.geteuid():
+                        fail(f"{label} authority differs")
+                    if stat.S_ISDIR(info.st_mode):
+                        try:
+                            child = os.open(
+                                entry.name,
+                                os.O_RDONLY
+                                | os.O_DIRECTORY
+                                | os.O_CLOEXEC
+                                | getattr(os, "O_NOFOLLOW", 0),
+                                dir_fd=directory_fd,
+                            )
+                        except FileNotFoundError:
+                            continue
+                        try:
+                            visit(child)
+                        finally:
+                            os.close(child)
+                        continue
+                    if (
+                        not stat.S_ISREG(info.st_mode)
+                        or info.st_nlink != 1
+                        or info.st_mode & 0o022
+                    ):
+                        fail(f"{label} contains an unsafe object")
+                    total += info.st_size
+                    if total > limit:
+                        fail(f"{label} byte bound exceeded")
+
+        visit(root_fd)
+        previous = self._external_tree_bytes.get(path, 0)
+        if total > previous:
+            self._admit_fd(root_fd, total - previous)
+            self._external_tree_bytes[path] = total
+        return total
+
     def close(self) -> None:
         for descriptor in set(self._directories.values()):
             os.close(descriptor)
@@ -1993,8 +2050,15 @@ class SourceBundle:
         return None
 
 
-def _direct_git(*arguments: str) -> bytes:
-    return execute([require_tool("git"), *arguments], env=child_env)
+def _direct_git(
+    git_root: Path, budget: HostWriteBudget, *arguments: str
+) -> bytes:
+    progress = lambda: budget.account_tree(git_root, GIT_OBJECT_BYTES, "Git object store")
+    output = execute(
+        [require_tool("git"), *arguments], env=child_env, progress=progress
+    )
+    progress()
+    return output
 
 
 def _git_tree_entries(payload: bytes) -> list[TreeEntry]:
@@ -2022,14 +2086,14 @@ def prepare_canonical_source(snapshot_root: Path, budget: HostWriteBudget) -> So
     git_root = snapshot_root / "git"
     budget.mkdir(source)
     budget.mkdir(git_root)
-    _direct_git("init", "--bare", str(git_root))
-    _direct_git("--git-dir", str(git_root), "fetch", "--depth=1", "--no-tags", "--force", source_repo, source_ref)
-    commit = _direct_git("--git-dir", str(git_root), "rev-parse", "FETCH_HEAD").decode("ascii").strip()
-    tree = _direct_git("--git-dir", str(git_root), "rev-parse", f"{commit}^{{tree}}").decode("ascii").strip()
+    _direct_git(git_root, budget, "init", "--bare", str(git_root))
+    _direct_git(git_root, budget, "--git-dir", str(git_root), "fetch", "--depth=1", "--no-tags", "--force", source_repo, source_ref)
+    commit = _direct_git(git_root, budget, "--git-dir", str(git_root), "rev-parse", "FETCH_HEAD").decode("ascii").strip()
+    tree = _direct_git(git_root, budget, "--git-dir", str(git_root), "rev-parse", f"{commit}^{{tree}}").decode("ascii").strip()
     if re.fullmatch(r"[0-9a-f]{40}", commit) is None or re.fullmatch(r"[0-9a-f]{40}", tree) is None:
         fail("canonical source identity is malformed")
-    entries = _git_tree_entries(_direct_git("--git-dir", str(git_root), "ls-tree", "-r", "-l", "-z", "--full-tree", commit))
-    archive = _direct_git("--git-dir", str(git_root), "archive", "--format=tar", commit)
+    entries = _git_tree_entries(_direct_git(git_root, budget, "--git-dir", str(git_root), "ls-tree", "-r", "-l", "-z", "--full-tree", commit))
+    archive = _direct_git(git_root, budget, "--git-dir", str(git_root), "archive", "--format=tar", commit)
     archive_path = snapshot_root / "source.tar"
     budget.write_new(archive_path, archive, 0o400)
     tree_ledger = _extract_archive(archive_path, source, commit, entries, budget)
@@ -2318,12 +2382,16 @@ def _open_built_candidate(path: Path) -> tuple[FileAuthority, bytes]:
 
 def build_candidate(source: SourceBundle, budget: HostWriteBudget) -> BuildBundle:
     metadata_command, metadata_env, target = _cargo_command(source, "metadata")
-    metadata_frame = execute_scoped("metadata", metadata_command, env=metadata_env)
+    metadata_frame = run_build_phase(
+        "metadata", metadata_command, env=metadata_env, budget=budget, target=target
+    )
     metadata_closure = _validate_metadata(
         metadata_frame.decode("utf-8", errors="strict"), str(source.source), str(target)
     )
     build_command, build_env, target = _cargo_command(source, "build")
-    execute_scoped("build", build_command, env=build_env)
+    run_build_phase(
+        "build", build_command, env=build_env, budget=budget, target=target
+    )
     candidate_path = target / TARGET_TRIPLE / "release" / "llm-guard-proxy"
     built_authority, candidate_data = _open_built_candidate(candidate_path)
     try:

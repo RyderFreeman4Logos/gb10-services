@@ -630,10 +630,46 @@ state = json.loads(state_path.read_text())
 authority = json.loads(Path(os.environ["GUARD_TEST_BWRAP_AUTHORITY"]).read_text())
 
 SCOPE_UNIT = re.compile(
-    r"llm-guard-rebuild-(metadata|build)-[0-9]+-[0-9]+\.scope"
+    r"llm-guard-rebuild-(metadata|build)-(?:[0-9]+-[0-9]+|[0-9a-f]{32})\.scope"
 )
 
 def valid_systemd_run(values):
+    if (
+        len(values) >= 19
+        and values[:3] == ["--user", "--scope", "--quiet"]
+        and values[3].startswith("--unit=")
+        and "--" in values[4:]
+    ):
+        match = SCOPE_UNIT.fullmatch(values[3].split("=", 1)[1])
+        separator = values.index("--", 4)
+        if match is None:
+            return False
+        limits = {
+            "metadata": (8589934592, 10737418240, 768, 200, 300, 134217728),
+            "build": (8589934592, 10737418240, 768, 200, 1800, 134217728),
+        }[match.group(1)]
+        properties = values[4:separator]
+        expected = [
+            f"--property=MemoryHigh={limits[0]}",
+            f"--property=MemoryMax={limits[1]}",
+            "--property=MemorySwapMax=0",
+            f"--property=TasksMax={limits[2]}",
+            f"--property=CPUQuota={limits[3]}%",
+            "--property=CPUQuotaPeriodSec=100ms",
+            "--property=KillMode=control-group",
+            "--property=SendSIGKILL=yes",
+            "--property=OOMPolicy=kill",
+            f"--property=RuntimeMaxSec={limits[4]}",
+            f"--property=LimitFSIZE={limits[5]}",
+        ]
+        payload = values[separator + 1:]
+        return (
+            properties == expected
+            and len(payload) >= 10
+            and payload[1].startswith("/proc/self/fd/")
+            and payload[2] == "--direct-scope-child"
+            and payload[6] == "--"
+        )
     if (
         len(values) < 8
         or values[:4] != ["--user", "--scope", "--quiet", "--collect"]
@@ -1188,6 +1224,93 @@ def drift():
 if name == "systemd_run":
     if state.get("scope_failure") in {"manager", "property"}:
         raise SystemExit(23)
+    if "--direct-scope-child" in args:
+        unit_arg = next((arg for arg in args if arg.startswith("--unit=")), "")
+        separator = args.index("--")
+        unit = unit_arg.split("=", 1)[1]
+        props = {
+            value.split("=", 1)[0]: value.split("=", 1)[1]
+            for value in args[4:separator]
+            if value.startswith("--property=")
+            for value in (value.removeprefix("--property="),)
+        }
+        scope = scope_paths(unit)
+        scope.mkdir(parents=True, exist_ok=True)
+        worker = os.fork()
+        if worker == 0:
+            os.kill(os.getpid(), signal.SIGSTOP)
+            os.execv(args[separator + 1], args[separator + 1:])
+        waited, stopped = os.waitpid(worker, os.WUNTRACED)
+        if waited != worker or not os.WIFSTOPPED(stopped):
+            raise SystemExit(30)
+        state["scope_unit"] = unit
+        state["scope_worker"] = worker
+        state["scope_worker_starttime"] = 9000 + worker
+        state["scope_registration"] = {
+            "cgroup_path": str(scope),
+            "unit": unit,
+            "worker_pid": worker,
+        }
+        save()
+        proc = Path(os.environ["LLM_GUARD_PROXY_REBUILD_PROC_ROOT"]) / str(worker)
+        proc.mkdir(parents=True, exist_ok=True)
+        fields = ["S"] + ["0"] * 18 + [str(9000 + worker)]
+        (proc / "stat").write_text(
+            f"{worker} (direct cargo) " + " ".join(fields) + "\n"
+        )
+        cgroup_unit = unit if state.get("scope_failure") != "cgroup" else "foreign.scope"
+        (proc / "cgroup").write_text(f"0::/fixture.slice/{cgroup_unit}\n")
+        files = {
+            "cgroup.procs": f"{worker}\n",
+            "cgroup.events": "populated 1\nfrozen 0\n",
+            "memory.high": str(props.get("MemoryHigh", "0")) + "\n",
+            "memory.max": str(props.get("MemoryMax", "0")) + "\n",
+            "memory.swap.max": str(props.get("MemorySwapMax", "0")) + "\n",
+            "memory.oom.group": "1\n",
+            "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n",
+            "pids.max": str(props.get("TasksMax", "0")) + "\n",
+            "pids.events": "max 0\n",
+            "cpu.max": (
+                "100000 100000\n"
+                if props.get("CPUQuota") == "100%"
+                else "200000 100000\n"
+            ),
+            "cgroup.kill": "",
+        }
+        if state.get("scope_failure") == "property-readback":
+            files["memory.max"] = "1\n"
+        if state.get("scope_failure") == "controller":
+            files.pop("memory.swap.max")
+        for filename, value in files.items():
+            (scope / filename).write_text(value)
+        os.kill(worker, signal.SIGCONT)
+        while True:
+            waited, child_status = os.waitpid(worker, os.WNOHANG)
+            if waited == worker:
+                break
+            if (scope / "cgroup.kill").read_text():
+                try:
+                    os.kill(worker, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                _, child_status = os.waitpid(worker, 0)
+                break
+            time.sleep(0.01)
+        clear_scope(unit)
+        shutil.rmtree(proc, ignore_errors=True)
+        latest = json.loads(state_path.read_text())
+        latest["scope_worker_reap_witness"] = {
+            "owner_pid": os.getpid(),
+            "worker_pid": worker,
+            "worker_starttime": 9000 + worker,
+        }
+        latest["scope_registration"] = {}
+        latest["scope_unit"] = ""
+        latest["scope_worker"] = 0
+        state.clear()
+        state.update(latest)
+        save()
+        raise SystemExit(os.waitstatus_to_exitcode(child_status))
     unit_arg = next((arg for arg in args if arg.startswith("--unit=")), "")
     if not unit_arg:
         raise SystemExit(24)
