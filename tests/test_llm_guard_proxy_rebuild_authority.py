@@ -30,16 +30,24 @@ ENGINE = ROOT / "scripts" / "llm_guard_proxy_cached_rebuild.py"
 WORKER = ROOT / "scripts" / "llm_guard_proxy_scoped_worker.py"
 
 
-def _load(path: Path, name: str) -> types.ModuleType:
+def _load(
+    path: Path, name: str, *, module_path: Path | None = None
+) -> types.ModuleType:
     if path == ENGINE:
-        source = path.read_text()
+        source_path = module_path or path
+        if module_path is not None:
+            assert source_path.read_bytes() == path.read_bytes()
+        source = source_path.read_text()
         entrypoint = "\nraise SystemExit(run_transaction())\n"
         assert source.endswith(entrypoint)
         module = types.ModuleType(name)
-        module.__file__ = str(path)
+        module.__file__ = str(source_path)
         module.__package__ = ""
         sys.modules[name] = module
-        exec(compile(source[: -len(entrypoint)], str(path), "exec"), module.__dict__)
+        exec(
+            compile(source[: -len(entrypoint)], str(source_path), "exec"),
+            module.__dict__,
+        )
         return module
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec and spec.loader
@@ -127,6 +135,53 @@ def _terminate_reap_group(
 
 
 class GuardCanonicalAuthorityTests(unittest.TestCase):
+    def test_engine_load_rejects_archive_mode_then_uses_exact_sibling_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            authority = Path(temporary)
+            authority_engine = authority / ENGINE.name
+            authority_helper = authority / BOUNDED.name
+            shutil.copyfile(ENGINE, authority_engine)
+            shutil.copyfile(BOUNDED, authority_helper)
+            authority_engine.chmod(0o600)
+            authority_helper.chmod(0o664)
+
+            old_handlers = {
+                number: signal.getsignal(number)
+                for number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+            }
+            try:
+                with (
+                    patch.object(sys, "argv", [str(authority_engine)]),
+                    self.assertRaisesRegex(
+                        RuntimeError, "bounded-process import authority differs"
+                    ),
+                ):
+                    _load(
+                        ENGINE,
+                        "archive_mode_failure",
+                        module_path=authority_engine,
+                    )
+                sys.modules.pop("archive_mode_failure", None)
+                authority_helper.chmod(0o600)
+                with patch.object(sys, "argv", [str(authority_engine)]):
+                    engine = _load(
+                        ENGINE,
+                        "exact_sibling_module_authority",
+                        module_path=authority_engine,
+                    )
+            finally:
+                for number, handler in old_handlers.items():
+                    signal.signal(number, handler)
+
+            self.assertEqual(engine.__file__, str(authority_engine))
+            self.assertEqual(engine._BOUNDED_PROCESS_PATH, authority_helper)
+            self.assertEqual(
+                hashlib.sha256(authority_helper.read_bytes()).hexdigest(),
+                engine.EXPECTED_BOUNDED_PROCESS_SHA256,
+            )
+
     def test_bounded_helper_loads_from_verified_bytes_after_path_replacement(
         self,
     ) -> None:
@@ -1038,7 +1093,30 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
         }
         try:
             sys.argv = [str(ENGINE)]
-            engine = _load(ENGINE, "native_production_cargo_sandbox")
+            module_authority = tempfile.TemporaryDirectory()
+            self.addCleanup(module_authority.cleanup)
+            authority = Path(module_authority.name)
+            authority_engine = authority / ENGINE.name
+            authority_helper = authority / BOUNDED.name
+            shutil.copyfile(ENGINE, authority_engine)
+            shutil.copyfile(BOUNDED, authority_helper)
+            authority_engine.chmod(0o600)
+            authority_helper.chmod(0o600)
+            engine = _load(
+                ENGINE,
+                "native_production_cargo_sandbox",
+                module_path=authority_engine,
+            )
+            archive_helper_sha256 = hashlib.sha256(BOUNDED.read_bytes()).hexdigest()
+            installed_helper_sha256 = hashlib.sha256(
+                Path("/home/obj/.local/bin/gb10_bounded_process.py").read_bytes()
+            ).hexdigest()
+            self.assertEqual(
+                archive_helper_sha256,
+                engine.EXPECTED_BOUNDED_PROCESS_SHA256,
+            )
+            self.assertEqual(installed_helper_sha256, archive_helper_sha256)
+            self.assertEqual(engine._BOUNDED_PROCESS_PATH, authority_helper)
         finally:
             sys.argv = old_argv
             for number, handler in old_handlers.items():
