@@ -135,6 +135,39 @@ def _terminate_reap_group(
 
 
 class GuardCanonicalAuthorityTests(unittest.TestCase):
+    def test_sysroot_runtime_allows_bounded_usr_links_but_rejects_escape_links(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            usr = Path(temporary) / "usr"
+            sysroot = usr / "lib" / "aarch64-linux-gnu"
+            (usr / "lib" / "libreoffice" / "program").mkdir(parents=True)
+            (usr / "share" / "qtchooser").mkdir(parents=True)
+            (sysroot / "qt-default" / "qtchooser").mkdir(parents=True)
+            (sysroot / "libuno_sal.so.3").symlink_to(
+                "../libreoffice/program/libuno_sal.so.3"
+            )
+            (sysroot / "qt-default" / "qtchooser" / "default.conf").symlink_to(
+                "../../../../share/qtchooser/qt5-aarch64-linux-gnu.conf"
+            )
+            with patch.object(sys, "argv", [str(ENGINE)]):
+                engine = _load(ENGINE, "sysroot_runtime_authority")
+            authority = engine._open_directory_authority("sysroot runtime", sysroot)
+            authority.close()
+
+            for name, target in (
+                ("escape", "../../../etc/passwd"),
+                ("absolute", "/etc/passwd"),
+            ):
+                with self.subTest(target=target):
+                    unsafe = sysroot / name
+                    unsafe.symlink_to(target)
+                    with self.assertRaisesRegex(
+                        engine.RebuildError,
+                        "unsafe symlink in directory authority: sysroot runtime",
+                    ):
+                        engine._open_directory_authority("sysroot runtime", sysroot)
+
     def test_production_tool_specs_pin_complete_gb10_authority(self) -> None:
         old_handlers = {
             number: signal.getsignal(number)

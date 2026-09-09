@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import posixpath
 import re
 import secrets
 import shlex
@@ -1202,7 +1203,7 @@ class DirectoryAuthority:
         )
         if fields != self.metadata or current_fields != self.metadata:
             fail(f"directory authority changed: {self.name}")
-        if _directory_ledger(self.descriptor, self.name) != self.ledger:
+        if _directory_ledger(self.descriptor, self.name, self.path) != self.ledger:
             fail(f"directory authority ledger changed: {self.name}")
 
     def receipt(self) -> dict[str, object]:
@@ -1223,7 +1224,7 @@ class DirectoryAuthority:
         os.close(self.descriptor)
 
 
-def _directory_ledger(root_fd: int, label: str) -> DirectoryLedger:
+def _directory_ledger(root_fd: int, label: str, root_path: Path) -> DirectoryLedger:
     content = hashlib.sha256()
     metadata_digest = hashlib.sha256()
     file_count = 0
@@ -1276,6 +1277,16 @@ def _directory_ledger(root_fd: int, label: str) -> DirectoryLedger:
                         and target == "../../aarch64-linux-gnu/libpython3.12.so.1"
                     )
                 )
+                if label == "sysroot runtime" and not target.startswith("/"):
+                    # Debian's AArch64 sysroot links into bounded siblings under /usr.
+                    link_path = posixpath.join(root_path.as_posix(), relative)
+                    resolved = posixpath.normpath(
+                        posixpath.join(posixpath.dirname(link_path), target)
+                    )
+                    allowed_root = root_path.parent.parent.as_posix()
+                    authorized_external = resolved == allowed_root or resolved.startswith(
+                        f"{allowed_root}/"
+                    )
                 if (target.startswith("/") or ".." in parts) and not authorized_external:
                     fail(f"unsafe symlink in directory authority: {label}")
                 content.update(f"L\0{relative}\0{mode:o}\0{target}\n".encode())
@@ -1351,7 +1362,7 @@ def _open_directory_authority(name: str, path: Path) -> DirectoryAuthority:
             info.st_ctime_ns,
         )
         authority = DirectoryAuthority(
-            name, path, descriptor, metadata, _directory_ledger(descriptor, name)
+            name, path, descriptor, metadata, _directory_ledger(descriptor, name, path)
         )
         authority.verify()
         return authority
