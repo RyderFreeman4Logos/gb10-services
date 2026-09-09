@@ -789,7 +789,8 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
         with RebuildFixture() as fixture:
             _, env = fixture._run_arguments(True, None)
             with patch.dict(os.environ, env, clear=True):
-                engine = _load(ENGINE, "metadata_fd_root_test")
+                with patch.object(sys, "argv", [str(ENGINE), "--test-only"]):
+                    engine = _load(ENGINE, "metadata_fd_root_test")
         source_root = "/snapshot/source"
         source_fd_root = "/proc/self/fd/17"
         target_root = "/snapshot/target"
