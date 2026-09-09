@@ -1001,6 +1001,31 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             for descriptor in reversed(list(held.values())):
                 os.close(descriptor)
 
+    def test_direct_sandbox_scope_materialization_resolves_worker_contract(self) -> None:
+        old_argv = sys.argv[:]
+        old_handlers = {
+            number: signal.getsignal(number)
+            for number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+        }
+        try:
+            sys.argv = [str(ENGINE)]
+            engine = _load(ENGINE, "direct_sandbox_scope_contract")
+        finally:
+            sys.argv = old_argv
+            for number, handler in old_handlers.items():
+                signal.signal(number, handler)
+
+        unit = "llm-guard-rebuild-build-" + "0" * 32 + ".scope"
+        command = engine._materialize_scope_unit(
+            engine._worker_payload("build", {"policy": {}}), unit
+        )
+        self.assertEqual(command[-1], unit)
+        self.assertNotIn(engine.SCOPE_UNIT_TOKEN, command)
+        self.assertEqual(
+            hashlib.sha256(WORKER.read_bytes()).hexdigest(),
+            engine._production_tool_specs()["scoped_worker"].sha256,
+        )
+
     @unittest.skipUnless(
         os.environ.get("JUST_NO_DOTENV") == "true" and os.uname().machine == "aarch64",
         "production Cargo sandbox requires a repository Just gate on native GB10 AArch64",
@@ -1021,17 +1046,44 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
 
         authorities = []
         source_bundle = None
+        old_cgroup_root = engine.cgroup_root
         parent, child = socket.socketpair()
         try:
             setattr(engine, "operation_deadline", time.monotonic() + 1800)
-            engine._open_all_tools()
             production_worker = engine._production_tool_specs()["scoped_worker"]
+            tracked_worker = WORKER.resolve(strict=True)
+            tracked_worker_info = tracked_worker.stat(follow_symlinks=False)
+            tracked_worker_sha256 = hashlib.sha256(tracked_worker.read_bytes()).hexdigest()
+            self.assertEqual(tracked_worker_sha256, production_worker.sha256)
+            engine.tool_specs["scoped_worker"] = engine.ToolSpec(
+                str(tracked_worker),
+                str(tracked_worker),
+                tracked_worker_info.st_uid,
+                tracked_worker_info.st_gid,
+                stat.S_IMODE(tracked_worker_info.st_mode),
+                tracked_worker_sha256,
+            )
+            engine._open_all_tools()
             self.assertEqual(
-                engine.held_tools["scoped_worker"].identity.sha256,
-                production_worker.sha256,
+                engine.held_tools["scoped_worker"].spec.logical, str(tracked_worker)
             )
             with tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
+                scope_root = root / "non-live-scope-contract"
+                scope_root.mkdir()
+                scope_policy = engine._scope_policy("build").contract()
+                for name, value in {
+                    "cgroup.events": "populated 1\n",
+                    "cgroup.procs": "2\n",
+                    "cpu.max": f"{int(scope_policy['cpu_percent']) * 1000} 100000\n",
+                    "memory.high": f"{scope_policy['memory_high']}\n",
+                    "memory.max": f"{scope_policy['memory_max']}\n",
+                    "memory.oom.group": "1\n",
+                    "memory.swap.max": "0\n",
+                    "pids.max": f"{scope_policy['tasks_max']}\n",
+                }.items():
+                    (scope_root / name).write_text(value)
+                setattr(engine, "cgroup_root", scope_root)
                 source = root / "source"
                 crate = source / "llm-guard-proxy"
                 (crate / "src").mkdir(parents=True)
@@ -1079,6 +1131,12 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                     authorities[5],
                     "build",
                 )
+                command = engine._materialize_scope_unit(
+                    command, "llm-guard-rebuild-build-" + "0" * 32 + ".scope"
+                )
+                self.assertNotIn(engine.SCOPE_UNIT_TOKEN, command)
+                self.assertNotIn("--share-net", command)
+                self.assertIn(engine.held_tools["scoped_worker"].exec_path, command)
 
                 fence_error = []
 
@@ -1131,6 +1189,7 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             for held_tool in reversed(list(engine.held_tools.values())):
                 held_tool.close()
             engine.held_tools.clear()
+            setattr(engine, "cgroup_root", old_cgroup_root)
             setattr(engine, "operation_deadline", None)
 
 

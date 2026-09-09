@@ -2493,6 +2493,10 @@ def _worker_payload(operation: str, config: dict[str, object]) -> list[str]:
     ]
 
 
+def _materialize_scope_unit(sandbox_arguments: list[str], unit: str) -> list[str]:
+    return [unit if value == SCOPE_UNIT_TOKEN else value for value in sandbox_arguments]
+
+
 def _fetch_sandbox(
     runtime_lib: DirectoryAuthority,
     python_lib: DirectoryAuthority,
