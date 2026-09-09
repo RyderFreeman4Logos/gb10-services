@@ -1513,6 +1513,7 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                     pass_fds=tuple(sorted(set(engine._tool_fds() + descriptors))),
                     env=engine.child_env,
                 )
+                child.close()
                 fence.join(timeout=5)
                 self.assertFalse(fence.is_alive())
                 self.assertEqual(fence_error, [])
