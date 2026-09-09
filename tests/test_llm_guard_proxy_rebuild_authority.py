@@ -856,16 +856,19 @@ class SharedBoundedScopeAuthorityTests(unittest.TestCase):
         with RebuildFixture() as fixture:
             fixture.set_state(
                 scope_build_exit=37,
-                scope_build_stderr="progress " + "x" * 300 + "\n\x1b[31merror: fixture compile failed\n",
+                scope_build_stderr=(
+                    "progress " + "x" * 600
+                    + "\n\x1b[31merror: fixture root cause\n"
+                    + "error: could not compile fixture\n"
+                ),
             )
             result = fixture.run(timeout=20)
             output = result.stdout + result.stderr
             self.assertNotEqual(result.returncode, 0, output)
-            self.assertIn(
-                "scoped payload failed (exit=37): ?[31merror: fixture compile failed",
-                output,
-            )
-            self.assertNotIn("progress xxx", output)
+            self.assertIn("scoped payload failed (exit=37):", output)
+            self.assertIn("?[31merror: fixture root cause", output)
+            self.assertIn("error: could not compile fixture", output)
+            self.assertNotIn("progress ", output)
             self.assertEqual(fixture.reload_state()["restart_calls"], 0)
 
     def test_scope_pins_writable_nofollow_cgroup_kill(self) -> None:

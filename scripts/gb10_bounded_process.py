@@ -330,10 +330,10 @@ def _bounded_error_summary(error: BaseException) -> str:
 
 def _scoped_payload_failure(returncode: int, stderr: _Capture) -> str:
     lines = _render(stderr).splitlines()
-    line = next((line.strip() for line in reversed(lines) if line.strip()), "")
+    text = " ".join(line.strip() for line in lines if line.strip())
     diagnostic = "".join(
-        character if character.isprintable() else "?" for character in line
-    )[:256]
+        character if character.isprintable() else "?" for character in text
+    )[-440:]
     failure = f"scoped payload failed (exit={returncode})"
     return f"{failure}: {diagnostic}" if diagnostic else failure
 
