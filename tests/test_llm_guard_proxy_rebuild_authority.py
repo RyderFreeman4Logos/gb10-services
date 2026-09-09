@@ -506,8 +506,29 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                 self.assertEqual(fixture.reload_state()["restart_calls"], 0)
                 fixture.assert_prior_restored(self)
 
-    def test_production_source_pins_canonical_tools_and_bwrap_shape(self) -> None:
+    def test_wrong_candidate_elf_machine_or_loader_fails_before_mutation(self) -> None:
+        cases = (
+            ("candidate_elf_machine", "Advanced Micro Devices X86-64", "machine"),
+            ("candidate_elf_interpreter", "/lib64/ld-linux-x86-64.so.2", "interpreter"),
+        )
+        for key, value, diagnostic in cases:
+            with self.subTest(key=key), RebuildFixture() as fixture:
+                fixture.set_state(**{key: value})
+                before = os.readlink(fixture.service_bin)
+                result = fixture.run()
+                output = result.stdout + result.stderr
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertIn(f"candidate ELF {diagnostic} differs", output)
+                self.assertEqual(os.readlink(fixture.service_bin), before)
+                self.assertEqual(fixture.reload_state()["restart_calls"], 0)
+                self.assertFalse(
+                    fixture.receipt_dir.joinpath("transaction.v1", "state.json").exists()
+                )
+                fixture.assert_no_backend_lifecycle(self)
+
+    def test_production_source_pins_native_gb10_aarch64_authority(self) -> None:
         source = ENGINE.read_text()
+        worker = WORKER.read_text()
         self.assertIn(
             'source_repo = "https://github.com/RyderFreeman4Logos/llm-guard-proxy.git"',
             source,
@@ -529,28 +550,62 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             "--die-with-parent",
             "--clearenv",
             "--tmpfs",
-            "/usr/local",
             "--chdir",
             "/src",
             "--offline",
             "--frozen",
             "--locked",
-            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "/home/obj/.rustup/toolchains/1.96.0-aarch64-unknown-linux-gnu",
+            "/usr/lib/gcc/aarch64-linux-gnu/13",
+            "/usr/lib/aarch64-linux-gnu",
+            "/usr/lib/python3.12",
+            "/usr/bin/aarch64-linux-gnu-gcc-13",
+            "/usr/bin/aarch64-linux-gnu-as",
+            "/usr/bin/aarch64-linux-gnu-ar",
+            "/usr/bin/aarch64-linux-gnu-ld.bfd",
+            "/usr/bin/aarch64-linux-gnu-readelf",
+            "2425682b7dd432769e2600eb2b3ea5113a00d37f41a754598f2af2e56e4fa2fe",
+            "7db170801729d4775347548ed5970b459844fc2f6b20798efb96f444b5b94fc3",
+            "a20520ee21543f243d40636a9181a142c45ecd989de31ab86b99a8ea5ada870d",
+            "1ffda50efb6d91b6b05ef933aced099595c36577594c0296c91161f2d13db374",
+            "f4583a612510e038dbc1ae8afb5eae5f0445c435bdd7c4c28e78acc7e757d2b1",
+            "1e4d3369b76845fa8e099b83513bf28f6f722e046f9b2cde1378c9e27f96d19c",
+            "6bca2bbd23b072db9e9a19ae0e65cf7b7c15c08a3c2cf01dd56453e1ac9340b1",
         ):
             self.assertIn(required, source)
+        self.assertIn('"--features",\n            "guard"', worker)
+        self.assertNotIn("x86_64-unknown-linux-gnu", source)
+        self.assertNotIn("x86_64-unknown-linux-gnu", worker)
         self.assertNotIn("shutil.which", source)
         self.assertNotIn('"--ro-bind",\n        "/usr",\n        "/usr"', source)
         self.assertIn('held_tools["ld"].exec_path', source)
         self.assertNotIn('clone",\n                "--filter=blob:none', source)
 
+    def test_wrong_toolchain_target_identity_fails_before_build_or_link(self) -> None:
+        for key, value in (
+            ("cargo_host", "x86_64-unknown-linux-gnu"),
+            ("rustc_host", "x86_64-unknown-linux-gnu"),
+            ("rustc_release", "1.95.0"),
+        ):
+            with self.subTest(key=key), RebuildFixture() as fixture:
+                fixture.set_state(**{key: value})
+                before = os.readlink(fixture.service_bin)
+                result = fixture.run()
+                output = result.stdout + result.stderr
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertIn("Cargo/rustc version contract differs", output)
+                self.assertNotIn("cargo build", fixture.calls())
+                self.assertEqual(os.readlink(fixture.service_bin), before)
+                self.assertEqual(fixture.reload_state()["restart_calls"], 0)
+
     @unittest.skipUnless(
-        os.environ.get("JUST_NO_DOTENV") == "true",
-        "real Cargo is permitted only when reached through repository Just gates",
+        os.environ.get("JUST_NO_DOTENV") == "true" and os.uname().machine == "aarch64",
+        "real Cargo smoke requires a repository Just gate on native GB10 AArch64",
     )
     def test_real_bwrap_offline_tiny_crate_positive(self) -> None:
         toolchain = Path(
-            "/usr/local/share/mise/installs/rust/stable/toolchains/"
-            "stable-x86_64-unknown-linux-gnu"
+            "/home/obj/.rustup/toolchains/1.96.0-aarch64-unknown-linux-gnu"
         )
         reviewed = {
             "bwrap": (
@@ -561,32 +616,32 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             "cargo": (
                 toolchain / "bin" / "cargo",
                 (1001, 1001, 0o755),
-                "828980723df339d62434390e9fb8ef8831036583343ae2316b7ab5646b5c1953",
+                "7db170801729d4775347548ed5970b459844fc2f6b20798efb96f444b5b94fc3",
             ),
             "rustc": (
                 toolchain / "bin" / "rustc",
                 (1001, 1001, 0o755),
-                "d3a664c970a9fd8361b64194861bebc1ae37b9054e5ee3400dc1c9e691797eea",
+                "2425682b7dd432769e2600eb2b3ea5113a00d37f41a754598f2af2e56e4fa2fe",
             ),
             "cc": (
-                Path("/usr/bin/x86_64-linux-gnu-gcc-12"),
+                Path("/usr/bin/aarch64-linux-gnu-gcc-13"),
                 (0, 0, 0o755),
-                "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+                "a20520ee21543f243d40636a9181a142c45ecd989de31ab86b99a8ea5ada870d",
             ),
             "ar": (
-                Path("/usr/bin/x86_64-linux-gnu-ar"),
+                Path("/usr/bin/aarch64-linux-gnu-ar"),
                 (0, 0, 0o755),
-                "3acbee2794e3668a74bcb90f2eaf7d981211fb95288ab940f0e3ac380e8f6023",
+                "f4583a612510e038dbc1ae8afb5eae5f0445c435bdd7c4c28e78acc7e757d2b1",
             ),
             "as": (
-                Path("/usr/bin/x86_64-linux-gnu-as"),
+                Path("/usr/bin/aarch64-linux-gnu-as"),
                 (0, 0, 0o755),
-                "41fe4f5a03389ea5cf7c92d6753fa1ecc69b45b12534fd8713c53bba0e2d7e17",
+                "1ffda50efb6d91b6b05ef933aced099595c36577594c0296c91161f2d13db374",
             ),
             "ld": (
-                Path("/usr/bin/x86_64-linux-gnu-ld.bfd"),
+                Path("/usr/bin/aarch64-linux-gnu-ld.bfd"),
                 (0, 0, 0o755),
-                "f6d71a1bcd45764550a42dfaa179bc43b63ee879ec6f875bfd39fca013515da7",
+                "1e4d3369b76845fa8e099b83513bf28f6f722e046f9b2cde1378c9e27f96d19c",
             ),
         }
         held: dict[str, int] = {}
@@ -644,10 +699,11 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                     source,
                     target,
                     toolchain,
+                    toolchain / "lib/rustlib/aarch64-unknown-linux-gnu",
                     cache,
                     index,
-                    Path("/usr/lib/gcc/x86_64-linux-gnu/12"),
-                    Path("/usr/lib/x86_64-linux-gnu"),
+                    Path("/usr/lib/gcc/aarch64-linux-gnu/13"),
+                    Path("/usr/lib/aarch64-linux-gnu"),
                     Path("/usr/include"),
                 )
                 for path in mount_paths:
@@ -664,6 +720,7 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                     source_fd,
                     target_fd,
                     toolchain_fd,
+                    rustlib_fd,
                     cache_fd,
                     index_fd,
                     gcc_fd,
@@ -692,44 +749,42 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                     "--dir",
                     "/usr/lib/gcc",
                     "--dir",
-                    "/usr/lib/gcc/x86_64-linux-gnu",
+                    "/usr/lib/gcc/aarch64-linux-gnu",
                     "--ro-bind",
                     f"/proc/self/fd/{gcc_fd}",
-                    "/usr/lib/gcc/x86_64-linux-gnu/12",
+                    "/usr/lib/gcc/aarch64-linux-gnu/13",
                     "--ro-bind",
                     f"/proc/self/fd/{sysroot_lib_fd}",
-                    "/usr/lib/x86_64-linux-gnu",
+                    "/usr/lib/aarch64-linux-gnu",
                     "--ro-bind",
                     f"/proc/self/fd/{sysroot_include_fd}",
                     "/usr/include",
                     "--ro-bind",
                     f"/proc/self/fd/{held['cc']}",
-                    "/usr/bin/x86_64-linux-gnu-gcc-12",
+                    "/usr/bin/aarch64-linux-gnu-gcc-13",
                     "--ro-bind",
                     f"/proc/self/fd/{held['as']}",
-                    "/usr/bin/as",
+                    "/usr/bin/aarch64-linux-gnu-as",
                     "--ro-bind",
                     f"/proc/self/fd/{held['ld']}",
-                    "/usr/bin/ld",
+                    "/usr/bin/aarch64-linux-gnu-ld.bfd",
                     "--ro-bind",
                     f"/proc/self/fd/{held['ar']}",
-                    "/usr/bin/x86_64-linux-gnu-ar",
-                    "--tmpfs",
-                    "/usr/local",
+                    "/usr/bin/aarch64-linux-gnu-ar",
                     "--tmpfs",
                     "/home",
                     "--symlink",
-                    "usr/lib",
+                    "usr/lib/aarch64-linux-gnu",
                     "/lib",
-                    "--symlink",
-                    "usr/lib/x86_64-linux-gnu",
-                    "/lib64",
                     "--ro-bind",
                     f"/proc/self/fd/{source_fd}",
                     "/src",
                     "--ro-bind",
                     f"/proc/self/fd/{toolchain_fd}",
                     "/toolchain",
+                    "--ro-bind",
+                    f"/proc/self/fd/{rustlib_fd}",
+                    "/toolchain/lib/rustlib/aarch64-unknown-linux-gnu",
                     "--ro-bind",
                     f"/proc/self/fd/{held['cargo']}",
                     "/toolchain/bin/cargo",
@@ -784,13 +839,13 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                     "/toolchain/bin/rustc",
                     "--setenv",
                     "CC",
-                    "/usr/bin/x86_64-linux-gnu-gcc-12",
+                    "/usr/bin/aarch64-linux-gnu-gcc-13",
                     "--setenv",
                     "AR",
-                    "/usr/bin/x86_64-linux-gnu-ar",
+                    "/usr/bin/aarch64-linux-gnu-ar",
                     "--setenv",
-                    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
-                    "/usr/bin/x86_64-linux-gnu-gcc-12",
+                    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER",
+                    "/usr/bin/aarch64-linux-gnu-gcc-13",
                     "--chdir",
                     "/src",
                     "--",
@@ -824,13 +879,13 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     cargo_version.stdout.splitlines()[0],
-                    "cargo 1.97.1 (c980f4866 2026-06-30)",
+                    "cargo 1.96.0 (30a34c682 2026-05-25)",
                 )
                 self.assertEqual(
                     rustc_version.stdout.splitlines()[0],
-                    "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+                    "rustc 1.96.0 (ac68faa20 2026-05-25)",
                 )
-                self.assertIn("LLVM version: 22.1.6", rustc_version.stdout)
+                self.assertIn("LLVM version: 22.1.2", rustc_version.stdout)
                 metadata = sandbox(
                     "/toolchain/bin/cargo",
                     "metadata",
@@ -839,7 +894,7 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                     "--locked",
                     "--offline",
                     "--filter-platform",
-                    "x86_64-unknown-linux-gnu",
+                    "aarch64-unknown-linux-gnu",
                 )
                 self.assertEqual(
                     metadata.returncode, 0, metadata.stdout + metadata.stderr
@@ -864,13 +919,13 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                     "--locked",
                     "--offline",
                     "--target",
-                    "x86_64-unknown-linux-gnu",
+                    "aarch64-unknown-linux-gnu",
                     "--features",
                     "guard",
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 artifact = (
-                    target / "x86_64-unknown-linux-gnu" / "release" / "llm-guard-proxy"
+                    target / "aarch64-unknown-linux-gnu" / "release" / "llm-guard-proxy"
                 )
                 artifact_info = artifact.stat(follow_symlinks=False)
                 if artifact_info.st_nlink == 2:
@@ -2622,8 +2677,8 @@ class StrictFakeGrammarTests(unittest.TestCase):
             config = json.loads(fixture.authority_config.read_text())
             tools = config["tools"]
             destinations = {
-                "/usr/lib/x86_64-linux-gnu": fixture.sysroot_lib,
-                "/usr/lib/python3.11": Path(config["python_stdlib"]),
+                "/usr/lib/aarch64-linux-gnu": fixture.sysroot_lib,
+                "/usr/lib/python3.12": Path(config["python_stdlib"]),
                 "/tools/python": Path(tools["python"]["logical"]),
                 "/worker.py": Path(tools["scoped_worker"]["logical"]),
                 "/etc/ssl/certs/ca-certificates.crt": Path(tools["ca_cert"]["logical"]),
@@ -2632,13 +2687,14 @@ class StrictFakeGrammarTests(unittest.TestCase):
                 "/etc/hosts": Path(tools["hosts"]["logical"]),
                 "/tools/git": Path(tools["git"]["logical"]),
                 "/tools/git-remote-https": Path(tools["git_remote_https"]["logical"]),
-                "/usr/lib/gcc/x86_64-linux-gnu/12": fixture.gcc_root,
+                "/usr/lib/gcc/aarch64-linux-gnu/13": fixture.gcc_root,
                 "/usr/include": fixture.sysroot_include,
-                "/usr/bin/cc": Path(tools["cc"]["logical"]),
-                "/usr/bin/as": Path(tools["as"]["logical"]),
-                "/usr/bin/ld": Path(tools["ld"]["logical"]),
-                "/usr/bin/ar": Path(tools["ar"]["logical"]),
+                "/usr/bin/aarch64-linux-gnu-gcc-13": Path(tools["cc"]["logical"]),
+                "/usr/bin/aarch64-linux-gnu-as": Path(tools["as"]["logical"]),
+                "/usr/bin/aarch64-linux-gnu-ld.bfd": Path(tools["ld"]["logical"]),
+                "/usr/bin/aarch64-linux-gnu-ar": Path(tools["ar"]["logical"]),
                 "/toolchain": fixture.toolchain_root,
+                "/toolchain/lib/rustlib/aarch64-unknown-linux-gnu": fixture.target_rustlib,
                 "/toolchain/bin/cargo": Path(tools["cargo"]["logical"]),
                 "/toolchain/bin/rustc": Path(tools["rustc"]["logical"]),
                 "/cargo-home/registry/cache": fixture.registry_cache,
@@ -3186,7 +3242,7 @@ if sys.argv[1] == 'metadata':
         'target_directory': '/target', 'version': 1,
         'workspace_members': [package], 'workspace_root': '/src'}))
 elif sys.argv[1] == 'build':
-    path = '/target/x86_64-unknown-linux-gnu/release/llm-guard-proxy'
+    path = '/target/aarch64-unknown-linux-gnu/release/llm-guard-proxy'
     os.makedirs(os.path.dirname(path), exist_ok=True)
     open(path, 'wb').write(b'\\x7fELF-real-bwrap-worker\\n')
     os.chmod(path, 0o700)

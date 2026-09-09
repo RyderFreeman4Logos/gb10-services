@@ -21,6 +21,7 @@ _LOG_BYTES = 4 * 1024 * 1024
 _ARCHIVE_BYTES = 160 * 1024 * 1024
 _CANDIDATE_BYTES = 128 * 1024 * 1024
 _READ_BYTES = 64 * 1024
+_TARGET_TRIPLE = "aarch64-unknown-linux-gnu"
 _EXPECTED_GIT_CONFIG = (
     b"[core]\n"
     b"\trepositoryformatversion = 0\n"
@@ -438,13 +439,19 @@ def _fetch(config: Mapping[str, object]) -> None:
 
 def _cargo_env() -> dict[str, str]:
     return {
+        "AR": "/usr/bin/aarch64-linux-gnu-ar",
+        "AR_aarch64_unknown_linux_gnu": "/usr/bin/aarch64-linux-gnu-ar",
+        "AS": "/usr/bin/aarch64-linux-gnu-as",
         "CARGO_HOME": "/cargo-home",
         "CARGO_NET_OFFLINE": "true",
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER": "/usr/bin/aarch64-linux-gnu-gcc-13",
         "CARGO_TARGET_DIR": "/target",
-        "CC": "/usr/bin/cc",
+        "CC": "/usr/bin/aarch64-linux-gnu-gcc-13",
+        "CC_aarch64_unknown_linux_gnu": "/usr/bin/aarch64-linux-gnu-gcc-13",
         "HOME": "/tmp",
         "LANG": "C",
         "LC_ALL": "C",
+        "LD": "/usr/bin/aarch64-linux-gnu-ld.bfd",
         "PATH": "/toolchain/bin:/usr/bin",
         "RUST_BACKTRACE": "0",
         "RUSTC": "/toolchain/bin/rustc",
@@ -532,7 +539,7 @@ def _build(config: Mapping[str, object]) -> None:
             "--locked",
             "--offline",
             "--target",
-            "x86_64-unknown-linux-gnu",
+            _TARGET_TRIPLE,
             "--manifest-path",
             "/src/llm-guard-proxy/Cargo.toml",
             "--package",
@@ -545,9 +552,7 @@ def _build(config: Mapping[str, object]) -> None:
         env=_cargo_env(),
         timeout=1800,
     )
-    candidate = Path(
-        "/target/x86_64-unknown-linux-gnu/release/llm-guard-proxy"
-    )
+    candidate = Path(f"/target/{_TARGET_TRIPLE}/release/llm-guard-proxy")
     size = _normalize_candidate(candidate)
     digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
     _write_frame(

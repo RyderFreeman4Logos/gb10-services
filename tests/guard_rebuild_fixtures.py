@@ -23,14 +23,14 @@ __all__ = ["RebuildFixture"]
 
 class RebuildFixture:
     cargo_identity = (
-        "cargo 1.90.0 (fixture)\nrelease: 1.90.0\nhost: x86_64-unknown-linux-gnu\n"
+        "cargo 1.96.0 (fixture)\nrelease: 1.96.0\nhost: aarch64-unknown-linux-gnu\n"
     )
     rustc_identity = (
-        "rustc 1.90.0 (fixture)\n"
+        "rustc 1.96.0 (fixture)\n"
         "binary: rustc\n"
         "commit-hash: fixture\n"
-        "host: x86_64-unknown-linux-gnu\n"
-        "release: 1.90.0\n"
+        "host: aarch64-unknown-linux-gnu\n"
+        "release: 1.96.0\n"
         "LLVM version: fixture\n"
     )
 
@@ -41,11 +41,15 @@ class RebuildFixture:
         self.fake_bin = self.root / "bin"
         self.toolchain_root = self.root / "toolchain"
         self.toolchain_bin = self.toolchain_root / "bin"
+        self.target_rustlib = (
+            self.toolchain_root / "lib/rustlib/aarch64-unknown-linux-gnu"
+        )
         self.registry_cache = self.root / "registry-cache"
         self.registry_index = self.root / "registry-index"
         self.gcc_root = self.root / "gcc-root"
         self.sysroot_lib = self.root / "sysroot-lib"
         self.sysroot_include = self.root / "sysroot-include"
+        self.python_stdlib = self.root / "python-stdlib"
         self.cgroup_root = self.root / "cgroup"
         self.authority_config = self.root / "authority.json"
         self.bwrap_authority_config = self.root / "bwrap-authority.json"
@@ -70,11 +74,13 @@ class RebuildFixture:
             self.home,
             self.fake_bin,
             self.toolchain_bin,
+            self.target_rustlib,
             self.registry_cache,
             self.registry_index,
             self.gcc_root,
             self.sysroot_lib,
             self.sysroot_include,
+            self.python_stdlib,
             self.cgroup_root,
             self.remote,
             self.service_bin.parent,
@@ -86,8 +92,10 @@ class RebuildFixture:
 
         self._init_remote()
         (self.gcc_root / "cc1").write_text("sealed cc1\n")
+        (self.target_rustlib / "libstd.rlib").write_text("sealed target rustlib\n")
         (self.sysroot_lib / "crt1.o").write_text("sealed crt\n")
         (self.sysroot_include / "stddef.h").write_text("sealed include\n")
+        (self.python_stdlib / "os.py").write_text("# sealed test stdlib\n")
         self.source_commit = self._git("rev-parse", "HEAD").stdout.strip()
         self.source_tree = self._git("rev-parse", "HEAD^{tree}").stdout.strip()
         self.binary_sha256 = hashlib.sha256(self.build_source.read_bytes()).hexdigest()
@@ -155,6 +163,11 @@ class RebuildFixture:
             "mutate_gcc_closure_during_build": False,
             "held_ld_consumed": False,
             "ambient_usr_consumed": False,
+            "cargo_host": "aarch64-unknown-linux-gnu",
+            "rustc_host": "aarch64-unknown-linux-gnu",
+            "rustc_release": "1.96.0",
+            "candidate_elf_machine": "AArch64",
+            "candidate_elf_interpreter": "/lib/ld-linux-aarch64.so.1",
             "scope_failure": "",
             "scope_status_mode": "canonical",
             "scope_frame_mode": "",
@@ -447,6 +460,7 @@ class RebuildFixture:
             "sysroot_lib": {},
             "sysroot_include": {},
             "python_stdlib": {},
+            "target_rustlib": {},
         }
         candidate_identity = self._identity(self.candidate)
         committed = None
@@ -530,6 +544,9 @@ class RebuildFixture:
                 ).hexdigest(),
                 "tool_authorities": tool_authorities,
                 "python_runtime_authority_sha256": self._python_runtime_authority_sha256(),
+                "target_triple": "aarch64-unknown-linux-gnu",
+                "candidate_elf_machine": "AArch64",
+                "candidate_elf_interpreter": "/lib/ld-linux-aarch64.so.1",
             },
             "manager_generation": {
                 "invocation": self.state["manager_invocation"],
@@ -953,33 +970,33 @@ def valid_bwrap(values):
     common_names = [
         "--unshare-user", "--unshare-all", "--disable-userns", "--die-with-parent",
         "--new-session", "--cap-drop", "--proc", "--dev",
-        *(["--dir"] * 9), *(["--ro-bind"] * 5), *(["--symlink"] * 2),
+        *(["--dir"] * 9), *(["--ro-bind"] * 5), "--symlink",
         "--tmpfs", "--clearenv", *(["--setenv"] * 4),
     ]
     extension_names = (
         ["--share-net", *(["--dir"] * 3), *(["--ro-bind"] * 6),
          "--size", "--tmpfs", "--size", "--tmpfs"]
         if phase == "fetch"
-        else [*(["--dir"] * 2), *(["--ro-bind"] * 10), *(["--dir"] * 2),
+        else [*(["--dir"] * 2), *(["--ro-bind"] * 11), *(["--dir"] * 2),
               *(["--ro-bind"] * 2), "--size", "--tmpfs", "--size", "--tmpfs"]
     )
     if [option for option, _ in parsed] != common_names + extension_names:
         return False
     directories = [arguments[0] for option, arguments in parsed if option == "--dir"]
     common_directories = [
-        "/usr", "/usr/bin", "/usr/lib", "/usr/lib/python3.11",
-        "/usr/lib/x86_64-linux-gnu", "/sys", "/sys/fs", "/sys/fs/cgroup", "/tools",
+        "/usr", "/usr/bin", "/usr/lib", "/usr/lib/python3.12",
+        "/usr/lib/aarch64-linux-gnu", "/sys", "/sys/fs", "/sys/fs/cgroup", "/tools",
     ]
     phase_directories = (
         ["/etc", "/etc/ssl", "/etc/ssl/certs"]
         if phase == "fetch"
-        else ["/usr/lib/gcc", "/usr/lib/gcc/x86_64-linux-gnu", "/cargo-home", "/cargo-home/registry"]
+        else ["/usr/lib/gcc", "/usr/lib/gcc/aarch64-linux-gnu", "/cargo-home", "/cargo-home/registry"]
     )
     binds = [arguments for option, arguments in parsed if option == "--ro-bind"]
     destinations = [arguments[1] for arguments in binds]
     sources = [arguments[0] for arguments in binds]
     common_destinations = [
-        "/usr/lib/x86_64-linux-gnu", "/usr/lib/python3.11", "/tools/python",
+        "/usr/lib/aarch64-linux-gnu", "/usr/lib/python3.12", "/tools/python",
         "/worker.py", "/sys/fs/cgroup",
     ]
     phase_destinations = (
@@ -990,8 +1007,10 @@ def valid_bwrap(values):
         ]
         if phase == "fetch"
         else [
-            "/usr/lib/gcc/x86_64-linux-gnu/12", "/usr/include", "/usr/bin/cc",
-            "/usr/bin/as", "/usr/bin/ld", "/usr/bin/ar", "/src", "/toolchain",
+            "/usr/lib/gcc/aarch64-linux-gnu/13", "/usr/include",
+            "/usr/bin/aarch64-linux-gnu-gcc-13", "/usr/bin/aarch64-linux-gnu-as",
+            "/usr/bin/aarch64-linux-gnu-ld.bfd", "/usr/bin/aarch64-linux-gnu-ar",
+            "/src", "/toolchain", "/toolchain/lib/rustlib/aarch64-unknown-linux-gnu",
             "/toolchain/bin/cargo", "/toolchain/bin/rustc",
             "/cargo-home/registry/cache", "/cargo-home/registry/index",
         ]
@@ -1010,9 +1029,8 @@ def valid_bwrap(values):
         == [["/proc"]]
         and [arguments for option, arguments in parsed if option == "--dev"]
         == [["/dev"]]
-        and [arguments for option, arguments in parsed if option == "--symlink"] == [
-            ["usr/lib", "/lib"], ["usr/lib/x86_64-linux-gnu", "/lib64"]
-        ]
+        and [arguments for option, arguments in parsed if option == "--symlink"]
+        == [["usr/lib/aarch64-linux-gnu", "/lib"]]
         and [arguments for option, arguments in parsed if option == "--tmpfs"]
         == ([ ["/home"], ["/fetch"], ["/tmp"] ] if phase == "fetch"
             else [ ["/home"], ["/target"], ["/tmp"] ])
@@ -1178,9 +1196,9 @@ elif name == "prlimit":
     os.execv(args[separator + 1], args[separator + 1:])
 elif name == "cargo":
     if args == ["--version", "--verbose"]:
-        print("cargo 1.90.0 (fixture)")
-        print("release: 1.90.0")
-        print("host: x86_64-unknown-linux-gnu")
+        print("cargo 1.96.0 (fixture)")
+        print("release: 1.96.0")
+        print("host: " + state["cargo_host"])
     elif args and args[0] == "build":
         manifest = Path(args[args.index("--manifest-path") + 1])
         if state.get("mutate_source_during_cargo"):
@@ -1201,12 +1219,21 @@ elif name == "cargo":
 elif name == "rustc":
     if args != ["-vV"]:
         raise SystemExit(92)
-    print("rustc 1.90.0 (fixture)")
+    print("rustc " + state["rustc_release"] + " (fixture)")
     print("binary: rustc")
     print("commit-hash: fixture")
-    print("host: x86_64-unknown-linux-gnu")
-    print("release: 1.90.0")
+    print("host: " + state["rustc_host"])
+    print("release: " + state["rustc_release"])
     print("LLVM version: fixture")
+elif name == "readelf":
+    path = args[-1]
+    if args[:2] == ["-hW", "-lW"]:
+        print("  Machine:                           " + state["candidate_elf_machine"])
+        print("      [Requesting program interpreter: " + state["candidate_elf_interpreter"] + "]")
+    elif args[:2] == ["-n", "--"]:
+        os.execv("/usr/bin/x86_64-linux-gnu-readelf", ["readelf", *args])
+    else:
+        raise SystemExit(92)
 elif name == "bwrap":
     status_fd = int(args[args.index("--json-status-fd") + 1])
     block_fd = int(args[args.index("--block-fd") + 1])
@@ -1395,7 +1422,7 @@ elif name == "bwrap":
                     "schema": 1,
                 }, artifact)
                 latest = json.loads(state_path.read_text())
-                ld_source = args[args.index("/usr/bin/ld") - 1]
+                ld_source = args[args.index("/usr/bin/aarch64-linux-gnu-ld.bfd") - 1]
                 latest["held_ld_consumed"] = (
                     ld_source.startswith("/proc/self/fd/")
                     and os.path.samefile(
@@ -1970,6 +1997,7 @@ else:
             "systemd_run": self.fake_bin / "systemd-run",
             "systemctl": self.fake_bin / "systemctl",
             "curl": self.fake_bin / "curl",
+            "readelf": self.fake_bin / "readelf",
         }
         for name, destination in destinations.items():
             destination.write_text(template.replace("__TOOL_NAME__", name))
@@ -1987,7 +2015,7 @@ else:
             "curl": self.fake_bin / "curl",
             "git": Path("/usr/bin/git"),
             "git_remote_https": Path("/usr/lib/git-core/git-remote-http"),
-            "readelf": Path("/usr/bin/x86_64-linux-gnu-readelf"),
+            "readelf": self.fake_bin / "readelf",
             "nice": Path("/usr/bin/nice"),
             "ionice": Path("/usr/bin/ionice"),
             "cc": Path("/usr/bin/x86_64-linux-gnu-gcc-12"),
@@ -2049,8 +2077,8 @@ else:
             return Path(tools[name]["resolved"])
 
         bwrap_authorities = {
-            "/usr/lib/x86_64-linux-gnu": bind_spec(self.sysroot_lib),
-            "/usr/lib/python3.11": bind_spec(Path("/usr/lib/python3.11")),
+            "/usr/lib/aarch64-linux-gnu": bind_spec(self.sysroot_lib),
+            "/usr/lib/python3.12": bind_spec(self.python_stdlib),
             "/tools/python": bind_spec(tool("python")),
             "/worker.py": bind_spec(tool("scoped_worker")),
             "/etc/ssl/certs/ca-certificates.crt": bind_spec(tool("ca_cert")),
@@ -2059,13 +2087,16 @@ else:
             "/etc/hosts": bind_spec(tool("hosts")),
             "/tools/git": bind_spec(tool("git")),
             "/tools/git-remote-https": bind_spec(tool("git_remote_https")),
-            "/usr/lib/gcc/x86_64-linux-gnu/12": bind_spec(self.gcc_root),
+            "/usr/lib/gcc/aarch64-linux-gnu/13": bind_spec(self.gcc_root),
             "/usr/include": bind_spec(self.sysroot_include),
-            "/usr/bin/cc": bind_spec(tool("cc")),
-            "/usr/bin/as": bind_spec(tool("as")),
-            "/usr/bin/ld": bind_spec(tool("ld")),
-            "/usr/bin/ar": bind_spec(tool("ar")),
+            "/usr/bin/aarch64-linux-gnu-gcc-13": bind_spec(tool("cc")),
+            "/usr/bin/aarch64-linux-gnu-as": bind_spec(tool("as")),
+            "/usr/bin/aarch64-linux-gnu-ld.bfd": bind_spec(tool("ld")),
+            "/usr/bin/aarch64-linux-gnu-ar": bind_spec(tool("ar")),
             "/toolchain": bind_spec(self.toolchain_root),
+            "/toolchain/lib/rustlib/aarch64-unknown-linux-gnu": bind_spec(
+                self.target_rustlib
+            ),
             "/toolchain/bin/cargo": bind_spec(tool("cargo")),
             "/toolchain/bin/rustc": bind_spec(tool("rustc")),
             "/cargo-home/registry/cache": bind_spec(self.registry_cache),
@@ -2118,10 +2149,11 @@ else:
             "gcc_root": str(self.gcc_root),
             "sysroot_lib": str(self.sysroot_lib),
             "sysroot_include": str(self.sysroot_include),
-            "python_stdlib": "/usr/lib/python3.11",
+            "python_stdlib": str(self.python_stdlib),
             "test_free_bytes": self.test_free_bytes,
             "test_env": test_env,
             "toolchain_root": str(self.toolchain_root),
+            "target_rustlib": str(self.target_rustlib),
             "tools": tools,
         }
         self.authority_config.write_text(json.dumps(payload, sort_keys=True))

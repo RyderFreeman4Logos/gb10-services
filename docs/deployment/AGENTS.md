@@ -153,14 +153,18 @@ hermetic tests and cannot emit the production completion contract.
 
 The script gates each fetch, Cargo-metadata, and Cargo-build payload behind a
 random transient user scope whose exact cgroup membership and effective hard
-memory/swap/PID/CPU limits are verified before GO. Bubblewrap keeps Git objects,
-Cargo target output, and temporary files in bounded tmpfs mounts; no writable
-host target or external Git worktree is mounted. The parent accepts bounded
-canonical frames, revalidates the immutable Git archive or candidate, applies one
-576 MiB host-write budget with 8 GiB free-space headroom, and cleans the exact
-process group, scope, and verified descendants on failure. Metadata-only
-receipts bind the complete containment policy and reviewed worker/tool authorities,
-but never persist transient scope names.
+memory/swap/PID/CPU limits are verified before GO. The build authority is the
+native GB10 `aarch64-unknown-linux-gnu` Rust target and target rustlib, with the
+reviewed AArch64 compiler, binutils, sysroot, and Python 3.12 standard library.
+Before any WAL or service-link mutation, held `readelf` authority must report an
+`AArch64` candidate using `/lib/ld-linux-aarch64.so.1`; mismatch fails closed.
+Bubblewrap keeps Git objects, Cargo target output, and temporary files in bounded
+tmpfs mounts; no writable host target or external Git worktree is mounted. The
+parent accepts bounded canonical frames, revalidates the immutable Git archive or
+candidate, applies one 576 MiB host-write budget with 8 GiB free-space headroom,
+and cleans the exact process group, scope, and verified descendants on failure.
+Metadata-only receipts bind the complete containment policy and reviewed
+worker/tool authorities, but never persist transient scope names.
 The parent keeps opened memory/pids event descriptors through the worker's final
 resource fence and reads them before a failed scope is collected, preserving
 exact limit evidence for nonzero status, signal/OOM, and early post-GO failure.

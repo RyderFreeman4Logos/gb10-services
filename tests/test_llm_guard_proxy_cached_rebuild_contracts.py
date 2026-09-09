@@ -381,6 +381,13 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
             self.assertRegex(authorities["metadata_closure_sha256"], r"^[0-9a-f]{64}$")
             self.assertRegex(authorities["sandbox_contract_sha256"], r"^[0-9a-f]{64}$")
             self.assertRegex(authorities["build_inputs_sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(authorities["target_triple"], "aarch64-unknown-linux-gnu")
+            self.assertEqual(authorities["candidate_elf_machine"], "AArch64")
+            self.assertEqual(
+                authorities["candidate_elf_interpreter"],
+                "/lib/ld-linux-aarch64.so.1",
+            )
+            self.assertIn("target_rustlib", authorities["build_inputs"])
             self.assertEqual(
                 set(authorities["tool_authorities"]),
                 {

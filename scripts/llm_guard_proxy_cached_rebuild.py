@@ -69,6 +69,11 @@ ScopePolicy = _bounded_module.ScopePolicy
 
 UNIT = "llm-guard-proxy.service"
 HEALTH_URL = "http://100.105.4.92:18009/health"
+TARGET_TRIPLE = "aarch64-unknown-linux-gnu"
+EXPECTED_ELF_MACHINE = "AArch64"
+EXPECTED_ELF_INTERPRETER = "/lib/ld-linux-aarch64.so.1"
+TOOLCHAIN_ROOT = Path("/home/obj/.rustup/toolchains/1.96.0-aarch64-unknown-linux-gnu")
+TARGET_RUSTLIB = TOOLCHAIN_ROOT / "lib" / "rustlib" / TARGET_TRIPLE
 PRODUCTION_COMPLETE = "LLM_GUARD_PROXY_REBUILD_COMPLETE"
 TEST_COMPLETE = "LLM_GUARD_PROXY_REBUILD_TEST_ONLY_COMPLETE"
 RECOVERY_COMPLETE = "LLM_GUARD_PROXY_REBUILD_RECOVERED"
@@ -553,13 +558,13 @@ def _runtime_python_authority() -> dict[str, object]:
         info.st_uid != 0
         or stat.S_IMODE(info.st_mode) != 0o755
         or info.st_nlink != 1
-        or digest != "6d972cf21be56fe3c947ab6ba257ff8d08c342dd2714442986791bd9a6dfabfe"
+        or digest != "a7d56a8a764faf7bbf5c164055a48fd072be52287bdeb523a9e07b2042f4e7e1"
     ):
         fail("Python runtime object authority differs")
     return {
         "logical_path": "/usr/bin/python3" if not test_only else sys.executable,
         "resolved_path": (
-            "/usr/bin/python3.11" if not test_only else os.readlink("/proc/self/exe")
+            "/usr/bin/python3.12" if not test_only else os.readlink("/proc/self/exe")
         ),
         "device": info.st_dev,
         "inode": info.st_ino,
@@ -644,10 +649,7 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
     def root(path: str, digest: str, *, gid: int = 0, mode: int = 0o755) -> ToolSpec:
         return ToolSpec(path, path, 0, gid, mode, digest)
 
-    toolchain = (
-        "/usr/local/share/mise/installs/rust/stable/toolchains/"
-        "stable-x86_64-unknown-linux-gnu"
-    )
+    toolchain = str(TOOLCHAIN_ROOT)
     return {
         "systemd_run": root(
             "/usr/bin/systemd-run",
@@ -658,8 +660,8 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
             "663634070079386b7401ccc9fb92522ec3ece10f07f84a83fe96ec3ecb0bc74b",
         ),
         "python": root(
-            "/usr/bin/python3.11",
-            "6d972cf21be56fe3c947ab6ba257ff8d08c342dd2714442986791bd9a6dfabfe",
+            "/usr/bin/python3.12",
+            "a7d56a8a764faf7bbf5c164055a48fd072be52287bdeb523a9e07b2042f4e7e1",
         ),
         "scoped_worker": ToolSpec(
             "/home/obj/.local/bin/llm_guard_proxy_scoped_worker.py",
@@ -667,7 +669,7 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
             1001,
             1001,
             0o644,
-            "a1538f69cdb2fe334fe3d8fe1bb5e67e2dcbed86da751ddb7707f8a844a0b50b",
+            "b764a30e5586059849b364c364c61688df40f20962c55e81e5b3a6a8874426af",
         ),
         "ca_cert": root(
             "/etc/ssl/certs/ca-certificates.crt",
@@ -710,8 +712,8 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
             "27125f0331490b7fbf4da11f2bd913ce1b94e071367b2fa8e535ce8c5526e29c",
         ),
         "readelf": root(
-            "/usr/bin/x86_64-linux-gnu-readelf",
-            "afa25ff2dc25a71b79e853b9e3a9abb7b4e8c83efac17c0a637cbbb687442a4f",
+            "/usr/bin/aarch64-linux-gnu-readelf",
+            "6bca2bbd23b072db9e9a19ae0e65cf7b7c15c08a3c2cf01dd56453e1ac9340b1",
         ),
         "nice": root(
             "/usr/bin/nice",
@@ -727,7 +729,7 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
             1001,
             1001,
             0o755,
-            "828980723df339d62434390e9fb8ef8831036583343ae2316b7ab5646b5c1953",
+            "7db170801729d4775347548ed5970b459844fc2f6b20798efb96f444b5b94fc3",
         ),
         "rustc": ToolSpec(
             f"{toolchain}/bin/rustc",
@@ -735,23 +737,23 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
             1001,
             1001,
             0o755,
-            "d3a664c970a9fd8361b64194861bebc1ae37b9054e5ee3400dc1c9e691797eea",
+            "2425682b7dd432769e2600eb2b3ea5113a00d37f41a754598f2af2e56e4fa2fe",
         ),
         "cc": root(
-            "/usr/bin/x86_64-linux-gnu-gcc-12",
-            "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+            "/usr/bin/aarch64-linux-gnu-gcc-13",
+            "a20520ee21543f243d40636a9181a142c45ecd989de31ab86b99a8ea5ada870d",
         ),
         "ld": root(
-            "/usr/bin/x86_64-linux-gnu-ld.bfd",
-            "f6d71a1bcd45764550a42dfaa179bc43b63ee879ec6f875bfd39fca013515da7",
+            "/usr/bin/aarch64-linux-gnu-ld.bfd",
+            "1e4d3369b76845fa8e099b83513bf28f6f722e046f9b2cde1378c9e27f96d19c",
         ),
         "ar": root(
-            "/usr/bin/x86_64-linux-gnu-ar",
-            "3acbee2794e3668a74bcb90f2eaf7d981211fb95288ab940f0e3ac380e8f6023",
+            "/usr/bin/aarch64-linux-gnu-ar",
+            "f4583a612510e038dbc1ae8afb5eae5f0445c435bdd7c4c28e78acc7e757d2b1",
         ),
         "as": root(
-            "/usr/bin/x86_64-linux-gnu-as",
-            "41fe4f5a03389ea5cf7c92d6753fa1ecc69b45b12534fd8713c53bba0e2d7e17",
+            "/usr/bin/aarch64-linux-gnu-as",
+            "1ffda50efb6d91b6b05ef933aced099595c36577594c0296c91161f2d13db374",
         ),
     }
 
@@ -797,6 +799,7 @@ def _load_test_authority_config(path: Path) -> dict[str, Any]:
         "python_stdlib",
         "test_free_bytes",
         "test_env",
+        "target_rustlib",
         "toolchain_root",
         "tools",
     }
@@ -810,6 +813,7 @@ def _load_test_authority_config(path: Path) -> dict[str, Any]:
     for key in (
         "registry_cache",
         "registry_index",
+        "target_rustlib",
         "toolchain_root",
         "gcc_root",
         "sysroot_lib",
@@ -866,20 +870,18 @@ if not test_only:
     proc_root = Path("/proc")
     cgroup_root = Path("/sys/fs/cgroup")
     receipt_dir = home / ".local/state/llm-guard-proxy-rebuild"
-    toolchain_root = Path(
-        "/usr/local/share/mise/installs/rust/stable/toolchains/"
-        "stable-x86_64-unknown-linux-gnu"
-    )
+    toolchain_root = TOOLCHAIN_ROOT
+    target_rustlib = TARGET_RUSTLIB
     registry_cache = Path(
         "/home/obj/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f"
     )
     registry_index = Path(
         "/home/obj/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f"
     )
-    gcc_root = Path("/usr/lib/gcc/x86_64-linux-gnu/12")
-    sysroot_lib = Path("/usr/lib/x86_64-linux-gnu")
+    gcc_root = Path("/usr/lib/gcc/aarch64-linux-gnu/13")
+    sysroot_lib = Path("/usr/lib/aarch64-linux-gnu")
     sysroot_include = Path("/usr/include")
-    python_stdlib = Path("/usr/lib/python3.11")
+    python_stdlib = Path("/usr/lib/python3.12")
     test_free_bytes: int | None = None
     tool_specs = _production_tool_specs()
     child_env = {
@@ -917,6 +919,7 @@ else:
         Path(required_env("LLM_GUARD_REBUILD_TEST_CONFIG"))
     )
     toolchain_root = Path(authority_config["toolchain_root"])
+    target_rustlib = Path(authority_config["target_rustlib"])
     registry_cache = Path(authority_config["registry_cache"])
     registry_index = Path(authority_config["registry_index"])
     gcc_root = Path(authority_config["gcc_root"])
@@ -935,6 +938,9 @@ else:
             "LANG": "C",
         }
     )
+
+if target_rustlib != toolchain_root / "lib" / "rustlib" / TARGET_TRIPLE:
+    fail("target rustlib authority differs from build target")
 
 missing_test_tool = (
     os.environ.get("LLM_GUARD_REBUILD_TEST_MISSING_TOOL", "") if test_only else ""
@@ -1258,12 +1264,12 @@ def _directory_ledger(root_fd: int, label: str) -> DirectoryLedger:
                 authorized_external = label == "sandbox Python standard library" and (
                     (
                         relative == "sitecustomize.py"
-                        and target == "/etc/python3.11/sitecustomize.py"
+                        and target == "/etc/python3.12/sitecustomize.py"
                     )
                     or (
                         relative
-                        == "config-3.11-x86_64-linux-gnu/libpython3.11.so"
-                        and target == "../../x86_64-linux-gnu/libpython3.11.so.1"
+                        == "config-3.12-aarch64-linux-gnu/libpython3.12.so"
+                        and target == "../../aarch64-linux-gnu/libpython3.12.so.1"
                     )
                 )
                 if (target.startswith("/") or ".." in parts) and not authorized_external:
@@ -2422,9 +2428,9 @@ def _sandbox_runtime_prefix(
         "--dir",
         "/usr/lib",
         "--dir",
-        "/usr/lib/python3.11",
+        "/usr/lib/python3.12",
         "--dir",
-        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
         "--dir",
         "/sys",
         "--dir",
@@ -2435,10 +2441,10 @@ def _sandbox_runtime_prefix(
         "/tools",
         "--ro-bind",
         f"/proc/self/fd/{runtime_lib.descriptor}",
-        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
         "--ro-bind",
         f"/proc/self/fd/{python_lib.descriptor}",
-        "/usr/lib/python3.11",
+        "/usr/lib/python3.12",
         "--ro-bind",
         held_tools["python"].exec_path,
         "/tools/python",
@@ -2449,11 +2455,8 @@ def _sandbox_runtime_prefix(
         str(cgroup_root),
         "/sys/fs/cgroup",
         "--symlink",
-        "usr/lib",
+        "usr/lib/aarch64-linux-gnu",
         "/lib",
-        "--symlink",
-        "usr/lib/x86_64-linux-gnu",
-        "/lib64",
         "--tmpfs",
         "/home",
         "--clearenv",
@@ -2597,6 +2600,7 @@ def prepare_canonical_source(
 def _cargo_sandbox(
     source: SourceBundle,
     toolchain: DirectoryAuthority,
+    rustlib: DirectoryAuthority,
     cache: DirectoryAuthority,
     index: DirectoryAuthority,
     gcc: DirectoryAuthority,
@@ -2613,31 +2617,34 @@ def _cargo_sandbox(
         "--dir",
         "/usr/lib/gcc",
         "--dir",
-        "/usr/lib/gcc/x86_64-linux-gnu",
+        "/usr/lib/gcc/aarch64-linux-gnu",
         "--ro-bind",
         f"/proc/self/fd/{gcc.descriptor}",
-        "/usr/lib/gcc/x86_64-linux-gnu/12",
+        "/usr/lib/gcc/aarch64-linux-gnu/13",
         "--ro-bind",
         f"/proc/self/fd/{sysroot_include_authority.descriptor}",
         "/usr/include",
         "--ro-bind",
         held_tools["cc"].exec_path,
-        "/usr/bin/cc",
+        "/usr/bin/aarch64-linux-gnu-gcc-13",
         "--ro-bind",
         held_tools["as"].exec_path,
-        "/usr/bin/as",
+        "/usr/bin/aarch64-linux-gnu-as",
         "--ro-bind",
         held_tools["ld"].exec_path,
-        "/usr/bin/ld",
+        "/usr/bin/aarch64-linux-gnu-ld.bfd",
         "--ro-bind",
         held_tools["ar"].exec_path,
-        "/usr/bin/ar",
+        "/usr/bin/aarch64-linux-gnu-ar",
         "--ro-bind",
         f"/proc/self/fd/{source.source_authority.descriptor}",
         "/src",
         "--ro-bind",
         f"/proc/self/fd/{toolchain.descriptor}",
         "/toolchain",
+        "--ro-bind",
+        f"/proc/self/fd/{rustlib.descriptor}",
+        f"/toolchain/lib/rustlib/{TARGET_TRIPLE}",
         "--ro-bind",
         held_tools["cargo"].exec_path,
         "/toolchain/bin/cargo",
@@ -2669,6 +2676,7 @@ def _cargo_sandbox(
         source.runtime_lib_authority.descriptor,
         source.python_stdlib_authority.descriptor,
         toolchain.descriptor,
+        rustlib.descriptor,
         cache.descriptor,
         index.descriptor,
         gcc.descriptor,
@@ -2750,6 +2758,7 @@ def _validate_metadata(payload: str) -> str:
 class BuildBundle:
     candidate: Path
     identity: ExecutableIdentity
+    elf: dict[str, str]
     metadata_closure_sha256: str
     sandbox_contract_sha256: str
     inputs: dict[str, object]
@@ -2797,7 +2806,7 @@ def _publish_candidate(
     header: dict[str, Any],
     payload: bytes,
     budget: HostWriteBudget,
-) -> tuple[Path, ExecutableIdentity, FileAuthority]:
+) -> tuple[Path, ExecutableIdentity, dict[str, str], FileAuthority]:
     if set(header) != {
         "kind",
         "payload_sha256",
@@ -2834,6 +2843,7 @@ def _publish_candidate(
             )
             try:
                 built_identity = fd_identity(descriptor)
+                candidate_elf_authority(descriptor)
             finally:
                 os.close(descriptor)
             if built_identity.sha256 != digest:
@@ -2853,7 +2863,12 @@ def _publish_candidate(
     if identity.sha256 != digest or identity.size != len(payload):
         candidate_file.close()
         fail("adopted candidate differs from build frame")
-    return candidate, identity, candidate_file
+    try:
+        elf = candidate_elf_authority(candidate_file.descriptor)
+    except BaseException:
+        candidate_file.close()
+        raise
+    return candidate, identity, elf, candidate_file
 
 
 def build_sandboxed_candidate(
@@ -2866,11 +2881,13 @@ def build_sandboxed_candidate(
         _open_directory_authority("registry index", registry_index),
         _open_directory_authority("gcc closure", gcc_root),
         _open_directory_authority("sysroot include", sysroot_include),
+        _open_directory_authority("target rustlib", target_rustlib),
     ]
     try:
         metadata_command, metadata_fds = _cargo_sandbox(
             source,
             authorities[0],
+            authorities[5],
             authorities[1],
             authorities[2],
             authorities[3],
@@ -2897,6 +2914,7 @@ def build_sandboxed_candidate(
         build_command, build_fds = _cargo_sandbox(
             source,
             authorities[0],
+            authorities[5],
             authorities[1],
             authorities[2],
             authorities[3],
@@ -2912,7 +2930,7 @@ def build_sandboxed_candidate(
         build_header, candidate_payload = _decode_frame(
             build_frame, "build", MAX_EXECUTABLE_BYTES
         )
-        candidate, candidate_identity, candidate_file = _publish_candidate(
+        candidate, candidate_identity, candidate_elf, candidate_file = _publish_candidate(
             source, build_header, candidate_payload, budget
         )
         source.verify()
@@ -2928,6 +2946,7 @@ def build_sandboxed_candidate(
         return BuildBundle(
             candidate,
             candidate_identity,
+            candidate_elf,
             metadata_closure,
             _containment_contract_sha256(),
             inputs,
@@ -2939,18 +2958,23 @@ def build_sandboxed_candidate(
 
 
 def _validate_reviewed_tool_versions(cargo: bytes, rustc: bytes) -> None:
-    if test_only:
-        return
     cargo_text = cargo.decode("ascii", errors="strict")
     rustc_text = rustc.decode("ascii", errors="strict")
+    cargo_lines = cargo_text.splitlines()
+    rustc_lines = rustc_text.splitlines()
     if (
-        cargo_text.splitlines()[0] != "cargo 1.97.1 (c980f4866 2026-06-30)"
-        or "release: 1.97.1" not in cargo_text.splitlines()
-        or "host: x86_64-unknown-linux-gnu" not in cargo_text.splitlines()
-        or rustc_text.splitlines()[0] != "rustc 1.97.1 (8bab26f4f 2026-07-14)"
-        or "host: x86_64-unknown-linux-gnu" not in rustc_text.splitlines()
-        or "release: 1.97.1" not in rustc_text.splitlines()
-        or "LLVM version: 22.1.6" not in rustc_text.splitlines()
+        f"host: {TARGET_TRIPLE}" not in cargo_lines
+        or "release: 1.96.0" not in cargo_lines
+        or f"host: {TARGET_TRIPLE}" not in rustc_lines
+        or "release: 1.96.0" not in rustc_lines
+        or (
+            not test_only
+            and (
+                cargo_lines[0] != "cargo 1.96.0 (30a34c682 2026-05-25)"
+                or rustc_lines[0] != "rustc 1.96.0 (ac68faa20 2026-05-25)"
+                or "LLVM version: 22.1.2" not in rustc_lines
+            )
+        )
     ):
         fail("reviewed Cargo/rustc version contract differs")
 
@@ -4299,6 +4323,29 @@ def elf_build_id(path: str, *, pass_fd: int | None = None) -> str:
     return matches[0].lower()
 
 
+def candidate_elf_authority(descriptor: int) -> dict[str, str]:
+    output = execute(
+        [
+            require_tool("readelf"),
+            "-hW",
+            "-lW",
+            "--",
+            f"/proc/self/fd/{descriptor}",
+        ],
+        capture=True,
+        pass_fds=(descriptor,),
+    ).decode("ascii", errors="strict")
+    machines = re.findall(r"(?m)^\s*Machine:\s*(\S(?:.*\S)?)\s*$", output)
+    interpreters = re.findall(
+        r"(?m)^\s*\[Requesting program interpreter:\s*(\S+)\]\s*$", output
+    )
+    if machines != [EXPECTED_ELF_MACHINE]:
+        fail("candidate ELF machine differs")
+    if interpreters != [EXPECTED_ELF_INTERPRETER]:
+        fail("candidate ELF interpreter differs")
+    return {"machine": machines[0], "interpreter": interpreters[0]}
+
+
 @dataclass(frozen=True)
 class ExecutableIdentity:
     device: int
@@ -4980,6 +5027,9 @@ def _validate_authorities(value: object) -> dict[str, Any]:
             "guard_unit_sha256",
             "tool_authorities",
             "python_runtime_authority_sha256",
+            "target_triple",
+            "candidate_elf_machine",
+            "candidate_elf_interpreter",
         },
         "authorities",
     )
@@ -4988,6 +5038,12 @@ def _validate_authorities(value: object) -> dict[str, Any]:
         or payload["canonical_source_ref"] != source_ref
     ):
         fail("canonical source authority differs")
+    if (
+        payload["target_triple"] != TARGET_TRIPLE
+        or payload["candidate_elf_machine"] != EXPECTED_ELF_MACHINE
+        or payload["candidate_elf_interpreter"] != EXPECTED_ELF_INTERPRETER
+    ):
+        fail("candidate architecture authority differs")
     for key in ("source_commit", "source_tree"):
         _strict_hex(payload[key], f"authorities.{key}", length=40)
     for key in (
@@ -5016,6 +5072,7 @@ def _validate_authorities(value: object) -> dict[str, Any]:
             "sysroot_lib",
             "sysroot_include",
             "python_stdlib",
+            "target_rustlib",
         }
         or sha256_bytes(
             json.dumps(
@@ -5699,6 +5756,11 @@ def attest_candidate(
     descriptor, running_link, executable = open_runtime_executable(
         generation.pid, replacement
     )
+    try:
+        candidate_elf_authority(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        raise
     if executable != expected:
         os.close(descriptor)
         fail("running executable identity does not match candidate")
@@ -5740,11 +5802,13 @@ def final_runtime_attestation(
         fail("current proc executable link changed during attestation")
     if fd_identity(accepted.descriptor) != accepted.executable:
         fail("held executable changed during attestation")
+    candidate_elf_authority(accepted.descriptor)
     if candidate_authority is None:
         fail("candidate executable authority is unavailable")
     candidate_authority.verify()
     if fd_identity(candidate_authority.descriptor) != expected:
         fail("candidate executable changed during attestation")
+    candidate_elf_authority(candidate_authority.descriptor)
     if not service_link_matches(str(candidate)) or not same_object(
         os.stat(service_bin), expected
     ):
@@ -6196,6 +6260,12 @@ def run_transaction() -> int:
             if candidate_authority.sha256 != candidate_identity.sha256:
                 fail("candidate executable authority differs from transaction")
             _open_all_tools()
+            elf = candidate_elf_authority(candidate_authority.descriptor)
+            if (
+                elf["machine"] != authorities["candidate_elf_machine"]
+                or elf["interpreter"] != authorities["candidate_elf_interpreter"]
+            ):
+                fail("candidate architecture differs from transaction authority")
             recover_stale_transaction(stale, write_budget)
             return 75
         if recovered_namespace:
@@ -6275,6 +6345,9 @@ def run_transaction() -> int:
             "guard_unit_sha256": unit_sha_initial,
             "tool_authorities": tool_receipts,
             "python_runtime_authority_sha256": _runtime_python_authority_sha256(),
+            "target_triple": TARGET_TRIPLE,
+            "candidate_elf_machine": build_bundle.elf["machine"],
+            "candidate_elf_interpreter": build_bundle.elf["interpreter"],
         }
         wal = _build_wal(
             prestate,
