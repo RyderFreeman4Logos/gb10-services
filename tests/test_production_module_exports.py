@@ -16,6 +16,7 @@ EXPECTED_EXPORTS = {
         "command",
         "remaining",
         "scoped_command",
+        "scoped_direct_command",
     ),
     "scripts/gb10_embedding_activation.py": (
         "ActivationInterrupted",
