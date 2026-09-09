@@ -205,6 +205,7 @@ class RebuildFixture:
             "scope_build_payload": "",
             "scope_build_exit": 0,
             "scope_build_stderr": "",
+            "real_cargo_artifact_authority": False,
             "scope_collect_immediate": True,
             "scope_resource_snapshot_fenced": False,
             "scope_worker_live_after_collect": False,
@@ -1501,7 +1502,13 @@ elif name == "cargo":
             if state.get("scope_build_payload") == "invalid-elf"
             else selected.read_bytes()
         )
-        target.chmod(0o755)
+        if state.get("real_cargo_artifact_authority"):
+            target.chmod(0o700)
+            dependency = target.parent / "deps" / "llm_guard_proxy-fixture"
+            dependency.parent.mkdir()
+            os.link(target, dependency)
+        else:
+            target.chmod(0o755)
         state["build_finished"] = True
         save()
     else:

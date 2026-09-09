@@ -680,6 +680,17 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                 receipt["authorities"]["build_inputs"]["directory_authorities"],
             )
 
+    def test_direct_build_seals_real_cargo_hardlinked_private_artifact(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(real_cargo_artifact_authority=True)
+            result = fixture.run(timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            receipt = json.loads(fixture.receipt_paths()[0].read_text())
+            candidate = Path(receipt["candidate"]["path"])
+            info = candidate.stat(follow_symlinks=False)
+            self.assertEqual(stat.S_IMODE(info.st_mode), 0o755)
+            self.assertEqual(info.st_nlink, 1)
+
     @unittest.skipUnless(
         os.uname().machine == "aarch64"
         and os.environ.get("GB10_NATIVE_AARCH64_REAL_CARGO") == "1",
@@ -711,6 +722,7 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                 "cargo": Path(config["toolchain_root"]) / "bin/cargo",
                 "rustc": Path(config["toolchain_root"]) / "bin/rustc",
                 "cc": Path("/usr/bin/aarch64-linux-gnu-gcc-13"),
+                "ld": Path("/usr/bin/aarch64-linux-gnu-ld.bfd"),
                 "ar": Path("/usr/bin/aarch64-linux-gnu-ar"),
                 "readelf": Path("/usr/bin/aarch64-linux-gnu-readelf"),
             }

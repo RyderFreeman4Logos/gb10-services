@@ -2682,6 +2682,36 @@ def _open_built_candidate(path: Path) -> tuple[FileAuthority, bytes]:
         raise
 
 
+def _seal_built_candidate(
+    path: Path, budget: HostWriteBudget
+) -> tuple[FileAuthority, bytes]:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as error:
+        raise RebuildError("unsafe Cargo build candidate authority") from error
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o022
+            or not info.st_mode & stat.S_IXUSR
+            or not 0 < info.st_size <= MAX_EXECUTABLE_BYTES
+        ):
+            fail("unsafe Cargo build candidate authority")
+        digest = _sha256_fd(descriptor, label="Cargo build candidate")
+        sealed = path.with_name(f".{path.name}.sealed")
+        budget.copy_fd(descriptor, sealed, 0o755)
+        if _sha256_fd(descriptor, label="Cargo build candidate") != digest:
+            fail("Cargo build candidate changed while sealing")
+        return _open_built_candidate(sealed)
+    finally:
+        os.close(descriptor)
+
+
 def build_candidate(source: SourceBundle, budget: HostWriteBudget) -> BuildBundle:
     cargo_home = registry_cache.parents[2]
     if registry_index.parents[2] != cargo_home:
@@ -2756,7 +2786,7 @@ def build_candidate(source: SourceBundle, budget: HostWriteBudget) -> BuildBundl
         for value in authorities.values():
             value.verify()
         candidate_path = target / TARGET_TRIPLE / "release" / "llm-guard-proxy"
-        built_authority, candidate_data = _open_built_candidate(candidate_path)
+        built_authority, candidate_data = _seal_built_candidate(candidate_path, budget)
         try:
             header = {"kind": "build", "payload_sha256": sha256_bytes(candidate_data), "payload_size": len(candidate_data), "schema": 1}
             candidate, identity, elf, authority = _publish_candidate(source, header, candidate_data, budget)
