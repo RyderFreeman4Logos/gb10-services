@@ -328,6 +328,16 @@ def _bounded_error_summary(error: BaseException) -> str:
     return (summary or "cleanup failure")[:256]
 
 
+def _scoped_payload_failure(returncode: int, stderr: _Capture) -> str:
+    lines = _render(stderr).splitlines()
+    line = next((line.strip() for line in lines if line.strip()), "")
+    diagnostic = "".join(
+        character if character.isprintable() else "?" for character in line
+    )[:256]
+    failure = f"scoped payload failed (exit={returncode})"
+    return f"{failure}: {diagnostic}" if diagnostic else failure
+
+
 def _signal_cleanup(
     tree: _ProcessTree,
     scope_signal: Callable[[int], None] | None,
@@ -1302,7 +1312,7 @@ def scoped_command(
                 )
                 resource_snapshot = True
         if failure is None and process.returncode not in {None, 0}:
-            failure = "scoped payload failed"
+            failure = _scoped_payload_failure(process.returncode, captures["stderr"])
         if resource_events:
             resource_failure = (
                 "scope resource limit was reached: " + ",".join(resource_events)
@@ -1313,7 +1323,10 @@ def scoped_command(
         if failure is not None:
             raise BoundedProcessError(failure)
         if process.returncode != 0:
-            raise BoundedProcessError("scoped payload failed")
+            assert process.returncode is not None
+            raise BoundedProcessError(
+                _scoped_payload_failure(process.returncode, captures["stderr"])
+            )
         rows = _status_rows(captures["status"], complete=True)
         if len(rows) != (1 if _direct else 2):
             raise BoundedProcessError("scope exit status is invalid")

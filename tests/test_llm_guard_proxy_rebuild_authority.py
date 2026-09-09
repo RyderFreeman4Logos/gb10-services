@@ -852,6 +852,22 @@ class SharedBoundedScopeAuthorityTests(unittest.TestCase):
             self.assertNotIn("cargo build", fixture.calls())
             self.assertEqual(fixture.reload_state()["restart_calls"], 0)
 
+    def test_direct_command_failure_preserves_bounded_sanitized_stderr(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(
+                scope_build_exit=37,
+                scope_build_stderr="\x1b[31merror: fixture compile failed\nprivate detail\n",
+            )
+            result = fixture.run(timeout=20)
+            output = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn(
+                "scoped payload failed (exit=37): ?[31merror: fixture compile failed",
+                output,
+            )
+            self.assertNotIn("private detail", output)
+            self.assertEqual(fixture.reload_state()["restart_calls"], 0)
+
     def test_scope_pins_writable_nofollow_cgroup_kill(self) -> None:
         bounded = _load(BOUNDED, "bounded_cgroup_kill_test")
         with tempfile.TemporaryDirectory() as temporary:

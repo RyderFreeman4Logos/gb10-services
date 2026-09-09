@@ -203,6 +203,8 @@ class RebuildFixture:
             "scope_moved_worker_pidfd_reaped": False,
             "scope_pidfd_reaped_after_cgroup_failure": False,
             "scope_build_payload": "",
+            "scope_build_exit": 0,
+            "scope_build_stderr": "",
             "scope_collect_immediate": True,
             "scope_resource_snapshot_fenced": False,
             "scope_worker_live_after_collect": False,
@@ -1454,6 +1456,9 @@ elif name == "cargo":
         }, sort_keys=True, separators=(",", ":")))
     elif args and args[0] == "build":
         manifest = Path(args[args.index("--manifest-path") + 1])
+        if state.get("scope_build_exit"):
+            sys.stderr.write(state.get("scope_build_stderr", ""))
+            raise SystemExit(state["scope_build_exit"])
         if state.get("mutate_source_during_cargo"):
             source = manifest
             original = source.read_bytes()
