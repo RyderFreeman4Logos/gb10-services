@@ -785,6 +785,37 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
         self.assertIn('"RUSTC": require_tool("rustc")', source)
         self.assertIn('"--package", "llm-guard-proxy", "--no-default-features", "--features", "guard"', source)
 
+    def test_metadata_accepts_only_the_held_source_fd_root(self) -> None:
+        with RebuildFixture() as fixture:
+            _, env = fixture._run_arguments(True, None)
+            with patch.dict(os.environ, env, clear=True):
+                engine = _load(ENGINE, "metadata_fd_root_test")
+        source_root = "/snapshot/source"
+        source_fd_root = "/proc/self/fd/17"
+        target_root = "/snapshot/target"
+        package_id = "path+file:///proc/self/fd/17#llm-guard-proxy@0.1.0"
+        metadata = {
+            "workspace_root": source_fd_root,
+            "target_directory": target_root,
+            "packages": [{
+                "id": package_id,
+                "manifest_path": f"{source_fd_root}/Cargo.toml",
+                "source": None,
+                "dependencies": [],
+            }],
+            "workspace_members": [package_id],
+            "resolve": {"nodes": [{"id": package_id}]},
+        }
+        closure = engine._validate_metadata(
+            json.dumps(metadata), source_root, target_root, source_fd_root
+        )
+        self.assertRegex(closure, r"^[0-9a-f]{64}$")
+        metadata["workspace_root"] = "/proc/self/fd/18"
+        with self.assertRaises(engine.RebuildError):
+            engine._validate_metadata(
+                json.dumps(metadata), source_root, target_root, source_fd_root
+            )
+
 
 
 

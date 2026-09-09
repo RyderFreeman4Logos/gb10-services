@@ -2399,15 +2399,29 @@ def _cargo_command(
     return arguments, _cargo_environment(source, target, authorities), target
 
 
-def _validate_metadata(payload: str, source_root: str, target_root: str) -> str:
+def _validate_metadata(
+    payload: str,
+    source_root: str,
+    target_root: str,
+    source_fd_root: str | None = None,
+) -> str:
     try:
         metadata = json.loads(payload, object_pairs_hook=_reject_duplicate_json)
     except json.JSONDecodeError as error:
         raise RebuildError("Cargo metadata output is malformed") from error
     if not isinstance(metadata, dict):
         fail("Cargo metadata root is malformed")
+    source_roots = (source_root,)
+    if source_fd_root is not None:
+        if re.fullmatch(r"/proc/self/fd/[1-9][0-9]*", source_fd_root) is None:
+            fail("Cargo source FD root is malformed")
+        source_roots += (source_fd_root,)
+
+    def under_source_root(path: str) -> bool:
+        return any(path == root or path.startswith(f"{root}/") for root in source_roots)
+
     if (
-        metadata.get("workspace_root") != source_root
+        metadata.get("workspace_root") not in source_roots
         or metadata.get("target_directory") != target_root
     ):
         fail("Cargo metadata escaped direct-build roots")
@@ -2436,10 +2450,7 @@ def _validate_metadata(payload: str, source_root: str, target_root: str) -> str:
         ):
             fail("Cargo metadata package fields are malformed")
         if source is None:
-            if not (
-                manifest == f"{source_root}/Cargo.toml"
-                or manifest.startswith(f"{source_root}/")
-            ):
+            if not under_source_root(manifest):
                 fail("Cargo path dependency escaped canonical workspace")
         elif not (
             isinstance(source, str)
@@ -2452,9 +2463,8 @@ def _validate_metadata(payload: str, source_root: str, target_root: str) -> str:
             if not isinstance(dependency, dict):
                 fail("Cargo metadata dependency is malformed")
             path = dependency.get("path")
-            if path is not None and not (
-                isinstance(path, str)
-                and (path == source_root or path.startswith(f"{source_root}/"))
+            if path is not None and (
+                not isinstance(path, str) or not under_source_root(path)
             ):
                 fail("Cargo path dependency escaped canonical workspace")
         package_ids.add(package_id)
@@ -2708,6 +2718,7 @@ def build_candidate(source: SourceBundle, budget: HostWriteBudget) -> BuildBundl
             metadata_frame.decode("utf-8", errors="strict"),
             str(source.source),
             str(target),
+            f"/proc/self/fd/{source.source_authority.descriptor}",
         )
         build_command, build_env, target = _cargo_command(
             source, "build", authorities
