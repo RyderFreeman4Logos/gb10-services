@@ -674,7 +674,7 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
         ),
         "ar": root(
             "/usr/bin/aarch64-linux-gnu-ar",
-            "f4583a612510e038dbc01e8afb5eae5f0445c435bdd7c4c28e78acc7e757d2b1",
+            "f4583a612510e038dbc1ae8afb5eae5f0445c435bdd7c4c28e78acc7e757d2b1",
         ),
     }
 

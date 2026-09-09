@@ -1244,10 +1244,19 @@ elif name == "cargo":
             source.write_bytes(b"transient dirty source\n")
             source.write_bytes(original)
             source.chmod(mode)
+        selected = Path(state.get("build_source_override") or os.environ["FIXTURE_BUILD_SOURCE"])
+        source_file = Path(os.environ["SOURCE_REPO"]) / "llm-guard-proxy" / "src" / "main.rs"
+        if "alternate" in source_file.read_text():
+            selected = Path(os.environ["FIXTURE_ALTERNATE_BUILD_SOURCE"])
         target = Path(os.environ["CARGO_TARGET_DIR"]) / "aarch64-unknown-linux-gnu" / "release" / "llm-guard-proxy"
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(os.environ["FIXTURE_BUILD_SOURCE"], target)
+        target.write_bytes(
+            b"not-an-elf\n"
+            if state.get("scope_build_payload") == "invalid-elf"
+            else selected.read_bytes()
+        )
         target.chmod(0o755)
+        state["build_finished"] = True
         save()
     else:
         raise SystemExit(91)
