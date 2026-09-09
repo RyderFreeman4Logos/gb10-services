@@ -129,7 +129,9 @@ class RebuildFixture:
             binary.chmod(0o755)
         self.service_bin.symlink_to(self.prior)
         self.guard_config.write_text('private_config_payload = "fixture-only"\n')
+        self.guard_config.chmod(0o644)
         self.guard_unit.write_text("[Service]\n# private-unit-payload\n")
+        self.guard_unit.chmod(0o644)
         (self.proc_root / "sys" / "kernel" / "random" / "boot_id").write_text(
             "12345678-1234-4abc-8def-1234567890ab\n"
         )
@@ -544,7 +546,7 @@ class RebuildFixture:
                 "source_byte_count": 1,
                 "git_config_sha256": "5" * 64,
                 "metadata_closure_sha256": "6" * 64,
-                "sandbox_contract_sha256": "7" * 64,
+                "direct_build_contract_sha256": "7" * 64,
                 "build_inputs": build_inputs,
                 "build_inputs_sha256": hashlib.sha256(
                     json.dumps(
@@ -631,45 +633,46 @@ state = json.loads(state_path.read_text())
 authority = json.loads(Path(os.environ["GUARD_TEST_BWRAP_AUTHORITY"]).read_text())
 
 SCOPE_UNIT = re.compile(
-    r"llm-guard-rebuild-(fetch|metadata|build)-[0-9a-f]{32}\.scope"
+    r"llm-guard-rebuild-(metadata|build)-[0-9]+-[0-9]+\.scope"
 )
 
 def valid_systemd_run(values):
     if (
-        len(values) < 26
+        len(values) < 8
         or values[:4] != ["--user", "--scope", "--quiet", "--collect"]
         or not values[4].startswith("--unit=")
-        or values[15] != "--"
-        or values[17:19] != ["-n", "10"]
-        or values[20:22] != ["-c", "3"]
-        or values[24] != "--"
-        or any(
-            re.fullmatch(r"/proc/self/fd/[1-9][0-9]*", values[index]) is None
-            for index in (16, 19, 22, 25)
-        )
+        or "--" not in values[5:]
     ):
         return False
     match = SCOPE_UNIT.fullmatch(values[4].split("=", 1)[1])
     if match is None:
         return False
+    separator = values.index("--", 5)
+    if separator != 5 + 2 * 11:
+        return False
+    properties = [
+        values[index + 1]
+        for index in range(5, separator, 2)
+        if values[index] == "--property"
+    ]
     limits = {
-        "fetch": (805306368, 1073741824, 32, 100, 300, 167772160),
         "metadata": (8589934592, 10737418240, 768, 200, 300, 134217728),
         "build": (8589934592, 10737418240, 768, 200, 1800, 134217728),
     }[match.group(1)]
     expected = [
-        f"--property=MemoryHigh={limits[0]}",
-        f"--property=MemoryMax={limits[1]}",
-        "--property=MemorySwapMax=0",
-        f"--property=TasksMax={limits[2]}",
-        f"--property=CPUQuota={limits[3]}%",
-        "--property=CPUQuotaPeriodSec=100ms",
-        "--property=KillMode=control-group",
-        "--property=SendSIGKILL=yes",
-        "--property=OOMPolicy=kill",
-        f"--property=RuntimeMaxSec={limits[4]}",
+        f"MemoryHigh={limits[0]}",
+        f"MemoryMax={limits[1]}",
+        "MemorySwapMax=0",
+        f"TasksMax={limits[2]}",
+        f"CPUQuota={limits[3]}%",
+        "CPUQuotaPeriodSec=100ms",
+        "KillMode=control-group",
+        "SendSIGKILL=yes",
+        "OOMPolicy=kill",
+        f"RuntimeMaxSec={limits[4]}",
+        f"LimitFSIZE={limits[5]}",
     ]
-    return values[5:15] == expected and values[23] == f"--fsize={limits[5]}:{limits[5]}"
+    return values[5:separator:2] == ["--property"] * 11 and properties == expected
 
 def valid_systemctl(values):
     manager = [
@@ -1201,9 +1204,11 @@ if name == "systemd_run":
         "worker_pid": 0,
     }
     state["scope_props"] = {
-        arg.split("=", 2)[1]: arg.split("=", 2)[2]
-        for arg in args
-        if arg.startswith("--property=") and arg.count("=") >= 2
+        arg.split("=", 1)[0]: arg.split("=", 1)[1]
+        for index, arg in enumerate(args)
+        if arg == "--property" and index + 1 < len(args)
+        for arg in (args[index + 1],)
+        if "=" in arg
     }
     save()
     separator = args.index("--")
@@ -1216,17 +1221,33 @@ elif name == "cargo":
         print("cargo 1.96.0 (fixture)")
         print("release: 1.96.0")
         print("host: " + state["cargo_host"])
+    elif args and args[0] == "metadata":
+        manifest = Path(args[args.index("--manifest-path") + 1])
+        source_root = str(manifest.parent)
+        package_id = f"path+file://{source_root}#llm-guard-proxy@0.1.0"
+        print(json.dumps({
+            "packages": [{
+                "id": package_id,
+                "manifest_path": str(manifest),
+                "source": None,
+                "dependencies": [],
+            }],
+            "workspace_members": [package_id],
+            "resolve": {"nodes": [{"id": package_id}]},
+            "workspace_root": source_root,
+            "target_directory": os.environ["CARGO_TARGET_DIR"],
+        }, sort_keys=True, separators=(",", ":")))
     elif args and args[0] == "build":
         manifest = Path(args[args.index("--manifest-path") + 1])
         if state.get("mutate_source_during_cargo"):
-            source = Path(os.environ["SOURCE_DIR"]) / "Cargo.toml"
+            source = manifest
             original = source.read_bytes()
             mode = source.stat().st_mode & 0o777
-            source.write_bytes(b"transient dirty source\n")
             source.chmod(0o600)
+            source.write_bytes(b"transient dirty source\n")
             source.write_bytes(original)
             source.chmod(mode)
-        target = Path(os.environ["CARGO_TARGET_DIR"]) / "release" / "llm-guard-proxy"
+        target = Path(os.environ["CARGO_TARGET_DIR"]) / "aarch64-unknown-linux-gnu" / "release" / "llm-guard-proxy"
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(os.environ["FIXTURE_BUILD_SOURCE"], target)
         target.chmod(0o755)
@@ -2081,7 +2102,6 @@ else:
             "ar": Path("/usr/bin/x86_64-linux-gnu-ar"),
             "as": Path("/usr/bin/x86_64-linux-gnu-as"),
             "python": Path("/usr/bin/python3.11"),
-            "scoped_worker": ROOT / "scripts" / "llm_guard_proxy_scoped_worker.py",
             "ca_cert": Path("/etc/ssl/certs/ca-certificates.crt"),
             "resolv_conf": Path("/etc/resolv.conf"),
             "nsswitch": Path("/etc/nsswitch.conf"),
@@ -2138,7 +2158,6 @@ else:
             "/usr/lib/aarch64-linux-gnu": bind_spec(self.sysroot_lib),
             "/usr/lib/python3.12": bind_spec(self.python_stdlib),
             "/tools/python": bind_spec(tool("python")),
-            "/worker.py": bind_spec(tool("scoped_worker")),
             "/etc/ssl/certs/ca-certificates.crt": bind_spec(tool("ca_cert")),
             "/etc/resolv.conf": bind_spec(tool("resolv_conf")),
             "/etc/nsswitch.conf": bind_spec(tool("nsswitch")),
@@ -2213,7 +2232,10 @@ else:
             "test_env": test_env,
             "toolchain_root": str(self.toolchain_root),
             "target_rustlib": str(self.target_rustlib),
-            "tools": tools,
+            "tools": {name: tools[name] for name in {
+                "ar", "cargo", "cc", "curl", "git", "readelf", "rustc",
+                "systemd_run", "systemctl",
+            }},
         }
         self.authority_config.write_text(json.dumps(payload, sort_keys=True))
         self.authority_config.chmod(0o600)

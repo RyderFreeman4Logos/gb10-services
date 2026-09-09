@@ -288,6 +288,7 @@ TOOL_NAMES = {
     "ar",
     "cargo",
     "cc",
+    "curl",
     "git",
     "readelf",
     "rustc",
@@ -636,44 +637,9 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
             "/usr/bin/systemd-run",
             "0253595d482ea0aa9c4bf2e58080e9615bc59a51e29dbe1cebd14145b92bd8fc",
         ),
-        "prlimit": root(
-            "/usr/bin/prlimit",
-            "2a479939c95a886fb8b52244381639816f8cf1f68eee713a9227d0c5d257c805",
-        ),
-        "python": root(
-            "/usr/bin/python3.12",
-            "a7d56a8a764faf7bbf5c164055a48fd072be52287bdeb523a9e07b2042f4e7e1",
-        ),
-        "ca_cert": root(
-            "/etc/ssl/certs/ca-certificates.crt",
-            "6602a85a36afc2e51c66a0df5ae3d383c5b7c2fed93339ccef7d37e01faf09e8",
-            mode=0o644,
-        ),
-        "resolv_conf": ToolSpec(
-            "/run/systemd/resolve/stub-resolv.conf",
-            "/run/systemd/resolve/stub-resolv.conf",
-            992,
-            992,
-            0o644,
-            "dc1495fcea40128057c4bfd1fa765c9c153011c3a6d26ca4d24bca81561e5934",
-        ),
-        "nsswitch": root(
-            "/etc/nsswitch.conf",
-            "0b955d14e07f12048c0eb69d9bf1a2c693636014d5007381286b2163fbeac8b8",
-            mode=0o644,
-        ),
-        "hosts": root(
-            "/etc/hosts",
-            "3c2e57459d0663b68ff68f174b73511d57aafe73bfadca6355bdf80187a2918a",
-            mode=0o644,
-        ),
         "git": root(
             "/usr/bin/git",
             "aa6540695d076182256dd6e96c8b302e4d56381e3000bbfd5c71bbdfe94a4942",
-        ),
-        "git_remote_https": root(
-            "/usr/lib/git-core/git-remote-http",
-            "8ebf256cd802e7af7ea0e91f67deed42c207737bd43c8e94070ed342bf55938d",
         ),
         "systemctl": root(
             "/usr/bin/systemctl",
@@ -686,14 +652,6 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
         "readelf": root(
             "/usr/bin/aarch64-linux-gnu-readelf",
             "6bca2bbd23b072db9e9a19ae0e65cf7b7c15c08a3c2cf01dd56453e1ac9340b1",
-        ),
-        "nice": root(
-            "/usr/bin/nice",
-            "0746d1600af7606b356e98974e05a26ce8db22e7c99df5bf4613d06128a3e566",
-        ),
-        "ionice": root(
-            "/usr/bin/ionice",
-            "5853dfc5b2513284f4e837b837aa5c05747ef98b9ce150cb0ba096b2ede6fa4b",
         ),
         "cargo": ToolSpec(
             f"{toolchain}/bin/cargo",
@@ -715,20 +673,11 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
             "/usr/bin/aarch64-linux-gnu-gcc-13",
             "a20520ee21543f243d40636a9181a142c45ecd989de31ab86b99a8ea5ada870d",
         ),
-        "ld": root(
-            "/usr/bin/aarch64-linux-gnu-ld.bfd",
-            "1e4d3369b76845fa8e099b83513bf28f6f722e046f9b2cde1378c9e27f96d19c",
-        ),
         "ar": root(
             "/usr/bin/aarch64-linux-gnu-ar",
-            "f4583a612510e038dbc1ae8afb5eae5f0445c435bdd7c4c28e78acc7e757d2b1",
-        ),
-        "as": root(
-            "/usr/bin/aarch64-linux-gnu-as",
-            "1ffda50efb6d91b6b05ef933aced099595c36577594c0296c91161f2d13db374",
+            "f4583a612510e038dbc01e8afb5eae5f0445c435bdd7c4c28e78acc7e757d2b1",
         ),
     }
-
 
 def _reject_duplicate_json(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}

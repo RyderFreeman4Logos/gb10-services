@@ -130,7 +130,6 @@ EXPECTED_EXPORTS = {
         "MAX_CLOUD_RESPONSE_BYTES",
         "call_deepinfra",
     ),
-    "scripts/llm_guard_proxy_scoped_worker.py": (),
     "scripts/verify_systemd_units.py": ("main",),
 }
 
