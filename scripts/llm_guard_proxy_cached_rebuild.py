@@ -25,7 +25,7 @@ from typing import Any, NoReturn, cast
 __all__: list[str] = []
 
 EXPECTED_BOUNDED_PROCESS_SHA256 = (
-    "943142f3d24f3b3ae4e58ddc5c19db32eef8ff512e98cd363e61b02854391fad"
+    "248762c2fdc73fdf54914fc5a20c2292bcc90430e59523c5767409ebf0f4c230"
 )
 _SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 _BOUNDED_PROCESS_PATH = _SCRIPT_DIRECTORY / "gb10_bounded_process.py"
@@ -64,7 +64,6 @@ exec(
     _bounded_module.__dict__,
 )
 run_bounded = _bounded_module.command
-run_scoped = _bounded_module.scoped_command
 ScopePolicy = _bounded_module.ScopePolicy
 
 UNIT = "llm-guard-proxy.service"
@@ -1000,7 +999,6 @@ def execute_scoped(
     phase: str,
     arguments: list[str],
     *,
-    max_output_bytes: int,
     pass_fds: tuple[int, ...] = (),
     env: dict[str, str] | None = None,
 ) -> bytes:
@@ -1010,15 +1008,36 @@ def execute_scoped(
     budget = deadline - time.monotonic()
     if budget <= 0:
         fail("transaction scoped-command deadline exhausted")
-    output = run_scoped(
-        arguments,
-        _scope_policy(phase),
-        systemd_run=require_tool("systemd_run"),
+    policy = _scope_policy(phase)
+    launcher = [
+        require_tool("systemd_run"),
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        f"--unit=llm-guard-rebuild-{phase}-{os.getpid()}-{time.monotonic_ns()}.scope",
+    ]
+    for value in (
+        f"MemoryHigh={policy.memory_high}",
+        f"MemoryMax={policy.memory_max}",
+        "MemorySwapMax=0",
+        f"TasksMax={policy.tasks_max}",
+        f"CPUQuota={policy.cpu_percent}%",
+        "CPUQuotaPeriodSec=100ms",
+        "KillMode=control-group",
+        "SendSIGKILL=yes",
+        "OOMPolicy=kill",
+        f"RuntimeMaxSec={policy.runtime_seconds}",
+        f"LimitFSIZE={policy.fsize_bytes}",
+    ):
+        launcher.extend(("--property", value))
+    launcher.extend(("--", *arguments))
+    output = run_bounded(
+        launcher,
         timeout=budget,
         deadline=deadline,
         env=child_env if env is None else env,
         pass_fds=tuple(sorted(set(_tool_fds() + pass_fds))),
-        max_output_bytes=max_output_bytes,
         cleanup_reserve=min(8.0, max(2.0, budget / 2)),
     )
     return output.encode("utf-8") if isinstance(output, str) else output
@@ -2281,12 +2300,12 @@ def _publish_candidate(
 
 def build_candidate(source: SourceBundle, budget: HostWriteBudget) -> BuildBundle:
     metadata_command, metadata_env, target = _cargo_command(source, "metadata")
-    metadata_frame = execute_scoped("metadata", metadata_command, env=metadata_env, max_output_bytes=16 * 1024 * 1024)
+    metadata_frame = execute_scoped("metadata", metadata_command, env=metadata_env)
     metadata_closure = _validate_metadata(
         metadata_frame.decode("utf-8", errors="strict"), str(source.source), str(target)
     )
     build_command, build_env, target = _cargo_command(source, "build")
-    execute_scoped("build", build_command, env=build_env, max_output_bytes=16 * 1024 * 1024)
+    execute_scoped("build", build_command, env=build_env)
     candidate_path = target / TARGET_TRIPLE / "release" / "llm-guard-proxy"
     candidate_data = candidate_path.read_bytes()
     header = {"kind": "build", "payload_sha256": sha256_bytes(candidate_data), "payload_size": len(candidate_data), "schema": 1}
