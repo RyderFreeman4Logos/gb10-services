@@ -856,7 +856,7 @@ class SharedBoundedScopeAuthorityTests(unittest.TestCase):
         with RebuildFixture() as fixture:
             fixture.set_state(
                 scope_build_exit=37,
-                scope_build_stderr="\x1b[31merror: fixture compile failed\nprivate detail\n",
+                scope_build_stderr="progress " + "x" * 300 + "\n\x1b[31merror: fixture compile failed\n",
             )
             result = fixture.run(timeout=20)
             output = result.stdout + result.stderr
@@ -865,7 +865,7 @@ class SharedBoundedScopeAuthorityTests(unittest.TestCase):
                 "scoped payload failed (exit=37): ?[31merror: fixture compile failed",
                 output,
             )
-            self.assertNotIn("private detail", output)
+            self.assertNotIn("progress xxx", output)
             self.assertEqual(fixture.reload_state()["restart_calls"], 0)
 
     def test_scope_pins_writable_nofollow_cgroup_kill(self) -> None:

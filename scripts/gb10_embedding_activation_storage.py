@@ -36,7 +36,7 @@ __all__ = [
 ]
 
 EXPECTED_VERIFIER_AUTHORITY: dict[str, str] = {
-    "gb10_bounded_process.py": "d70f27785e77b74d94c021ead2558db80f76a44a86b2d4cf763158188a090d48",
+    "gb10_bounded_process.py": "0685ca4937a69f92700831e908e659ba4e651f3e74f1219d52dec5084d1a3907",
     "gb10_verify_embedding_profile.py": "5ddbea42ec11ab6cf8fd8a0df14d40edd6b3920d33851510274c24a5092732f4",
     "gb10_embedding_profile_contract.py": "77a3b044c7020ac67a516dbb29ea5e978aa56663cd1c010b62b4cd7cfcd996d7",
     "gb10_embedding_verifier_runtime.py": "e52242e13d6a8aaa6be9c73b4a6f2cb46bb73a01a8a8592d73ccdacbc0b35434",
