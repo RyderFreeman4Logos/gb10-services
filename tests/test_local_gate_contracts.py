@@ -10,6 +10,10 @@ LEFTHOOK = ROOT / "lefthook.yml"
 SYSTEMD_VERIFY = ROOT / "scripts" / "verify_systemd_units.py"
 LOOP_RECOVERY_SMOKE = ROOT / "scripts" / "llm_guard_proxy_loop_recovery_smoke.py"
 ACTIVE_GUARD_DOCS = (ROOT / "README.md", ROOT / "docs" / "deployment" / "AGENTS.md")
+MISE_GUARD = (
+    "cargo:https://github.com/RyderFreeman4Logos/llm-guard-proxy@branch:main"
+    "[crate=llm-guard-proxy,features=guard]"
+)
 
 
 class LocalGateContractTests(unittest.TestCase):
@@ -174,6 +178,15 @@ class LocalGateContractTests(unittest.TestCase):
         ):
             with self.subTest(stale_claim=stale_claim):
                 self.assertNotIn(stale_claim, active_text)
+
+    def test_active_guard_docs_use_mise_cargo_git_without_rebuild_helpers(self) -> None:
+        for path in ACTIVE_GUARD_DOCS:
+            with self.subTest(path=path):
+                text = path.read_text()
+                self.assertIn(MISE_GUARD, text)
+                self.assertIn('install -Dm755 "$(mise which llm-guard-proxy)"', text)
+                self.assertNotIn("llm_guard_proxy_cached_rebuild", text)
+                self.assertNotIn("llm-guard-proxy-rebuild", text)
 
     def test_systemd_gate_uses_unprivileged_user_manager_semantics(self) -> None:
         helper = SYSTEMD_VERIFY.read_text()

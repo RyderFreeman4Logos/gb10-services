@@ -112,9 +112,7 @@ cp scripts/aeon_hang_guard.py /home/obj/scripts/
 install -m 0755 scripts/aeon_text_stop_start.sh /home/obj/scripts/aeon_text_stop_start.sh
 cp scripts/aeon_chat_ready.py /home/obj/.local/bin/
 cp scripts/gb10_check_mem_available.sh /home/obj/.local/bin/
-install -m 0755 scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/llm_guard_proxy_cached_rebuild.sh
-install -m 0644 scripts/llm_guard_proxy_cached_rebuild.py \
-  scripts/gb10_bounded_process.py /home/obj/.local/bin/
+install -m 0644 scripts/gb10_bounded_process.py /home/obj/.local/bin/
 cp scripts/llm_guard_proxy_publish_cgroup_registration.sh /home/obj/.local/bin/
 install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py /home/obj/.local/bin/gb10_verify_vllm_no_swap_core.py
 install -m 0755 scripts/gb10_verify_vllm_no_swap.sh /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh
@@ -126,7 +124,6 @@ cp scripts/sysmon.sh /home/obj/.local/bin/
 chmod +x /home/obj/scripts/*.sh
 chmod +x /home/obj/.local/bin/aeon_chat_ready.py \
   /home/obj/.local/bin/gb10_check_mem_available.sh \
-  /home/obj/.local/bin/llm_guard_proxy_cached_rebuild.sh \
   /home/obj/.local/bin/llm_guard_proxy_publish_cgroup_registration.sh \
   /home/obj/.local/bin/sysmon.sh
 ```
@@ -140,91 +137,13 @@ cp profile/aeon-ultimate-uncensored-nvfp4/llm-guard-proxy/config.toml /home/obj/
 
 ### 3. Build llm-guard-proxy
 ```bash
-# Build/update the reviewed main branch through verified hard-contained scopes.
-# Production accepts no environment overrides.
-/home/obj/.local/bin/llm_guard_proxy_cached_rebuild.sh
+# Build/update the reviewed main branch with mise's cargo-Git backend.
+mise use -g 'cargo:https://github.com/RyderFreeman4Logos/llm-guard-proxy@branch:main[crate=llm-guard-proxy,features=guard]'
+install -Dm755 "$(mise which llm-guard-proxy)" /home/obj/.local/bin/llm-guard-proxy
 ```
 
-Production invocation accepts no override environment variables. With no
-arguments, the cached rebuild hard-binds the canonical repository/branch,
-source/cache paths, installed config/unit, service symlink, owner-only recovery
-state, real `/proc`, and fixed tool path. `--test-only` is exclusively for
-hermetic tests and cannot emit the production completion contract.
-
-Cargo metadata and build run directly, without bubblewrap or a scoped worker, only
-after each transient user scope is proven in its exact cgroup with hard
-memory/swap/PID/CPU/file-size limits. The shared bounded-process path retains
-cgroup event and kill descriptors, verifies membership and controller values,
-and proves quiescence so descendants cannot survive cleanup.
-
-Git runs through its held executable descriptor and writes only inside the
-transaction snapshot; its object store is accounted against a 64 MiB cap.
-Cargo and rustc execute through held file descriptors with the manifest rooted
-at the held canonical-source directory. The canonical source is an immutable Git archive;
-recursive ledgers are checked before and after Cargo for the source, Cargo home and registry,
-toolchain and target rustlib, GCC closure, and sysroot include/runtime directories. Cargo target
-writes are accounted against a 512 MiB cap within the aggregate 576 MiB host
-write budget and 8 GiB free-space floor.
-
-The built candidate is opened once with `O_NOFOLLOW`, validated as an owned,
-single-link regular `0755` file no larger than 128 MiB, read through the shared
-deadline-aware bounded FD reader, and kept identity-bound through publication.
-The content-addressed release lives under
-`~/.cache/cargo-target/llm-guard-proxy-main/releases/`. WAL receipts record the
-exact Cargo argv, held tool hashes, directory ledgers, cgroup policy, write
-limits and observed Git/Cargo bytes; resource-limit events are read before the
-scope is released.
-
-Before any link mutation it snapshots and validates exact prior symlink or
-absence plus `MainPID`, `InvocationID`, monotonic start, boot ID, and
-`/proc/<pid>/stat` starttime. It hashes/stats/build-ID-checks one held
-`/proc/<pid>/exe` file descriptor, then proves the current proc entry still names
-that object and generation at publication. Same-content replacement, PID reuse,
-exec drift, and systemd generation drift fail closed.
-
-The owner-`0700` state root
-`/home/obj/.local/state/llm-guard-proxy-rebuild/` contains `lock.v1`, active
-`transaction.v1/state.json`, content-addressed `rollback/`, and committed
-`receipts/<txid>/state.json`. The only WAL phases are `prestate`, `mutated`, and
-`committed`; owner-`0600` state publication is ordered by write, file `fsync`,
-atomic rename, and directory `fsync`. Initial publication atomically renames one
-complete, tightly named sibling directory. Startup promotes only that complete
-form, retains an incomplete publication temp, and finishes exact owner-only
-cleanup tombstones. Transaction cleanup renames the whole directory before
-FD-relative removal; it never unlinks canonical state while siblings remain.
-
-The WAL binds the snapshot-root device/inode. Cleanup opens that exact root
-relative to a held owner-safe parent, quarantines it atomically, and uses the
-stdlib symlink-resistant FD-relative walker; a replacement symlink, directory,
-or leaf is preserved and the WAL remains. If the prior service link was absent,
-the original runtime pathname must be a held no-follow exact executable before
-forward mutation, remains the rollback restart pathname, and is re-proved after
-link absence and cleanup are restored.
-Scratch cleanup exchanges the exact target with a held placeholder, parks the
-placeholder in a durable reusable slot, and retains the target as its durable
-deletion record; it never removes a validated replacement leaf by name. Cleanup
-and recovery reuse the active write budget and held destination parent, with a
-zero-byte free-space admission before any host mutation.
-All other exact-leaf retirements use one held, identity-named park under the
-cache root. Receipt, rollback, WAL, candidate, backup, temporary, and service-link
-namespaces never retain hidden parks; malformed or cross-device park state fails
-closed before the source leaf moves.
-
-Cutover and every external command share one 1,800-second forward deadline.
-Failure or stale-WAL recovery gets a fresh 180 seconds shared by direct
-reads/hashes, job waits, rollback, diagnostics, and cleanup. Restart intent and
-the user-manager generation are durable before dispatch. Recovery cancels only
-a recorded Guard restart job ID whose unit/type/state remain exact under that
-unchanged generation. Foreign jobs, generation drift, ID reuse, and the
-dispatch-to-record gap are waited out within the deadline and are never adopted.
-Committed executable evidence must exactly equal the candidate identity and
-held runtime before archival. Successful recovery exits 75 before a new build.
-An unsafe WAL or unprovable exact prior generation is retained and blocks
-completion; operators must preserve it for diagnosis.
-The script never restarts a vLLM backend. A durable `committed` generation is
-not rolled back for a later stdout failure. The only production success claim is
-`LLM_GUARD_PROXY_REBUILD_COMPLETE receipt_sha256=<64hex>`; marker absence alone
-does not imply rollback.
+The explicit crate and `guard` feature select the production binary. The user
+unit keeps its stable `/home/obj/.local/bin/llm-guard-proxy` entrypoint.
 
 ### 4. Verify the integrated guardian profile
 

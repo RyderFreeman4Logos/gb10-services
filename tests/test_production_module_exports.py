@@ -76,7 +76,6 @@ EXPECTED_EXPORTS = {
         "verify_production",
     ),
     "scripts/gb10_verify_vllm_no_swap_core.py": ("main",),
-    "scripts/llm_guard_proxy_cached_rebuild.py": (),
     "scripts/hooks/receipt-store.py": ("StoreError", "main", "run"),
     "scripts/querit_checkpoint_convert.py": (
         "convert_snapshot",
@@ -137,7 +136,7 @@ EXPECTED_EXPORTS = {
 
 class ProductionModuleExportContractTests(unittest.TestCase):
     def test_new_production_modules_declare_exact_public_api(self) -> None:
-        self.assertEqual(len(EXPECTED_EXPORTS), 15)
+        self.assertEqual(len(EXPECTED_EXPORTS), 14)
         for relative_path, expected in EXPECTED_EXPORTS.items():
             with self.subTest(module=relative_path):
                 tree = ast.parse((ROOT / relative_path).read_text(), filename=relative_path)
