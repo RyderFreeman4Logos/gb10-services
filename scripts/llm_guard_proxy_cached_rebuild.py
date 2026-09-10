@@ -25,7 +25,7 @@ from typing import Any, NoReturn, cast
 __all__: list[str] = []
 
 EXPECTED_BOUNDED_PROCESS_SHA256 = (
-    "7d6e64ace6dcf733d17e22ba6ec57be10bccbef45e5a152d2f98b42068c875ff"
+    "c21857e9c00df19002285850b31075c715441dce2357f65888b750185773ebb9"
 )
 _SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 _BOUNDED_PROCESS_PATH = _SCRIPT_DIRECTORY / "gb10_bounded_process.py"
@@ -67,6 +67,7 @@ exec(
 run_bounded = _bounded_module.command
 run_scoped_direct = _bounded_module.scoped_direct_command
 ScopePolicy = _bounded_module.ScopePolicy
+BoundedProcessError = _bounded_module.BoundedProcessError
 
 UNIT = "llm-guard-proxy.service"
 HEALTH_URL = "http://100.105.4.92:18009/health"
@@ -1293,7 +1294,10 @@ def run_build_phase(
         return output
     except RuntimeError as error:
         reason = _bounded_primary_error(error)
-        if any(token in reason for token in ("deadline", "exhausted", "budget")):
+        if isinstance(error, BoundedProcessError) and (
+            reason.startswith("insufficient scoped command budget")
+            or reason.endswith("deadline exhausted")
+        ):
             fail("transaction scoped-command deadline exhausted")
         raise RebuildError(reason) from error
     finally:

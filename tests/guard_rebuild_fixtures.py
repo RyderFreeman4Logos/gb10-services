@@ -200,10 +200,13 @@ class RebuildFixture:
             "scope_reuse_on_kill_entry": False,
             "scope_foreign_signalled": False,
             "scope_cleanup_failure": "",
+            "scope_collection_requested": False,
             "scope_moved_worker_pidfd_reaped": False,
             "scope_pidfd_reaped_after_cgroup_failure": False,
             "scope_build_payload": "",
             "scope_build_exit": 0,
+            "scope_build_hang": False,
+            "scope_build_oom": False,
             "scope_build_stderr": "",
             "real_cargo_artifact_authority": False,
             "scope_collect_immediate": True,
@@ -840,6 +843,13 @@ def valid_systemctl(values):
         and values[:4] == ["--user", "show", "--property=ControlGroup", "--value"]
     ):
         return SCOPE_UNIT.fullmatch(values[4]) is not None
+    if (
+        len(values) == 5
+        and values[:4] == ["--user", "show", "--property=LoadState", "--value"]
+    ):
+        return SCOPE_UNIT.fullmatch(values[4]) is not None
+    if len(values) == 3 and values[:2] == ["--user", "reset-failed"]:
+        return SCOPE_UNIT.fullmatch(values[2]) is not None
     return (
         len(values) == 5
         and values[:4] == [
@@ -1325,6 +1335,7 @@ if name == "systemd_run":
     if state.get("scope_failure") in {"manager", "property"}:
         raise SystemExit(23)
     if "--direct-scope-child" in args:
+        signal.signal(signal.SIGTERM, lambda *_: None)
         unit_arg = next((arg for arg in args if arg.startswith("--unit=")), "")
         separator = args.index("--")
         unit = unit_arg.split("=", 1)[1]
@@ -1404,9 +1415,6 @@ if name == "systemd_run":
             "worker_pid": worker,
             "worker_starttime": 9000 + worker,
         }
-        latest["scope_registration"] = {}
-        latest["scope_unit"] = ""
-        latest["scope_worker"] = 0
         state.clear()
         state.update(latest)
         save()
@@ -1480,6 +1488,14 @@ elif name == "cargo":
             state["held_ld_consumed"] = False
         state["ambient_usr_consumed"] = linker_path in {"/usr/bin", "/bin"}
         save()
+        if state.get("scope_build_oom"):
+            unit = state["scope_unit"]
+            (scope_paths(unit) / "memory.events").write_text(
+                "low 0\nhigh 0\nmax 1\noom 1\noom_kill 1\n"
+            )
+            raise SystemExit(137)
+        if state.get("scope_build_hang"):
+            time.sleep(30)
         if state.get("scope_build_exit"):
             sys.stderr.write(state.get("scope_build_stderr", ""))
             raise SystemExit(state["scope_build_exit"])
@@ -2037,6 +2053,40 @@ elif name == "bwrap":
     raise SystemExit(exit_code)
 elif name == "systemctl":
     joined = " ".join(args)
+    if (
+        len(args) == 5
+        and args[:4] == ["--user", "show", "--property=LoadState", "--value"]
+    ):
+        unit = args[4]
+        registration = state.get("scope_registration")
+        scope = scope_paths(unit)
+        loaded = (
+            isinstance(registration, dict)
+            and registration.get("unit") == unit
+            and registration.get("cgroup_path") == str(scope)
+            and scope.is_dir()
+        )
+        print("failed" if loaded else "not-found")
+        raise SystemExit(0)
+    if len(args) == 3 and args[:2] == ["--user", "reset-failed"]:
+        unit = args[2]
+        registration = state.get("scope_registration")
+        scope = scope_paths(unit)
+        if (
+            not isinstance(registration, dict)
+            or registration.get("unit") != unit
+            or registration.get("cgroup_path") != str(scope)
+            or not scope.is_dir()
+        ):
+            raise SystemExit(93)
+        clear_scope(unit)
+        shutil.rmtree(scope)
+        state["scope_collection_requested"] = True
+        state["scope_registration"] = {}
+        state["scope_unit"] = ""
+        state["scope_worker"] = 0
+        save()
+        raise SystemExit(0)
     if (
         len(args) == 5
         and args[:4] == ["--user", "show", "--property=ControlGroup", "--value"]

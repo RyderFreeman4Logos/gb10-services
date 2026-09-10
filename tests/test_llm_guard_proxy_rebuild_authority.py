@@ -879,7 +879,15 @@ class SharedBoundedScopeAuthorityTests(unittest.TestCase):
             self.assertIn("scope controller value is not exact", output)
             self.assertNotIn("cargo metadata", fixture.calls())
             self.assertNotIn("cargo build", fixture.calls())
-            self.assertEqual(fixture.reload_state()["restart_calls"], 0)
+            state = fixture.reload_state()
+            self.assertEqual(state["restart_calls"], 0)
+            self.assertTrue(state["scope_collection_requested"], output)
+            self.assertEqual(state["scope_unit"], "", output)
+            self.assertEqual(
+                list((fixture.cgroup_root / "fixture.slice").glob("*.scope")),
+                [],
+                output,
+            )
 
     def test_direct_command_failure_preserves_bounded_sanitized_stderr(self) -> None:
         with RebuildFixture() as fixture:
@@ -899,6 +907,61 @@ class SharedBoundedScopeAuthorityTests(unittest.TestCase):
             self.assertIn("error: could not compile fixture", output)
             self.assertNotIn("progress ", output)
             self.assertEqual(fixture.reload_state()["restart_calls"], 0)
+
+    def test_direct_command_failure_collects_exact_unit_and_cgroup(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(
+                scope_build_exit=37,
+                scope_collect_immediate=False,
+            )
+            result = fixture.run(timeout=20)
+            output = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0, output)
+            state = fixture.reload_state()
+            self.assertTrue(state["scope_collection_requested"], output)
+            self.assertEqual(state["scope_unit"], "", output)
+            self.assertEqual(
+                list((fixture.cgroup_root / "fixture.slice").glob("*.scope")),
+                [],
+                output,
+            )
+
+    def test_direct_command_success_oom_and_timeout_collect_scope(self) -> None:
+        cases = (
+            ({}, {}, 0),
+            ({"scope_build_oom": True}, {}, 1),
+            (
+                {"scope_build_hang": True},
+                {"LLM_GUARD_REBUILD_TEST_FORWARD_SECONDS": "10"},
+                1,
+            ),
+        )
+        for state_updates, extra_env, failed in cases:
+            with self.subTest(state_updates=state_updates), RebuildFixture() as fixture:
+                fixture.set_state(**state_updates)
+                result = fixture.run(extra_env=extra_env, timeout=12)
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode != 0, bool(failed), output)
+                state = fixture.reload_state()
+                self.assertTrue(state["scope_collection_requested"], output)
+                self.assertEqual(state["scope_unit"], "", output)
+                self.assertEqual(
+                    list((fixture.cgroup_root / "fixture.slice").glob("*.scope")),
+                    [],
+                    output,
+                )
+
+    def test_scope_cgroup_closes_directory_descriptor_last(self) -> None:
+        bounded = _load(BOUNDED, "bounded_cgroup_close_order_test")
+        authority = bounded._ScopeCgroup(
+            "/fixture.slice/unit.scope",
+            {"directory": 10, "cgroup.events": 11, "cgroup.kill": 12},
+        )
+        closed: list[int] = []
+        with patch.object(bounded.os, "close", side_effect=closed.append):
+            authority.close()
+        self.assertEqual(closed, [11, 12, 10])
+        self.assertEqual(authority.descriptors, {})
 
     def test_scope_pins_writable_nofollow_cgroup_kill(self) -> None:
         bounded = _load(BOUNDED, "bounded_cgroup_kill_test")
@@ -1603,6 +1666,50 @@ class CrashSafeHostWriteTests(unittest.TestCase):
                 (target / "three").write_bytes(b"6")
                 with self.assertRaisesRegex(engine.RebuildError, "Cargo target byte bound"):
                     budget.account_tree(target, 5, "Cargo target")
+            finally:
+                budget.close()
+
+    def test_build_progress_preserves_aggregate_host_write_budget_error(self) -> None:
+        with RebuildFixture() as fixture, patch.dict(os.environ, fixture.env, clear=False):
+            old_argv = sys.argv[:]
+            try:
+                sys.argv = [str(ENGINE), "--test-only"]
+                engine = _load(ENGINE, "build_progress_write_budget_test")
+            finally:
+                sys.argv = old_argv
+
+            fixture.cache_root.mkdir(mode=0o700)
+            target = fixture.cache_root / "target"
+            target.mkdir(mode=0o700)
+            (target / "artifact").write_bytes(b"x")
+            budget = engine.HostWriteBudget(fixture.cache_root)
+            engine.test_free_bytes = (
+                engine.HOST_FREE_FLOOR_BYTES + engine.HOST_WRITE_BUDGET_BYTES
+            )
+            engine.operation_deadline = time.monotonic() + 10
+            budget.used = engine.HOST_WRITE_BUDGET_BYTES
+
+            def run_scoped(*_arguments: object, **keywords: object) -> bytes:
+                keywords["progress"]()
+                self.fail("progress callback did not enforce the aggregate write budget")
+
+            try:
+                with (
+                    patch.object(engine, "run_scoped_direct", side_effect=run_scoped),
+                    patch.object(engine, "require_tool", return_value="/bin/true"),
+                    patch.object(engine, "_verify_all_tools"),
+                    self.assertRaisesRegex(
+                        engine.RebuildError, "^host write budget exceeded$"
+                    ),
+                ):
+                    engine.run_build_phase(
+                        "build",
+                        ["cargo", "build"],
+                        env={},
+                        budget=budget,
+                        target=target,
+                        pass_fds=(),
+                    )
             finally:
                 budget.close()
 

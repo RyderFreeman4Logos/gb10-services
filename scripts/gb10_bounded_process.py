@@ -536,9 +536,12 @@ class _ScopeCgroup:
         return payload
 
     def close(self) -> None:
+        directory = self.descriptors.pop("directory", -1)
         for descriptor in self.descriptors.values():
             os.close(descriptor)
         self.descriptors.clear()
+        if directory >= 0:
+            os.close(directory)
 
 
 def _read_small_file(path: Path, maximum: int = _SCOPE_STATUS_BYTES) -> bytes:
@@ -735,6 +738,7 @@ def _verify_scope(
     unit: str,
     wrapper_pid: int,
     worker_pid: int,
+    expected_relative_path: str,
 ) -> tuple[int, int, _ScopeCgroup, dict[str, int], dict[str, int]]:
     if worker_pid <= 1 or worker_pid == wrapper_pid:
         raise BoundedProcessError("scope worker identity is invalid")
@@ -751,7 +755,7 @@ def _verify_scope(
     if len(lines) != 1 or not lines[0].startswith("0::/"):
         raise BoundedProcessError("scope cgroup membership is malformed")
     relative_path = lines[0][3:]
-    if Path(relative_path).name != unit:
+    if relative_path != expected_relative_path or Path(relative_path).name != unit:
         raise BoundedProcessError("scope cgroup membership is not exact")
     cgroup = _open_scope_cgroup(policy, relative_path)
     worker_pidfd = -1
@@ -811,9 +815,13 @@ def _scope_manager_command(
     pass_fds: Sequence[int],
     arguments: Sequence[str],
     label: str,
+    deadline: float,
     *,
     capture: bool = False,
 ) -> bytes:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise BoundedProcessError(f"scope manager {label} deadline exhausted")
     try:
         process = subprocess.Popen(
             [systemctl, *arguments],
@@ -827,7 +835,7 @@ def _scope_manager_command(
     except (OSError, subprocess.SubprocessError) as error:
         raise BoundedProcessError(f"scope manager {label} failed") from error
     try:
-        output, _ = process.communicate(timeout=2)
+        output, _ = process.communicate(timeout=min(2.0, remaining))
     except BaseException as error:
         cleanup_error: BaseException | None = None
         try:
@@ -836,7 +844,7 @@ def _scope_manager_command(
         except BaseException as failure:
             cleanup_error = failure
         try:
-            process.wait(timeout=1)
+            process.wait(timeout=max(0.001, min(1.0, deadline - time.monotonic())))
         except BaseException as failure:
             cleanup_error = cleanup_error or failure
         if process.returncode is None:
@@ -856,6 +864,111 @@ def _scope_manager_command(
     if process.returncode != 0 or len(output) > _SCOPE_STATUS_BYTES:
         raise BoundedProcessError(f"scope manager {label} failed")
     return output
+
+
+def _scope_load_state(
+    systemctl: str, pass_fds: Sequence[int], unit: str, deadline: float
+) -> str:
+    payload = _scope_manager_command(
+        systemctl,
+        pass_fds,
+        ["--user", "show", "--property=LoadState", "--value", unit],
+        "state query",
+        deadline,
+        capture=True,
+    )
+    try:
+        state = payload.decode("ascii", errors="strict").strip()
+    except UnicodeDecodeError as error:
+        raise BoundedProcessError("scope manager state is malformed") from error
+    if not state or any(character not in "abcdefghijklmnopqrstuvwxyz-" for character in state):
+        raise BoundedProcessError("scope manager state is malformed")
+    return state
+
+
+def _scope_control_group(
+    systemctl: str, pass_fds: Sequence[int], unit: str, deadline: float
+) -> str:
+    payload = _scope_manager_command(
+        systemctl,
+        pass_fds,
+        ["--user", "show", "--property=ControlGroup", "--value", unit],
+        "cgroup query",
+        deadline,
+        capture=True,
+    )
+    try:
+        relative_path = payload.decode("ascii", errors="strict").strip()
+    except UnicodeDecodeError as error:
+        raise BoundedProcessError("scope manager cgroup is malformed") from error
+    parts = relative_path.lstrip("/").split("/")
+    if (
+        not relative_path.startswith("/")
+        or not parts
+        or any(part in {"", ".", ".."} for part in parts)
+        or parts[-1] != unit
+    ):
+        raise BoundedProcessError("scope manager cgroup is malformed")
+    return relative_path
+
+
+def _collect_scope(
+    systemctl: str,
+    pass_fds: Sequence[int],
+    policy: ScopePolicy,
+    unit: str,
+    relative_path: str,
+    cgroup: _ScopeCgroup | None,
+    deadline: float,
+) -> None:
+    path = policy.cgroup_root / relative_path.lstrip("/")
+    request_error: BaseException | None = None
+    try:
+        try:
+            current = os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None and cgroup is not None:
+            pinned = os.fstat(cgroup.descriptors["directory"])
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino) != (pinned.st_dev, pinned.st_ino)
+            ):
+                raise BoundedProcessError("scope changed before collection")
+        if _scope_load_state(systemctl, pass_fds, unit, deadline) != "not-found":
+            _scope_manager_command(
+                systemctl,
+                pass_fds,
+                ["--user", "reset-failed", unit],
+                "collection",
+                deadline,
+            )
+    except BaseException as error:
+        request_error = error
+    finally:
+        if cgroup is not None:
+            cgroup.close()
+
+    last_error = request_error
+    while True:
+        try:
+            absent = _scope_load_state(systemctl, pass_fds, unit, deadline) == "not-found"
+            try:
+                os.stat(path, follow_symlinks=False)
+            except FileNotFoundError:
+                cgroup_absent = True
+            else:
+                cgroup_absent = False
+            if absent and cgroup_absent:
+                return
+        except BaseException as error:
+            last_error = error
+        if time.monotonic() >= deadline:
+            failure = BoundedProcessError("scope collection deadline exhausted")
+            if last_error is not None:
+                failure.add_note(f"collection diagnostic: {_bounded_error_summary(last_error)}")
+            raise failure from last_error
+        time.sleep(min(_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
 
 def _scope_signal(
@@ -1149,10 +1262,13 @@ def scoped_command(
     memory_before: dict[str, int] = {}
     pids_before: dict[str, int] = {}
     resource_events: tuple[str, ...] = ()
+    scope_relative_path: str | None = None
     resource_snapshot = False
     fence_released = False
     failure: str | None = None
     identity_lost_at: float | None = None
+    scope_quiescent = False
+    collection_attempted = False
     try:
         try:
             process = subprocess.Popen(
@@ -1202,13 +1318,18 @@ def scoped_command(
                 break
         if worker_pid == 0:
             raise BoundedProcessError("scope did not report a worker")
+        scope_relative_path = _scope_control_group(
+            systemctl, pass_fds, unit, hard_deadline
+        )
         (
             worker_starttime,
             worker_pidfd,
             cgroup,
             memory_before,
             pids_before,
-        ) = _verify_scope(policy, unit, process.pid, worker_pid)
+        ) = _verify_scope(
+            policy, unit, process.pid, worker_pid, scope_relative_path
+        )
         if not _scope_worker_exact(
             policy, unit, worker_pid, worker_starttime, cgroup
         ):
@@ -1340,10 +1461,21 @@ def scoped_command(
             )
         ):
             raise BoundedProcessError("scope exit status is invalid")
-        if not _scope_quiescent(
+        scope_quiescent = _scope_quiescent(
             policy, worker_pid, worker_starttime, worker_pidfd, cgroup
-        ):
+        )
+        if not scope_quiescent:
             raise BoundedProcessError("scope worker survived collection")
+        collection_attempted = True
+        _collect_scope(
+            systemctl,
+            pass_fds,
+            policy,
+            unit,
+            scope_relative_path,
+            cgroup,
+            hard_deadline,
+        )
         return bytes(captures["stdout"].retained)
     except BaseException as error:
         resource_diagnostics: list[str] = []
@@ -1399,8 +1531,7 @@ def scoped_command(
             except BaseException as cleanup_failure:
                 cleanup_error = cleanup_failure
             cleanup_diagnostics: list[str] = []
-            scope_quiescent = False
-            if cgroup is not None:
+            if cgroup is not None and not collection_attempted:
                 try:
                     scope_quiescent = _scope_quiescent(
                         policy,
@@ -1411,8 +1542,28 @@ def scoped_command(
                     )
                 except BaseException as diagnostic_failure:
                     cleanup_error = cleanup_error or diagnostic_failure
+            elif scope_relative_path is not None and cleanup_error is None:
+                scope_quiescent = True
             if cgroup is not None and not scope_quiescent:
                 cleanup_diagnostics.append("hard-contained scope survived cleanup")
+            if (
+                scope_relative_path is not None
+                and scope_quiescent
+                and not collection_attempted
+            ):
+                collection_attempted = True
+                try:
+                    _collect_scope(
+                        systemctl,
+                        pass_fds,
+                        policy,
+                        unit,
+                        scope_relative_path,
+                        cgroup,
+                        hard_deadline,
+                    )
+                except BaseException as diagnostic_failure:
+                    cleanup_error = cleanup_error or diagnostic_failure
             if process.returncode is None:
                 cleanup_diagnostics.append("scope wrapper survived cleanup")
             if cleanup_error is not None:
