@@ -1156,7 +1156,10 @@ def _open_fixed_authorities(expected: dict[str, Any] | None = None) -> None:
             ).decode("utf-8")
         except UnicodeDecodeError as error:
             raise RebuildError("installed Guard unit is not UTF-8") from error
-        if any(line.strip().startswith("EnvironmentFile=") for line in unit_text.splitlines()):
+        if any(
+            re.match(r"^[\t ]*EnvironmentFile[\t ]*=", line)
+            for line in unit_text.splitlines()
+        ):
             fail("installed Guard unit contains EnvironmentFile")
         fixed_authorities.update(opened)
     except BaseException:

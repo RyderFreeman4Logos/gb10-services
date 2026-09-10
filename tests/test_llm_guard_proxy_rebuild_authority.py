@@ -426,6 +426,20 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, output)
             self.assertIn("LLM_GUARD_PROXY_REBUILD_TEST_ONLY_COMPLETE", output)
 
+    def test_environment_file_whitespace_variants_are_rejected(self) -> None:
+        directives = (
+            "EnvironmentFile = /tmp/guard.env",
+            "\tEnvironmentFile\t=\t/tmp/guard.env",
+        )
+        for directive in directives:
+            with self.subTest(directive=directive), RebuildFixture() as fixture:
+                fixture.guard_unit.write_text(f"[Service]\n{directive}\n")
+                result = fixture.run(timeout=20)
+                output = result.stdout + result.stderr
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertIn("installed Guard unit contains EnvironmentFile", output)
+                fixture.assert_prior_restored(self)
+
     def test_running_config_credential_mismatch_is_not_adopted(self) -> None:
         with RebuildFixture() as fixture:
             fixture.set_state(applied_config_override="substituted-config\n")
