@@ -407,6 +407,39 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             self.assertEqual(os.readlink(fixture.service_bin), before)
             self.assertEqual(fixture.reload_state()["restart_calls"], 0)
 
+    def test_supported_generation_field_missing_fails_closed(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(omit_generation_field="ProtectSystem")
+            before = os.readlink(fixture.service_bin)
+            result = fixture.run(timeout=20)
+            output = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("systemd generation output is missing fields", output)
+            self.assertEqual(os.readlink(fixture.service_bin), before)
+            self.assertEqual(fixture.reload_state()["restart_calls"], 0)
+
+    def test_systemd_255_omits_environment_files_without_rebuild_failure(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(omit_environment_files=True)
+            result = fixture.run(timeout=20)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("LLM_GUARD_PROXY_REBUILD_TEST_ONLY_COMPLETE", output)
+
+    def test_environment_file_whitespace_variants_are_rejected(self) -> None:
+        directives = (
+            "EnvironmentFile = /tmp/guard.env",
+            "\tEnvironmentFile\t=\t/tmp/guard.env",
+        )
+        for directive in directives:
+            with self.subTest(directive=directive), RebuildFixture() as fixture:
+                fixture.guard_unit.write_text(f"[Service]\n{directive}\n")
+                result = fixture.run(timeout=20)
+                output = result.stdout + result.stderr
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertIn("installed Guard unit contains EnvironmentFile", output)
+                fixture.assert_prior_restored(self)
+
     def test_running_config_credential_mismatch_is_not_adopted(self) -> None:
         with RebuildFixture() as fixture:
             fixture.set_state(applied_config_override="substituted-config\n")

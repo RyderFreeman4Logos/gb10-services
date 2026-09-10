@@ -148,7 +148,6 @@ GENERATION_FIELDS = (
     "ProtectHome",
     "UMask",
     "Environment",
-    "EnvironmentFiles",
 )
 MANAGER_FIELDS = ("InvocationID", "UserspaceTimestampMonotonic")
 MANAGER_POLL_SECONDS = 0.2
@@ -1149,6 +1148,19 @@ def _open_fixed_authorities(expected: dict[str, Any] | None = None) -> None:
             or opened["unit"].sha256 != expected["guard_unit_sha256"]
         ):
             fail("installed Guard config or unit differs from transaction authority")
+        try:
+            unit_text = _read_fd_limited(
+                opened["unit"].descriptor,
+                opened["unit"].max_bytes,
+                opened["unit"].label,
+            ).decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise RebuildError("installed Guard unit is not UTF-8") from error
+        if any(
+            re.match(r"^[\t ]*EnvironmentFile[\t ]*=", line)
+            for line in unit_text.splitlines()
+        ):
+            fail("installed Guard unit contains EnvironmentFile")
         fixed_authorities.update(opened)
     except BaseException:
         for authority in opened.values():
@@ -3993,7 +4005,6 @@ def _verify_manager_contract(values: dict[str, str]) -> None:
         "ProtectHome": "read-only",
         "UMask": "0077",
         "Environment": "",
-        "EnvironmentFiles": "",
     }
     if (
         match is None
