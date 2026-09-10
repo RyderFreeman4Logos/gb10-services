@@ -380,6 +380,7 @@ class GuardRebuildProvenanceTests(unittest.TestCase):
                 set(authorities["tool_authorities"]),
                 {
                     "ar",
+                    "busctl",
                     "cargo",
                     "cc",
                     "curl",

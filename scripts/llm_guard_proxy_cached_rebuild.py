@@ -144,7 +144,6 @@ GENERATION_FIELDS = (
     "Result",
     "Job",
     "ExecStart",
-    "LoadCredential",
     "NoNewPrivileges",
     "PrivateTmp",
     "ProtectSystem",
@@ -302,6 +301,7 @@ def atomic_copy_fd(
 
 TOOL_NAMES = {
     "ar",
+    "busctl",
     "cargo",
     "cc",
     "curl",
@@ -899,6 +899,10 @@ def _production_tool_specs() -> dict[str, ToolSpec]:
         "systemctl": root(
             "/usr/bin/systemctl",
             "1bf2f1e98c533b0313a78143ffcda2690116d90d76816dc7b74df79c4767aa95",
+        ),
+        "busctl": root(
+            "/usr/bin/busctl",
+            "abe9b9f6a8d8826dde773ef1a4396f71d78e221409d54227c2909524b01bb5e6",
         ),
         "curl": root(
             "/usr/bin/curl",
@@ -4001,7 +4005,6 @@ def _verify_manager_contract(values: dict[str, str]) -> None:
         values["ExecStart"],
     )
     expected = {
-        "LoadCredential": f"llm-guard-config:{guard_config}",
         "NoNewPrivileges": "yes",
         "PrivateTmp": "yes",
         "ProtectSystem": "strict",
@@ -4015,6 +4018,29 @@ def _verify_manager_contract(values: dict[str, str]) -> None:
         or match.group(2) != expected_argv
         or any(values[key] != value for key, value in expected.items())
     ):
+        fail("manager-loaded Guard contract differs")
+
+    credential = execute(
+        [
+            require_tool("busctl"),
+            "--user",
+            "--json=short",
+            "get-property",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1/unit/llm_2dguard_2dproxy_2eservice",
+            "org.freedesktop.systemd1.Service",
+            "LoadCredential",
+        ],
+        capture=True,
+    )
+    expected_credential = json.dumps(
+        {
+            "type": "a(ss)",
+            "data": [["llm-guard-config", str(guard_config)]],
+        },
+        separators=(",", ":"),
+    ).encode("ascii") + b"\n"
+    if credential != expected_credential:
         fail("manager-loaded Guard contract differs")
 
 

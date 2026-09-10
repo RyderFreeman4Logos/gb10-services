@@ -142,6 +142,7 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             engine = _load(ENGINE, "complete_production_tool_authority")
         expected = {
             "ar": ("/usr/bin/aarch64-linux-gnu-ar", "f4583a612510e038dbc1ae8afb5eae5f0445c435bdd7c4c28e78acc7e757d2b1"),
+            "busctl": ("/usr/bin/busctl", "abe9b9f6a8d8826dde773ef1a4396f71d78e221409d54227c2909524b01bb5e6"),
             "cargo": ("/home/obj/.rustup/toolchains/1.96.0-aarch64-unknown-linux-gnu/bin/cargo", "7db170801729d4775347548ed5970b459844fc2f6b20798efb96f444b5b94fc3"),
             "cc": ("/usr/bin/aarch64-linux-gnu-gcc-13", "a20520ee21543f243d40636a9181a142c45ecd989de31ab86b99a8ea5ada870d"),
             "curl": ("/usr/bin/curl", "67054bcf748d42e1bf4b2a0eb4ba768e37dde8681313a64edd2f343c5d17a0ac"),
@@ -399,6 +400,25 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
     def test_manager_loaded_contract_mismatch_prevents_link_mutation(self) -> None:
         with RebuildFixture() as fixture:
             fixture.set_state(manager_contract_mismatch=True)
+            before = os.readlink(fixture.service_bin)
+            result = fixture.run(timeout=20)
+            output = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("manager-loaded Guard contract differs", output)
+            self.assertEqual(os.readlink(fixture.service_bin), before)
+            self.assertEqual(fixture.reload_state()["restart_calls"], 0)
+
+    def test_systemd_255_unprintable_load_credential_uses_typed_property(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(systemctl_unprintable_load_credential=True)
+            result = fixture.run(timeout=20)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("LLM_GUARD_PROXY_REBUILD_TEST_ONLY_COMPLETE", output)
+
+    def test_typed_load_credential_mismatch_prevents_link_mutation(self) -> None:
+        with RebuildFixture() as fixture:
+            fixture.set_state(load_credential_override=str(fixture.wrong_hash))
             before = os.readlink(fixture.service_bin)
             result = fixture.run(timeout=20)
             output = result.stdout + result.stderr
