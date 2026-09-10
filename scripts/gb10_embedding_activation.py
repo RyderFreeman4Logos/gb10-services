@@ -17,10 +17,10 @@ from typing import Any
 __all__ = ["ActivationInterrupted", "activate", "main"]
 
 EXPECTED_IMPORT_AUTHORITY: dict[str, str] = {
-    "gb10_bounded_process.py": "c21857e9c00df19002285850b31075c715441dce2357f65888b750185773ebb9",
+    "gb10_bounded_process.py": "c731aff6b3f67e69bca68ea4ebc57888cedb0f9ca3d73f644796cfdb33e06c24",
     "gb10_embedding_activation_checks.py": "7e6d00538e8d952c137e5b5114fc16919f6e1bab59d6260602f989a2103f44a4",
     "gb10_embedding_activation_config.py": "fd3053512ae084418efd6acbedc09d2209dcd961cd87c503cfcad275a38668c8",
-    "gb10_embedding_activation_storage.py": "9705b5a69b09f5529f3c671b0305660001df6f3935c5ff663776c460fd907810",
+    "gb10_embedding_activation_storage.py": "117b5c1cbb39526533687336fc0d765c4204342cf57243c8a245a5ba26524250",
     "gb10_embedding_profile_contract.py": "77a3b044c7020ac67a516dbb29ea5e978aa56663cd1c010b62b4cd7cfcd996d7",
     "gb10_embedding_verifier_runtime.py": "e52242e13d6a8aaa6be9c73b4a6f2cb46bb73a01a8a8592d73ccdacbc0b35434",
     "gb10_verify_embedding_profile.py": "5ddbea42ec11ab6cf8fd8a0df14d40edd6b3920d33851510274c24a5092732f4",

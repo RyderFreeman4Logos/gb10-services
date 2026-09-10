@@ -739,7 +739,8 @@ def _verify_scope(
     wrapper_pid: int,
     worker_pid: int,
     expected_relative_path: str,
-) -> tuple[int, int, _ScopeCgroup, dict[str, int], dict[str, int]]:
+    cgroup: _ScopeCgroup,
+) -> tuple[int, dict[str, int], dict[str, int]]:
     if worker_pid <= 1 or worker_pid == wrapper_pid:
         raise BoundedProcessError("scope worker identity is invalid")
     row = _proc_row_under(policy.proc_root, worker_pid)
@@ -757,57 +758,38 @@ def _verify_scope(
     relative_path = lines[0][3:]
     if relative_path != expected_relative_path or Path(relative_path).name != unit:
         raise BoundedProcessError("scope cgroup membership is not exact")
-    cgroup = _open_scope_cgroup(policy, relative_path)
-    worker_pidfd = -1
-    try:
-        expected = {
-            "memory.high": str(policy.memory_high),
-            "memory.max": str(policy.memory_max),
-            "memory.oom.group": "1",
-            "memory.swap.max": "0",
-            "pids.max": str(policy.tasks_max),
-            "cpu.max": f"{policy.cpu_percent * 1000} 100000",
-        }
-        for name, value in expected.items():
-            if cgroup.read(name).decode("ascii", errors="strict").strip() != value:
-                raise BoundedProcessError("scope controller value is not exact")
-        procs = cgroup.read("cgroup.procs").split()
-        if str(worker_pid).encode("ascii") not in procs:
-            raise BoundedProcessError("scope worker is outside exact cgroup")
-        events = _integer_map(cgroup.read("cgroup.events"))
-        if events.get("populated") != 1:
-            raise BoundedProcessError("scope cgroup is not populated")
-        memory_events = _integer_map(cgroup.read("memory.events"))
-        pids_events = _integer_map(cgroup.read("pids.events"))
-        for key in ("oom", "oom_kill", "max"):
-            if key not in memory_events:
-                raise BoundedProcessError("scope memory events are incomplete")
-        if "max" not in pids_events:
-            raise BoundedProcessError("scope PID events are incomplete")
-        if (
-            any(memory_events[key] != 0 for key in ("oom", "oom_kill", "max"))
-            or pids_events["max"] != 0
-        ):
-            raise BoundedProcessError("scope pre-GO resource event is nonzero")
-        if not _scope_worker_exact(policy, unit, worker_pid, row[1], cgroup):
-            raise BoundedProcessError("scope worker identity changed before GO")
-        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
-            raise BoundedProcessError("scope worker pidfd authority is unavailable")
-        try:
-            worker_pidfd = os.pidfd_open(worker_pid, 0)
-            signal.pidfd_send_signal(worker_pidfd, 0, None, 0)
-        except (AttributeError, ProcessLookupError, OSError) as error:
-            raise BoundedProcessError(
-                "scope worker pidfd authority is unavailable"
-            ) from error
-        if not _scope_worker_exact(policy, unit, worker_pid, row[1], cgroup):
-            raise BoundedProcessError("scope worker identity changed before GO")
-    except BaseException:
-        if worker_pidfd >= 0:
-            os.close(worker_pidfd)
-        cgroup.close()
-        raise
-    return row[1], worker_pidfd, cgroup, memory_events, pids_events
+    expected = {
+        "memory.high": str(policy.memory_high),
+        "memory.max": str(policy.memory_max),
+        "memory.oom.group": "1",
+        "memory.swap.max": "0",
+        "pids.max": str(policy.tasks_max),
+        "cpu.max": f"{policy.cpu_percent * 1000} 100000",
+    }
+    for name, value in expected.items():
+        if cgroup.read(name).decode("ascii", errors="strict").strip() != value:
+            raise BoundedProcessError("scope controller value is not exact")
+    procs = cgroup.read("cgroup.procs").split()
+    if str(worker_pid).encode("ascii") not in procs:
+        raise BoundedProcessError("scope worker is outside exact cgroup")
+    events = _integer_map(cgroup.read("cgroup.events"))
+    if events.get("populated") != 1:
+        raise BoundedProcessError("scope cgroup is not populated")
+    memory_events = _integer_map(cgroup.read("memory.events"))
+    pids_events = _integer_map(cgroup.read("pids.events"))
+    for key in ("oom", "oom_kill", "max"):
+        if key not in memory_events:
+            raise BoundedProcessError("scope memory events are incomplete")
+    if "max" not in pids_events:
+        raise BoundedProcessError("scope PID events are incomplete")
+    if (
+        any(memory_events[key] != 0 for key in ("oom", "oom_kill", "max"))
+        or pids_events["max"] != 0
+    ):
+        raise BoundedProcessError("scope pre-GO resource event is nonzero")
+    if not _scope_worker_exact(policy, unit, worker_pid, row[1], cgroup):
+        raise BoundedProcessError("scope worker identity changed before GO")
+    return row[1], memory_events, pids_events
 
 
 def _scope_manager_command(
@@ -1001,17 +983,18 @@ def _scope_signal(
         except BaseException as error:
             first_error = first_error or error
             errors.append("scope cgroup KILL failed")
-    try:
-        signal.pidfd_send_signal(worker_pidfd, number, None, 0)
-    except ProcessLookupError:
-        pass
-    except BaseException as error:
-        first_error = first_error or error
-        errors.append(
-            "scope worker pidfd KILL failed"
-            if number == signal.SIGKILL
-            else "scope worker pidfd TERM failed"
-        )
+    if worker_pidfd >= 0:
+        try:
+            signal.pidfd_send_signal(worker_pidfd, number, None, 0)
+        except ProcessLookupError:
+            pass
+        except BaseException as error:
+            first_error = first_error or error
+            errors.append(
+                "scope worker pidfd KILL failed"
+                if number == signal.SIGKILL
+                else "scope worker pidfd TERM failed"
+            )
     if number != signal.SIGKILL:
         if errors:
             raise BoundedProcessError("; ".join(dict.fromkeys(errors))) from first_error
@@ -1076,14 +1059,15 @@ def _scope_quiescent(
     row = _proc_row_under(policy.proc_root, worker_pid)
     if row is not None and row[1] == worker_starttime:
         return False
-    try:
-        signal.pidfd_send_signal(worker_pidfd, 0, None, 0)
-    except ProcessLookupError:
-        pass
-    except (AttributeError, OSError):
-        return False
-    else:
-        return False
+    if worker_pidfd >= 0:
+        try:
+            signal.pidfd_send_signal(worker_pidfd, 0, None, 0)
+        except ProcessLookupError:
+            pass
+        except (AttributeError, OSError):
+            return False
+        else:
+            return False
     try:
         events = _integer_map(cgroup.read("cgroup.events"))
         procs = cgroup.read("cgroup.procs").split()
@@ -1321,15 +1305,23 @@ def scoped_command(
         scope_relative_path = _scope_control_group(
             systemctl, pass_fds, unit, hard_deadline
         )
+        cgroup = _open_scope_cgroup(policy, scope_relative_path)
         (
             worker_starttime,
-            worker_pidfd,
-            cgroup,
             memory_before,
             pids_before,
         ) = _verify_scope(
-            policy, unit, process.pid, worker_pid, scope_relative_path
+            policy, unit, process.pid, worker_pid, scope_relative_path, cgroup
         )
+        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+            raise BoundedProcessError("scope worker pidfd authority is unavailable")
+        try:
+            worker_pidfd = os.pidfd_open(worker_pid, 0)
+            signal.pidfd_send_signal(worker_pidfd, 0, None, 0)
+        except (AttributeError, ProcessLookupError, OSError) as error:
+            raise BoundedProcessError(
+                "scope worker pidfd authority is unavailable"
+            ) from error
         if not _scope_worker_exact(
             policy, unit, worker_pid, worker_starttime, cgroup
         ):

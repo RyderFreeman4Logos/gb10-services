@@ -216,6 +216,7 @@ class RebuildFixture:
             "scope_worker": 0,
             "scope_worker_starttime": 0,
             "scope_worker_reap_witness": None,
+            "scope_worker_pre_admission_reaped": False,
             "scope_registration": {},
             "scope_props": {},
         }
@@ -1390,14 +1391,56 @@ if name == "systemd_run":
         }
         if state.get("scope_failure") == "property-readback":
             files["memory.max"] = "1\n"
+        if state.get("scope_failure") == "membership":
+            files["cgroup.procs"] = "999999\n"
         if state.get("scope_failure") == "controller":
             files.pop("memory.swap.max")
+        pre_go_event = state.get("scope_pre_go_resource_event", "")
+        if pre_go_event == "memory":
+            files["memory.events"] = "low 0\nhigh 0\nmax 1\noom 0\noom_kill 0\n"
+        elif pre_go_event == "oom-kill":
+            files["memory.events"] = "low 0\nhigh 0\nmax 0\noom 1\noom_kill 1\n"
+        elif pre_go_event == "pids":
+            files["pids.events"] = "max 1\n"
         for filename, value in files.items():
             (scope / filename).write_text(value)
         os.kill(worker, signal.SIGCONT)
+        if state.get("scope_failure") == "pidfd":
+            wait_deadline = time.monotonic() + 2
+            while time.monotonic() < wait_deadline:
+                try:
+                    if Path(f"/proc/{worker}/wchan").read_text().strip() == "pipe_read":
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.01)
+            os.kill(worker, signal.SIGKILL)
+            _, child_status = os.waitpid(worker, 0)
+            state["scope_worker_pre_admission_reaped"] = True
+            save()
+        else:
+            child_status = 0
+        admission_rejection = state.get("scope_failure") in {
+            "membership", "pidfd", "property-readback"
+        } or bool(state.get("scope_pre_go_resource_event"))
+        kill_deadline = time.monotonic() + 4
         while True:
+            if state.get("scope_failure") == "pidfd":
+                if (
+                    (scope / "cgroup.kill").read_text()
+                    or time.monotonic() >= kill_deadline
+                ):
+                    break
+                time.sleep(0.01)
+                continue
             waited, child_status = os.waitpid(worker, os.WNOHANG)
             if waited == worker:
+                while (
+                    admission_rejection
+                    and not (scope / "cgroup.kill").read_text()
+                    and time.monotonic() < kill_deadline
+                ):
+                    time.sleep(0.01)
                 break
             if (scope / "cgroup.kill").read_text():
                 try:
@@ -1407,8 +1450,9 @@ if name == "systemd_run":
                 _, child_status = os.waitpid(worker, 0)
                 break
             time.sleep(0.01)
-        clear_scope(unit)
-        shutil.rmtree(proc, ignore_errors=True)
+        if not admission_rejection or (scope / "cgroup.kill").read_text():
+            clear_scope(unit)
+            shutil.rmtree(proc, ignore_errors=True)
         latest = json.loads(state_path.read_text())
         latest["scope_worker_reap_witness"] = {
             "owner_pid": os.getpid(),
@@ -2079,6 +2123,8 @@ elif name == "systemctl":
             or not scope.is_dir()
         ):
             raise SystemExit(93)
+        if "populated 1" in (scope / "cgroup.events").read_text().splitlines():
+            raise SystemExit(94)
         clear_scope(unit)
         shutil.rmtree(scope)
         state["scope_collection_requested"] = True
@@ -2101,6 +2147,14 @@ elif name == "systemctl":
             or not scope.is_dir()
         ):
             raise SystemExit(93)
+        if state.get("scope_failure") == "pidfd":
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if json.loads(state_path.read_text()).get("scope_worker_pre_admission_reaped"):
+                    break
+                time.sleep(0.01)
+            else:
+                raise SystemExit(95)
         print("/fixture.slice/" + unit)
         raise SystemExit(0)
     if args[:2] == ["--user", "kill"]:

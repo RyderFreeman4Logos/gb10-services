@@ -870,24 +870,34 @@ class SharedBoundedScopeAuthorityTests(unittest.TestCase):
         self.assertNotIn("def execute_scoped(", source)
         self.assertIn("run_scoped_direct(", source)
 
-    def test_direct_command_mode_rejects_unproven_scope_before_cargo(self) -> None:
-        with RebuildFixture() as fixture:
-            fixture.set_state(scope_failure="property-readback")
-            result = fixture.run(timeout=20)
-            output = result.stdout + result.stderr
-            self.assertNotEqual(result.returncode, 0, output)
-            self.assertIn("scope controller value is not exact", output)
-            self.assertNotIn("cargo metadata", fixture.calls())
-            self.assertNotIn("cargo build", fixture.calls())
-            state = fixture.reload_state()
-            self.assertEqual(state["restart_calls"], 0)
-            self.assertTrue(state["scope_collection_requested"], output)
-            self.assertEqual(state["scope_unit"], "", output)
-            self.assertEqual(
-                list((fixture.cgroup_root / "fixture.slice").glob("*.scope")),
-                [],
-                output,
-            )
+    def test_direct_command_mode_collects_post_creation_admission_rejections(self) -> None:
+        cases = (
+            ({"scope_failure": "property-readback"}, "scope controller value is not exact"),
+            ({"scope_failure": "membership"}, "scope worker is outside exact cgroup"),
+            ({"scope_pre_go_resource_event": "memory"}, "scope pre-GO resource event is nonzero"),
+            ({"scope_failure": "pidfd"}, "scope worker pidfd authority is unavailable"),
+        )
+        for state_updates, diagnostic in cases:
+            with self.subTest(state_updates=state_updates), RebuildFixture() as fixture:
+                fixture.set_state(scope_collect_immediate=False, **state_updates)
+                result = fixture.run(
+                    extra_env={"LLM_GUARD_REBUILD_TEST_FORWARD_SECONDS": "10"},
+                    timeout=15,
+                )
+                output = result.stdout + result.stderr
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertNotIn("cargo metadata", fixture.calls())
+                self.assertNotIn("cargo build", fixture.calls())
+                state = fixture.reload_state()
+                self.assertEqual(state["restart_calls"], 0)
+                self.assertTrue(state["scope_collection_requested"], output)
+                self.assertEqual(state["scope_unit"], "", output)
+                self.assertEqual(
+                    list((fixture.cgroup_root / "fixture.slice").glob("*.scope")),
+                    [],
+                    output,
+                )
+                self.assertIn(diagnostic, output)
 
     def test_direct_command_failure_preserves_bounded_sanitized_stderr(self) -> None:
         with RebuildFixture() as fixture:
