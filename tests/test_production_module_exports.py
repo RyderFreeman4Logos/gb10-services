@@ -16,6 +16,7 @@ EXPECTED_EXPORTS = {
         "command",
         "remaining",
         "scoped_command",
+        "scoped_direct_command",
     ),
     "scripts/gb10_embedding_activation.py": (
         "ActivationInterrupted",
@@ -130,14 +131,13 @@ EXPECTED_EXPORTS = {
         "MAX_CLOUD_RESPONSE_BYTES",
         "call_deepinfra",
     ),
-    "scripts/llm_guard_proxy_scoped_worker.py": (),
     "scripts/verify_systemd_units.py": ("main",),
 }
 
 
 class ProductionModuleExportContractTests(unittest.TestCase):
     def test_new_production_modules_declare_exact_public_api(self) -> None:
-        self.assertEqual(len(EXPECTED_EXPORTS), 16)
+        self.assertEqual(len(EXPECTED_EXPORTS), 15)
         for relative_path, expected in EXPECTED_EXPORTS.items():
             with self.subTest(module=relative_path):
                 tree = ast.parse((ROOT / relative_path).read_text(), filename=relative_path)

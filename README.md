@@ -318,19 +318,29 @@ config/unit, service symlink, owner-only recovery state, real `/proc`, and a
 fixed tool path. Hermetic tests alone use `--test-only`; their marker cannot
 equal the production completion contract.
 
-The rebuild releases each fetch, Cargo-metadata, and Cargo-build payload only
-after its random transient user scope is proven in the exact cgroup with hard
-memory/swap/PID/CPU/file-size limits. Fetch and build intermediates live only in
-bounded bubblewrap tmpfs mounts; no writable host Cargo target or external Git
-worktree is mounted. The parent accepts one bounded canonical frame, revalidates
-the immutable Git archive or candidate, enforces a 576 MiB host-write budget with
-8 GiB free-space headroom, and publishes a content-addressed release under
-`~/.cache/cargo-target/llm-guard-proxy-main/releases/`. Receipts bind the complete
-containment policy and reviewed worker/tool authorities without persisting
-transient scope names.
-The parent retains opened memory/pids event descriptors through the worker's
-final resource fence and reads them before a failed scope can be collected, so
-nonzero status, signal/OOM, and early post-GO failures keep exact limit evidence.
+Cargo metadata and build run directly, without bubblewrap or a scoped worker, only
+after each transient user scope is proven in its exact cgroup with hard
+memory/swap/PID/CPU/file-size limits. The shared bounded-process path retains
+cgroup event and kill descriptors, verifies membership and controller values,
+and proves quiescence so descendants cannot survive cleanup.
+
+Git runs through its held executable descriptor and writes only inside the
+transaction snapshot; its object store is accounted against a 64 MiB cap.
+Cargo and rustc execute through held file descriptors with the manifest rooted
+at the held canonical-source directory. The canonical source is an immutable Git archive;
+recursive ledgers are checked before and after Cargo for the source, Cargo home and registry,
+toolchain and target rustlib, GCC closure, and sysroot include/runtime directories. Cargo target
+writes are accounted against a 512 MiB cap within the aggregate 576 MiB host
+write budget and 8 GiB free-space floor.
+
+The built candidate is opened once with `O_NOFOLLOW`, validated as an owned,
+single-link regular `0755` file no larger than 128 MiB, read through the shared
+deadline-aware bounded FD reader, and kept identity-bound through publication.
+The content-addressed release lives under
+`~/.cache/cargo-target/llm-guard-proxy-main/releases/`. WAL receipts record the
+exact Cargo argv, held tool hashes, directory ledgers, cgroup policy, write
+limits and observed Git/Cargo bytes; resource-limit events are read before the
+scope is released.
 
 Before Git or build work, the script takes nonblocking `flock` authority at
 `~/.local/state/llm-guard-proxy-rebuild/lock.v1` and resolves any durable
@@ -406,7 +416,7 @@ cp scripts/aeon_chat_ready.py ~/.local/bin/
 cp scripts/gb10_apply_aeon_querit_profile.sh ~/.local/bin/
 cp scripts/gb10_check_mem_available.sh ~/.local/bin/
 install -m 0755 scripts/llm_guard_proxy_cached_rebuild.sh ~/.local/bin/llm_guard_proxy_cached_rebuild.sh
-install -m 0644 scripts/llm_guard_proxy_cached_rebuild.py scripts/llm_guard_proxy_scoped_worker.py \
+install -m 0644 scripts/llm_guard_proxy_cached_rebuild.py \
   scripts/gb10_bounded_process.py ~/.local/bin/
 cp scripts/llm_guard_proxy_publish_cgroup_registration.sh ~/.local/bin/
 install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py ~/.local/bin/gb10_verify_vllm_no_swap_core.py

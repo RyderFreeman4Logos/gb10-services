@@ -357,6 +357,7 @@ class PrePushHookTests(unittest.TestCase):
             fixture = HookFixture(Path(raw_tmp))
             receipt_dir = fixture.root / ".git" / "gb10-pre-push-receipts"
             receipt_dir.mkdir(mode=0o755)
+            receipt_dir.chmod(0o755)
             sentinel = receipt_dir / "sentinel"
             sentinel.write_text("untouched\n")
 

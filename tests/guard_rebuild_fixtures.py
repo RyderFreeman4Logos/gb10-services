@@ -23,14 +23,14 @@ __all__ = ["RebuildFixture"]
 
 class RebuildFixture:
     cargo_identity = (
-        "cargo 1.90.0 (fixture)\nrelease: 1.90.0\nhost: x86_64-unknown-linux-gnu\n"
+        "cargo 1.96.0 (fixture)\nrelease: 1.96.0\nhost: aarch64-unknown-linux-gnu\n"
     )
     rustc_identity = (
-        "rustc 1.90.0 (fixture)\n"
+        "rustc 1.96.0 (fixture)\n"
         "binary: rustc\n"
         "commit-hash: fixture\n"
-        "host: x86_64-unknown-linux-gnu\n"
-        "release: 1.90.0\n"
+        "host: aarch64-unknown-linux-gnu\n"
+        "release: 1.96.0\n"
         "LLVM version: fixture\n"
     )
 
@@ -41,11 +41,16 @@ class RebuildFixture:
         self.fake_bin = self.root / "bin"
         self.toolchain_root = self.root / "toolchain"
         self.toolchain_bin = self.toolchain_root / "bin"
-        self.registry_cache = self.root / "registry-cache"
-        self.registry_index = self.root / "registry-index"
+        self.target_rustlib = (
+            self.toolchain_root / "lib/rustlib/aarch64-unknown-linux-gnu"
+        )
+        self.cargo_home = self.root / "cargo-home"
+        self.registry_cache = self.cargo_home / "registry" / "cache" / "fixture"
+        self.registry_index = self.cargo_home / "registry" / "index" / "fixture"
         self.gcc_root = self.root / "gcc-root"
         self.sysroot_lib = self.root / "sysroot-lib"
         self.sysroot_include = self.root / "sysroot-include"
+        self.python_stdlib = self.root / "python-stdlib"
         self.cgroup_root = self.root / "cgroup"
         self.authority_config = self.root / "authority.json"
         self.bwrap_authority_config = self.root / "bwrap-authority.json"
@@ -64,17 +69,20 @@ class RebuildFixture:
         self.prior = self.root / "prior-llm-guard-proxy"
         self.wrong_hash = self.root / "wrong-hash-llm-guard-proxy"
         self.same_hash_other_inode = self.root / "same-hash-other-inode"
-        self.build_source = Path("/usr/bin/true")
+        self.build_source = self.root / "aarch64-elf-fixture"
+        self.alternate_build_source = self.root / "alternate-aarch64-elf-fixture"
 
         for directory in (
             self.home,
             self.fake_bin,
             self.toolchain_bin,
+            self.target_rustlib,
             self.registry_cache,
             self.registry_index,
             self.gcc_root,
             self.sysroot_lib,
             self.sysroot_include,
+            self.python_stdlib,
             self.cgroup_root,
             self.remote,
             self.service_bin.parent,
@@ -84,10 +92,28 @@ class RebuildFixture:
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
+        for source, destination in (
+            (Path("/usr/bin/true"), self.build_source),
+            (Path("/usr/bin/false"), self.alternate_build_source),
+        ):
+            payload = bytearray(source.read_bytes())
+            payload[18:20] = (183).to_bytes(2, "little")
+            old_interpreter = b"/lib64/ld-linux-x86-64.so.2"
+            new_interpreter = b"/lib/ld-linux-aarch64.so.1"
+            if payload.count(old_interpreter) == 1:
+                offset = payload.index(old_interpreter)
+                payload[offset : offset + len(old_interpreter)] = new_interpreter + b"\0"
+            elif payload.count(new_interpreter) != 1:
+                raise AssertionError("host ELF interpreter fixture differs")
+            destination.write_bytes(payload)
+            destination.chmod(0o755)
+
         self._init_remote()
         (self.gcc_root / "cc1").write_text("sealed cc1\n")
+        (self.target_rustlib / "libstd.rlib").write_text("sealed target rustlib\n")
         (self.sysroot_lib / "crt1.o").write_text("sealed crt\n")
         (self.sysroot_include / "stddef.h").write_text("sealed include\n")
+        (self.python_stdlib / "os.py").write_text("# sealed test stdlib\n")
         self.source_commit = self._git("rev-parse", "HEAD").stdout.strip()
         self.source_tree = self._git("rev-parse", "HEAD^{tree}").stdout.strip()
         self.binary_sha256 = hashlib.sha256(self.build_source.read_bytes()).hexdigest()
@@ -98,14 +124,16 @@ class RebuildFixture:
             / "llm-guard-proxy"
         )
 
-        shutil.copyfile("/usr/bin/false", self.prior)
-        shutil.copyfile("/usr/bin/false", self.wrong_hash)
+        shutil.copyfile(self.alternate_build_source, self.prior)
+        shutil.copyfile(self.alternate_build_source, self.wrong_hash)
         shutil.copyfile(self.build_source, self.same_hash_other_inode)
         for binary in (self.prior, self.wrong_hash, self.same_hash_other_inode):
             binary.chmod(0o755)
         self.service_bin.symlink_to(self.prior)
         self.guard_config.write_text('private_config_payload = "fixture-only"\n')
+        self.guard_config.chmod(0o644)
         self.guard_unit.write_text("[Service]\n# private-unit-payload\n")
+        self.guard_unit.chmod(0o644)
         (self.proc_root / "sys" / "kernel" / "random" / "boot_id").write_text(
             "12345678-1234-4abc-8def-1234567890ab\n"
         )
@@ -135,6 +163,7 @@ class RebuildFixture:
             "replace_bwrap_during_use": False,
             "rename_source_mount": False,
             "artifact_mode": "",
+            "build_source_override": "",
             "candidate_path_swap": False,
             "build_finished": False,
             "jobs": {},
@@ -155,6 +184,10 @@ class RebuildFixture:
             "mutate_gcc_closure_during_build": False,
             "held_ld_consumed": False,
             "ambient_usr_consumed": False,
+            "cargo_host": "aarch64-unknown-linux-gnu",
+            "rustc_host": "aarch64-unknown-linux-gnu",
+            "rustc_release": "1.96.0",
+            "candidate_elf_output_mode": "",
             "scope_failure": "",
             "scope_status_mode": "canonical",
             "scope_frame_mode": "",
@@ -167,9 +200,15 @@ class RebuildFixture:
             "scope_reuse_on_kill_entry": False,
             "scope_foreign_signalled": False,
             "scope_cleanup_failure": "",
+            "scope_collection_requested": False,
             "scope_moved_worker_pidfd_reaped": False,
             "scope_pidfd_reaped_after_cgroup_failure": False,
             "scope_build_payload": "",
+            "scope_build_exit": 0,
+            "scope_build_hang": False,
+            "scope_build_oom": False,
+            "scope_build_stderr": "",
+            "real_cargo_artifact_authority": False,
             "scope_collect_immediate": True,
             "scope_resource_snapshot_fenced": False,
             "scope_worker_live_after_collect": False,
@@ -177,6 +216,7 @@ class RebuildFixture:
             "scope_worker": 0,
             "scope_worker_starttime": 0,
             "scope_worker_reap_witness": None,
+            "scope_worker_pre_admission_reaped": False,
             "scope_registration": {},
             "scope_props": {},
         }
@@ -187,6 +227,7 @@ class RebuildFixture:
         self.env = {
             "CACHE_ROOT": str(self.cache_root),
             "FIXTURE_BUILD_SOURCE": str(self.build_source),
+            "FIXTURE_ALTERNATE_BUILD_SOURCE": str(self.alternate_build_source),
             "GUARD_TEST_CGROUP_ROOT": str(self.cgroup_root),
             "GUARD_TEST_BWRAP_AUTHORITY": str(self.bwrap_authority_config),
             "GUARD_TEST_STATE": str(self.state_path),
@@ -362,7 +403,7 @@ class RebuildFixture:
     @staticmethod
     def _build_id(path: Path) -> str:
         output = subprocess.run(
-            ["/usr/bin/x86_64-linux-gnu-readelf", "-n", "--", str(path)],
+            ["/usr/bin/readelf", "-n", "--", str(path)],
             check=True,
             text=True,
             capture_output=True,
@@ -439,15 +480,107 @@ class RebuildFixture:
                     Path(spec["logical"]).read_bytes()
                 ).hexdigest(),
             }
-        build_inputs = {
-            "toolchain": {},
-            "registry_cache": {},
-            "registry_index": {},
-            "gcc_closure": {},
-            "sysroot_lib": {},
-            "sysroot_include": {},
-            "python_stdlib": {},
+        directory_authorities = {
+            name: {
+                "path": str(self.root / f"directory-{name}"),
+                "device": 1,
+                "inode": index,
+                "mode": 0o755,
+                "mtime_ns": 1,
+                "ctime_ns": 1,
+                "content_sha256": "b" * 64,
+                "metadata_sha256": "c" * 64,
+                "file_count": 1,
+                "byte_count": 1,
+            }
+            for index, name in enumerate(
+                (
+                    "canonical_source",
+                    "cargo_home",
+                    "gcc_closure",
+                    "linker_tools",
+                    "registry_cache",
+                    "registry_index",
+                    "sysroot_include",
+                    "sysroot_runtime",
+                    "target_rustlib",
+                    "toolchain",
+                ),
+                start=1,
+            )
         }
+        tool_sha256 = {
+            name: authority["sha256"]
+            for name, authority in tool_authorities.items()
+        }
+        build_inputs = {
+            "source": str(self.build_source),
+            "target": str(self.cache_root / "target"),
+            "cargo_argv": [],
+            "rustc_exec": tool_sha256["rustc"],
+            "tool_sha256": tool_sha256,
+            "directory_authorities": directory_authorities,
+            "write_contract": {
+                "limits": {
+                    "cargo_target_bytes": 512 * 1024 * 1024,
+                    "git_object_bytes": 64 * 1024 * 1024,
+                    "host_write_bytes": 576 * 1024 * 1024,
+                },
+                "cargo_target_bytes": 512 * 1024 * 1024,
+                "git_object_bytes": 64 * 1024 * 1024,
+            },
+        }
+        direct_build_contract = {
+            "schema": 1,
+            "output": {"candidate_bytes": 128 * 1024 * 1024},
+            "host": {
+                "free_floor_bytes": 8 * 1024 * 1024 * 1024,
+                "write_budget_bytes": 576 * 1024 * 1024,
+            },
+            "scope": {
+                phase: {
+                    "cpu_percent": 200,
+                    "fsize_bytes": 128 * 1024 * 1024,
+                    "memory_high": 8 * 1024 * 1024 * 1024,
+                    "memory_max": 10 * 1024 * 1024 * 1024,
+                    "min_mem_available": 16 * 1024 * 1024 * 1024,
+                    "phase": phase,
+                    "runtime_seconds": runtime,
+                    "tasks_max": 768,
+                }
+                for phase, runtime in (("metadata", 300), ("build", 1800))
+            },
+            "direct_build": {
+                "target": "aarch64-unknown-linux-gnu",
+                "cargo": "held-file-fd",
+                "rustc": "held-file-fd",
+                "manifest": "held-source-dirfd",
+                "directory_authorities": [
+                    "canonical_source",
+                    "cargo_home",
+                    "gcc_closure",
+                    "linker_tools",
+                    "registry_cache",
+                    "registry_index",
+                    "sysroot_include",
+                    "sysroot_runtime",
+                    "target_rustlib",
+                    "toolchain",
+                ],
+                "write_limits": {
+                    "cargo_target_bytes": 512 * 1024 * 1024,
+                    "git_object_bytes": 64 * 1024 * 1024,
+                },
+            },
+            "tool_sha256": {
+                name: tool_sha256[name] for name in sorted(tool_sha256)
+            },
+        }
+        direct_build_contract_sha256 = hashlib.sha256(
+            json.dumps(
+                direct_build_contract, sort_keys=True, separators=(",", ":")
+            ).encode("ascii")
+        ).hexdigest()
         candidate_identity = self._identity(self.candidate)
         committed = None
         if phase == "committed":
@@ -513,7 +646,7 @@ class RebuildFixture:
                 "source_byte_count": 1,
                 "git_config_sha256": "5" * 64,
                 "metadata_closure_sha256": "6" * 64,
-                "sandbox_contract_sha256": "7" * 64,
+                "direct_build_contract_sha256": direct_build_contract_sha256,
                 "build_inputs": build_inputs,
                 "build_inputs_sha256": hashlib.sha256(
                     json.dumps(
@@ -530,6 +663,9 @@ class RebuildFixture:
                 ).hexdigest(),
                 "tool_authorities": tool_authorities,
                 "python_runtime_authority_sha256": self._python_runtime_authority_sha256(),
+                "target_triple": "aarch64-unknown-linux-gnu",
+                "candidate_elf_machine": "AArch64",
+                "candidate_elf_interpreter": "/lib/ld-linux-aarch64.so.1",
             },
             "manager_generation": {
                 "invocation": self.state["manager_invocation"],
@@ -597,45 +733,83 @@ state = json.loads(state_path.read_text())
 authority = json.loads(Path(os.environ["GUARD_TEST_BWRAP_AUTHORITY"]).read_text())
 
 SCOPE_UNIT = re.compile(
-    r"llm-guard-rebuild-(fetch|metadata|build)-[0-9a-f]{32}\.scope"
+    r"llm-guard-rebuild-(metadata|build)-(?:[0-9]+-[0-9]+|[0-9a-f]{32})\.scope"
 )
 
 def valid_systemd_run(values):
     if (
-        len(values) < 26
+        len(values) >= 19
+        and values[:3] == ["--user", "--scope", "--quiet"]
+        and values[3].startswith("--unit=")
+        and "--" in values[4:]
+    ):
+        match = SCOPE_UNIT.fullmatch(values[3].split("=", 1)[1])
+        separator = values.index("--", 4)
+        if match is None:
+            return False
+        limits = {
+            "metadata": (8589934592, 10737418240, 768, 200, 300, 134217728),
+            "build": (8589934592, 10737418240, 768, 200, 1800, 134217728),
+        }[match.group(1)]
+        properties = values[4:separator]
+        expected = [
+            f"--property=MemoryHigh={limits[0]}",
+            f"--property=MemoryMax={limits[1]}",
+            "--property=MemorySwapMax=0",
+            f"--property=TasksMax={limits[2]}",
+            f"--property=CPUQuota={limits[3]}%",
+            "--property=CPUQuotaPeriodSec=100ms",
+            "--property=KillMode=control-group",
+            "--property=SendSIGKILL=yes",
+            "--property=OOMPolicy=kill",
+            f"--property=RuntimeMaxSec={limits[4]}",
+            f"--property=LimitFSIZE={limits[5]}",
+        ]
+        payload = values[separator + 1:]
+        return (
+            properties == expected
+            and len(payload) >= 10
+            and payload[1].startswith("/proc/self/fd/")
+            and payload[2] == "--direct-scope-child"
+            and payload[6] == "--"
+            and re.fullmatch(r"/proc/self/fd/[1-9][0-9]*", payload[7]) is not None
+        )
+    if (
+        len(values) < 8
         or values[:4] != ["--user", "--scope", "--quiet", "--collect"]
         or not values[4].startswith("--unit=")
-        or values[15] != "--"
-        or values[17:19] != ["-n", "10"]
-        or values[20:22] != ["-c", "3"]
-        or values[24] != "--"
-        or any(
-            re.fullmatch(r"/proc/self/fd/[1-9][0-9]*", values[index]) is None
-            for index in (16, 19, 22, 25)
-        )
+        or "--" not in values[5:]
     ):
         return False
     match = SCOPE_UNIT.fullmatch(values[4].split("=", 1)[1])
     if match is None:
         return False
+    separator = values.index("--", 5)
+    if separator != 5 + 2 * 11:
+        return False
+    properties = [
+        values[index + 1]
+        for index in range(5, separator, 2)
+        if values[index] == "--property"
+    ]
     limits = {
-        "fetch": (805306368, 1073741824, 32, 100, 300, 167772160),
         "metadata": (8589934592, 10737418240, 768, 200, 300, 134217728),
         "build": (8589934592, 10737418240, 768, 200, 1800, 134217728),
     }[match.group(1)]
     expected = [
-        f"--property=MemoryHigh={limits[0]}",
-        f"--property=MemoryMax={limits[1]}",
-        "--property=MemorySwapMax=0",
-        f"--property=TasksMax={limits[2]}",
-        f"--property=CPUQuota={limits[3]}%",
-        "--property=CPUQuotaPeriodSec=100ms",
-        "--property=KillMode=control-group",
-        "--property=SendSIGKILL=yes",
-        "--property=OOMPolicy=kill",
-        f"--property=RuntimeMaxSec={limits[4]}",
+        f"MemoryHigh={limits[0]}",
+        f"MemoryMax={limits[1]}",
+        "MemorySwapMax=0",
+        f"TasksMax={limits[2]}",
+        f"CPUQuota={limits[3]}%",
+        "CPUQuotaPeriodSec=100ms",
+        "KillMode=control-group",
+        "SendSIGKILL=yes",
+        "OOMPolicy=kill",
+        f"RuntimeMaxSec={limits[4]}",
+        f"LimitFSIZE={limits[5]}",
     ]
-    return values[5:15] == expected and values[23] == f"--fsize={limits[5]}:{limits[5]}"
+    return values[5:separator:2] == ["--property"] * 11 and properties == expected
 
 def valid_systemctl(values):
     manager = [
@@ -670,6 +844,13 @@ def valid_systemctl(values):
         and values[:4] == ["--user", "show", "--property=ControlGroup", "--value"]
     ):
         return SCOPE_UNIT.fullmatch(values[4]) is not None
+    if (
+        len(values) == 5
+        and values[:4] == ["--user", "show", "--property=LoadState", "--value"]
+    ):
+        return SCOPE_UNIT.fullmatch(values[4]) is not None
+    if len(values) == 3 and values[:2] == ["--user", "reset-failed"]:
+        return SCOPE_UNIT.fullmatch(values[2]) is not None
     return (
         len(values) == 5
         and values[:4] == [
@@ -953,33 +1134,33 @@ def valid_bwrap(values):
     common_names = [
         "--unshare-user", "--unshare-all", "--disable-userns", "--die-with-parent",
         "--new-session", "--cap-drop", "--proc", "--dev",
-        *(["--dir"] * 9), *(["--ro-bind"] * 5), *(["--symlink"] * 2),
+        *(["--dir"] * 9), *(["--ro-bind"] * 5), "--symlink",
         "--tmpfs", "--clearenv", *(["--setenv"] * 4),
     ]
     extension_names = (
         ["--share-net", *(["--dir"] * 3), *(["--ro-bind"] * 6),
          "--size", "--tmpfs", "--size", "--tmpfs"]
         if phase == "fetch"
-        else [*(["--dir"] * 2), *(["--ro-bind"] * 10), *(["--dir"] * 2),
+        else [*(["--dir"] * 2), *(["--ro-bind"] * 11), *(["--dir"] * 2),
               *(["--ro-bind"] * 2), "--size", "--tmpfs", "--size", "--tmpfs"]
     )
     if [option for option, _ in parsed] != common_names + extension_names:
         return False
     directories = [arguments[0] for option, arguments in parsed if option == "--dir"]
     common_directories = [
-        "/usr", "/usr/bin", "/usr/lib", "/usr/lib/python3.11",
-        "/usr/lib/x86_64-linux-gnu", "/sys", "/sys/fs", "/sys/fs/cgroup", "/tools",
+        "/usr", "/usr/bin", "/usr/lib", "/usr/lib/python3.12",
+        "/usr/lib/aarch64-linux-gnu", "/sys", "/sys/fs", "/sys/fs/cgroup", "/tools",
     ]
     phase_directories = (
         ["/etc", "/etc/ssl", "/etc/ssl/certs"]
         if phase == "fetch"
-        else ["/usr/lib/gcc", "/usr/lib/gcc/x86_64-linux-gnu", "/cargo-home", "/cargo-home/registry"]
+        else ["/usr/lib/gcc", "/usr/lib/gcc/aarch64-linux-gnu", "/cargo-home", "/cargo-home/registry"]
     )
     binds = [arguments for option, arguments in parsed if option == "--ro-bind"]
     destinations = [arguments[1] for arguments in binds]
     sources = [arguments[0] for arguments in binds]
     common_destinations = [
-        "/usr/lib/x86_64-linux-gnu", "/usr/lib/python3.11", "/tools/python",
+        "/usr/lib/aarch64-linux-gnu", "/usr/lib/python3.12", "/tools/python",
         "/worker.py", "/sys/fs/cgroup",
     ]
     phase_destinations = (
@@ -990,8 +1171,10 @@ def valid_bwrap(values):
         ]
         if phase == "fetch"
         else [
-            "/usr/lib/gcc/x86_64-linux-gnu/12", "/usr/include", "/usr/bin/cc",
-            "/usr/bin/as", "/usr/bin/ld", "/usr/bin/ar", "/src", "/toolchain",
+            "/usr/lib/gcc/aarch64-linux-gnu/13", "/usr/include",
+            "/usr/bin/aarch64-linux-gnu-gcc-13", "/usr/bin/aarch64-linux-gnu-as",
+            "/usr/bin/aarch64-linux-gnu-ld.bfd", "/usr/bin/aarch64-linux-gnu-ar",
+            "/src", "/toolchain", "/toolchain/lib/rustlib/aarch64-unknown-linux-gnu",
             "/toolchain/bin/cargo", "/toolchain/bin/rustc",
             "/cargo-home/registry/cache", "/cargo-home/registry/index",
         ]
@@ -1010,9 +1193,8 @@ def valid_bwrap(values):
         == [["/proc"]]
         and [arguments for option, arguments in parsed if option == "--dev"]
         == [["/dev"]]
-        and [arguments for option, arguments in parsed if option == "--symlink"] == [
-            ["usr/lib", "/lib"], ["usr/lib/x86_64-linux-gnu", "/lib64"]
-        ]
+        and [arguments for option, arguments in parsed if option == "--symlink"]
+        == [["usr/lib/aarch64-linux-gnu", "/lib"]]
         and [arguments for option, arguments in parsed if option == "--tmpfs"]
         == ([ ["/home"], ["/fetch"], ["/tmp"] ] if phase == "fetch"
             else [ ["/home"], ["/target"], ["/tmp"] ])
@@ -1153,6 +1335,134 @@ def drift():
 if name == "systemd_run":
     if state.get("scope_failure") in {"manager", "property"}:
         raise SystemExit(23)
+    if "--direct-scope-child" in args:
+        signal.signal(signal.SIGTERM, lambda *_: None)
+        unit_arg = next((arg for arg in args if arg.startswith("--unit=")), "")
+        separator = args.index("--")
+        unit = unit_arg.split("=", 1)[1]
+        props = {
+            value.split("=", 1)[0]: value.split("=", 1)[1]
+            for value in args[4:separator]
+            if value.startswith("--property=")
+            for value in (value.removeprefix("--property="),)
+        }
+        scope = scope_paths(unit)
+        scope.mkdir(parents=True, exist_ok=True)
+        worker = os.fork()
+        if worker == 0:
+            os.kill(os.getpid(), signal.SIGSTOP)
+            os.execv(args[separator + 1], args[separator + 1:])
+        waited, stopped = os.waitpid(worker, os.WUNTRACED)
+        if waited != worker or not os.WIFSTOPPED(stopped):
+            raise SystemExit(30)
+        state["scope_unit"] = unit
+        state["scope_worker"] = worker
+        state["scope_worker_starttime"] = 9000 + worker
+        state["scope_registration"] = {
+            "cgroup_path": str(scope),
+            "unit": unit,
+            "worker_pid": worker,
+        }
+        save()
+        proc = Path(os.environ["LLM_GUARD_PROXY_REBUILD_PROC_ROOT"]) / str(worker)
+        proc.mkdir(parents=True, exist_ok=True)
+        fields = ["S"] + ["0"] * 18 + [str(9000 + worker)]
+        (proc / "stat").write_text(
+            f"{worker} (direct cargo) " + " ".join(fields) + "\n"
+        )
+        cgroup_unit = unit if state.get("scope_failure") != "cgroup" else "foreign.scope"
+        (proc / "cgroup").write_text(f"0::/fixture.slice/{cgroup_unit}\n")
+        files = {
+            "cgroup.procs": f"{worker}\n",
+            "cgroup.events": "populated 1\nfrozen 0\n",
+            "memory.high": str(props.get("MemoryHigh", "0")) + "\n",
+            "memory.max": str(props.get("MemoryMax", "0")) + "\n",
+            "memory.swap.max": str(props.get("MemorySwapMax", "0")) + "\n",
+            "memory.oom.group": "1\n",
+            "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n",
+            "pids.max": str(props.get("TasksMax", "0")) + "\n",
+            "pids.events": "max 0\n",
+            "cpu.max": (
+                "100000 100000\n"
+                if props.get("CPUQuota") == "100%"
+                else "200000 100000\n"
+            ),
+            "cgroup.kill": "",
+        }
+        if state.get("scope_failure") == "property-readback":
+            files["memory.max"] = "1\n"
+        if state.get("scope_failure") == "membership":
+            files["cgroup.procs"] = "999999\n"
+        if state.get("scope_failure") == "controller":
+            files.pop("memory.swap.max")
+        pre_go_event = state.get("scope_pre_go_resource_event", "")
+        if pre_go_event == "memory":
+            files["memory.events"] = "low 0\nhigh 0\nmax 1\noom 0\noom_kill 0\n"
+        elif pre_go_event == "oom-kill":
+            files["memory.events"] = "low 0\nhigh 0\nmax 0\noom 1\noom_kill 1\n"
+        elif pre_go_event == "pids":
+            files["pids.events"] = "max 1\n"
+        for filename, value in files.items():
+            (scope / filename).write_text(value)
+        os.kill(worker, signal.SIGCONT)
+        if state.get("scope_failure") == "pidfd":
+            wait_deadline = time.monotonic() + 2
+            while time.monotonic() < wait_deadline:
+                try:
+                    if Path(f"/proc/{worker}/wchan").read_text().strip() == "pipe_read":
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.01)
+            os.kill(worker, signal.SIGKILL)
+            _, child_status = os.waitpid(worker, 0)
+            state["scope_worker_pre_admission_reaped"] = True
+            save()
+        else:
+            child_status = 0
+        admission_rejection = state.get("scope_failure") in {
+            "membership", "pidfd", "property-readback"
+        } or bool(state.get("scope_pre_go_resource_event"))
+        kill_deadline = time.monotonic() + 4
+        while True:
+            if state.get("scope_failure") == "pidfd":
+                if (
+                    (scope / "cgroup.kill").read_text()
+                    or time.monotonic() >= kill_deadline
+                ):
+                    break
+                time.sleep(0.01)
+                continue
+            waited, child_status = os.waitpid(worker, os.WNOHANG)
+            if waited == worker:
+                while (
+                    admission_rejection
+                    and not (scope / "cgroup.kill").read_text()
+                    and time.monotonic() < kill_deadline
+                ):
+                    time.sleep(0.01)
+                break
+            if (scope / "cgroup.kill").read_text():
+                try:
+                    os.kill(worker, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                _, child_status = os.waitpid(worker, 0)
+                break
+            time.sleep(0.01)
+        if not admission_rejection or (scope / "cgroup.kill").read_text():
+            clear_scope(unit)
+            shutil.rmtree(proc, ignore_errors=True)
+        latest = json.loads(state_path.read_text())
+        latest["scope_worker_reap_witness"] = {
+            "owner_pid": os.getpid(),
+            "worker_pid": worker,
+            "worker_starttime": 9000 + worker,
+        }
+        state.clear()
+        state.update(latest)
+        save()
+        raise SystemExit(os.waitstatus_to_exitcode(child_status))
     unit_arg = next((arg for arg in args if arg.startswith("--unit=")), "")
     if not unit_arg:
         raise SystemExit(24)
@@ -1166,9 +1476,11 @@ if name == "systemd_run":
         "worker_pid": 0,
     }
     state["scope_props"] = {
-        arg.split("=", 2)[1]: arg.split("=", 2)[2]
-        for arg in args
-        if arg.startswith("--property=") and arg.count("=") >= 2
+        arg.split("=", 1)[0]: arg.split("=", 1)[1]
+        for index, arg in enumerate(args)
+        if arg == "--property" and index + 1 < len(args)
+        for arg in (args[index + 1],)
+        if "=" in arg
     }
     save()
     separator = args.index("--")
@@ -1178,35 +1490,145 @@ elif name == "prlimit":
     os.execv(args[separator + 1], args[separator + 1:])
 elif name == "cargo":
     if args == ["--version", "--verbose"]:
-        print("cargo 1.90.0 (fixture)")
-        print("release: 1.90.0")
-        print("host: x86_64-unknown-linux-gnu")
+        print("cargo 1.96.0 (fixture)")
+        print("release: 1.96.0")
+        print("host: " + state["cargo_host"])
+    elif args and args[0] == "metadata":
+        manifest = Path(args[args.index("--manifest-path") + 1])
+        source_root = str(manifest.resolve().parent)
+        package_id = f"path+file://{source_root}#llm-guard-proxy@0.1.0"
+        print(json.dumps({
+            "packages": [{
+                "id": package_id,
+                "manifest_path": str(manifest.resolve()),
+                "source": None,
+                "dependencies": [],
+            }],
+            "workspace_members": [package_id],
+            "resolve": {"nodes": [{"id": package_id}]},
+            "workspace_root": source_root,
+            "target_directory": os.environ["CARGO_TARGET_DIR"],
+        }, sort_keys=True, separators=(",", ":")))
     elif args and args[0] == "build":
         manifest = Path(args[args.index("--manifest-path") + 1])
+        linker_path = os.environ.get("PATH", "")
+        linker_match = re.fullmatch(r"/proc/self/fd/([1-9][0-9]*)", linker_path)
+        linker = Path(linker_path) / "ld"
+        linker_spec = authority["bwrap_authorities"][
+            "/usr/bin/aarch64-linux-gnu-ld.bfd"
+        ]
+        try:
+            linker_info = linker.stat(follow_symlinks=False)
+            state["held_ld_consumed"] = (
+                linker_match is not None
+                and stat.S_ISREG(linker_info.st_mode)
+                and stat.S_IMODE(linker_info.st_mode) == 0o500
+                and linker_info.st_nlink == 1
+                and linker_info.st_size == linker_spec["size"]
+                and hashlib.sha256(linker.read_bytes()).hexdigest()
+                == linker_spec["sha256"]
+            )
+        except OSError:
+            state["held_ld_consumed"] = False
+        state["ambient_usr_consumed"] = linker_path in {"/usr/bin", "/bin"}
+        save()
+        if state.get("scope_build_oom"):
+            unit = state["scope_unit"]
+            (scope_paths(unit) / "memory.events").write_text(
+                "low 0\nhigh 0\nmax 1\noom 1\noom_kill 1\n"
+            )
+            raise SystemExit(137)
+        if state.get("scope_build_hang"):
+            time.sleep(30)
+        if state.get("scope_build_exit"):
+            sys.stderr.write(state.get("scope_build_stderr", ""))
+            raise SystemExit(state["scope_build_exit"])
         if state.get("mutate_source_during_cargo"):
-            source = Path(os.environ["SOURCE_DIR"]) / "Cargo.toml"
+            source = manifest
             original = source.read_bytes()
             mode = source.stat().st_mode & 0o777
-            source.write_bytes(b"transient dirty source\n")
             source.chmod(0o600)
+            source.write_bytes(b"transient dirty source\n")
             source.write_bytes(original)
             source.chmod(mode)
-        target = Path(os.environ["CARGO_TARGET_DIR"]) / "release" / "llm-guard-proxy"
+        selected = Path(state.get("build_source_override") or os.environ["FIXTURE_BUILD_SOURCE"])
+        source_file = Path(os.environ["SOURCE_REPO"]) / "llm-guard-proxy" / "src" / "main.rs"
+        if "alternate" in source_file.read_text():
+            selected = Path(os.environ["FIXTURE_ALTERNATE_BUILD_SOURCE"])
+        target = Path(os.environ["CARGO_TARGET_DIR"]) / "aarch64-unknown-linux-gnu" / "release" / "llm-guard-proxy"
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(os.environ["FIXTURE_BUILD_SOURCE"], target)
-        target.chmod(0o755)
+        target.write_bytes(
+            b"not-an-elf\n"
+            if state.get("scope_build_payload") == "invalid-elf"
+            else selected.read_bytes()
+        )
+        if state.get("real_cargo_artifact_authority"):
+            target.chmod(0o700)
+            dependency = target.parent / "deps" / "llm_guard_proxy-fixture"
+            dependency.parent.mkdir()
+            os.link(target, dependency)
+        else:
+            target.chmod(0o755)
+        state["build_finished"] = True
         save()
     else:
         raise SystemExit(91)
 elif name == "rustc":
     if args != ["-vV"]:
         raise SystemExit(92)
-    print("rustc 1.90.0 (fixture)")
+    print("rustc " + state["rustc_release"] + " (fixture)")
     print("binary: rustc")
     print("commit-hash: fixture")
-    print("host: x86_64-unknown-linux-gnu")
-    print("release: 1.90.0")
+    print("host: " + state["rustc_host"])
+    print("release: " + state["rustc_release"])
     print("LLVM version: fixture")
+elif name == "readelf":
+    path = args[-1]
+    if args[:2] == ["-hW", "-lW"]:
+        descriptor = int(path.rsplit("/", 1)[-1])
+        result = subprocess.run(
+            ["/usr/bin/readelf", *args],
+            check=False,
+            text=True,
+            capture_output=True,
+            pass_fds=(descriptor,),
+        )
+        if result.returncode:
+            sys.stderr.write(result.stderr)
+            raise SystemExit(result.returncode)
+        output = result.stdout
+        mode = state.get("candidate_elf_output_mode", "")
+        machine = re.compile(r"(?m)^\s*Machine:.*$")
+        interpreter = re.compile(r"(?m)^\s*\[Requesting program interpreter:.*$")
+        if mode == "wrong-machine":
+            output = machine.sub("  Machine: Advanced Micro Devices X86-64", output)
+        elif mode == "missing-machine":
+            output = machine.sub("", output)
+        elif mode == "multiple-machine":
+            output += "  Machine: AArch64\n"
+        elif mode == "malformed-machine":
+            output = machine.sub("  Machine AArch64", output)
+        elif mode == "wrong-interpreter":
+            output = interpreter.sub(
+                "      [Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]",
+                output,
+            )
+        elif mode == "missing-interpreter":
+            output = interpreter.sub("", output)
+        elif mode == "multiple-interpreter":
+            output += "      [Requesting program interpreter: /lib/ld-linux-aarch64.so.1]\n"
+        elif mode == "malformed-interpreter":
+            output = interpreter.sub(
+                "      [Requesting program interpreter /lib/ld-linux-aarch64.so.1]",
+                output,
+            )
+        elif mode:
+            raise SystemExit(93)
+        sys.stdout.write(output)
+    elif args[:2] == ["-n", "--"]:
+        os.execv("/usr/bin/readelf", ["readelf", *args])
+    else:
+        raise SystemExit(92)
 elif name == "bwrap":
     status_fd = int(args[args.index("--json-status-fd") + 1])
     block_fd = int(args[args.index("--block-fd") + 1])
@@ -1353,11 +1775,9 @@ elif name == "bwrap":
                 if state.get("mutate_gcc_closure_during_build"):
                     (Path(os.environ["GCC_ROOT"]) / "cc1").write_text("mutated cc1\n")
                 source_file = Path(os.environ["SOURCE_REPO"]) / "llm-guard-proxy" / "src" / "main.rs"
-                selected = (
-                    Path("/usr/bin/false")
-                    if "alternate" in source_file.read_text()
-                    else Path(os.environ["FIXTURE_BUILD_SOURCE"])
-                )
+                selected = Path(state.get("build_source_override") or os.environ["FIXTURE_BUILD_SOURCE"])
+                if "alternate" in source_file.read_text():
+                    selected = Path(os.environ["FIXTURE_ALTERNATE_BUILD_SOURCE"])
                 artifact = (
                     b"not-an-elf\n"
                     if state.get("scope_build_payload") == "invalid-elf"
@@ -1395,7 +1815,7 @@ elif name == "bwrap":
                     "schema": 1,
                 }, artifact)
                 latest = json.loads(state_path.read_text())
-                ld_source = args[args.index("/usr/bin/ld") - 1]
+                ld_source = args[args.index("/usr/bin/aarch64-linux-gnu-ld.bfd") - 1]
                 latest["held_ld_consumed"] = (
                     ld_source.startswith("/proc/self/fd/")
                     and os.path.samefile(
@@ -1679,6 +2099,42 @@ elif name == "systemctl":
     joined = " ".join(args)
     if (
         len(args) == 5
+        and args[:4] == ["--user", "show", "--property=LoadState", "--value"]
+    ):
+        unit = args[4]
+        registration = state.get("scope_registration")
+        scope = scope_paths(unit)
+        loaded = (
+            isinstance(registration, dict)
+            and registration.get("unit") == unit
+            and registration.get("cgroup_path") == str(scope)
+            and scope.is_dir()
+        )
+        print("failed" if loaded else "not-found")
+        raise SystemExit(0)
+    if len(args) == 3 and args[:2] == ["--user", "reset-failed"]:
+        unit = args[2]
+        registration = state.get("scope_registration")
+        scope = scope_paths(unit)
+        if (
+            not isinstance(registration, dict)
+            or registration.get("unit") != unit
+            or registration.get("cgroup_path") != str(scope)
+            or not scope.is_dir()
+        ):
+            raise SystemExit(93)
+        if "populated 1" in (scope / "cgroup.events").read_text().splitlines():
+            raise SystemExit(94)
+        clear_scope(unit)
+        shutil.rmtree(scope)
+        state["scope_collection_requested"] = True
+        state["scope_registration"] = {}
+        state["scope_unit"] = ""
+        state["scope_worker"] = 0
+        save()
+        raise SystemExit(0)
+    if (
+        len(args) == 5
         and args[:4] == ["--user", "show", "--property=ControlGroup", "--value"]
     ):
         unit = args[4]
@@ -1691,6 +2147,14 @@ elif name == "systemctl":
             or not scope.is_dir()
         ):
             raise SystemExit(93)
+        if state.get("scope_failure") == "pidfd":
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if json.loads(state_path.read_text()).get("scope_worker_pre_admission_reaped"):
+                    break
+                time.sleep(0.01)
+            else:
+                raise SystemExit(95)
         print("/fixture.slice/" + unit)
         raise SystemExit(0)
     if args[:2] == ["--user", "kill"]:
@@ -1878,7 +2342,12 @@ elif name == "systemctl":
         target = Path(os.readlink(link))
         if not target.is_absolute():
             target = link.parent / target
-        if str(target) == os.environ["EXPECTED_CANDIDATE"]:
+        expected_candidate = Path(os.environ["EXPECTED_CANDIDATE"])
+        is_expected_candidate = str(target) == str(expected_candidate) or (
+            target.parent == expected_candidate.parent
+            and target.name.startswith(f".{expected_candidate.name}.bound.")
+        )
+        if is_expected_candidate:
             mode = state.get("candidate_restart_mode", "exact")
             if mode == "wrong-hash":
                 target = Path(os.environ["WRONG_HASH_TARGET"])
@@ -1970,6 +2439,7 @@ else:
             "systemd_run": self.fake_bin / "systemd-run",
             "systemctl": self.fake_bin / "systemctl",
             "curl": self.fake_bin / "curl",
+            "readelf": self.fake_bin / "readelf",
         }
         for name, destination in destinations.items():
             destination.write_text(template.replace("__TOOL_NAME__", name))
@@ -1987,15 +2457,14 @@ else:
             "curl": self.fake_bin / "curl",
             "git": Path("/usr/bin/git"),
             "git_remote_https": Path("/usr/lib/git-core/git-remote-http"),
-            "readelf": Path("/usr/bin/x86_64-linux-gnu-readelf"),
+            "readelf": self.fake_bin / "readelf",
             "nice": Path("/usr/bin/nice"),
             "ionice": Path("/usr/bin/ionice"),
-            "cc": Path("/usr/bin/x86_64-linux-gnu-gcc-12"),
-            "ld": Path("/usr/bin/x86_64-linux-gnu-ld.bfd"),
-            "ar": Path("/usr/bin/x86_64-linux-gnu-ar"),
-            "as": Path("/usr/bin/x86_64-linux-gnu-as"),
-            "python": Path("/usr/bin/python3.11"),
-            "scoped_worker": ROOT / "scripts" / "llm_guard_proxy_scoped_worker.py",
+            "cc": Path("/usr/bin/gcc").resolve(strict=True),
+            "ld": Path("/usr/bin/ld.bfd").resolve(strict=True),
+            "ar": Path("/usr/bin/ar").resolve(strict=True),
+            "as": Path("/usr/bin/as").resolve(strict=True),
+            "python": Path("/usr/bin/python3").resolve(strict=True),
             "ca_cert": Path("/etc/ssl/certs/ca-certificates.crt"),
             "resolv_conf": Path("/etc/resolv.conf"),
             "nsswitch": Path("/etc/nsswitch.conf"),
@@ -2049,23 +2518,25 @@ else:
             return Path(tools[name]["resolved"])
 
         bwrap_authorities = {
-            "/usr/lib/x86_64-linux-gnu": bind_spec(self.sysroot_lib),
-            "/usr/lib/python3.11": bind_spec(Path("/usr/lib/python3.11")),
+            "/usr/lib/aarch64-linux-gnu": bind_spec(self.sysroot_lib),
+            "/usr/lib/python3.12": bind_spec(self.python_stdlib),
             "/tools/python": bind_spec(tool("python")),
-            "/worker.py": bind_spec(tool("scoped_worker")),
             "/etc/ssl/certs/ca-certificates.crt": bind_spec(tool("ca_cert")),
             "/etc/resolv.conf": bind_spec(tool("resolv_conf")),
             "/etc/nsswitch.conf": bind_spec(tool("nsswitch")),
             "/etc/hosts": bind_spec(tool("hosts")),
             "/tools/git": bind_spec(tool("git")),
             "/tools/git-remote-https": bind_spec(tool("git_remote_https")),
-            "/usr/lib/gcc/x86_64-linux-gnu/12": bind_spec(self.gcc_root),
+            "/usr/lib/gcc/aarch64-linux-gnu/13": bind_spec(self.gcc_root),
             "/usr/include": bind_spec(self.sysroot_include),
-            "/usr/bin/cc": bind_spec(tool("cc")),
-            "/usr/bin/as": bind_spec(tool("as")),
-            "/usr/bin/ld": bind_spec(tool("ld")),
-            "/usr/bin/ar": bind_spec(tool("ar")),
+            "/usr/bin/aarch64-linux-gnu-gcc-13": bind_spec(tool("cc")),
+            "/usr/bin/aarch64-linux-gnu-as": bind_spec(tool("as")),
+            "/usr/bin/aarch64-linux-gnu-ld.bfd": bind_spec(tool("ld")),
+            "/usr/bin/aarch64-linux-gnu-ar": bind_spec(tool("ar")),
             "/toolchain": bind_spec(self.toolchain_root),
+            "/toolchain/lib/rustlib/aarch64-unknown-linux-gnu": bind_spec(
+                self.target_rustlib
+            ),
             "/toolchain/bin/cargo": bind_spec(tool("cargo")),
             "/toolchain/bin/rustc": bind_spec(tool("rustc")),
             "/cargo-home/registry/cache": bind_spec(self.registry_cache),
@@ -2095,6 +2566,7 @@ else:
             "BWRAP_LOGICAL_PATH": str(self.fake_bin / "bwrap"),
             "EXPECTED_CANDIDATE": str(self.candidate),
             "FIXTURE_BUILD_SOURCE": str(self.build_source),
+            "FIXTURE_ALTERNATE_BUILD_SOURCE": str(self.alternate_build_source),
             "GUARD_TEST_BWRAP_AUTHORITY": str(self.bwrap_authority_config),
             "GUARD_TEST_STATE": str(self.state_path),
             "GUARD_TEST_TOOL_LOG": str(self.tool_log),
@@ -2118,11 +2590,15 @@ else:
             "gcc_root": str(self.gcc_root),
             "sysroot_lib": str(self.sysroot_lib),
             "sysroot_include": str(self.sysroot_include),
-            "python_stdlib": "/usr/lib/python3.11",
+            "python_stdlib": str(self.python_stdlib),
             "test_free_bytes": self.test_free_bytes,
             "test_env": test_env,
             "toolchain_root": str(self.toolchain_root),
-            "tools": tools,
+            "target_rustlib": str(self.target_rustlib),
+            "tools": {name: tools[name] for name in {
+                "ar", "cargo", "cc", "curl", "git", "ld", "readelf", "rustc",
+                "systemd_run", "systemctl",
+            }},
         }
         self.authority_config.write_text(json.dumps(payload, sort_keys=True))
         self.authority_config.chmod(0o600)
@@ -2174,7 +2650,7 @@ else:
         cwd: Path = ROOT,
     ) -> subprocess.CompletedProcess[str]:
         command, env = self._run_arguments(test_only, extra_env)
-        return subprocess.run(
+        result = subprocess.run(
             command,
             cwd=cwd,
             env=env,
@@ -2183,6 +2659,16 @@ else:
             timeout=timeout,
             check=False,
         )
+        if self.service_bin.is_symlink():
+            published = Path(os.readlink(self.service_bin))
+            try:
+                published.relative_to(self.cache_root / "releases")
+            except ValueError:
+                pass
+            else:
+                self.candidate = published
+                self.env["EXPECTED_CANDIDATE"] = str(published)
+        return result
 
     def calls(self) -> str:
         return self.tool_log.read_text() if self.tool_log.exists() else ""

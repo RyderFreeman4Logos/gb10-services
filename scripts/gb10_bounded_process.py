@@ -9,12 +9,19 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["ScopePolicy", "command", "remaining", "scoped_command"]
+__all__ = [
+    "ScopePolicy",
+    "command",
+    "remaining",
+    "scoped_command",
+    "scoped_direct_command",
+]
 
 _MAX_STREAM_BYTES = 4 * 1024 * 1024
 _READ_BYTES = 64 * 1024
@@ -321,6 +328,16 @@ def _bounded_error_summary(error: BaseException) -> str:
     return (summary or "cleanup failure")[:256]
 
 
+def _scoped_payload_failure(returncode: int, stderr: _Capture) -> str:
+    lines = _render(stderr).splitlines()
+    text = " ".join(line.strip() for line in lines if line.strip())
+    diagnostic = "".join(
+        character if character.isprintable() else "?" for character in text
+    )[-440:]
+    failure = f"scoped payload failed (exit={returncode})"
+    return f"{failure}: {diagnostic}" if diagnostic else failure
+
+
 def _signal_cleanup(
     tree: _ProcessTree,
     scope_signal: Callable[[int], None] | None,
@@ -519,9 +536,12 @@ class _ScopeCgroup:
         return payload
 
     def close(self) -> None:
+        directory = self.descriptors.pop("directory", -1)
         for descriptor in self.descriptors.values():
             os.close(descriptor)
         self.descriptors.clear()
+        if directory >= 0:
+            os.close(directory)
 
 
 def _read_small_file(path: Path, maximum: int = _SCOPE_STATUS_BYTES) -> bytes:
@@ -718,7 +738,9 @@ def _verify_scope(
     unit: str,
     wrapper_pid: int,
     worker_pid: int,
-) -> tuple[int, int, _ScopeCgroup, dict[str, int], dict[str, int]]:
+    expected_relative_path: str,
+    cgroup: _ScopeCgroup,
+) -> tuple[int, dict[str, int], dict[str, int]]:
     if worker_pid <= 1 or worker_pid == wrapper_pid:
         raise BoundedProcessError("scope worker identity is invalid")
     row = _proc_row_under(policy.proc_root, worker_pid)
@@ -734,59 +756,40 @@ def _verify_scope(
     if len(lines) != 1 or not lines[0].startswith("0::/"):
         raise BoundedProcessError("scope cgroup membership is malformed")
     relative_path = lines[0][3:]
-    if Path(relative_path).name != unit:
+    if relative_path != expected_relative_path or Path(relative_path).name != unit:
         raise BoundedProcessError("scope cgroup membership is not exact")
-    cgroup = _open_scope_cgroup(policy, relative_path)
-    worker_pidfd = -1
-    try:
-        expected = {
-            "memory.high": str(policy.memory_high),
-            "memory.max": str(policy.memory_max),
-            "memory.oom.group": "1",
-            "memory.swap.max": "0",
-            "pids.max": str(policy.tasks_max),
-            "cpu.max": f"{policy.cpu_percent * 1000} 100000",
-        }
-        for name, value in expected.items():
-            if cgroup.read(name).decode("ascii", errors="strict").strip() != value:
-                raise BoundedProcessError("scope controller value is not exact")
-        procs = cgroup.read("cgroup.procs").split()
-        if str(worker_pid).encode("ascii") not in procs:
-            raise BoundedProcessError("scope worker is outside exact cgroup")
-        events = _integer_map(cgroup.read("cgroup.events"))
-        if events.get("populated") != 1:
-            raise BoundedProcessError("scope cgroup is not populated")
-        memory_events = _integer_map(cgroup.read("memory.events"))
-        pids_events = _integer_map(cgroup.read("pids.events"))
-        for key in ("oom", "oom_kill", "max"):
-            if key not in memory_events:
-                raise BoundedProcessError("scope memory events are incomplete")
-        if "max" not in pids_events:
-            raise BoundedProcessError("scope PID events are incomplete")
-        if (
-            any(memory_events[key] != 0 for key in ("oom", "oom_kill", "max"))
-            or pids_events["max"] != 0
-        ):
-            raise BoundedProcessError("scope pre-GO resource event is nonzero")
-        if not _scope_worker_exact(policy, unit, worker_pid, row[1], cgroup):
-            raise BoundedProcessError("scope worker identity changed before GO")
-        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
-            raise BoundedProcessError("scope worker pidfd authority is unavailable")
-        try:
-            worker_pidfd = os.pidfd_open(worker_pid, 0)
-            signal.pidfd_send_signal(worker_pidfd, 0, None, 0)
-        except (AttributeError, ProcessLookupError, OSError) as error:
-            raise BoundedProcessError(
-                "scope worker pidfd authority is unavailable"
-            ) from error
-        if not _scope_worker_exact(policy, unit, worker_pid, row[1], cgroup):
-            raise BoundedProcessError("scope worker identity changed before GO")
-    except BaseException:
-        if worker_pidfd >= 0:
-            os.close(worker_pidfd)
-        cgroup.close()
-        raise
-    return row[1], worker_pidfd, cgroup, memory_events, pids_events
+    expected = {
+        "memory.high": str(policy.memory_high),
+        "memory.max": str(policy.memory_max),
+        "memory.oom.group": "1",
+        "memory.swap.max": "0",
+        "pids.max": str(policy.tasks_max),
+        "cpu.max": f"{policy.cpu_percent * 1000} 100000",
+    }
+    for name, value in expected.items():
+        if cgroup.read(name).decode("ascii", errors="strict").strip() != value:
+            raise BoundedProcessError("scope controller value is not exact")
+    procs = cgroup.read("cgroup.procs").split()
+    if str(worker_pid).encode("ascii") not in procs:
+        raise BoundedProcessError("scope worker is outside exact cgroup")
+    events = _integer_map(cgroup.read("cgroup.events"))
+    if events.get("populated") != 1:
+        raise BoundedProcessError("scope cgroup is not populated")
+    memory_events = _integer_map(cgroup.read("memory.events"))
+    pids_events = _integer_map(cgroup.read("pids.events"))
+    for key in ("oom", "oom_kill", "max"):
+        if key not in memory_events:
+            raise BoundedProcessError("scope memory events are incomplete")
+    if "max" not in pids_events:
+        raise BoundedProcessError("scope PID events are incomplete")
+    if (
+        any(memory_events[key] != 0 for key in ("oom", "oom_kill", "max"))
+        or pids_events["max"] != 0
+    ):
+        raise BoundedProcessError("scope pre-GO resource event is nonzero")
+    if not _scope_worker_exact(policy, unit, worker_pid, row[1], cgroup):
+        raise BoundedProcessError("scope worker identity changed before GO")
+    return row[1], memory_events, pids_events
 
 
 def _scope_manager_command(
@@ -794,9 +797,13 @@ def _scope_manager_command(
     pass_fds: Sequence[int],
     arguments: Sequence[str],
     label: str,
+    deadline: float,
     *,
     capture: bool = False,
 ) -> bytes:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise BoundedProcessError(f"scope manager {label} deadline exhausted")
     try:
         process = subprocess.Popen(
             [systemctl, *arguments],
@@ -810,7 +817,7 @@ def _scope_manager_command(
     except (OSError, subprocess.SubprocessError) as error:
         raise BoundedProcessError(f"scope manager {label} failed") from error
     try:
-        output, _ = process.communicate(timeout=2)
+        output, _ = process.communicate(timeout=min(2.0, remaining))
     except BaseException as error:
         cleanup_error: BaseException | None = None
         try:
@@ -819,7 +826,7 @@ def _scope_manager_command(
         except BaseException as failure:
             cleanup_error = failure
         try:
-            process.wait(timeout=1)
+            process.wait(timeout=max(0.001, min(1.0, deadline - time.monotonic())))
         except BaseException as failure:
             cleanup_error = cleanup_error or failure
         if process.returncode is None:
@@ -839,6 +846,111 @@ def _scope_manager_command(
     if process.returncode != 0 or len(output) > _SCOPE_STATUS_BYTES:
         raise BoundedProcessError(f"scope manager {label} failed")
     return output
+
+
+def _scope_load_state(
+    systemctl: str, pass_fds: Sequence[int], unit: str, deadline: float
+) -> str:
+    payload = _scope_manager_command(
+        systemctl,
+        pass_fds,
+        ["--user", "show", "--property=LoadState", "--value", unit],
+        "state query",
+        deadline,
+        capture=True,
+    )
+    try:
+        state = payload.decode("ascii", errors="strict").strip()
+    except UnicodeDecodeError as error:
+        raise BoundedProcessError("scope manager state is malformed") from error
+    if not state or any(character not in "abcdefghijklmnopqrstuvwxyz-" for character in state):
+        raise BoundedProcessError("scope manager state is malformed")
+    return state
+
+
+def _scope_control_group(
+    systemctl: str, pass_fds: Sequence[int], unit: str, deadline: float
+) -> str:
+    payload = _scope_manager_command(
+        systemctl,
+        pass_fds,
+        ["--user", "show", "--property=ControlGroup", "--value", unit],
+        "cgroup query",
+        deadline,
+        capture=True,
+    )
+    try:
+        relative_path = payload.decode("ascii", errors="strict").strip()
+    except UnicodeDecodeError as error:
+        raise BoundedProcessError("scope manager cgroup is malformed") from error
+    parts = relative_path.lstrip("/").split("/")
+    if (
+        not relative_path.startswith("/")
+        or not parts
+        or any(part in {"", ".", ".."} for part in parts)
+        or parts[-1] != unit
+    ):
+        raise BoundedProcessError("scope manager cgroup is malformed")
+    return relative_path
+
+
+def _collect_scope(
+    systemctl: str,
+    pass_fds: Sequence[int],
+    policy: ScopePolicy,
+    unit: str,
+    relative_path: str,
+    cgroup: _ScopeCgroup | None,
+    deadline: float,
+) -> None:
+    path = policy.cgroup_root / relative_path.lstrip("/")
+    request_error: BaseException | None = None
+    try:
+        try:
+            current = os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None and cgroup is not None:
+            pinned = os.fstat(cgroup.descriptors["directory"])
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino) != (pinned.st_dev, pinned.st_ino)
+            ):
+                raise BoundedProcessError("scope changed before collection")
+        if _scope_load_state(systemctl, pass_fds, unit, deadline) != "not-found":
+            _scope_manager_command(
+                systemctl,
+                pass_fds,
+                ["--user", "reset-failed", unit],
+                "collection",
+                deadline,
+            )
+    except BaseException as error:
+        request_error = error
+    finally:
+        if cgroup is not None:
+            cgroup.close()
+
+    last_error = request_error
+    while True:
+        try:
+            absent = _scope_load_state(systemctl, pass_fds, unit, deadline) == "not-found"
+            try:
+                os.stat(path, follow_symlinks=False)
+            except FileNotFoundError:
+                cgroup_absent = True
+            else:
+                cgroup_absent = False
+            if absent and cgroup_absent:
+                return
+        except BaseException as error:
+            last_error = error
+        if time.monotonic() >= deadline:
+            failure = BoundedProcessError("scope collection deadline exhausted")
+            if last_error is not None:
+                failure.add_note(f"collection diagnostic: {_bounded_error_summary(last_error)}")
+            raise failure from last_error
+        time.sleep(min(_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
 
 def _scope_signal(
@@ -871,17 +983,18 @@ def _scope_signal(
         except BaseException as error:
             first_error = first_error or error
             errors.append("scope cgroup KILL failed")
-    try:
-        signal.pidfd_send_signal(worker_pidfd, number, None, 0)
-    except ProcessLookupError:
-        pass
-    except BaseException as error:
-        first_error = first_error or error
-        errors.append(
-            "scope worker pidfd KILL failed"
-            if number == signal.SIGKILL
-            else "scope worker pidfd TERM failed"
-        )
+    if worker_pidfd >= 0:
+        try:
+            signal.pidfd_send_signal(worker_pidfd, number, None, 0)
+        except ProcessLookupError:
+            pass
+        except BaseException as error:
+            first_error = first_error or error
+            errors.append(
+                "scope worker pidfd KILL failed"
+                if number == signal.SIGKILL
+                else "scope worker pidfd TERM failed"
+            )
     if number != signal.SIGKILL:
         if errors:
             raise BoundedProcessError("; ".join(dict.fromkeys(errors))) from first_error
@@ -946,14 +1059,15 @@ def _scope_quiescent(
     row = _proc_row_under(policy.proc_root, worker_pid)
     if row is not None and row[1] == worker_starttime:
         return False
-    try:
-        signal.pidfd_send_signal(worker_pidfd, 0, None, 0)
-    except ProcessLookupError:
-        pass
-    except (AttributeError, OSError):
-        return False
-    else:
-        return False
+    if worker_pidfd >= 0:
+        try:
+            signal.pidfd_send_signal(worker_pidfd, 0, None, 0)
+        except ProcessLookupError:
+            pass
+        except (AttributeError, OSError):
+            return False
+        else:
+            return False
     try:
         events = _integer_map(cgroup.read("cgroup.events"))
         procs = cgroup.read("cgroup.procs").split()
@@ -977,22 +1091,28 @@ def scoped_command(
     pass_fds: Sequence[int],
     max_output_bytes: int,
     cleanup_reserve: float = 4.0,
+    progress: Callable[[], None] | None = None,
+    _direct: bool = False,
 ) -> bytes:
-    """Run one bwrap payload only after its exact user scope is proven."""
+    """Run one payload only after its exact user scope is proven."""
 
     if (
         not sandbox_arguments
+        or (_direct and len(sandbox_arguments) < 3)
         or timeout <= 0
         or cleanup_reserve <= 0
         or max_output_bytes <= 0
         or max_output_bytes > 192 * 1024 * 1024
     ):
         raise BoundedProcessError("invalid scoped command")
-    try:
-        unshare_all = sandbox_arguments.index("--unshare-all")
-        proc_mount = sandbox_arguments.index("--proc")
-    except ValueError as error:
-        raise BoundedProcessError("invalid scoped namespace policy") from error
+    if _direct:
+        unshare_all = proc_mount = -1
+    else:
+        try:
+            unshare_all = sandbox_arguments.index("--unshare-all")
+            proc_mount = sandbox_arguments.index("--proc")
+        except ValueError as error:
+            raise BoundedProcessError("invalid scoped namespace policy") from error
     weaker_unshares = {
         "--unshare-cgroup",
         "--unshare-ipc",
@@ -1006,7 +1126,7 @@ def scoped_command(
         if list(sandbox_arguments[index : index + 3])
         == ["--setenv", "GB10_RESOURCE_FENCE", "1"]
     ]
-    if (
+    if not _direct and (
         sandbox_arguments.count("--unshare-user") != 1
         or sandbox_arguments.count("--unshare-all") != 1
         or sandbox_arguments.count("--proc") != 1
@@ -1031,7 +1151,7 @@ def scoped_command(
     if work_deadline <= started:
         raise BoundedProcessError("insufficient scoped command budget")
 
-    namespace_keys = {
+    namespace_keys = set() if _direct else {
         "cgroup-namespace",
         "ipc-namespace",
         "mnt-namespace",
@@ -1048,20 +1168,33 @@ def scoped_command(
     block_read, block_write = os.pipe2(os.O_CLOEXEC)
     fence_parent, fence_child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     fence_parent.setblocking(False)
-    sandbox = [
-        sandbox[0],
-        "--json-status-fd",
-        str(status_write),
-        "--block-fd",
-        str(block_read),
-        *sandbox[1:],
-    ]
+    sandbox = (
+        [
+            sandbox[0],
+            sandbox[1],
+            "--direct-scope-child",
+            str(status_write),
+            str(block_read),
+            unit,
+            "--",
+            *sandbox[2:],
+        ]
+        if _direct
+        else [
+            sandbox[0],
+            "--json-status-fd",
+            str(status_write),
+            "--block-fd",
+            str(block_read),
+            *sandbox[1:],
+        ]
+    )
     arguments = [
         systemd_run,
         "--user",
         "--scope",
         "--quiet",
-        "--collect",
+        *([] if _direct else ["--collect"]),
         f"--unit={unit}",
         f"--property=MemoryHigh={policy.memory_high}",
         f"--property=MemoryMax={policy.memory_max}",
@@ -1073,16 +1206,23 @@ def scoped_command(
         "--property=SendSIGKILL=yes",
         "--property=OOMPolicy=kill",
         f"--property=RuntimeMaxSec={policy.runtime_seconds}",
+        *([f"--property=LimitFSIZE={policy.fsize_bytes}"] if _direct else []),
         "--",
-        nice,
-        "-n",
-        "10",
-        ionice,
-        "-c",
-        "3",
-        prlimit,
-        f"--fsize={policy.fsize_bytes}:{policy.fsize_bytes}",
-        "--",
+        *(
+            []
+            if _direct
+            else [
+                nice,
+                "-n",
+                "10",
+                ionice,
+                "-c",
+                "3",
+                prlimit,
+                f"--fsize={policy.fsize_bytes}:{policy.fsize_bytes}",
+                "--",
+            ]
+        ),
         *sandbox,
     ]
     inherited = tuple(sorted(set((*pass_fds, status_write, block_read))))
@@ -1106,10 +1246,13 @@ def scoped_command(
     memory_before: dict[str, int] = {}
     pids_before: dict[str, int] = {}
     resource_events: tuple[str, ...] = ()
+    scope_relative_path: str | None = None
     resource_snapshot = False
     fence_released = False
     failure: str | None = None
     identity_lost_at: float | None = None
+    scope_quiescent = False
+    collection_attempted = False
     try:
         try:
             process = subprocess.Popen(
@@ -1159,13 +1302,26 @@ def scoped_command(
                 break
         if worker_pid == 0:
             raise BoundedProcessError("scope did not report a worker")
+        scope_relative_path = _scope_control_group(
+            systemctl, pass_fds, unit, hard_deadline
+        )
+        cgroup = _open_scope_cgroup(policy, scope_relative_path)
         (
             worker_starttime,
-            worker_pidfd,
-            cgroup,
             memory_before,
             pids_before,
-        ) = _verify_scope(policy, unit, process.pid, worker_pid)
+        ) = _verify_scope(
+            policy, unit, process.pid, worker_pid, scope_relative_path, cgroup
+        )
+        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+            raise BoundedProcessError("scope worker pidfd authority is unavailable")
+        try:
+            worker_pidfd = os.pidfd_open(worker_pid, 0)
+            signal.pidfd_send_signal(worker_pidfd, 0, None, 0)
+        except (AttributeError, ProcessLookupError, OSError) as error:
+            raise BoundedProcessError(
+                "scope worker pidfd authority is unavailable"
+            ) from error
         if not _scope_worker_exact(
             policy, unit, worker_pid, worker_starttime, cgroup
         ):
@@ -1176,6 +1332,8 @@ def scoped_command(
 
         while True:
             tree.scan()
+            if progress is not None:
+                progress()
             _drain_once(
                 selector,
                 streams,
@@ -1267,7 +1425,7 @@ def scoped_command(
                 )
                 resource_snapshot = True
         if failure is None and process.returncode not in {None, 0}:
-            failure = "scoped payload failed"
+            failure = _scoped_payload_failure(process.returncode, captures["stderr"])
         if resource_events:
             resource_failure = (
                 "scope resource limit was reached: " + ",".join(resource_events)
@@ -1278,22 +1436,38 @@ def scoped_command(
         if failure is not None:
             raise BoundedProcessError(failure)
         if process.returncode != 0:
-            raise BoundedProcessError("scoped payload failed")
+            assert process.returncode is not None
+            raise BoundedProcessError(
+                _scoped_payload_failure(process.returncode, captures["stderr"])
+            )
         rows = _status_rows(captures["status"], complete=True)
-        if len(rows) != 2:
+        if len(rows) != (1 if _direct else 2):
             raise BoundedProcessError("scope exit status is invalid")
-        exit_code = rows[1].get("exit-code")
-        if (
-            rows[0] != ready_row
-            or set(rows[1]) != {"exit-code"}
-            or type(exit_code) is not int
-            or exit_code != 0
+        exit_code = 0 if _direct else rows[1].get("exit-code")
+        if rows[0] != ready_row or (
+            not _direct
+            and (
+                set(rows[1]) != {"exit-code"}
+                or type(exit_code) is not int
+                or exit_code != 0
+            )
         ):
             raise BoundedProcessError("scope exit status is invalid")
-        if not _scope_quiescent(
+        scope_quiescent = _scope_quiescent(
             policy, worker_pid, worker_starttime, worker_pidfd, cgroup
-        ):
+        )
+        if not scope_quiescent:
             raise BoundedProcessError("scope worker survived collection")
+        collection_attempted = True
+        _collect_scope(
+            systemctl,
+            pass_fds,
+            policy,
+            unit,
+            scope_relative_path,
+            cgroup,
+            hard_deadline,
+        )
         return bytes(captures["stdout"].retained)
     except BaseException as error:
         resource_diagnostics: list[str] = []
@@ -1349,8 +1523,7 @@ def scoped_command(
             except BaseException as cleanup_failure:
                 cleanup_error = cleanup_failure
             cleanup_diagnostics: list[str] = []
-            scope_quiescent = False
-            if cgroup is not None:
+            if cgroup is not None and not collection_attempted:
                 try:
                     scope_quiescent = _scope_quiescent(
                         policy,
@@ -1361,8 +1534,28 @@ def scoped_command(
                     )
                 except BaseException as diagnostic_failure:
                     cleanup_error = cleanup_error or diagnostic_failure
+            elif scope_relative_path is not None and cleanup_error is None:
+                scope_quiescent = True
             if cgroup is not None and not scope_quiescent:
                 cleanup_diagnostics.append("hard-contained scope survived cleanup")
+            if (
+                scope_relative_path is not None
+                and scope_quiescent
+                and not collection_attempted
+            ):
+                collection_attempted = True
+                try:
+                    _collect_scope(
+                        systemctl,
+                        pass_fds,
+                        policy,
+                        unit,
+                        scope_relative_path,
+                        cgroup,
+                        hard_deadline,
+                    )
+                except BaseException as diagnostic_failure:
+                    cleanup_error = cleanup_error or diagnostic_failure
             if process.returncode is None:
                 cleanup_diagnostics.append("scope wrapper survived cleanup")
             if cleanup_error is not None:
@@ -1405,6 +1598,82 @@ def scoped_command(
             cgroup.close()
 
 
+def scoped_direct_command(
+    arguments: Sequence[str],
+    policy: ScopePolicy,
+    *,
+    python: str,
+    module_fd: int,
+    systemd_run: str,
+    systemctl: str,
+    nice: str,
+    ionice: str,
+    prlimit: str,
+    timeout: float,
+    deadline: float,
+    env: Mapping[str, str],
+    pass_fds: Sequence[int],
+    max_output_bytes: int,
+    cleanup_reserve: float = 4.0,
+    progress: Callable[[], None] | None = None,
+) -> bytes:
+    """Run an exact command directly after cgroup authority is proven."""
+
+    if module_fd < 0:
+        raise BoundedProcessError("invalid bounded-process module authority")
+    return scoped_command(
+        [python, f"/proc/self/fd/{module_fd}", *arguments],
+        policy,
+        systemd_run=systemd_run,
+        systemctl=systemctl,
+        nice=nice,
+        ionice=ionice,
+        prlimit=prlimit,
+        timeout=timeout,
+        deadline=deadline,
+        env=env,
+        pass_fds=tuple((*pass_fds, module_fd)),
+        max_output_bytes=max_output_bytes,
+        cleanup_reserve=cleanup_reserve,
+        progress=progress,
+        _direct=True,
+    )
+
+
+def _direct_scope_child(arguments: Sequence[str]) -> None:
+    if len(arguments) < 5 or arguments[3] != "--":
+        raise BoundedProcessError("invalid direct scope child")
+    try:
+        status_fd, block_fd = (int(arguments[0]), int(arguments[1]))
+    except ValueError as error:
+        raise BoundedProcessError("invalid direct scope child descriptors") from error
+    unit = arguments[2]
+    command_arguments = list(arguments[4:])
+    if (
+        status_fd <= 2
+        or block_fd <= 2
+        or status_fd == block_fd
+        or not command_arguments
+        or not unit.startswith("llm-guard-rebuild-")
+        or not unit.endswith(".scope")
+        or Path(unit).name != unit
+    ):
+        raise BoundedProcessError("invalid direct scope child authority")
+    payload = json.dumps(
+        {"child-pid": os.getpid()},
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("ascii") + b"\n"
+    if os.write(status_fd, payload) != len(payload):
+        raise BoundedProcessError("direct scope child status write failed")
+    os.close(status_fd)
+    if os.read(block_fd, 2) != b"G":
+        raise BoundedProcessError("direct scope child release failed")
+    os.close(block_fd)
+    os.execvpe(command_arguments[0], command_arguments, os.environ)
+
+
 def command(
     arguments: Sequence[str],
     timeout: float = 20,
@@ -1415,6 +1684,7 @@ def command(
     env: Mapping[str, str] | None = None,
     pass_fds: Sequence[int] = (),
     cleanup_reserve: float = 2.0,
+    progress: Callable[[], None] | None = None,
 ) -> str:
     """Run one complete process tree with capped concurrent output and hard cleanup."""
 
@@ -1482,6 +1752,8 @@ def command(
                     process.stdin.close()
                 if input_offset >= len(input_payload) and not process.stdin.closed:
                     process.stdin.close()
+            if progress is not None:
+                progress()
             tree.scan()
             _drain_once(
                 selector,
@@ -1559,3 +1831,9 @@ def command(
         raise BoundedProcessError(
             f"command stdout is not valid UTF-8: {arguments[0]}"
         ) from error
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] != "--direct-scope-child":
+        raise SystemExit(64)
+    _direct_scope_child(sys.argv[2:])
