@@ -1713,6 +1713,42 @@ class CrashSafeHostWriteTests(unittest.TestCase):
             finally:
                 budget.close()
 
+    def test_git_progress_preserves_aggregate_host_write_budget_error(self) -> None:
+        with RebuildFixture() as fixture, patch.dict(os.environ, fixture.env, clear=False):
+            old_argv = sys.argv[:]
+            try:
+                sys.argv = [str(ENGINE), "--test-only"]
+                engine = _load(ENGINE, "git_progress_write_budget_test")
+            finally:
+                sys.argv = old_argv
+
+            fixture.cache_root.mkdir(mode=0o700)
+            git_root = fixture.cache_root / "git"
+            git_root.mkdir(mode=0o700)
+            (git_root / "object").write_bytes(b"x")
+            budget = engine.HostWriteBudget(fixture.cache_root)
+            engine.test_free_bytes = (
+                engine.HOST_FREE_FLOOR_BYTES + engine.HOST_WRITE_BUDGET_BYTES
+            )
+            engine.operation_deadline = time.monotonic() + 10
+            budget.used = engine.HOST_WRITE_BUDGET_BYTES
+
+            def run_bounded(*_arguments: object, **keywords: object) -> str:
+                keywords["progress"]()
+                self.fail("progress callback did not enforce the aggregate write budget")
+
+            try:
+                with (
+                    patch.object(engine, "run_bounded", side_effect=run_bounded),
+                    patch.object(engine, "require_tool", return_value="/bin/true"),
+                    self.assertRaisesRegex(
+                        engine.RebuildError, "^host write budget exceeded$"
+                    ),
+                ):
+                    engine._direct_git(git_root, budget, "status")
+            finally:
+                budget.close()
+
     def test_write_budget_tracks_actual_destination_device(self) -> None:
         with RebuildFixture() as fixture:
             fixture.test_free_bytes = 8 * 1024 * 1024 * 1024 - 1

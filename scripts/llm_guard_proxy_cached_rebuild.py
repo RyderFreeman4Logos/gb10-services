@@ -1225,7 +1225,7 @@ def execute(
         return output.encode("utf-8")
     except RuntimeError as error:
         reason = _bounded_primary_error(error)
-        if any(token in reason for token in ("deadline", "exhausted", "budget")):
+        if _bounded_deadline_error(error, reason):
             fail("transaction command deadline exhausted")
         raise RebuildError(reason) from error
     finally:
@@ -1253,6 +1253,24 @@ def _scope_policy(phase: str) -> Any:
 def _bounded_primary_error(error: BaseException) -> str:
     line = str(error).splitlines()[0] if str(error) else type(error).__name__
     return "".join(character if character.isprintable() else "?" for character in line)[:512]
+
+
+def _bounded_deadline_error(error: BaseException, reason: str) -> bool:
+    return isinstance(error, BoundedProcessError) and (
+        reason.startswith(
+            (
+                "operation deadline exhausted",
+                "command deadline exhausted",
+                "scoped command deadline exhausted",
+                "subprocess cleanup deadline exhausted",
+                "scope collection deadline exhausted",
+                "insufficient command budget",
+                "insufficient scoped command budget",
+            )
+        )
+        or reason.startswith("scope manager ")
+        and reason.endswith("deadline exhausted")
+    )
 
 
 def run_build_phase(
@@ -1294,10 +1312,7 @@ def run_build_phase(
         return output
     except RuntimeError as error:
         reason = _bounded_primary_error(error)
-        if isinstance(error, BoundedProcessError) and (
-            reason.startswith("insufficient scoped command budget")
-            or reason.endswith("deadline exhausted")
-        ):
+        if _bounded_deadline_error(error, reason):
             fail("transaction scoped-command deadline exhausted")
         raise RebuildError(reason) from error
     finally:
