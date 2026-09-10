@@ -770,6 +770,7 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
                 check=True,
                 text=True,
                 capture_output=True,
+                env={**os.environ, "LC_ALL": "C"},
             ).stdout
             self.assertIn("Machine:", header)
             self.assertIn("AArch64", header)
