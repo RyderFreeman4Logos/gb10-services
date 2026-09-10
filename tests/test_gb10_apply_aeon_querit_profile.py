@@ -236,7 +236,7 @@ class QueritDeployerContractTests(unittest.TestCase):
             'fi\n'
             'if [[ "${FAKE_DOCKER_MODE:-ok}" == hang ]]; then\n'
             f"  : > {docker_marker}\n"
-            "  /bin/sleep 30\n"
+            "  exec /bin/sleep 30\n"
             "fi\n"
             'if [[ "$*" == *"Config.Cmd"* ]]; then\n'
             f"  cat {shlex.quote(str(command_json))}\n"
@@ -256,7 +256,7 @@ class QueritDeployerContractTests(unittest.TestCase):
             '  if [[ "${FAKE_GUARD_MODE:-fail}" == fail ]]; then exit 22; fi\n'
             '  if [[ "${FAKE_GUARD_MODE:-fail}" == hang ]]; then\n'
             f"    : > {signal_marker}\n"
-            "    /bin/sleep 30\n"
+            "    exec /bin/sleep 30\n"
             "  fi\n"
             "  echo '{\"data\":[{\"score\":1.0}]}'\n"
             "  exit 0\n"
@@ -780,6 +780,11 @@ class QueritDeployerContractTests(unittest.TestCase):
         self.assertIn("run_docker()", self.source)
         self.assertIn("/usr/bin/timeout --signal=TERM", self.source)
         self.assertNotIn('command_json="$(docker inspect', self.source)
+
+    def test_hanging_fixture_commands_exec_their_sleeper(self) -> None:
+        fixture_source = Path(__file__).read_text()
+        self.assertIn('"  exec /bin/sleep 30\\n"', fixture_source)
+        self.assertIn('"    exec /bin/sleep 30\\n"', fixture_source)
 
     def test_no_swap_verification_uses_clean_production_environment(self) -> None:
         for contract in (
