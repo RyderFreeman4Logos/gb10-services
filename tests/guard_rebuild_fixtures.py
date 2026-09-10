@@ -180,6 +180,8 @@ class RebuildFixture:
             "restart_noop_after": 0,
             "hang_restart_calls": [],
             "manager_contract_mismatch": False,
+            "systemctl_unprintable_load_credential": False,
+            "load_credential_override": "",
             "omit_environment_files": False,
             "omit_generation_field": "",
             "applied_config_override": "",
@@ -822,7 +824,7 @@ def valid_systemctl(values):
     fields = [
         "LoadState", "ActiveState", "SubState", "FragmentPath", "DropInPaths",
         "MainPID", "InvocationID", "ActiveEnterTimestampMonotonic", "Result",
-        "Job", "ExecStart", "LoadCredential", "NoNewPrivileges", "PrivateTmp",
+        "Job", "ExecStart", "NoNewPrivileges", "PrivateTmp",
         "ProtectSystem", "ProtectHome", "UMask", "Environment",
     ]
     service = [
@@ -863,6 +865,13 @@ def valid_systemctl(values):
         ]
         and SCOPE_UNIT.fullmatch(values[4]) is not None
     )
+
+def valid_busctl(values):
+    return values == [
+        "--user", "--json=short", "get-property", "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1/unit/llm_2dguard_2dproxy_2eservice",
+        "org.freedesktop.systemd1.Service", "LoadCredential",
+    ]
 
 def digest_fd(descriptor):
     digest = hashlib.sha256()
@@ -1217,6 +1226,7 @@ def valid_bwrap(values):
 valid = {
     "systemd_run": valid_systemd_run,
     "systemctl": valid_systemctl,
+    "busctl": valid_busctl,
     "bwrap": valid_bwrap,
 }.get(name)
 if valid is not None and not valid(args):
@@ -1340,7 +1350,15 @@ def drift():
     state["drifted"] = True
     save()
 
-if name == "systemd_run":
+if name == "busctl":
+    source = state.get("load_credential_override") or os.environ[
+        "LLM_GUARD_PROXY_REBUILD_GUARD_CONFIG"
+    ]
+    print(json.dumps({
+        "type": "a(ss)",
+        "data": [["llm-guard-config", source]],
+    }, separators=(",", ":")))
+elif name == "systemd_run":
     if state.get("scope_failure") in {"manager", "property"}:
         raise SystemExit(23)
     if "--direct-scope-child" in args:
@@ -2279,6 +2297,8 @@ elif name == "systemctl":
         }
         if state.get("manager_contract_mismatch"):
             values["ProtectSystem"] = "no"
+        if state.get("systemctl_unprintable_load_credential"):
+            values["LoadCredential"] = "[unprintable]"
         requested = [
             argument.split("=", 1)[1]
             for argument in args
@@ -2447,6 +2467,7 @@ else:
             "cargo": self.toolchain_bin / "cargo",
             "rustc": self.toolchain_bin / "rustc",
             "bwrap": self.fake_bin / "bwrap",
+            "busctl": self.fake_bin / "busctl",
             "prlimit": self.fake_bin / "prlimit",
             "systemd_run": self.fake_bin / "systemd-run",
             "systemctl": self.fake_bin / "systemctl",
@@ -2463,6 +2484,7 @@ else:
             "cargo": self.toolchain_bin / "cargo",
             "rustc": self.toolchain_bin / "rustc",
             "bwrap": self.fake_bin / "bwrap",
+            "busctl": self.fake_bin / "busctl",
             "prlimit": self.fake_bin / "prlimit",
             "systemd_run": self.fake_bin / "systemd-run",
             "systemctl": self.fake_bin / "systemctl",
@@ -2608,8 +2630,8 @@ else:
             "toolchain_root": str(self.toolchain_root),
             "target_rustlib": str(self.target_rustlib),
             "tools": {name: tools[name] for name in {
-                "ar", "cargo", "cc", "curl", "git", "ld", "readelf", "rustc",
-                "systemd_run", "systemctl",
+                "ar", "busctl", "cargo", "cc", "curl", "git", "ld", "readelf",
+                "rustc", "systemd_run", "systemctl",
             }},
         }
         self.authority_config.write_text(json.dumps(payload, sort_keys=True))
