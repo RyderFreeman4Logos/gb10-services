@@ -469,12 +469,48 @@ class GuardCanonicalAuthorityTests(unittest.TestCase):
             self.assertIn("running Guard config authority differs", output)
             fixture.assert_prior_restored(self)
 
-    def test_exact_running_config_credential_generation_passes(self) -> None:
+    def test_systemd_255_exec_start_and_exact_credential_generation_pass(self) -> None:
         with RebuildFixture() as fixture:
             result = fixture.run(timeout=20)
             output = result.stdout + result.stderr
             self.assertEqual(result.returncode, 0, output)
             self.assertIn("LLM_GUARD_PROXY_REBUILD_TEST_ONLY_COMPLETE", output)
+
+    def test_exec_start_contract_rejects_unsafe_renderings(self) -> None:
+        for kind in (
+            "extra-command",
+            "foreign-path",
+            "foreign-argv",
+            "ignore-errors",
+            "malformed-delimiter",
+        ):
+            with self.subTest(kind=kind), RebuildFixture() as fixture:
+                executable = str(fixture.service_bin)
+                value = (
+                    f"{{ path={executable} ; argv[]={executable}"
+                    " --config /run/user/1001/credentials/llm-guard-proxy.service/llm-guard-config"
+                    " --guardian-runtime-dir /run/user/1001/gb10-memory-guardian"
+                    " ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a]"
+                    " ; pid=0 ; code=(null) ; status=0/0 }"
+                )
+                if kind == "extra-command":
+                    value += " { path=/usr/bin/true ; argv[]=/usr/bin/true ; ignore_errors=no }"
+                elif kind == "foreign-path":
+                    value = value.replace(f"path={executable}", "path=/usr/bin/true")
+                elif kind == "foreign-argv":
+                    value = value.replace(f"argv[]={executable}", "argv[]=/usr/bin/true")
+                elif kind == "ignore-errors":
+                    value = value.replace("ignore_errors=no", "ignore_errors=yes")
+                else:
+                    value = value.replace(" ; ignore_errors=no", " ignore_errors=no")
+                fixture.set_state(exec_start_override=value)
+                before = os.readlink(fixture.service_bin)
+                result = fixture.run(timeout=20)
+                output = result.stdout + result.stderr
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertIn("manager-loaded Guard contract differs", output)
+                self.assertEqual(os.readlink(fixture.service_bin), before)
+                self.assertEqual(fixture.reload_state()["restart_calls"], 0)
 
 
 

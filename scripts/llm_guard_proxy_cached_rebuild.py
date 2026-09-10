@@ -4001,7 +4001,7 @@ def _verify_manager_contract(values: dict[str, str]) -> None:
         f" --guardian-runtime-dir {runtime_dir}"
     )
     match = re.fullmatch(
-        r"\{ path=([^ ]+) ; argv\[\]=(.+?) ; ignore_errors=no(?: ; .*)? ; \}",
+        r"\{ path=([^ ]+) ; argv\[\]=(.+?) ; ignore_errors=no(?: ; [^{}]*?)?(?: ;)? \}",
         values["ExecStart"],
     )
     expected = {

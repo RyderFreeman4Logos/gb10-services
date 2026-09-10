@@ -180,6 +180,7 @@ class RebuildFixture:
             "restart_noop_after": 0,
             "hang_restart_calls": [],
             "manager_contract_mismatch": False,
+            "exec_start_override": "",
             "systemctl_unprintable_load_credential": False,
             "load_credential_override": "",
             "omit_environment_files": False,
@@ -2279,10 +2280,18 @@ elif name == "systemctl":
                 else ""
             ),
             "ExecStart": (
-                "{ path=" + os.environ["SERVICE_BIN"]
-                + " ; argv[]=" + os.environ["SERVICE_BIN"]
-                + " --config /run/user/1001/credentials/llm-guard-proxy.service/llm-guard-config"
-                + " --guardian-runtime-dir /run/user/1001/gb10-memory-guardian ; ignore_errors=no ; }"
+                state.get("exec_start_override")
+                or (
+                    "{ path=/home/obj/.local/bin/llm-guard-proxy"
+                    " ; argv[]=/home/obj/.local/bin/llm-guard-proxy"
+                    " --config /run/user/1001/credentials/llm-guard-proxy.service/llm-guard-config"
+                    " --guardian-runtime-dir /run/user/1001/gb10-memory-guardian"
+                    " ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a]"
+                    " ; pid=0 ; code=(null) ; status=0/0 }"
+                ).replace(
+                    "/home/obj/.local/bin/llm-guard-proxy",
+                    os.environ["SERVICE_BIN"],
+                )
             ),
             "LoadCredential": (
                 "llm-guard-config:" + os.environ["LLM_GUARD_PROXY_REBUILD_GUARD_CONFIG"]
