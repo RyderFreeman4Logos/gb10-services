@@ -418,6 +418,14 @@ class QueritServiceContractTests(unittest.TestCase):
                 "abliterated-qwen-latest-27b-medium",
             ],
         )
+        self.assertEqual(
+            profiles["qwen3-embedding-8b"]["match_models"],
+            ["qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B"],
+        )
+        self.assertEqual(
+            profiles["qwen3-reranker-8b"]["match_models"],
+            ["qwen3-reranker-8b", "Qwen/Qwen3-Reranker-8B"],
+        )
         self.assertEqual(default_chat["upstream_model"], "aeon-ultimate")
         self.assertEqual(default_chat["thinking"]["mode"], "force_disable")
         self.assertTrue(default_chat["thinking"]["force_disable"])

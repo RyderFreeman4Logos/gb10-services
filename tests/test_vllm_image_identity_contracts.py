@@ -7,6 +7,8 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 
+from test_querit_vllm_production_contracts import _unit_directive_values
+
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE_REPOSITORY = "ghcr.io/aeon-7/aeon-vllm-ultimate"
@@ -403,6 +405,9 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         self.assertNotIn("/draft", unit)
         self.assertIn("--enable-prefix-caching", runtime)
         self.assertNotIn("--no-enable-prefix-caching", runtime)
+        conflicts = set(" ".join(_unit_directive_values(unit, "Conflicts")).split())
+        self.assertIn("sglang-qwen38-27b.service", conflicts)
+        self.assertIn("vllm-aeon-27b-dflash.service", conflicts)
 
 
 if __name__ == "__main__":
