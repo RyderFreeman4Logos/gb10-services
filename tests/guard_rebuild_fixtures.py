@@ -180,6 +180,8 @@ class RebuildFixture:
             "restart_noop_after": 0,
             "hang_restart_calls": [],
             "manager_contract_mismatch": False,
+            "omit_environment_files": False,
+            "omit_generation_field": "",
             "applied_config_override": "",
             "mutate_gcc_closure_during_build": False,
             "held_ld_consumed": False,
@@ -820,16 +822,18 @@ def valid_systemctl(values):
         "LoadState", "ActiveState", "SubState", "FragmentPath", "DropInPaths",
         "MainPID", "InvocationID", "ActiveEnterTimestampMonotonic", "Result",
         "Job", "ExecStart", "LoadCredential", "NoNewPrivileges", "PrivateTmp",
-        "ProtectSystem", "ProtectHome", "UMask", "Environment", "EnvironmentFiles",
+        "ProtectSystem", "ProtectHome", "UMask", "Environment",
     ]
     service = [
         "--user", "show", "llm-guard-proxy.service", "--no-pager",
         *("--property=" + field for field in fields),
     ]
+    legacy_service = [*service, "--property=EnvironmentFiles"]
     candidate = tuple(values)
     if candidate in {
         tuple(manager),
         tuple(service),
+        tuple(legacy_service),
         ("--user", "list-jobs", "--output=json"),
         (
             "--user", "restart", "--no-block", "--job-mode=fail", "--",
@@ -2277,6 +2281,10 @@ elif name == "systemctl":
             if argument.startswith("--property=")
         ]
         for key in requested:
+            if key == "EnvironmentFiles" and state.get("omit_environment_files"):
+                continue
+            if key == state.get("omit_generation_field"):
+                continue
             print(f"{key}={values[key]}")
         if (
             state.get("drift_after") == "candidate-attestation"
