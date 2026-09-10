@@ -353,11 +353,12 @@ class RebuildFixture:
         )
         (pid_dir / "cmdline").write_bytes(
             str(self.service_bin).encode()
-            + b"\0--config\0/run/credentials/llm-guard-proxy.service/llm-guard-config\0"
+            + b"\0--config\0/run/user/1001/credentials/llm-guard-proxy.service/llm-guard-config\0"
             + b"--guardian-runtime-dir\0/run/user/1001/gb10-memory-guardian\0"
         )
         credential = (
-            pid_dir / "root/run/credentials/llm-guard-proxy.service/llm-guard-config"
+            pid_dir
+            / "root/run/user/1001/credentials/llm-guard-proxy.service/llm-guard-config"
         )
         credential.parent.mkdir(parents=True, exist_ok=True)
         credential.unlink(missing_ok=True)
@@ -1293,10 +1294,13 @@ def write_proc(target):
     )
     (pid_dir / "cmdline").write_bytes(
         os.environ["SERVICE_BIN"].encode()
-        + b"\0--config\0/run/credentials/llm-guard-proxy.service/llm-guard-config\0"
+        + b"\0--config\0/run/user/1001/credentials/llm-guard-proxy.service/llm-guard-config\0"
         + b"--guardian-runtime-dir\0/run/user/1001/gb10-memory-guardian\0"
     )
-    credential = pid_dir / "root/run/credentials/llm-guard-proxy.service/llm-guard-config"
+    credential = (
+        pid_dir
+        / "root/run/user/1001/credentials/llm-guard-proxy.service/llm-guard-config"
+    )
     credential.parent.mkdir(parents=True, exist_ok=True)
     credential.unlink(missing_ok=True)
     override = state.get("applied_config_override", "")
@@ -2259,7 +2263,7 @@ elif name == "systemctl":
             "ExecStart": (
                 "{ path=" + os.environ["SERVICE_BIN"]
                 + " ; argv[]=" + os.environ["SERVICE_BIN"]
-                + " --config /run/credentials/llm-guard-proxy.service/llm-guard-config"
+                + " --config /run/user/1001/credentials/llm-guard-proxy.service/llm-guard-config"
                 + " --guardian-runtime-dir /run/user/1001/gb10-memory-guardian ; ignore_errors=no ; }"
             ),
             "LoadCredential": (

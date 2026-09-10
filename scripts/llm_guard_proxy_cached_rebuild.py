@@ -70,6 +70,9 @@ ScopePolicy = _bounded_module.ScopePolicy
 BoundedProcessError = _bounded_module.BoundedProcessError
 
 UNIT = "llm-guard-proxy.service"
+GUARD_CREDENTIAL_PATH = (
+    f"/run/user/{os.getuid()}/credentials/{UNIT}/llm-guard-config"
+)
 HEALTH_URL = "http://100.105.4.92:18009/health"
 TARGET_TRIPLE = "aarch64-unknown-linux-gnu"
 EXPECTED_ELF_MACHINE = "AArch64"
@@ -3988,10 +3991,10 @@ class ManagerJob:
 
 
 def _verify_manager_contract(values: dict[str, str]) -> None:
-    credential = "/run/credentials/llm-guard-proxy.service/llm-guard-config"
     runtime_dir = f"/run/user/{os.getuid()}/gb10-memory-guardian"
     expected_argv = (
-        f"{service_bin} --config {credential} --guardian-runtime-dir {runtime_dir}"
+        f"{service_bin} --config {GUARD_CREDENTIAL_PATH}"
+        f" --guardian-runtime-dir {runtime_dir}"
     )
     match = re.fullmatch(
         r"\{ path=([^ ]+) ; argv\[\]=(.+?) ; ignore_errors=no(?: ; .*)? ; \}",
@@ -4176,11 +4179,10 @@ def proc_starttime(pid: int) -> int:
 def verify_running_config(pid: int) -> None:
     if "config" not in fixed_authorities:
         fail("installed Guard config authority is unavailable")
-    credential = "/run/credentials/llm-guard-proxy.service/llm-guard-config"
     expected_cmdline = (
         str(service_bin).encode()
         + b"\0--config\0"
-        + credential.encode()
+        + GUARD_CREDENTIAL_PATH.encode()
         + b"\0--guardian-runtime-dir\0"
         + f"/run/user/{os.getuid()}/gb10-memory-guardian".encode()
         + b"\0"
@@ -4189,7 +4191,7 @@ def verify_running_config(pid: int) -> None:
         fail("running Guard launch argv differs")
     applied = _open_file_authority(
         "running Guard config",
-        proc_root / str(pid) / "root" / credential.lstrip("/"),
+        proc_root / str(pid) / "root" / GUARD_CREDENTIAL_PATH.lstrip("/"),
         expected_mode=0o400,
         max_bytes=1024 * 1024,
     )
