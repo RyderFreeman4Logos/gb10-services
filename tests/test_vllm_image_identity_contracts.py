@@ -7,6 +7,8 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 
+from test_querit_vllm_production_contracts import _unit_directive_values
+
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE_REPOSITORY = "ghcr.io/aeon-7/aeon-vllm-ultimate"
@@ -374,6 +376,38 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         ):
             with self.subTest(alias=alias):
                 self.assertIn(alias, guide)
+
+    def test_qwen38_uses_in_checkpoint_mtp_k5_not_dflash(self) -> None:
+        unit = (
+            ROOT
+            / "profile"
+            / "qwen3.8-27b-nvfp4-vllm"
+            / "vllm-aeon-qwen38-dflash.service"
+        ).read_text()
+        unit_lines = unit.splitlines()
+        start = next(
+            index for index, line in enumerate(unit_lines) if line.startswith("ExecStart=")
+        )
+        command_lines = [unit_lines[start].removeprefix("ExecStart=")]
+        while command_lines[-1].rstrip().endswith("\\"):
+            start += 1
+            self.assertLess(start, len(unit_lines))
+            command_lines.append(unit_lines[start].strip())
+        command = " ".join(
+            line.rstrip().removesuffix("\\").rstrip() for line in command_lines
+        )
+        argv = shlex.split(command)
+        runtime = argv[argv.index("serve") + 1 :]
+        speculative = json.loads(runtime[runtime.index("--speculative-config") + 1])
+        self.assertEqual(speculative["method"], "qwen3_5_mtp")
+        self.assertEqual(speculative["num_speculative_tokens"], 5)
+        self.assertNotIn("model", speculative)
+        self.assertNotIn("/draft", unit)
+        self.assertIn("--enable-prefix-caching", runtime)
+        self.assertNotIn("--no-enable-prefix-caching", runtime)
+        conflicts = set(" ".join(_unit_directive_values(unit, "Conflicts")).split())
+        self.assertIn("sglang-qwen38-27b.service", conflicts)
+        self.assertIn("vllm-aeon-27b-dflash.service", conflicts)
 
 
 if __name__ == "__main__":

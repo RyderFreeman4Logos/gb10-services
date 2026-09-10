@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shlex
@@ -33,6 +34,17 @@ IMAGE = (
     "ghcr.io/aeon-7/aeon-vllm-ultimate@"
     "sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee"
 )
+
+
+def reserved_ingress_errors(config: dict) -> list[str]:
+    reserved = config.get("upstream", {}).get("reserved_ingress_model_ids")
+    if reserved is None or set(reserved) != BACKEND_ALIASES:
+        return [
+            "upstream.reserved_ingress_model_ids must exactly match the reserved identities"
+        ]
+    if not set(reserved).isdisjoint(PUBLIC_GUARD_ALIASES):
+        return ["reserved identities must not appear in public aliases"]
+    return []
 
 
 def _unit_text() -> str:
@@ -167,6 +179,7 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
         self.assertFalse(any(model.startswith("qwen3.6-") for model in default_models))
         self.assertEqual(upstreams[0]["upstream_model"], "aeon-ultimate")
         self.assertEqual(upstreams[0]["base_url"], "http://100.105.4.92:18010/v1")
+        self.assertEqual(reserved_ingress_errors(config), [])
         docs = DEPLOYMENT_GUIDANCE.read_text()
         for required in (
             "vllm-aeon-ultimate-uncensored-nvfp4.service",
@@ -258,6 +271,30 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
             self.assertEqual(profile["thinking_budget"], 65536)
             self.assertEqual(profile["output_cap"], 16384)
             self.assertEqual(profile["thinking_budget"] + profile["output_cap"], 81920)
+
+    def test_reserved_ingress_rejects_missing_stale_and_extra_identities(self) -> None:
+        source = tomllib.loads(GUARD_CONFIG.read_text())
+        mutations = {
+            "absent": None,
+            "missing": ["abliterated-qwen-latest-27b-nvfp4", "aeon-ultimate"],
+            "extra": [*BACKEND_ALIASES, "extra"],
+            "stale": [
+                "abliterated-qwen-latest-27b-nvfp4",
+                "aeon",
+                "qwen3.6-27b-decensor-by-aeon",
+            ],
+        }
+        for label, reserved in mutations.items():
+            with self.subTest(mutation=label):
+                candidate = copy.deepcopy(source)
+                if reserved is None:
+                    candidate["upstream"].pop("reserved_ingress_model_ids")
+                else:
+                    candidate["upstream"]["reserved_ingress_model_ids"] = reserved
+                self.assertIn(
+                    "upstream.reserved_ingress_model_ids must exactly match the reserved identities",
+                    reserved_ingress_errors(candidate),
+                )
 
 
 if __name__ == "__main__":
