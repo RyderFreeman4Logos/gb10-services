@@ -113,7 +113,7 @@ install -m 0755 scripts/aeon_text_stop_start.sh /home/obj/scripts/aeon_text_stop
 cp scripts/aeon_chat_ready.py /home/obj/.local/bin/
 cp scripts/gb10_check_mem_available.sh /home/obj/.local/bin/
 install -m 0755 scripts/llm_guard_proxy_cached_rebuild.sh /home/obj/.local/bin/llm_guard_proxy_cached_rebuild.sh
-install -m 0644 scripts/llm_guard_proxy_cached_rebuild.py scripts/llm_guard_proxy_scoped_worker.py \
+install -m 0644 scripts/llm_guard_proxy_cached_rebuild.py \
   scripts/gb10_bounded_process.py /home/obj/.local/bin/
 cp scripts/llm_guard_proxy_publish_cgroup_registration.sh /home/obj/.local/bin/
 install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py /home/obj/.local/bin/gb10_verify_vllm_no_swap_core.py
@@ -151,23 +151,29 @@ source/cache paths, installed config/unit, service symlink, owner-only recovery
 state, real `/proc`, and fixed tool path. `--test-only` is exclusively for
 hermetic tests and cannot emit the production completion contract.
 
-The script gates each fetch, Cargo-metadata, and Cargo-build payload behind a
-random transient user scope whose exact cgroup membership and effective hard
-memory/swap/PID/CPU limits are verified before GO. The build authority is the
-native GB10 `aarch64-unknown-linux-gnu` Rust target and target rustlib, with the
-reviewed AArch64 compiler, binutils, sysroot, and Python 3.12 standard library.
-Before any WAL or service-link mutation, held `readelf` authority must report an
-`AArch64` candidate using `/lib/ld-linux-aarch64.so.1`; mismatch fails closed.
-Bubblewrap keeps Git objects, Cargo target output, and temporary files in bounded
-tmpfs mounts; no writable host target or external Git worktree is mounted. The
-parent accepts bounded canonical frames, revalidates the immutable Git archive or
-candidate, applies one 576 MiB host-write budget with 8 GiB free-space headroom,
-and cleans the exact process group, scope, and verified descendants on failure.
-Metadata-only receipts bind the complete containment policy and reviewed
-worker/tool authorities, but never persist transient scope names.
-The parent keeps opened memory/pids event descriptors through the worker's final
-resource fence and reads them before a failed scope is collected, preserving
-exact limit evidence for nonzero status, signal/OOM, and early post-GO failure.
+Cargo metadata and build run directly, without bubblewrap or a scoped worker, only
+after each transient user scope is proven in its exact cgroup with hard
+memory/swap/PID/CPU/file-size limits. The shared bounded-process path retains
+cgroup event and kill descriptors, verifies membership and controller values,
+and proves quiescence so descendants cannot survive cleanup.
+
+Git runs through its held executable descriptor and writes only inside the
+transaction snapshot; its object store is accounted against a 64 MiB cap.
+Cargo and rustc execute through held file descriptors with the manifest rooted
+at the held canonical-source directory. The canonical source is an immutable Git archive;
+recursive ledgers are checked before and after Cargo for the source, Cargo home and registry,
+toolchain and target rustlib, GCC closure, and sysroot include/runtime directories. Cargo target
+writes are accounted against a 512 MiB cap within the aggregate 576 MiB host
+write budget and 8 GiB free-space floor.
+
+The built candidate is opened once with `O_NOFOLLOW`, validated as an owned,
+single-link regular `0755` file no larger than 128 MiB, read through the shared
+deadline-aware bounded FD reader, and kept identity-bound through publication.
+The content-addressed release lives under
+`~/.cache/cargo-target/llm-guard-proxy-main/releases/`. WAL receipts record the
+exact Cargo argv, held tool hashes, directory ledgers, cgroup policy, write
+limits and observed Git/Cargo bytes; resource-limit events are read before the
+scope is released.
 
 Before any link mutation it snapshots and validates exact prior symlink or
 absence plus `MainPID`, `InvocationID`, monotonic start, boot ID, and
