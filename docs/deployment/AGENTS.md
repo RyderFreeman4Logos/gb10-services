@@ -32,7 +32,7 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 * `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
 * `llm-guard-proxy` routes by request `model` to the three forced AEON chat aliases (`abliterated-qwen-latest-27b-none`, `abliterated-qwen-latest-27b-low`, `abliterated-qwen-latest-27b-medium`), while the backend keeps its canonical served names (`aeon`, `abliterated-qwen-latest-27b-nvfp4`, `aeon-ultimate`); legacy qwen3.6 backend aliases (`qwen3.6-27b-decensor-by-aeon`, `qwen3.6-27b-decensored`, `qwen3.6-27b-nvfp4-fast-nothinking`) remain documented for their separate service but are not admitted by the active `:18009` Guard route. Embedding (`qwen3-embedding-8b`, `Qwen/Qwen3-Embedding-8B`), and reranker (`qwen3-reranker-8b`, `Qwen/Qwen3-Reranker-8B`) routes remain available.
 * `llm-guard-proxy` default chat (`:18009`) is force_disable with a single no-thinking rung. Opt-in legacy bounded chat (`:18014`) keeps its multi-rung ladder and `bounded_answer_from_cot`; guarded max-thinking (`:18011`) uses `truncate_cot_then_answer` for one retry-local no-thinking synthesis. The legacy 18002/18003 ports are guard-owned downstream listeners, not raw vLLM publishes.
-* To change `[server]` default/chat request parallelism, per-`[[upstreams]]` `max_in_flight_requests` / `max_queued_generation_requests`, or `[guardian]` policy, edit the profile-owned source `profile/aeon-ultimate-uncensored-nvfp4/llm-guard-proxy/config.toml`, copy it to `/home/obj/.config/llm-guard-proxy/config.toml`, then run `systemctl --user restart llm-guard-proxy`. The running service continues using its activation-time credential copy until restart; this restarts only the proxy, so vLLM backends keep running.
+* To change `[server]` default/chat request parallelism, per-`[[upstreams]]` `max_in_flight_requests` / `max_queued_generation_requests`, or `[guardian]` policy, edit the profile-owned source `profile/aeon-ultimate-uncensored-nvfp4/llm-guard-proxy/config.toml`, then atomically replace `/home/obj/.config/llm-guard-proxy/config.toml` (in-place `sed` is rejected). Generation limits are hot-reloadable when topology is unchanged; `systemctl --user restart llm-guard-proxy` is an optional fallback and never restarts vLLM. Live Ultimate `:18010` keeps `--max-num-seqs 32`; Guard `:18009` AEON admits 8 active + 56 queued with body-routing 8/128.
 
 ### llm-guard-proxy Enabled Features
 
@@ -45,11 +45,10 @@ chat-only mutation disabled for embedding/reranker profiles:
   request `model` field. The default and aggregate listeners still use port
   `18009`/`18005`; legacy `18002` only allows the embedding profile and legacy
   `18003` only allows the reranker profile.
-* **Admission control**: default/chat concurrency is `4` in-flight and `4`
-  queued requests. Embedding and reranker each have independent `8` in-flight
-  and `8` queued limits. Guard workflow alias/pre/post execution has a separate
-  hard limit of `4` in-flight executions. Full queues return HTTP `429` with
-  `Retry-After: 10`.
+* **Admission control**: body-routing is `8` in-flight and `128` queued.
+  Default `:18009` AEON (`aeon-default-no-think`) is `8` in-flight and `56`
+  queued. Embedding and reranker each have independent `8` in-flight and `64`
+  queued limits. Full queues return HTTP `429` with `Retry-After: 10`.
 * **Control-plane headroom**: `max_control_plane_in_flight_requests = 128`, so
   health/metrics/debug traffic is not starved by generation work.
 * **Metadata discovery/enrichment**: upstream model metadata discovery and
@@ -423,20 +422,19 @@ curl -s -X POST http://100.105.4.92:18009/v1/rerank \
   -d '{"model":"qwen3-reranker-8b","query":"hello","documents":["hello world","goodbye"]}'
 ```
 
-### Restart Guard for Chat Parallelism
+### Hot-reload Guard generation limits
 
-To tune throughput versus single-stream latency, edit
-`/home/obj/.config/llm-guard-proxy/config.toml`, then run
-`systemctl --user restart llm-guard-proxy` after adjusting:
+To tune throughput versus single-stream latency, edit the profile-owned source
+and atomically replace `/home/obj/.config/llm-guard-proxy/config.toml`
+(in-place `sed` is rejected). Generation limits hot-reload when topology is
+unchanged. Restarting Guard is an optional fallback; never restart vLLM for
+this change.
 
 ```toml
+# :18009 AEON path (aeon-default-no-think)
 max_in_flight_requests = 8
-max_queued_generation_requests = 8
+max_queued_generation_requests = 56
 ```
-
-The running proxy continues using its activation-time credential copy until
-restart. This command restarts only `llm-guard-proxy`; vLLM backends keep
-running.
 
 ---
 
