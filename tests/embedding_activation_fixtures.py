@@ -7,6 +7,7 @@ import errno
 import hashlib
 import json
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -721,6 +722,10 @@ class ActivationFixture:
 
     def _live_identities(self, identities: list[tuple[int, int, int]]) -> bool:
         for _pid, _starttime, fd in identities:
+            poller = select.poll()
+            poller.register(fd, select.POLLIN)
+            if poller.poll(0):
+                continue
             try:
                 self._pidfd_send(fd, 0)
             except ProcessLookupError:
