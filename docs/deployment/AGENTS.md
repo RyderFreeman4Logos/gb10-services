@@ -117,7 +117,6 @@ install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py /home/obj/.local/bin/gb
 install -m 0755 scripts/gb10_verify_vllm_no_swap.sh /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh
 install -m 0755 scripts/gb10_service_ready.sh /home/obj/.local/bin/gb10_service_ready.sh
 install -m 0755 scripts/gb10_lifecycle.sh /home/obj/.local/bin/gb10_lifecycle.sh
-install -m 0755 scripts/gb10_restart_text_safe.sh /home/obj/.local/bin/gb10_restart_text_safe.sh
 cp scripts/sysmon.sh /home/obj/.local/bin/
 
 # Make executable
@@ -250,10 +249,11 @@ cross-process transaction or lock protocol around the pair. Investigation-begin
 gates future submissions only; it does not guarantee lifecycle quiescence for an
 in-flight start job already submitted with `--no-block`.
 
-`aeon_text_stop_start.sh` and `gb10_restart_text_safe.sh` route their AEON and
-reranker stop/start calls through this wrapper. The independently locked,
-no-argument embedding activation transaction retains its own durable receipts;
-do not replace that transaction with manual lifecycle commands.
+`aeon_text_stop_start.sh` routes its AEON stop/start calls through this wrapper.
+The independently locked, no-argument embedding activation transaction retains
+its own durable receipts; do not replace that transaction with manual lifecycle
+commands. `gb10_restart_text_safe.sh` is legacy-27B-fallback-only and is not on
+the current install path.
 
 ### Generation-bound vLLM no-swap authority
 

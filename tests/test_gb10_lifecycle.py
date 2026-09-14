@@ -545,18 +545,28 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
     def test_deployment_docs_install_all_lifecycle_helpers(self) -> None:
         runbook = " ".join(RUNBOOK.read_text().split())
         readme = " ".join(README.read_text().split())
-        destinations = (
+        current_destinations = (
             "install -m 0755 scripts/gb10_lifecycle.sh "
             "/home/obj/.local/bin/gb10_lifecycle.sh",
             "install -m 0755 scripts/aeon_text_stop_start.sh "
             "/home/obj/scripts/aeon_text_stop_start.sh",
-            "install -m 0755 scripts/gb10_restart_text_safe.sh "
-            "/home/obj/.local/bin/gb10_restart_text_safe.sh",
         )
+        legacy_restart_install = (
+            "install -m 0755 scripts/gb10_restart_text_safe.sh "
+            "/home/obj/.local/bin/gb10_restart_text_safe.sh"
+        )
+        historical_readme = readme.replace("~/.local", "/home/obj/.local")
 
-        for destination in destinations:
+        for destination in current_destinations:
             self.assertIn(destination, runbook)
-            self.assertIn(destination, readme.replace("~/.local", "/home/obj/.local"))
+            self.assertIn(destination, historical_readme)
+
+        self.assertNotIn(legacy_restart_install, runbook)
+        self.assertNotIn(
+            "aeon_text_stop_start.sh and gb10_restart_text_safe.sh",
+            runbook,
+        )
+        self.assertIn(legacy_restart_install, historical_readme)
 
         guard_config = GUARD_CONFIG.read_text()
         # The primary profile plus guarded, default-no-think, and legacy-bounded
