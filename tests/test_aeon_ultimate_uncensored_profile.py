@@ -34,6 +34,11 @@ IMAGE = (
     "ghcr.io/aeon-7/aeon-vllm-ultimate@"
     "sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7"
 )
+MIXED_MODEL = (
+    "/home/obj/models/"
+    "AEON-7--Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-NVFP4-MIXED--"
+    "8b185f4e3c97dfba1b015e652deba6be179ef5f0"
+)
 
 
 def reserved_ingress_errors(config: dict) -> list[str]:
@@ -79,10 +84,8 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
         unit = _unit_text()
         argv = _argv()
         self.assertIn(IMAGE, unit)
-        self.assertIn(
-            "-v /home/obj/models/AEON-ULTIMATE-UNCENSORED-NVFP4-beta-version:/model:ro",
-            unit,
-        )
+        self.assertIn(f"-v {MIXED_MODEL}:/model:ro", unit)
+        self.assertNotIn("AEON-ULTIMATE-UNCENSORED-NVFP4-beta-version", unit)
         self.assertIn(
             "-v /home/obj/models/z-lab/Qwen3.8-27B-DFlash2:/draft:ro",
             unit,
@@ -106,7 +109,9 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
     def test_unit_uses_spark_engine_contract_without_yarn(self) -> None:
         unit = _unit_text()
         argv = _argv()
-        self.assertEqual(_option_value(argv, "--quantization"), "compressed-tensors")
+        self.assertNotIn("--quantization", argv)
+        self.assertNotIn("compressed-tensors", unit)
+        self.assertIn("hf_quant_config.json selects modelopt_mixed", unit)
         self.assertEqual(_option_value(argv, "--attention-backend"), "TRITON_ATTN")
         self.assertEqual(_option_value(argv, "--kv-cache-dtype"), "fp8")
         self.assertEqual(_option_value(argv, "--max-model-len"), "262144")
@@ -156,6 +161,13 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
         self.assertIn("gb10_verify_vllm_no_swap.sh", unit)
         self.assertIn("llm_guard_proxy_publish_cgroup_registration.sh", unit)
         self.assertIn("gb10_service_ready.sh chat http://100.105.4.92:18010 aeon", unit)
+        ready_posts = [
+            line
+            for line in unit.splitlines()
+            if line.startswith("ExecStartPost=") and "gb10_service_ready.sh" in line
+        ]
+        self.assertEqual(len(ready_posts), 1)
+        self.assertIn("XDG_RUNTIME_DIR=/run/user/1001", ready_posts[0])
         self.assertIn("--deadline 2800", unit)
         self.assertIn("TimeoutStartSec=3000", unit)
         self.assertIn("OOMScoreAdjust=800", unit)
@@ -183,13 +195,15 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
         docs = DEPLOYMENT_GUIDANCE.read_text()
         for required in (
             "vllm-aeon-ultimate-uncensored-nvfp4.service",
-            "AEON-ULTIMATE-UNCENSORED-NVFP4-beta-version",
+            MIXED_MODEL,
             "DFlash n=7",
             "max-model-len=262144",
             "72G",
-            "not deployed",
+            "hf_quant_config",
         ):
             self.assertIn(required, docs)
+        self.assertNotIn("AEON-ULTIMATE-UNCENSORED-NVFP4-beta-version", docs)
+        self.assertNotIn("not deployed", docs.split("vllm-aeon-ultimate-uncensored-nvfp4.service", 1)[1][:400])
 
     def test_guard_config_is_profile_authority_and_install_source(self) -> None:
         self.assertTrue(GUARD_CONFIG.is_file())

@@ -9,14 +9,15 @@ readonly ACTIVE_WAIT_SECS=30
 readonly LIFECYCLE="${GB10_LIFECYCLE_BIN:-/home/obj/.local/bin/gb10_lifecycle.sh}"
 readonly LIFECYCLE_ACTOR="llm-guard-proxy.local-recovery"
 readonly LIFECYCLE_REASON="automatic-local-recovery"
-readonly UNIT="vllm-aeon-27b-dflash.service"
+readonly UNIT="vllm-aeon-ultimate-uncensored-nvfp4.service"
 
-# The former HiKV unit name is a systemd alias, not a profile selector.
+# GB10_TEXT_UNIT is an allowlist only. HiKV remains an alias name, not a selector.
+# Recovery always recycles the current :18010 owner (UNIT), never the alias.
 case "${GB10_TEXT_UNIT:-$UNIT}" in
-    vllm-aeon-27b-dflash.service|vllm-aeon-27b-dflash-hikv.service)
+    vllm-aeon-ultimate-uncensored-nvfp4.service|vllm-aeon-27b-dflash.service|vllm-aeon-27b-dflash-hikv.service)
         ;;
     *)
-        printf 'unsupported AEON text unit: %s\n' "${GB10_TEXT_UNIT}" >&2
+        printf 'unsupported AEON text unit: %s\n' "${GB10_TEXT_UNIT:-$UNIT}" >&2
         exit 1
         ;;
 esac

@@ -333,7 +333,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         self.assertEqual(len(reference_rows), 1)
         reference_row = reference_rows[0]
         for expected in (
-            "sole AEON text runtime owner",
+            "retained 27B DFlash fallback",
             "DFlash n=10",
             "kv-cache-dtype=fp8_e4m3",
             "attention-backend=TRITON_ATTN",
