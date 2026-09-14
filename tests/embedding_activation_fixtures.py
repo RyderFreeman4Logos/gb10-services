@@ -323,7 +323,7 @@ class ActivationFixture:
         self.marker = self.root / "pause.marker"
         self.release = self.root / "pause.release"
         self.child_pid_path = self.root / "child.pid"
-        self._owned_groups: list[int] = []
+        self._owned_groups: list[tuple[int, int, int]] = []
         self.cgroup_root = self.root / "cgroup"
         for directory, mode in (
             (self.source_unit.parent, 0o755),
@@ -492,8 +492,31 @@ class ActivationFixture:
         return argv
 
     def _remember_group(self, pid: int) -> None:
-        if pid not in self._owned_groups:
-            self._owned_groups.append(pid)
+        identity = self._process_identity(pid)
+        if identity is not None and identity not in self._owned_groups:
+            self._owned_groups.append(identity)
+
+    def _forget_group(self, pid: int) -> None:
+        self._owned_groups = [identity for identity in self._owned_groups if identity[0] != pid]
+
+    def _process_identity(self, pid: int) -> tuple[int, int, int] | None:
+        parsed = self._stat_ids(pid)
+        if parsed is None:
+            return None
+        starttime, pgid = parsed
+        return pid, starttime, pgid
+
+    def _matching_identity(self, recorded: object) -> tuple[int, int, int] | None:
+        if not isinstance(recorded, tuple) or len(recorded) != 3:
+            return None
+        try:
+            pid, starttime, pgid = (int(recorded[0]), int(recorded[1]), int(recorded[2]))
+        except (TypeError, ValueError):
+            return None
+        current = self._process_identity(pid)
+        if current is None or current != (pid, starttime, pgid):
+            return None
+        return current
 
     def _stat_ids(self, pid: int) -> tuple[int, int] | None:
         try:
@@ -504,10 +527,10 @@ class ActivationFixture:
         if closing <= 1:
             return None
         fields = payload[closing + 2 :].split()
-        if len(fields) < 4:
+        if len(fields) < 20:
             return None
         try:
-            return int(fields[1]), int(fields[2])
+            return int(fields[19]), int(fields[2])
         except ValueError:
             return None
 
@@ -526,58 +549,61 @@ class ActivationFixture:
             children.extend(int(token) for token in payload.split() if token.isdigit())
         return children
 
-    def _descendant_groups(self, leader: int) -> list[int]:
-        seen = {leader}
-        pending = [leader]
-        groups = {leader}
-        if self.child_pid_path.exists():
-            try:
-                child = int(self.child_pid_path.read_text())
-            except ValueError:
-                child = 0
-            if child > 1:
-                pending.append(child)
+    def _owned_identities(self, leader: object) -> list[tuple[int, int, int]]:
+        current = self._matching_identity(leader)
+        if current is None:
+            return []
+        seen = {current[0]}
+        pending = [current]
+        found = [current]
         while pending:
-            pid = pending.pop()
-            ids = self._stat_ids(pid)
-            if ids is not None:
-                groups.add(ids[1])
-            for child in self._direct_children(pid):
-                if child not in seen:
-                    seen.add(child)
-                    pending.append(child)
-        owner = os.getpgrp()
-        return [group for group in groups if group > 1 and group != owner]
+            ident = self._matching_identity(pending.pop())
+            if ident is None:
+                continue
+            for child in self._direct_children(ident[0]):
+                child_ident = self._process_identity(child)
+                if child_ident is None or child in seen:
+                    continue
+                seen.add(child)
+                pending.append(child_ident)
+                found.append(child_ident)
+        return found
 
-    def _signal_groups(self, groups: list[int], number: int) -> None:
-        for pgid in groups:
+    def _signal_identities(self, identities: list[tuple[int, int, int]], number: int) -> None:
+        owner = os.getpgrp()
+        signaled: set[int] = set()
+        for recorded in identities:
+            current = self._matching_identity(recorded)
+            if current is None:
+                continue
+            pgid = current[2]
+            if pgid <= 1 or pgid == owner or pgid in signaled:
+                continue
             try:
                 os.killpg(pgid, number)
             except ProcessLookupError:
                 continue
+            signaled.add(pgid)
 
-    def _live_groups(self, groups: list[int]) -> bool:
-        for pgid in groups:
-            try:
-                os.killpg(pgid, 0)
-            except ProcessLookupError:
-                continue
-            return True
+    def _live_identities(self, identities: list[tuple[int, int, int]]) -> bool:
+        for recorded in identities:
+            if self._matching_identity(recorded) is not None:
+                return True
         return False
 
-    def _reap_tree(self, leader: int, timeout: float = 2) -> None:
-        groups = self._descendant_groups(leader)
-        if not groups:
+    def _reap_tree(self, leader: object, timeout: float = 2) -> None:
+        identities = self._owned_identities(leader)
+        if not identities:
             return
-        self._signal_groups(groups, signal.SIGTERM)
+        self._signal_identities(identities, signal.SIGTERM)
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and self._live_groups(groups):
+        while time.monotonic() < deadline and self._live_identities(identities):
             time.sleep(0.02)
-        if not self._live_groups(groups):
+        if not self._live_identities(identities):
             return
-        self._signal_groups(groups, signal.SIGKILL)
+        self._signal_identities(identities, signal.SIGKILL)
         deadline = time.monotonic() + 1
-        while time.monotonic() < deadline and self._live_groups(groups):
+        while time.monotonic() < deadline and self._live_identities(identities):
             time.sleep(0.02)
 
     def _reap_owned_groups(self) -> None:
@@ -585,6 +611,12 @@ class ActivationFixture:
         self._owned_groups.clear()
         for leader in groups:
             self._reap_tree(leader)
+
+    def _recorded_identity(self, pid: int) -> tuple[int, int, int] | None:
+        for identity in self._owned_groups:
+            if identity[0] == pid:
+                return identity
+        return None
 
     def run(self, *, optimized: bool = False, timeout: float = 20) -> subprocess.CompletedProcess[str]:
         self.save()
@@ -600,19 +632,21 @@ class ActivationFixture:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as error:
-            self._reap_tree(process.pid)
+            self._reap_tree(self._recorded_identity(process.pid))
             try:
                 process.communicate(timeout=2)
             except subprocess.TimeoutExpired:
                 process.wait(timeout=2)
+            self._forget_group(process.pid)
             raise error
         except BaseException:
-            self._reap_tree(process.pid)
+            self._reap_tree(self._recorded_identity(process.pid))
             try:
                 process.communicate(timeout=2)
             except subprocess.TimeoutExpired:
                 process.wait(timeout=2)
             raise
+        self._forget_group(process.pid)
         return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 
     def spawn(self, *, optimized: bool = False) -> subprocess.Popen[str]:
