@@ -18,6 +18,20 @@ QWEN36_UNIT = Path(
     "profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service"
 )
 EMBEDDING_UNIT = Path("profile/qwen3-embedding-8b/vllm-embedding.service")
+UNIT_PATHS = (
+    Path("profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service"),
+    Path("profile/querit-4b-reranker/vllm-querit-4b-reranker.service"),
+    EMBEDDING_UNIT,
+    Path("profile/qwen3-reranker-8b/vllm-qwen3-reranker-8b.service"),
+    QWEN36_UNIT,
+    Path("profile/qwen3.8-27b-nvfp4-vllm/vllm-aeon-qwen38-dflash.service"),
+)
+ALIASES = {
+    Path("profile/abliterated-qwen-latest-27b"): Path("aeon-ultimate-uncensored-nvfp4"),
+    Path("profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash-hikv.service"): Path(
+        "vllm-aeon-27b-dflash.service"
+    ),
+}
 CONTRACT = Path("scripts/gb10_embedding_profile_contract.py")
 STORAGE = Path("scripts/gb10_embedding_activation_storage.py")
 ACTIVATION = Path("scripts/gb10_embedding_activation.py")
@@ -41,6 +55,7 @@ ANNOTATION = re.compile(
     re.MULTILINE,
 )
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+IMAGE = re.compile(r"[0-9A-Za-z./:_-]+@sha256:[0-9a-f]{64}")
 
 
 def _sha256(text: str) -> str:
@@ -131,18 +146,25 @@ def _append_rollback(readme: str, guide: str, identity_test: str, old: dict[str,
 
 def _render(root: Path) -> dict[Path, str]:
     release = _load_release(root)
-    unit_paths = tuple(
-        sorted(
-            path.relative_to(root)
-            for path in (root / "profile").glob("*/*.service")
-            if not path.is_symlink()
-            and release["repository"] in path.read_text()
-        )
-    )
-    if not unit_paths:
-        raise ValueError("no active AEON vLLM unit consumers found")
+    for alias, target in ALIASES.items():
+        path = root / alias
+        if not path.is_symlink() or path.readlink() != target:
+            raise ValueError(f"{alias}: expected symlink target {target}")
+    for path in UNIT_PATHS:
+        candidate = root / path
+        if not candidate.is_file() or candidate.is_symlink():
+            raise ValueError(f"{path}: expected canonical AEON unit is missing")
+    discovered = {
+        path.resolve().relative_to(root)
+        for path in (root / "profile").glob("*/*.service")
+        if "# AEON image release:" in path.read_text()
+    }
+    if discovered != set(UNIT_PATHS):
+        missing = sorted(set(UNIT_PATHS) - discovered)
+        extra = sorted(discovered - set(UNIT_PATHS))
+        raise ValueError(f"AEON unit inventory mismatch: missing={missing}, extra={extra}")
 
-    paths = set((*unit_paths, *CURRENT_SURFACES, STORAGE, ACTIVATION, WRAPPER))
+    paths = set((*UNIT_PATHS, *CURRENT_SURFACES, STORAGE, ACTIVATION, WRAPPER))
     texts = {path: (root / path).read_text() for path in paths}
     canonical = texts[QWEN36_UNIT]
     match = ANNOTATION.search(canonical)
@@ -167,19 +189,25 @@ def _render(root: Path) -> dict[Path, str]:
     old_container_cache = f"aeon-qwen36-{old_cache}"
     new_container_cache = f"aeon-qwen36-{new_cache}"
 
-    for path in unit_paths:
+    expected_annotation = (
+        f"# AEON image release: {release['tag']}; immutable digest: "
+        f"{release['repository_digest']}"
+    )
+    expected_image = f"{release['repository']}@{release['repository_digest']}"
+    for path in UNIT_PATHS:
         text = texts[path]
         for key in ("repository", "tag", "repository_digest", "runtime_version"):
             text = _replace(text, old[key], release[key], str(path))
         if path == QWEN36_UNIT:
             text = _replace(text, old_host_cache, new_host_cache, str(path))
             text = _replace(text, old_container_cache, new_container_cache, str(path))
-        annotations = ANNOTATION.findall(text)
-        image = f"{release['repository']}@{release['repository_digest']}"
+        annotations = [match.group(0) for match in ANNOTATION.finditer(text)]
+        images = IMAGE.findall(text)
         descriptions = [line for line in text.splitlines() if line.startswith("Description=")]
-        if len(annotations) != 1 or text.count(image) != 1 or len(descriptions) != 1:
+        if annotations != [expected_annotation] or images != [expected_image] or len(descriptions) != 1:
             raise ValueError(f"{path}: generated unit release identity is ambiguous")
-        if release["runtime_version"] not in descriptions[0]:
+        versions = re.findall(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?", descriptions[0])
+        if versions != [release["runtime_version"]]:
             raise ValueError(f"{path}: Description does not identify the generated release")
         texts[path] = text
 
@@ -223,6 +251,18 @@ def _render(root: Path) -> dict[Path, str]:
     else:
         raise ValueError(f"{GUIDE}: compile-cache row is missing")
     texts[GUIDE] = "".join(guide_lines)
+
+    start = texts[GUIDE].find("The tracked text units retain")
+    end = texts[GUIDE].find("\n\n", start)
+    if start < 0 or end < 0:
+        raise ValueError(f"{GUIDE}: compile-cache troubleshooting guidance is missing")
+    guidance = texts[GUIDE][start:end]
+    if old["tag"] != release["tag"]:
+        guidance = _replace(guidance, old_host_cache, new_host_cache, str(GUIDE))
+        guidance = _replace(guidance, old_container_cache, new_container_cache, str(GUIDE))
+    if guidance.count(new_host_cache) != 1 or guidance.count(new_container_cache) != 2:
+        raise ValueError(f"{GUIDE}: compile-cache troubleshooting guidance is stale")
+    texts[GUIDE] = texts[GUIDE][:start] + guidance + texts[GUIDE][end:]
 
     command_note = (
         "For the next release, edit only `config/aeon-vllm-release.json`, then run\n"

@@ -778,21 +778,43 @@ class ActivationFixture:
     def _kill_unreaped(self, process: subprocess.Popen[str] | None) -> None:
         if process is None:
             return
-        if process.poll() is None:
-            process.kill()
+        errors: list[BaseException] = []
         streams = [stream for stream in (process.stdout, process.stderr) if stream is not None]
         try:
+            try:
+                running = process.poll() is None
+            except BaseException as error:
+                errors.append(error)
+                running = True
+            if running:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                except BaseException as error:
+                    errors.append(error)
             if any(not stream.closed for stream in streams):
                 try:
                     process.communicate(timeout=2)
-                except subprocess.TimeoutExpired:
-                    pass
-            process.wait(timeout=2)
+                except BaseException as error:
+                    errors.append(error)
+            try:
+                process.wait(timeout=2)
+            except BaseException as error:
+                errors.append(error)
+            try:
+                if process.poll() is None:
+                    errors.append(RuntimeError(f"owned process {process.pid} was not reaped"))
+            except BaseException as error:
+                errors.append(error)
         finally:
             for stream in streams:
-                stream.close()
-        if process.poll() is None:
-            raise RuntimeError(f"owned process {process.pid} was not reaped")
+                try:
+                    stream.close()
+                except BaseException as error:
+                    errors.append(error)
+        if errors:
+            raise BaseExceptionGroup(f"owned process {process.pid} cleanup failed", errors)
 
     def _reap_owned_groups(self) -> None:
         errors: list[BaseException] = []

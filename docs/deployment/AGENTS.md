@@ -454,8 +454,10 @@ evidence, not a v0.27.1-slim readiness diagnosis.**
 The tracked text units retain `MAX_JOBS=1` + `CMAKE_BUILD_PARALLEL_LEVEL=1` to
 serialize compilation. The container itself is ephemeral (`--rm`), but both text
 units bind-mount a host compile cache at
-`/home/obj/.cache/vllm-compile/aeon-qwen36-v0271-2fb855` into the container
-cache path, so host-side JIT/compile artifacts persist across container recycles.
+`/home/obj/.cache/vllm-compile/aeon-qwen36-v0290-2421bb` into
+`/var/cache/vllm/aeon-qwen36-v0290`, so host-side JIT/compile artifacts persist
+across container recycles. Retained v0.27.1 and v0.26.0 rollback cache namespaces
+listed in the current reference runtime above remain immutable history.
 This retained v0.25.1 observation does not establish v0.27.1-slim's HIGH-KV
 compilation/profiling latency. The integrated guardian remains active and enforces
 the configured 5 GiB `MemAvailable` threshold during startup; serialized

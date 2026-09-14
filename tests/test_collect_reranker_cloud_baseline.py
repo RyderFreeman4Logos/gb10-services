@@ -21,25 +21,43 @@ collector = importlib.import_module("collect_reranker_cloud_baseline")
 
 
 def _close_driver(process: subprocess.Popen[str]) -> None:
-    if process.poll() is None:
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
+    errors: list[BaseException] = []
+    streams = [stream for stream in (process.stdout, process.stderr) if stream is not None]
     try:
-        process.communicate(timeout=2)
-    except subprocess.TimeoutExpired:
-        for stream in (process.stdout, process.stderr):
-            if stream is not None:
-                stream.close()
+        try:
+            running = process.poll() is None
+        except BaseException as error:
+            errors.append(error)
+            running = True
+        if running:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except BaseException as error:
+                errors.append(error)
+        if any(not stream.closed for stream in streams):
+            try:
+                process.communicate(timeout=2)
+            except BaseException as error:
+                errors.append(error)
         try:
             process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            pass
+        except BaseException as error:
+            errors.append(error)
+        try:
+            if process.poll() is None:
+                errors.append(RuntimeError(f"driver process {process.pid} was not reaped"))
+        except BaseException as error:
+            errors.append(error)
     finally:
-        for stream in (process.stdout, process.stderr):
-            if stream is not None:
+        for stream in streams:
+            try:
                 stream.close()
+            except BaseException as error:
+                errors.append(error)
+    if errors:
+        raise BaseExceptionGroup(f"driver process {process.pid} cleanup failed", errors)
 
 
 class _OversizedHTTPResponse:
@@ -139,7 +157,10 @@ class CloudCollectorSafetyTests(unittest.TestCase):
             with self.subTest(returncode=returncode):
                 process = MagicMock(spec=subprocess.Popen)
                 process.pid = 12345
-                process.poll.return_value = returncode
+                process.poll.side_effect = (
+                    returncode,
+                    returncode if returncode is not None else -9,
+                )
                 process.stdout = io.StringIO()
                 process.stderr = io.StringIO()
                 process.communicate.return_value = ("", "")
@@ -151,6 +172,45 @@ class CloudCollectorSafetyTests(unittest.TestCase):
                 process.communicate.assert_called_once_with(timeout=2)
                 self.assertTrue(process.stdout.closed)
                 self.assertTrue(process.stderr.closed)
+
+    def test_driver_cleanup_aggregates_failures_and_still_reaps_and_closes(self) -> None:
+        for failure in ("poll", "kill", "communicate", "wait"):
+            with self.subTest(failure=failure):
+                process = MagicMock(spec=subprocess.Popen)
+                process.pid = 12345
+                process.stdout = io.StringIO()
+                process.stderr = io.StringIO()
+                process.poll.side_effect = (
+                    (PermissionError("poll denied"), -9)
+                    if failure == "poll"
+                    else (None, None if failure == "wait" else -9)
+                )
+                if failure == "kill":
+                    process.kill.side_effect = PermissionError("kill denied")
+                if failure == "communicate":
+                    process.communicate.side_effect = OSError("communicate failed")
+                if failure == "wait":
+                    process.wait.side_effect = subprocess.TimeoutExpired(["driver"], 2)
+                with self.assertRaises(ExceptionGroup):
+                    _close_driver(process)
+                process.kill.assert_called_once_with()
+                process.communicate.assert_called_once_with(timeout=2)
+                process.wait.assert_called_once_with(timeout=2)
+                self.assertTrue(process.stdout.closed)
+                self.assertTrue(process.stderr.closed)
+
+    def test_driver_cleanup_closes_streams_for_already_exited_process(self) -> None:
+        process = MagicMock(spec=subprocess.Popen)
+        process.poll.side_effect = (0, 0)
+        process.stdout = io.StringIO()
+        process.stderr = io.StringIO()
+        _close_driver(process)
+        process.kill.assert_not_called()
+        process.communicate.assert_called_once_with(timeout=2)
+        process.wait.assert_called_once_with(timeout=2)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+
     def test_empty_corpus_is_not_a_success_and_creates_no_artifacts(self) -> None:
         for dry_run in (False, True):
             with self.subTest(dry_run=dry_run), tempfile.TemporaryDirectory() as raw_tmp:

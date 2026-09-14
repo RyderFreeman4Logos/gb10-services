@@ -102,16 +102,45 @@ def _pidfd_reap_identity(recorded: tuple[int, int] | None) -> None:
 
 
 def _reap_owned_popen(process: subprocess.Popen[str] | subprocess.Popen[bytes] | None) -> None:
-    if process is None or process.poll() is not None:
+    if process is None:
         return
-    process.kill()
-    for stream in (process.stdout, process.stderr):
-        if stream is not None:
-            stream.close()
+    errors: list[BaseException] = []
+    streams = [stream for stream in (process.stdout, process.stderr) if stream is not None]
     try:
-        process.wait(timeout=2)
-    except Exception:
-        pass
+        try:
+            running = process.poll() is None
+        except BaseException as error:
+            errors.append(error)
+            running = True
+        if running:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except BaseException as error:
+                errors.append(error)
+        if any(not stream.closed for stream in streams):
+            try:
+                process.communicate(timeout=2)
+            except BaseException as error:
+                errors.append(error)
+        try:
+            process.wait(timeout=2)
+        except BaseException as error:
+            errors.append(error)
+        try:
+            if process.poll() is None:
+                errors.append(RuntimeError(f"owned process {process.pid} was not reaped"))
+        except BaseException as error:
+            errors.append(error)
+    finally:
+        for stream in streams:
+            try:
+                stream.close()
+            except BaseException as error:
+                errors.append(error)
+    if errors:
+        raise BaseExceptionGroup(f"owned process {process.pid} cleanup failed", errors)
 
 
 class EmbeddingActivationTransactionTests(unittest.TestCase):
@@ -1201,6 +1230,83 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             fixture._owned_groups.clear()
             fixture._owned_processes.clear()
             fixture.cleanup()
+
+    def test_root_cleanup_failures_still_attempt_bounded_reap_and_retain_owner(self) -> None:
+        for failure in ("poll", "kill", "communicate", "wait"):
+            with self.subTest(failure=failure):
+                process = MagicMock(spec=subprocess.Popen)
+                process.pid = 424242
+                process.stdout = io.StringIO()
+                process.stderr = io.StringIO()
+                process.poll.side_effect = (
+                    (PermissionError("poll denied"), -signal.SIGKILL)
+                    if failure == "poll"
+                    else (None, None if failure == "wait" else -signal.SIGKILL)
+                )
+                if failure == "kill":
+                    process.kill.side_effect = PermissionError("kill denied")
+                if failure == "communicate":
+                    process.communicate.side_effect = OSError("communicate failed")
+                if failure == "wait":
+                    process.wait.side_effect = subprocess.TimeoutExpired(["owned"], 2)
+                fixture = ActivationFixture()
+                try:
+                    fixture._owned_groups = [(process.pid, 1)]
+                    fixture._owned_processes = {process.pid: process}
+                    with (
+                        patch.object(fixture, "_reap_tree"),
+                        self.assertRaises(ExceptionGroup),
+                    ):
+                        fixture._reap_owned_groups()
+                    process.kill.assert_called_once_with()
+                    process.communicate.assert_called_once_with(timeout=2)
+                    process.wait.assert_called_once_with(timeout=2)
+                    self.assertTrue(process.stdout.closed)
+                    self.assertTrue(process.stderr.closed)
+                    self.assertIn(process.pid, fixture._owned_processes)
+                finally:
+                    fixture._owned_groups.clear()
+                    fixture._owned_processes.clear()
+                    fixture._unresolved_groups.clear()
+                    fixture.cleanup()
+
+    def test_emergency_popen_cleanup_aggregates_failures_and_closes_streams(self) -> None:
+        for failure in ("poll", "kill", "communicate", "wait"):
+            with self.subTest(failure=failure):
+                process = MagicMock(spec=subprocess.Popen)
+                process.pid = 424242
+                process.stdout = io.StringIO()
+                process.stderr = io.StringIO()
+                process.poll.side_effect = (
+                    (PermissionError("poll denied"), -signal.SIGKILL)
+                    if failure == "poll"
+                    else (None, None if failure == "wait" else -signal.SIGKILL)
+                )
+                if failure == "kill":
+                    process.kill.side_effect = PermissionError("kill denied")
+                if failure == "communicate":
+                    process.communicate.side_effect = OSError("communicate failed")
+                if failure == "wait":
+                    process.wait.side_effect = subprocess.TimeoutExpired(["owned"], 2)
+                with self.assertRaises(ExceptionGroup):
+                    _reap_owned_popen(process)
+                process.kill.assert_called_once_with()
+                process.communicate.assert_called_once_with(timeout=2)
+                process.wait.assert_called_once_with(timeout=2)
+                self.assertTrue(process.stdout.closed)
+                self.assertTrue(process.stderr.closed)
+
+    def test_emergency_popen_cleanup_closes_streams_for_already_exited_process(self) -> None:
+        process = MagicMock(spec=subprocess.Popen)
+        process.poll.side_effect = (0, 0)
+        process.stdout = io.StringIO()
+        process.stderr = io.StringIO()
+        _reap_owned_popen(process)
+        process.kill.assert_not_called()
+        process.communicate.assert_called_once_with(timeout=2)
+        process.wait.assert_called_once_with(timeout=2)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
 
     def test_run_preserves_timeout_when_cleanup_also_fails(self) -> None:
         timeout = subprocess.TimeoutExpired(["fake"], 0.01)
