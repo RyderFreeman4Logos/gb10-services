@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -322,6 +323,7 @@ class ActivationFixture:
         self.marker = self.root / "pause.marker"
         self.release = self.root / "pause.release"
         self.child_pid_path = self.root / "child.pid"
+        self._owned_groups: list[int] = []
         self.cgroup_root = self.root / "cgroup"
         for directory, mode in (
             (self.source_unit.parent, 0o755),
@@ -482,35 +484,149 @@ class ActivationFixture:
             env.pop("PYTHONOPTIMIZE", None)
         return env
 
+    def _engine_argv(self, *, optimized: bool) -> list[str]:
+        argv = ["/usr/bin/python3", "-I", "-B", "-S"]
+        if optimized:
+            argv.append("-O")
+        argv.extend([str(ACTIVATION_ENGINE), "--test-only", str(self.config)])
+        return argv
+
+    def _remember_group(self, pid: int) -> None:
+        if pid not in self._owned_groups:
+            self._owned_groups.append(pid)
+
+    def _stat_ids(self, pid: int) -> tuple[int, int] | None:
+        try:
+            payload = Path(f"/proc/{pid}/stat").read_text()
+        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+            return None
+        closing = payload.rfind(")")
+        if closing <= 1:
+            return None
+        fields = payload[closing + 2 :].split()
+        if len(fields) < 4:
+            return None
+        try:
+            return int(fields[1]), int(fields[2])
+        except ValueError:
+            return None
+
+    def _direct_children(self, pid: int) -> list[int]:
+        children: list[int] = []
+        task_root = Path(f"/proc/{pid}/task")
+        try:
+            tasks = list(task_root.iterdir())
+        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+            return children
+        for task in tasks:
+            try:
+                payload = (task / "children").read_text()
+            except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+                continue
+            children.extend(int(token) for token in payload.split() if token.isdigit())
+        return children
+
+    def _descendant_groups(self, leader: int) -> list[int]:
+        seen = {leader}
+        pending = [leader]
+        groups = {leader}
+        if self.child_pid_path.exists():
+            try:
+                child = int(self.child_pid_path.read_text())
+            except ValueError:
+                child = 0
+            if child > 1:
+                pending.append(child)
+        while pending:
+            pid = pending.pop()
+            ids = self._stat_ids(pid)
+            if ids is not None:
+                groups.add(ids[1])
+            for child in self._direct_children(pid):
+                if child not in seen:
+                    seen.add(child)
+                    pending.append(child)
+        owner = os.getpgrp()
+        return [group for group in groups if group > 1 and group != owner]
+
+    def _signal_groups(self, groups: list[int], number: int) -> None:
+        for pgid in groups:
+            try:
+                os.killpg(pgid, number)
+            except ProcessLookupError:
+                continue
+
+    def _live_groups(self, groups: list[int]) -> bool:
+        for pgid in groups:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                continue
+            return True
+        return False
+
+    def _reap_tree(self, leader: int, timeout: float = 2) -> None:
+        groups = self._descendant_groups(leader)
+        if not groups:
+            return
+        self._signal_groups(groups, signal.SIGTERM)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and self._live_groups(groups):
+            time.sleep(0.02)
+        if not self._live_groups(groups):
+            return
+        self._signal_groups(groups, signal.SIGKILL)
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and self._live_groups(groups):
+            time.sleep(0.02)
+
+    def _reap_owned_groups(self) -> None:
+        groups = list(self._owned_groups)
+        self._owned_groups.clear()
+        for leader in groups:
+            self._reap_tree(leader)
+
     def run(self, *, optimized: bool = False, timeout: float = 20) -> subprocess.CompletedProcess[str]:
         self.save()
-        argv = ["/usr/bin/python3", "-I", "-B", "-S"]
-        if optimized:
-            argv.append("-O")
-        argv.extend([str(ACTIVATION_ENGINE), "--test-only", str(self.config)])
-        return subprocess.run(
-            argv,
-            env=self.env(optimized=optimized),
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=timeout,
-        )
-
-    def spawn(self, *, optimized: bool = False) -> subprocess.Popen[str]:
-        self.save()
-        argv = ["/usr/bin/python3", "-I", "-B", "-S"]
-        if optimized:
-            argv.append("-O")
-        argv.extend([str(ACTIVATION_ENGINE), "--test-only", str(self.config)])
-        return subprocess.Popen(
-            argv,
+        process = subprocess.Popen(
+            self._engine_argv(optimized=optimized),
             env=self.env(optimized=optimized),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        self._remember_group(process.pid)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            self._reap_tree(process.pid)
+            try:
+                process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.wait(timeout=2)
+            raise error
+        except BaseException:
+            self._reap_tree(process.pid)
+            try:
+                process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.wait(timeout=2)
+            raise
+        return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+
+    def spawn(self, *, optimized: bool = False) -> subprocess.Popen[str]:
+        self.save()
+        process = subprocess.Popen(
+            self._engine_argv(optimized=optimized),
+            env=self.env(optimized=optimized),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        self._remember_group(process.pid)
+        return process
 
     def wait_for_marker(self, timeout: float = 5) -> None:
         deadline = time.monotonic() + timeout
@@ -536,6 +652,7 @@ class ActivationFixture:
         return self.command_log.read_text() if self.command_log.exists() else ""
 
     def cleanup(self) -> None:
+        self._reap_owned_groups()
         shutil.rmtree(self.root, ignore_errors=True)
         self.temporary.cleanup()
 

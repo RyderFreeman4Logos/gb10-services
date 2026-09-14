@@ -4,6 +4,7 @@ import importlib
 import io
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -329,18 +330,16 @@ worker, scripts, corpus, output, start, paid_log = sys.argv[1:]
 sys.path.insert(0, scripts)
 import collect_reranker_cloud_baseline as collector
 
-output_path = Path(output)
-original_append = collector._append_durable
+original_lock = collector._acquire_output_lock
 
-def synchronized_append(path, record):
-    if path == collector.intent_path(output_path):
-        Path(output + '.intent-ready-' + worker).touch()
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            if len(list(Path(output).parent.glob(Path(output).name + '.intent-ready-*'))) == 2:
-                break
-            time.sleep(0.005)
-    original_append(path, record)
+def synchronized_lock(locked_output):
+    Path(output + '.intent-ready-' + worker).touch()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if len(list(Path(output).parent.glob(Path(output).name + '.intent-ready-*'))) == 2:
+            return original_lock(locked_output)
+        time.sleep(0.005)
+    raise SystemExit('dual intent-ready deadlock')
 
 def paid_call(*_args, **_kwargs):
     descriptor = os.open(paid_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
@@ -351,7 +350,7 @@ def paid_call(*_args, **_kwargs):
         os.close(descriptor)
     return 200, {'input_tokens': 1, 'scores': [0.5]}, {'http_status': 200}
 
-collector._append_durable = synchronized_append
+collector._acquire_output_lock = synchronized_lock
 collector.call_deepinfra = paid_call
 while not Path(start).exists():
     time.sleep(0.005)
@@ -381,22 +380,38 @@ raise SystemExit(collector.main())
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    start_new_session=True,
                     env={**os.environ, "DEEPINFRA_KEY": "unit-secret"},
                 )
                 for worker in range(2)
             ]
-            time.sleep(0.05)
-            start.touch()
-            results = [process.communicate(timeout=8) for process in processes]
-
-            self.assertEqual(sorted(process.returncode for process in processes), [0, 2], results)
-            self.assertEqual(len(paid_log.read_text().splitlines()), 1)
-            self.assertEqual(len(output.read_text().splitlines()), 1)
-            self.assertEqual(len(collector.intent_path(output).read_text().splitlines()), 1)
-            lock = output.with_name(output.name + ".lock")
-            metadata = lock.stat()
-            self.assertEqual(metadata.st_uid, os.geteuid())
-            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            pids = [process.pid for process in processes]
+            try:
+                time.sleep(0.05)
+                start.touch()
+                results = [process.communicate(timeout=8) for process in processes]
+                self.assertEqual(sorted(process.returncode for process in processes), [0, 2], results)
+                self.assertEqual(len(paid_log.read_text().splitlines()), 1)
+                self.assertEqual(len(output.read_text().splitlines()), 1)
+                self.assertEqual(len(collector.intent_path(output).read_text().splitlines()), 1)
+                lock = output.with_name(output.name + ".lock")
+                metadata = lock.stat()
+                self.assertEqual(metadata.st_uid, os.geteuid())
+                self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            finally:
+                for process in processes:
+                    if process.poll() is None:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            pass
+            for pid in pids:
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
 
     def test_ambiguous_paid_transport_blocks_automatic_resume(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:

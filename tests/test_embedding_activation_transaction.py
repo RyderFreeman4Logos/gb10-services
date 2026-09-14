@@ -768,6 +768,32 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(child_pid, 0)
 
+    def test_outer_run_timeout_reaps_hang_once_group_before_next_fixture(self) -> None:
+        leaked: list[int] = []
+        try:
+            with ActivationFixture() as fixture:
+                fixture.state["hang_once"] = "show"
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    fixture.run(timeout=1)
+                self.assertTrue(fixture.child_pid_path.exists())
+                child_pid = int(fixture.child_pid_path.read_text())
+                leaked.append(child_pid)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(leaked[0], 0)
+            with ActivationFixture() as next_fixture:
+                result = next_fixture.run()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        finally:
+            for pid in leaked:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    continue
+                try:
+                    os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    pass
+
     def test_production_wrapper_has_no_test_or_environment_override_channel(self) -> None:
         source = ACTIVATOR.read_text()
         self.assertNotIn("--test-only", source)
