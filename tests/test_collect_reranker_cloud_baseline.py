@@ -4,7 +4,6 @@ import importlib
 import io
 import json
 import os
-import signal
 import stat
 import subprocess
 import sys
@@ -19,6 +18,28 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 collector = importlib.import_module("collect_reranker_cloud_baseline")
+
+
+def _close_driver(process: subprocess.Popen[str]) -> None:
+    if process.poll() is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        process.communicate(timeout=2)
+    except subprocess.TimeoutExpired:
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
 
 
 class _OversizedHTTPResponse:
@@ -113,6 +134,23 @@ def _run_main(
 
 
 class CloudCollectorSafetyTests(unittest.TestCase):
+    def test_driver_cleanup_uses_owned_popen_and_closes_pipes(self) -> None:
+        for returncode in (None, 0):
+            with self.subTest(returncode=returncode):
+                process = MagicMock(spec=subprocess.Popen)
+                process.pid = 12345
+                process.poll.return_value = returncode
+                process.stdout = io.StringIO()
+                process.stderr = io.StringIO()
+                process.communicate.return_value = ("", "")
+                with patch.object(os, "killpg") as killpg:
+                    _close_driver(process)
+                killpg.assert_not_called()
+                if returncode is None:
+                    process.kill.assert_called_once_with()
+                process.communicate.assert_called_once_with(timeout=2)
+                self.assertTrue(process.stdout.closed)
+                self.assertTrue(process.stderr.closed)
     def test_empty_corpus_is_not_a_success_and_creates_no_artifacts(self) -> None:
         for dry_run in (False, True):
             with self.subTest(dry_run=dry_run), tempfile.TemporaryDirectory() as raw_tmp:
@@ -380,7 +418,6 @@ raise SystemExit(collector.main())
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    start_new_session=True,
                     env={**os.environ, "DEEPINFRA_KEY": "unit-secret"},
                 )
                 for worker in range(2)
@@ -400,15 +437,7 @@ raise SystemExit(collector.main())
                 self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
             finally:
                 for process in processes:
-                    if process.poll() is None:
-                        try:
-                            os.killpg(process.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                        try:
-                            process.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            pass
+                    _close_driver(process)
             for pid in pids:
                 with self.assertRaises(ProcessLookupError):
                     os.kill(pid, 0)
