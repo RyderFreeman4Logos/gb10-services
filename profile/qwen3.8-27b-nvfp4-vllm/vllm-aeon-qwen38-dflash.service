@@ -1,12 +1,12 @@
 # SuperQwen3.8 NVFP4 + in-checkpoint MTP K=5 on AEON omni.
-# Image digest: sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee
+# AEON image release: 2026-09-11-v0.29.0-omni; immutable digest: sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7
 # Target: /home/obj/models/Jiunsong/SuperQwen3.8-27b-abliterated-NVFP4-DGX-Spark (sealed SHA256SUMS.json)
 # Speculative method qwen3_5_mtp is the official SuperQwen3.8 MTP name (fine-tuned checkpoint; DFlash2 is not compatible).
 # Sampling defaults come from the model generation_config (temperature=1.0, top_p=0.95, top_k=20; min_p/presence_penalty/repetition_penalty stay 0/0/1).
 # Chat template defaults enable_thinking=true and reasoning_effort=medium (low/medium/xhigh via chat_template_kwargs).
 # Capacity note: KV≥262144 is a live receipt, not a source claim.
 [Unit]
-Description=vLLM SuperQwen3.8-27B NVFP4 + MTP K=5 (prefix cache on)
+Description=vLLM SuperQwen3.8-27B NVFP4 + MTP K=5 (AEON v0.29.0-omni, prefix cache on)
 # Start after co-resident services are ordered, without requiring either one.
 After=network.target
 After=vllm-querit-4b-reranker.service
@@ -51,7 +51,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --memory-swap 70g \
   --oom-score-adj 800 \
   --entrypoint python3 \
-  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee \
+  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7 \
   /usr/local/bin/vllm \
   serve \
     --model /model \

@@ -23,7 +23,7 @@ graph TD
 
 ### The 5 Core Services
 1. **vllm-aeon-27b-dflash.service**
-   Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside the pinned AEON v0.27.1-slim GB10 Docker image for long-context processing up to 256k tokens, with FP8 KV cache and DFlash `TRITON_ATTN` enabled.
+   Serves the uncensored chat model (`aeon-ultimate`) utilizing the `DFlash` speculative decoding draft model. This is run inside the pinned AEON v0.29.0-omni GB10 Docker image for long-context processing up to 256k tokens, with FP8 KV cache and DFlash `TRITON_ATTN` enabled.
 2. **vllm-embedding.service**
    Serves BF16 `Qwen/Qwen3-Embedding-8B` with its full 4,096-dimensional output. This is the reliability-critical baseline service. The tracked source profile contracts for 32,768 tokens and 4,800 MiB explicit KV while preserving 8,192 batched tokens, 64 sequences, aliases, and quality semantics. It requests an equal 24g Docker memory/swap envelope (the 5 GiB OS pad lives outside every `--memory`), with the 32,768/4,800M quality contract unchanged. Before readiness, its verifier binds the full Docker ID, PID, Docker `StartedAt`, `/proc` PID starttime and canonical Docker scope, scope inode, and `cgroup.events` population, then proves `HostConfig.MemorySwap == HostConfig.Memory`, `memory.swap.max == 0`, and `memory.swap.current == 0` on that unchanged generation. Its raw backend listens only on port `18012`; clients should use `llm-guard-proxy` on port `18009` or the guard-owned legacy listener `18002` with model `qwen3-embedding-8b`.
 3. **vllm-querit-4b-reranker.service**
@@ -85,26 +85,29 @@ checkout owns the integrated guardian implementation and build. The retained
 `%t/gb10-memory-guardian` name is only the runtime registration directory
 shared by the proxy and text unit.
 
-### Reference Production Profile (source updated 2026-08-17)
+### Reference Production Profile (source updated 2026-09-14)
 
 The tracked source selects this friendly release and immutable repository digest
 for every AEON-backed unit. The running containers remain on their prior image
 until a separately authorized deployment changes them.
 
 ```text
-friendly tag: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-08-17-v0.27.1-slim
-repository digest: sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f
-rollback/superseded: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-08-16-v0.27.1 @ sha256:13c0df6a321ade60507a9026b0d2963ad51f0499a228de430eeba3bb74ad7954
-runtime version: v0.27.1-slim
+friendly tag: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-09-11-v0.29.0-omni
+repository digest: sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7
+rollback/superseded: 2026-08-24-v0.27.1-omni @ sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee; 2026-08-17-v0.27.1-slim @ sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f
+runtime version: v0.29.0-omni
 ```
 
-The v0.27.1-slim image's `ai.aeon.vllm_base` metadata identifies vLLM
-0.27.1+aeon.sm121a.dspark with torch 2.13.0+cu130 and FlashInfer 0.6.16.post3;
-the slim rebase is 18.3GB. Its inherited OCI description still names v0.25.1,
-so the dated friendly tag and immutable digest above are the release identity;
-the stale description is not release provenance. Historical prior-generation
-feature claims and deployment evidence remain in their dated research records
-and do not establish v0.27.1 behavior.
+The official package tag above resolves to the immutable OCI index digest shown
+above and selects the Linux ARM64 manifest
+`sha256:1cc0e0921ebf535db40f42e9d0cdf5ac0f94e5e01ac359216b8a51b79811a336`.
+The release name declares vLLM v0.29.0-omni; source pinning does not establish
+model readiness or feature compatibility. Historical prior-generation claims
+and deployment evidence remain in their dated research records.
+
+For the next release, edit only `config/aeon-vllm-release.json`, then run
+`python3 scripts/update_aeon_vllm_release.py`; it regenerates every literal
+unit/contract pin and the embedding activation authority-hash chain.
 
 Capacity contracts and evidence:
 
@@ -359,16 +362,17 @@ cp config/llm-guard-proxy/config.toml ~/.config/llm-guard-proxy/config.toml
 ```
 
 > [!NOTE]
-> Update the IP address `100.105.4.92` in `systemd/*.service` and `config/llm-guard-proxy/config.toml` to match your local or Tailscale network interface IP address.
+> Update the IP address `100.105.4.92` in `profile/*/*.service` and `config/llm-guard-proxy/config.toml` to match your local or Tailscale network interface IP address.
 
 ### Step 2: Install Systemd Services
 ```bash
 mkdir -p ~/.config/systemd/user/
 install -m 0644 profile/llm-guard-proxy/llm-guard-proxy.service \
-  systemd/vllm-querit-4b-reranker.service systemd/sysmon.service \
-  systemd/vllm-aeon-27b-dflash.service \
-  systemd/vllm-embedding.service \
-  systemd/vllm-qwen3-reranker-8b.service \
+  profile/querit-4b-reranker/vllm-querit-4b-reranker.service \
+  profile/sysmon/sysmon.service \
+  profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service \
+  profile/qwen3-embedding-8b/vllm-embedding.service \
+  profile/qwen3-reranker-8b/vllm-qwen3-reranker-8b.service \
   ~/.config/systemd/user/
 
 install -d -m 0755 ~/.config/gb10/aeon-dflash-profiles

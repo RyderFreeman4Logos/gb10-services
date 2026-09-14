@@ -29,6 +29,9 @@ AEON_UNIT = (
     / "vllm-aeon-27b-dflash.service"
 )
 GIB = 1024 * 1024 * 1024
+# A complete fake deployment performs 101 bounded commands, each preceded by the
+# real cryptographic profile-attestation path; 5s cannot contain its measured 8.2s.
+FULL_DEPLOY_TEST_TIMEOUT_SECONDS = 15
 
 
 def _canonical_aeon_docker_profile() -> tuple[list[str], int, int]:
@@ -354,7 +357,7 @@ class QueritDeployerContractTests(unittest.TestCase):
                 env=env,
                 text=True,
                 capture_output=True,
-                timeout=5,
+                timeout=FULL_DEPLOY_TEST_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -399,7 +402,7 @@ class QueritDeployerContractTests(unittest.TestCase):
                 env=env,
                 text=True,
                 capture_output=True,
-                timeout=5,
+                timeout=FULL_DEPLOY_TEST_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -431,7 +434,7 @@ class QueritDeployerContractTests(unittest.TestCase):
                     env=env,
                     text=True,
                     capture_output=True,
-                    timeout=5,
+                    timeout=FULL_DEPLOY_TEST_TIMEOUT_SECONDS,
                     check=False,
                 )
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -452,7 +455,7 @@ class QueritDeployerContractTests(unittest.TestCase):
                 env=env,
                 text=True,
                 capture_output=True,
-                timeout=5,
+                timeout=FULL_DEPLOY_TEST_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -471,7 +474,7 @@ class QueritDeployerContractTests(unittest.TestCase):
                 env=env,
                 text=True,
                 capture_output=True,
-                timeout=5,
+                timeout=FULL_DEPLOY_TEST_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -534,7 +537,7 @@ class QueritDeployerContractTests(unittest.TestCase):
                     env=env,
                     text=True,
                     capture_output=True,
-                    timeout=5,
+                    timeout=FULL_DEPLOY_TEST_TIMEOUT_SECONDS,
                     check=False,
                 )
                 self.assertNotEqual(result.returncode, 0)
@@ -568,7 +571,7 @@ class QueritDeployerContractTests(unittest.TestCase):
                 env=env,
                 text=True,
                 capture_output=True,
-                timeout=5,
+                timeout=FULL_DEPLOY_TEST_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -600,7 +603,7 @@ class QueritDeployerContractTests(unittest.TestCase):
                     env=env,
                     text=True,
                     capture_output=True,
-                    timeout=5,
+                    timeout=FULL_DEPLOY_TEST_TIMEOUT_SECONDS,
                     check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -623,7 +626,7 @@ class QueritDeployerContractTests(unittest.TestCase):
             )
             result = subprocess.run(
                 ["bash", str(DEPLOYER)], env=env, text=True,
-                capture_output=True, timeout=5, check=False,
+                capture_output=True, timeout=FULL_DEPLOY_TEST_TIMEOUT_SECONDS, check=False,
             )
             return result, calls.read_text().splitlines()
 
@@ -678,7 +681,7 @@ class QueritDeployerContractTests(unittest.TestCase):
                     env=env,
                     text=True,
                     capture_output=True,
-                    timeout=5,
+                    timeout=FULL_DEPLOY_TEST_TIMEOUT_SECONDS,
                     check=False,
                 )
                 self.assertNotEqual(result.returncode, 0)
@@ -705,7 +708,7 @@ class QueritDeployerContractTests(unittest.TestCase):
                 env=env,
                 text=True,
                 capture_output=True,
-                timeout=5,
+                timeout=FULL_DEPLOY_TEST_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0)
@@ -729,7 +732,7 @@ class QueritDeployerContractTests(unittest.TestCase):
                 env=env,
                 text=True,
                 capture_output=True,
-                timeout=5,
+                timeout=FULL_DEPLOY_TEST_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0)
@@ -828,7 +831,7 @@ class QueritDeployerContractTests(unittest.TestCase):
                     env=env,
                     text=True,
                     capture_output=True,
-                    timeout=5,
+                    timeout=FULL_DEPLOY_TEST_TIMEOUT_SECONDS,
                     check=False,
                 )
                 self.assertNotEqual(result.returncode, 0)
@@ -851,7 +854,7 @@ class QueritDeployerContractTests(unittest.TestCase):
                 env=env,
                 text=True,
                 capture_output=True,
-                timeout=5,
+                timeout=FULL_DEPLOY_TEST_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0)
@@ -903,7 +906,7 @@ class QueritDeployerContractTests(unittest.TestCase):
                 env=env,
                 text=True,
                 capture_output=True,
-                timeout=5,
+                timeout=FULL_DEPLOY_TEST_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0)
@@ -944,7 +947,7 @@ class QueritDeployerContractTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
-            deadline = time.monotonic() + 3
+            deadline = time.monotonic() + FULL_DEPLOY_TEST_TIMEOUT_SECONDS
             while not signal_marker.exists() and time.monotonic() < deadline:
                 time.sleep(0.02)
             self.assertTrue(signal_marker.exists(), "deployer did not reach Guard smoke")

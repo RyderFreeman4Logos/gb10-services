@@ -620,7 +620,18 @@ class GuardOfflineSelfTestTests(unittest.TestCase):
                 assert proc.stdout is not None
                 self.assertEqual(proc.stdout.readline().strip(), "READY")
                 main_pid = int((root / "main.pid").read_text())
-                descendant_pid = int((root / "descendant.pid").read_text())
+                descendant_text = ""
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    try:
+                        descendant_text = (root / "descendant.pid").read_text()
+                    except FileNotFoundError:
+                        pass
+                    if descendant_text.isdigit() and int(descendant_text) > 0:
+                        break
+                    time.sleep(0.01)
+                self.assertRegex(descendant_text, r"^[1-9][0-9]*$")
+                descendant_pid = int(descendant_text)
                 shown_main = subprocess.run(
                     [
                         smoke.SYSTEMCTL_BIN,

@@ -48,27 +48,20 @@ class ImageRelease:
 
 
 CURRENT_RELEASE = ImageRelease(
-    date="2026-08-17",
-    version="v0.27.1-slim",
-    digest="sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f",
+    date="2026-09-11",
+    version="v0.29.0-omni",
+    digest="sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7",
 )
-OMNI_RELEASE = ImageRelease(
-    date="2026-08-24",
-    version="v0.27.1-omni",
-    digest="sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee",
-)
-OMNI_UNITS = {
-    "vllm-embedding.service",
-    "vllm-querit-4b-reranker.service",
-    "vllm-aeon-qwen38-dflash.service",
-    "vllm-aeon-ultimate-uncensored-nvfp4.service",
-}
 PREVIOUS_RELEASE = ImageRelease(
     date="2026-07-16",
     version="v0.25.1",
     digest="sha256:c15e2c4b767c611fc739046129d550d0c347c906a3c9020888acc981f55f137d",
 )
 SUPERSEDED_MARKERS = (
+    "2026-08-24-v0.27.1-omni",
+    "2026-08-17-v0.27.1-slim",
+    "e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee",
+    "2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f",
     "2026-07-14-v0.25.0",
     "18c09e6b",
     "0.25.0+aeon.sm121a.dflash",
@@ -169,27 +162,13 @@ class VllmImageIdentityContractTests(unittest.TestCase):
             text = path.read_text()
             with self.subTest(path=path.relative_to(ROOT)):
                 annotations = _release_annotations(text)
-                expected_annotations = (
-                    []
-                    if path.name == "vllm-aeon-qwen38-dflash.service"
-                    else [OMNI_RELEASE]
-                    if path.name
-                    in {
-                        "vllm-aeon-ultimate-uncensored-nvfp4.service",
-                        "vllm-querit-4b-reranker.service",
-                    }
-                    else [CURRENT_RELEASE]
-                )
-                self.assertEqual(annotations, expected_annotations)
-                expected_release = (
-                    OMNI_RELEASE if path.name in OMNI_UNITS else CURRENT_RELEASE
-                )
+                self.assertEqual(annotations, [CURRENT_RELEASE])
                 self.assertEqual(
                     re.findall(
                         rf"{re.escape(IMAGE_REPOSITORY)}@sha256:[0-9a-f]{{64}}",
                         text,
                     ),
-                    [expected_release.image_reference],
+                    [CURRENT_RELEASE.image_reference],
                 )
                 descriptions = [
                     line
@@ -197,17 +176,12 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                     if line.startswith("Description=")
                 ]
                 self.assertEqual(len(descriptions), 1)
-                if path.name not in {
-                    "vllm-aeon-qwen38-dflash.service",
-                    "vllm-aeon-ultimate-uncensored-nvfp4.service",
-                    "vllm-querit-4b-reranker.service",
-                }:
-                    self.assertIn(CURRENT_RELEASE.version, descriptions[0])
+                self.assertIn(CURRENT_RELEASE.version, descriptions[0])
                 self.assertNotRegex(text, r"aeon-vllm-ultimate:[^\s\\]+")
 
     def test_aeon_compile_cache_namespace_rotates_with_the_release(self) -> None:
-        host_cache = "/home/obj/.cache/vllm-compile/aeon-qwen36-v0271-2fb855"
-        container_cache = "/var/cache/vllm/aeon-qwen36-v0271"
+        host_cache = "/home/obj/.cache/vllm-compile/aeon-qwen36-v0290-2421bb"
+        container_cache = "/var/cache/vllm/aeon-qwen36-v0290"
         for unit_name in ("vllm-aeon-27b-dflash.service",):
             text = UNIT_PATHS[unit_name].read_text()
             with self.subTest(unit=unit_name):
@@ -264,7 +238,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
 
     def test_current_docs_publish_one_coherent_release_identity(self) -> None:
         readme = (ROOT / "README.md").read_text()
-        self.assertIn("pinned AEON v0.27.1-slim GB10 Docker image", readme)
+        self.assertIn("pinned AEON v0.29.0-omni GB10 Docker image", readme)
         self.assertNotIn("pinned AEON v0.25 GB10 Docker image", readme)
         self.assertRegex(
             readme,
@@ -279,8 +253,8 @@ class VllmImageIdentityContractTests(unittest.TestCase):
 
         guide = (ROOT / "docs" / "deployment" / "AGENTS.md").read_text()
         self.assertIn(
-            f"`{IMAGE_REPOSITORY}:{OMNI_RELEASE.tag}` "
-            f"(`{OMNI_RELEASE.digest}`; runtime `{OMNI_RELEASE.version}`)",
+            f"`{IMAGE_REPOSITORY}:{CURRENT_RELEASE.tag}` "
+            f"(`{CURRENT_RELEASE.digest}`; runtime `{CURRENT_RELEASE.version}`)",
             guide,
         )
 
@@ -290,7 +264,17 @@ class VllmImageIdentityContractTests(unittest.TestCase):
             (ROOT / "docs" / "deployment" / "AGENTS.md").read_text(),
         )
         for document in documents:
-            self.assertIn("systemd/vllm-aeon-27b-dflash.service", document)
+            self.assertIn(
+                "profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service",
+                document,
+            )
+            self.assertIn(
+                "profile/qwen3-embedding-8b/vllm-embedding.service", document
+            )
+            self.assertIn(
+                "profile/querit-4b-reranker/vllm-querit-4b-reranker.service",
+                document,
+            )
             self.assertIn("vllm-aeon-27b-dflash-hikv.service", document)
             self.assertIn("active.env", document)
 
@@ -360,7 +344,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
             "gpu-memory-utilization=0.355",
             "hikv.env",
             "286,962 KV tokens",
-            "record a v0.27.1 live receipt",
+            "record a v0.29.0 live receipt",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, reference_row)

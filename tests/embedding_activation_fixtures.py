@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
+import select
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
+
+_PIDFD_OPEN = 434
+_PIDFD_SEND_SIGNAL = 424
 
 ROOT = Path(__file__).resolve().parents[1]
 UNIT = "vllm-embedding.service"
@@ -322,6 +329,9 @@ class ActivationFixture:
         self.marker = self.root / "pause.marker"
         self.release = self.root / "pause.release"
         self.child_pid_path = self.root / "child.pid"
+        self._owned_groups: list[tuple[int, int]] = []
+        self._owned_processes: dict[int, subprocess.Popen[str]] = {}
+        self._unresolved_groups: set[int] = set()
         self.cgroup_root = self.root / "cgroup"
         for directory, mode in (
             (self.source_unit.parent, 0o755),
@@ -482,35 +492,406 @@ class ActivationFixture:
             env.pop("PYTHONOPTIMIZE", None)
         return env
 
+    def _engine_argv(self, *, optimized: bool) -> list[str]:
+        argv = ["/usr/bin/python3", "-I", "-B", "-S"]
+        if optimized:
+            argv.append("-O")
+        argv.extend([str(ACTIVATION_ENGINE), "--test-only", str(self.config)])
+        return argv
+
+    def _remember_group(self, process: subprocess.Popen[str]) -> None:
+        pid = process.pid
+        if pid is None:
+            return
+        self._owned_processes[pid] = process
+        try:
+            identity = self._process_identity(pid)
+        except Exception:
+            self._unresolved_groups.add(pid)
+            return
+        if identity is None:
+            self._unresolved_groups.add(pid)
+        elif identity not in self._owned_groups:
+            self._owned_groups.append(identity)
+
+    def _forget_group(self, pid: int) -> None:
+        retained: list[tuple[int, int]] = []
+        for identity in self._owned_groups:
+            if not isinstance(identity, tuple) or len(identity) != 2:
+                continue
+            try:
+                if int(identity[0]) != pid:
+                    retained.append(identity)
+            except (TypeError, ValueError):
+                continue
+        self._owned_groups = retained
+        self._owned_processes.pop(pid, None)
+        self._unresolved_groups.discard(pid)
+
+    def _process_identity(self, pid: int) -> tuple[int, int] | None:
+        state = self._stat_process(pid)
+        if state is None:
+            return None
+        return pid, state[1]
+
+    def _matching_identity(self, recorded: object) -> tuple[int, int] | None:
+        if not isinstance(recorded, tuple) or len(recorded) != 2:
+            return None
+        try:
+            pid, starttime = int(recorded[0]), int(recorded[1])
+        except (TypeError, ValueError):
+            return None
+        if pid <= 1 or pid == os.getpid():
+            return None
+        current = self._process_identity(pid)
+        if current is None or current != (pid, starttime):
+            return None
+        return current
+
+    def _stat_process(self, pid: int) -> tuple[int, int] | None:
+        try:
+            payload = Path(f"/proc/{pid}/stat").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        closing = payload.rfind(")")
+        if closing <= 1:
+            raise RuntimeError(f"malformed /proc/{pid}/stat")
+        fields = payload[closing + 2 :].split()
+        if len(fields) < 20:
+            raise RuntimeError(f"short /proc/{pid}/stat")
+        try:
+            return int(fields[1]), int(fields[19])
+        except ValueError as error:
+            raise RuntimeError(f"invalid /proc/{pid}/stat") from error
+
+    def _stat_starttime(self, pid: int) -> int | None:
+        state = self._stat_process(pid)
+        return None if state is None else state[1]
+
+    def _direct_children(self, pid: int) -> list[int]:
+        children: list[int] = []
+        task_root = Path(f"/proc/{pid}/task")
+        try:
+            tasks = list(task_root.iterdir())
+        except (FileNotFoundError, ProcessLookupError):
+            return children
+        for task in tasks:
+            try:
+                payload = (task / "children").read_text()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            children.extend(int(token) for token in payload.split() if token.isdigit())
+        return children
+
+    def _owned_identities(self, leader: object) -> list[tuple[int, int, int]]:
+        current = self._matching_identity(leader)
+        if current is None or current[0] not in self._owned_processes:
+            return []
+        if self._recorded_identity(current[0]) != current:
+            return []
+        root_fd = self._pin_pidfd(current)
+        if root_fd is None:
+            return []
+        seen = {current[0]}
+        pending = [(current[0], current[1], root_fd)]
+        found = list(pending)
+        try:
+            while pending:
+                parent_pid, parent_starttime, parent_fd = pending.pop()
+                parent_state = self._stat_process(parent_pid)
+                if parent_state is None or parent_state[1] != parent_starttime:
+                    continue
+                for child in self._direct_children(parent_pid):
+                    if child in seen:
+                        continue
+                    child_fd = self._open_pidfd(child)
+                    if child_fd is None:
+                        continue
+                    retain = False
+                    try:
+                        child_state = self._stat_process(child)
+                        parent_state = self._stat_process(parent_pid)
+                        if (
+                            child_state is None
+                            or parent_state is None
+                            or child_state[0] != parent_pid
+                            or parent_state[1] != parent_starttime
+                        ):
+                            continue
+                        self._pidfd_send(parent_fd, 0)
+                        self._pidfd_send(child_fd, 0)
+                        child_ident = (child, child_state[1], child_fd)
+                        seen.add(child)
+                        pending.append(child_ident)
+                        found.append(child_ident)
+                        retain = True
+                    except ProcessLookupError:
+                        continue
+                    finally:
+                        if not retain:
+                            os.close(child_fd)
+        except BaseException:
+            for _pid, _starttime, fd in found:
+                os.close(fd)
+            raise
+        return found
+
+    def _pin_gap(self, recorded: object, fd: int) -> None:
+        return None
+
+    def _open_pidfd(self, pid: int) -> int | None:
+        if hasattr(os, "pidfd_open"):
+            try:
+                return os.pidfd_open(pid, 0)
+            except (FileNotFoundError, ProcessLookupError):
+                return None
+            except OSError as error:
+                if error.errno == errno.ESRCH:
+                    return None
+                raise
+        if os.uname().machine != "x86_64":
+            raise OSError(errno.ENOSYS, "pidfd_open unavailable")
+        libc = ctypes.CDLL(None, use_errno=True)
+        fd = libc.syscall(_PIDFD_OPEN, ctypes.c_int(pid), ctypes.c_uint(0))
+        if fd < 0:
+            err = ctypes.get_errno()
+            if err == errno.ESRCH:
+                return None
+            raise OSError(err, "pidfd_open")
+        return int(fd)
+
+    def _pidfd_send(self, fd: int, number: int) -> None:
+        if hasattr(signal, "pidfd_send_signal"):
+            signal.pidfd_send_signal(fd, number, None, 0)
+            return
+        if os.uname().machine != "x86_64":
+            raise OSError(errno.ENOSYS, "pidfd_send_signal unavailable")
+        libc = ctypes.CDLL(None, use_errno=True)
+        rc = libc.syscall(
+            _PIDFD_SEND_SIGNAL,
+            ctypes.c_int(fd),
+            ctypes.c_int(number),
+            ctypes.c_void_p(),
+            ctypes.c_uint(0),
+        )
+        if rc < 0:
+            err = ctypes.get_errno()
+            if err == errno.ESRCH:
+                raise ProcessLookupError(err, "No such process")
+            raise OSError(err, "pidfd_send_signal")
+
+    def _pin_pidfd(self, recorded: object) -> int | None:
+        current = self._matching_identity(recorded)
+        if current is None:
+            return None
+        fd = self._open_pidfd(current[0])
+        if fd is None:
+            return None
+        keep = False
+        try:
+            if self._matching_identity(recorded) is None:
+                return None
+            self._pidfd_send(fd, 0)
+            keep = True
+            return fd
+        except ProcessLookupError:
+            return None
+        finally:
+            if not keep:
+                os.close(fd)
+
+    def _signal_identities(
+        self,
+        identities: list[tuple[int, int, int]],
+        number: int,
+        errors: list[BaseException],
+    ) -> int:
+        sent = 0
+        ordered = list(reversed(identities[1:])) + identities[:1]
+        for pid, starttime, fd in ordered:
+            recorded = (pid, starttime)
+            try:
+                self._pin_gap(recorded, fd)
+                self._pidfd_send(fd, number)
+                sent += 1
+            except ProcessLookupError:
+                sent += 1
+            except OSError as error:
+                errors.append(error)
+        return sent
+
+    def _live_identities(self, identities: list[tuple[int, int, int]]) -> bool:
+        for _pid, _starttime, fd in identities:
+            poller = select.poll()
+            poller.register(fd, select.POLLIN)
+            if poller.poll(0):
+                continue
+            try:
+                self._pidfd_send(fd, 0)
+            except ProcessLookupError:
+                continue
+            return True
+        return False
+
+    def _wait_identities(
+        self,
+        identities: list[tuple[int, int, int]],
+        timeout: float,
+        errors: list[BaseException],
+    ) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if not self._live_identities(identities):
+                    return False
+            except OSError as error:
+                errors.append(error)
+                return True
+            time.sleep(0.02)
+        return True
+
+    def _reap_tree(self, leader: object, timeout: float = 2) -> None:
+        identities: list[tuple[int, int, int]] = []
+        errors: list[BaseException] = []
+        try:
+            try:
+                identities = self._owned_identities(leader)
+            except BaseException as error:
+                errors.append(error)
+            if identities:
+                self._signal_identities(identities, signal.SIGTERM, errors)
+                live = self._wait_identities(identities, timeout, errors)
+                if live:
+                    self._signal_identities(identities, signal.SIGKILL, errors)
+                    self._wait_identities(identities[1:], 1, errors)
+                try:
+                    if self._live_identities(identities[1:]):
+                        errors.append(RuntimeError("owned descendants remain live"))
+                except OSError as error:
+                    errors.append(error)
+        finally:
+            for _pid, _starttime, fd in identities:
+                os.close(fd)
+        if errors:
+            raise BaseExceptionGroup("subprocess tree cleanup failed", errors)
+
+    def _kill_unreaped(self, process: subprocess.Popen[str] | None) -> None:
+        if process is None:
+            return
+        errors: list[BaseException] = []
+        streams = [stream for stream in (process.stdout, process.stderr) if stream is not None]
+        try:
+            try:
+                running = process.poll() is None
+            except BaseException as error:
+                errors.append(error)
+                running = True
+            if running:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                except BaseException as error:
+                    errors.append(error)
+            if any(not stream.closed for stream in streams):
+                try:
+                    process.communicate(timeout=2)
+                except BaseException as error:
+                    errors.append(error)
+            try:
+                process.wait(timeout=2)
+            except BaseException as error:
+                errors.append(error)
+            try:
+                if process.poll() is None:
+                    errors.append(RuntimeError(f"owned process {process.pid} was not reaped"))
+            except BaseException as error:
+                errors.append(error)
+        finally:
+            for stream in streams:
+                try:
+                    stream.close()
+                except BaseException as error:
+                    errors.append(error)
+        if errors:
+            raise BaseExceptionGroup(f"owned process {process.pid} cleanup failed", errors)
+
+    def _reap_owned_groups(self) -> None:
+        errors: list[BaseException] = []
+        for pid, process in list(self._owned_processes.items()):
+            process_errors: list[BaseException] = []
+            if pid in self._unresolved_groups:
+                process_errors.append(RuntimeError(f"cleanup state is unresolved for process {pid}"))
+            leader = self._recorded_identity(pid)
+            if leader is None:
+                process_errors.append(RuntimeError(f"identity unavailable for owned process {pid}"))
+            else:
+                try:
+                    self._reap_tree(leader)
+                except BaseException as error:
+                    process_errors.append(error)
+            try:
+                self._kill_unreaped(process)
+            except BaseException as error:
+                process_errors.append(error)
+            if process_errors:
+                self._unresolved_groups.add(pid)
+                errors.extend(process_errors)
+            else:
+                self._forget_group(pid)
+        if errors:
+            raise BaseExceptionGroup("subprocess cleanup failed", errors)
+
+    def _recorded_identity(self, pid: int) -> tuple[int, int] | None:
+        for identity in self._owned_groups:
+            if isinstance(identity, tuple) and len(identity) == 2:
+                try:
+                    if int(identity[0]) == pid:
+                        return pid, int(identity[1])
+                except (TypeError, ValueError):
+                    continue
+        return None
+
     def run(self, *, optimized: bool = False, timeout: float = 20) -> subprocess.CompletedProcess[str]:
         self.save()
-        argv = ["/usr/bin/python3", "-I", "-B", "-S"]
-        if optimized:
-            argv.append("-O")
-        argv.extend([str(ACTIVATION_ENGINE), "--test-only", str(self.config)])
-        return subprocess.run(
-            argv,
-            env=self.env(optimized=optimized),
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=timeout,
-        )
-
-    def spawn(self, *, optimized: bool = False) -> subprocess.Popen[str]:
-        self.save()
-        argv = ["/usr/bin/python3", "-I", "-B", "-S"]
-        if optimized:
-            argv.append("-O")
-        argv.extend([str(ACTIVATION_ENGINE), "--test-only", str(self.config)])
-        return subprocess.Popen(
-            argv,
+        process = subprocess.Popen(
+            self._engine_argv(optimized=optimized),
             env=self.env(optimized=optimized),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        self._remember_group(process)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            try:
+                self._reap_owned_groups()
+            except BaseException as cleanup_error:
+                error.add_note(f"subprocess cleanup also failed: {cleanup_error!r}")
+            raise
+        except BaseException as error:
+            try:
+                self._reap_owned_groups()
+            except BaseException as cleanup_error:
+                error.add_note(f"subprocess cleanup also failed: {cleanup_error!r}")
+            raise
+        self._forget_group(process.pid)
+        return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+
+    def spawn(self, *, optimized: bool = False) -> subprocess.Popen[str]:
+        self.save()
+        process = subprocess.Popen(
+            self._engine_argv(optimized=optimized),
+            env=self.env(optimized=optimized),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        self._remember_group(process)
+        return process
 
     def wait_for_marker(self, timeout: float = 5) -> None:
         deadline = time.monotonic() + timeout
@@ -536,6 +917,7 @@ class ActivationFixture:
         return self.command_log.read_text() if self.command_log.exists() else ""
 
     def cleanup(self) -> None:
+        self._reap_owned_groups()
         shutil.rmtree(self.root, ignore_errors=True)
         self.temporary.cleanup()
 

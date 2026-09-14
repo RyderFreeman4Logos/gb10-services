@@ -20,6 +20,46 @@ sys.path.insert(0, str(ROOT / "scripts"))
 collector = importlib.import_module("collect_reranker_cloud_baseline")
 
 
+def _close_driver(process: subprocess.Popen[str]) -> None:
+    errors: list[BaseException] = []
+    streams = [stream for stream in (process.stdout, process.stderr) if stream is not None]
+    try:
+        try:
+            running = process.poll() is None
+        except BaseException as error:
+            errors.append(error)
+            running = True
+        if running:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except BaseException as error:
+                errors.append(error)
+        if any(not stream.closed for stream in streams):
+            try:
+                process.communicate(timeout=2)
+            except BaseException as error:
+                errors.append(error)
+        try:
+            process.wait(timeout=2)
+        except BaseException as error:
+            errors.append(error)
+        try:
+            if process.poll() is None:
+                errors.append(RuntimeError(f"driver process {process.pid} was not reaped"))
+        except BaseException as error:
+            errors.append(error)
+    finally:
+        for stream in streams:
+            try:
+                stream.close()
+            except BaseException as error:
+                errors.append(error)
+    if errors:
+        raise BaseExceptionGroup(f"driver process {process.pid} cleanup failed", errors)
+
+
 class _OversizedHTTPResponse:
     status = 200
     headers: dict[str, str] = {}
@@ -112,6 +152,65 @@ def _run_main(
 
 
 class CloudCollectorSafetyTests(unittest.TestCase):
+    def test_driver_cleanup_uses_owned_popen_and_closes_pipes(self) -> None:
+        for returncode in (None, 0):
+            with self.subTest(returncode=returncode):
+                process = MagicMock(spec=subprocess.Popen)
+                process.pid = 12345
+                process.poll.side_effect = (
+                    returncode,
+                    returncode if returncode is not None else -9,
+                )
+                process.stdout = io.StringIO()
+                process.stderr = io.StringIO()
+                process.communicate.return_value = ("", "")
+                with patch.object(os, "killpg") as killpg:
+                    _close_driver(process)
+                killpg.assert_not_called()
+                if returncode is None:
+                    process.kill.assert_called_once_with()
+                process.communicate.assert_called_once_with(timeout=2)
+                self.assertTrue(process.stdout.closed)
+                self.assertTrue(process.stderr.closed)
+
+    def test_driver_cleanup_aggregates_failures_and_still_reaps_and_closes(self) -> None:
+        for failure in ("poll", "kill", "communicate", "wait"):
+            with self.subTest(failure=failure):
+                process = MagicMock(spec=subprocess.Popen)
+                process.pid = 12345
+                process.stdout = io.StringIO()
+                process.stderr = io.StringIO()
+                process.poll.side_effect = (
+                    (PermissionError("poll denied"), -9)
+                    if failure == "poll"
+                    else (None, None if failure == "wait" else -9)
+                )
+                if failure == "kill":
+                    process.kill.side_effect = PermissionError("kill denied")
+                if failure == "communicate":
+                    process.communicate.side_effect = OSError("communicate failed")
+                if failure == "wait":
+                    process.wait.side_effect = subprocess.TimeoutExpired(["driver"], 2)
+                with self.assertRaises(ExceptionGroup):
+                    _close_driver(process)
+                process.kill.assert_called_once_with()
+                process.communicate.assert_called_once_with(timeout=2)
+                process.wait.assert_called_once_with(timeout=2)
+                self.assertTrue(process.stdout.closed)
+                self.assertTrue(process.stderr.closed)
+
+    def test_driver_cleanup_closes_streams_for_already_exited_process(self) -> None:
+        process = MagicMock(spec=subprocess.Popen)
+        process.poll.side_effect = (0, 0)
+        process.stdout = io.StringIO()
+        process.stderr = io.StringIO()
+        _close_driver(process)
+        process.kill.assert_not_called()
+        process.communicate.assert_called_once_with(timeout=2)
+        process.wait.assert_called_once_with(timeout=2)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+
     def test_empty_corpus_is_not_a_success_and_creates_no_artifacts(self) -> None:
         for dry_run in (False, True):
             with self.subTest(dry_run=dry_run), tempfile.TemporaryDirectory() as raw_tmp:
@@ -329,18 +428,16 @@ worker, scripts, corpus, output, start, paid_log = sys.argv[1:]
 sys.path.insert(0, scripts)
 import collect_reranker_cloud_baseline as collector
 
-output_path = Path(output)
-original_append = collector._append_durable
+original_lock = collector._acquire_output_lock
 
-def synchronized_append(path, record):
-    if path == collector.intent_path(output_path):
-        Path(output + '.intent-ready-' + worker).touch()
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            if len(list(Path(output).parent.glob(Path(output).name + '.intent-ready-*'))) == 2:
-                break
-            time.sleep(0.005)
-    original_append(path, record)
+def synchronized_lock(locked_output):
+    Path(output + '.intent-ready-' + worker).touch()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if len(list(Path(output).parent.glob(Path(output).name + '.intent-ready-*'))) == 2:
+            return original_lock(locked_output)
+        time.sleep(0.005)
+    raise SystemExit('dual intent-ready deadlock')
 
 def paid_call(*_args, **_kwargs):
     descriptor = os.open(paid_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
@@ -351,7 +448,7 @@ def paid_call(*_args, **_kwargs):
         os.close(descriptor)
     return 200, {'input_tokens': 1, 'scores': [0.5]}, {'http_status': 200}
 
-collector._append_durable = synchronized_append
+collector._acquire_output_lock = synchronized_lock
 collector.call_deepinfra = paid_call
 while not Path(start).exists():
     time.sleep(0.005)
@@ -385,18 +482,25 @@ raise SystemExit(collector.main())
                 )
                 for worker in range(2)
             ]
-            time.sleep(0.05)
-            start.touch()
-            results = [process.communicate(timeout=8) for process in processes]
-
-            self.assertEqual(sorted(process.returncode for process in processes), [0, 2], results)
-            self.assertEqual(len(paid_log.read_text().splitlines()), 1)
-            self.assertEqual(len(output.read_text().splitlines()), 1)
-            self.assertEqual(len(collector.intent_path(output).read_text().splitlines()), 1)
-            lock = output.with_name(output.name + ".lock")
-            metadata = lock.stat()
-            self.assertEqual(metadata.st_uid, os.geteuid())
-            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            pids = [process.pid for process in processes]
+            try:
+                time.sleep(0.05)
+                start.touch()
+                results = [process.communicate(timeout=8) for process in processes]
+                self.assertEqual(sorted(process.returncode for process in processes), [0, 2], results)
+                self.assertEqual(len(paid_log.read_text().splitlines()), 1)
+                self.assertEqual(len(output.read_text().splitlines()), 1)
+                self.assertEqual(len(collector.intent_path(output).read_text().splitlines()), 1)
+                lock = output.with_name(output.name + ".lock")
+                metadata = lock.stat()
+                self.assertEqual(metadata.st_uid, os.geteuid())
+                self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            finally:
+                for process in processes:
+                    _close_driver(process)
+            for pid in pids:
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
 
     def test_ambiguous_paid_transport_blocks_automatic_resume(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:

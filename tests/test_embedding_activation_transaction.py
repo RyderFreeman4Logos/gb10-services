@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import ast
 import ctypes
+import errno
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import pwd
@@ -16,7 +18,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from embedding_activation_fixtures import (  # noqa: E402
     ACTIVATION_ENGINE,
@@ -50,6 +52,95 @@ def _literal_string_map(path: Path, name: str) -> dict[str, str]:
     ):
         raise AssertionError(f"missing literal string-map authority {name} in {path}")
     return value
+
+
+def _stat_starttime(pid: int) -> int | None:
+    try:
+        payload = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+    closing = payload.rfind(")")
+    if closing <= 1:
+        return None
+    fields = payload[closing + 2 :].split()
+    if len(fields) < 20:
+        return None
+    try:
+        return int(fields[19])
+    except ValueError:
+        return None
+
+
+def _identity(pid: int) -> tuple[int, int] | None:
+    starttime = _stat_starttime(pid)
+    if starttime is None:
+        return None
+    return pid, starttime
+
+
+def _pidfd_reap_identity(recorded: tuple[int, int] | None) -> None:
+    if recorded is None:
+        return
+    pid, starttime = recorded
+    if pid <= 1 or pid == os.getpid():
+        return
+    if _identity(pid) != (pid, starttime):
+        return
+    try:
+        fd = os.pidfd_open(pid, 0)
+    except OSError:
+        return
+    try:
+        if _identity(pid) != (pid, starttime):
+            return
+        try:
+            signal.pidfd_send_signal(fd, signal.SIGKILL, None, 0)
+        except ProcessLookupError:
+            return
+    finally:
+        os.close(fd)
+
+
+def _reap_owned_popen(process: subprocess.Popen[str] | subprocess.Popen[bytes] | None) -> None:
+    if process is None:
+        return
+    errors: list[BaseException] = []
+    streams = [stream for stream in (process.stdout, process.stderr) if stream is not None]
+    try:
+        try:
+            running = process.poll() is None
+        except BaseException as error:
+            errors.append(error)
+            running = True
+        if running:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except BaseException as error:
+                errors.append(error)
+        if any(not stream.closed for stream in streams):
+            try:
+                process.communicate(timeout=2)
+            except BaseException as error:
+                errors.append(error)
+        try:
+            process.wait(timeout=2)
+        except BaseException as error:
+            errors.append(error)
+        try:
+            if process.poll() is None:
+                errors.append(RuntimeError(f"owned process {process.pid} was not reaped"))
+        except BaseException as error:
+            errors.append(error)
+    finally:
+        for stream in streams:
+            try:
+                stream.close()
+            except BaseException as error:
+                errors.append(error)
+    if errors:
+        raise BaseExceptionGroup(f"owned process {process.pid} cleanup failed", errors)
 
 
 class EmbeddingActivationTransactionTests(unittest.TestCase):
@@ -767,6 +858,545 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 time.sleep(0.02)
             with self.assertRaises(ProcessLookupError):
                 os.kill(child_pid, 0)
+
+    def test_cleanup_refuses_stale_pid_reuse_and_still_reaps_owned_tree(self) -> None:
+        foreign: subprocess.Popen[bytes] | None = None
+        owned: subprocess.Popen[str] | None = None
+        hang_child = 0
+        hang_ident: tuple[int, int] | None = None
+        foreign_ident: tuple[int, int] | None = None
+        owned_ident: tuple[int, int] | None = None
+        numeric: list[tuple[str, int, int]] = []
+        real_kill = os.kill
+        real_killpg = os.killpg
+
+        def spy_kill(pid: int, sig: int) -> None:
+            if sig in (signal.SIGTERM, signal.SIGKILL):
+                numeric.append(("kill", pid, int(sig)))
+            real_kill(pid, sig)
+
+        def spy_killpg(pgid: int, sig: int) -> None:
+            if sig in (signal.SIGTERM, signal.SIGKILL):
+                numeric.append(("killpg", pgid, int(sig)))
+            real_killpg(pgid, sig)
+
+        try:
+            foreign = subprocess.Popen(
+                ["/usr/bin/sleep", "30"],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            assert foreign.pid is not None
+            foreign_ident = _identity(foreign.pid)
+            self.assertIsNotNone(foreign_ident)
+            assert foreign_ident is not None
+            with (
+                patch.object(os, "kill", spy_kill),
+                patch.object(os, "killpg", spy_killpg),
+                ActivationFixture() as fixture,
+            ):
+                fixture.state["hang_once"] = "show"
+                fixture.save()
+                owned = fixture.spawn()
+                assert owned.pid is not None
+                owned_ident = _identity(owned.pid)
+                self.assertIsNotNone(owned_ident)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not fixture.child_pid_path.exists():
+                    time.sleep(0.02)
+                self.assertTrue(fixture.child_pid_path.exists())
+                hang_child = int(fixture.child_pid_path.read_text())
+                hang_ident = _identity(hang_child)
+                self.assertIsNotNone(hang_ident)
+                original_child_pid = fixture.child_pid_path.read_text()
+                recorded: list[object] = list(getattr(fixture, "_owned_groups"))
+                recorded.append(foreign.pid)
+                recorded.append((foreign.pid, 1, foreign_ident[0]))
+                recorded.append((foreign.pid, 1))
+                recorded.append(foreign_ident)
+                setattr(fixture, "_owned_groups", recorded)
+                fixture.child_pid_path.write_text(str(foreign.pid))
+                fixture._reap_owned_groups()
+                fixture.child_pid_path.write_text(original_child_pid)
+                self.assertEqual(_identity(foreign.pid), foreign_ident)
+                self.assertIsNone(foreign.poll())
+                self.assertFalse(
+                    any(target == foreign.pid for _kind, target, _sig in numeric)
+                )
+                if owned.poll() is None:
+                    try:
+                        owned.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
+                self.assertIsNotNone(owned.poll())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(hang_child, 0)
+        finally:
+            _pidfd_reap_identity(hang_ident)
+            _reap_owned_popen(owned)
+            _pidfd_reap_identity(owned_ident)
+            _reap_owned_popen(foreign)
+
+    def test_held_pidfd_send_is_esrch_after_owned_generation_retires(self) -> None:
+        foreign: subprocess.Popen[bytes] | None = None
+        owned: subprocess.Popen[str] | None = None
+        hang_child = 0
+        hang_ident: tuple[int, int] | None = None
+        foreign_ident: tuple[int, int] | None = None
+        owned_ident: tuple[int, int] | None = None
+        numeric: list[tuple[str, int, int]] = []
+        sends: list[tuple[int, int]] = []
+        send_errors: list[int | None] = []
+        real_kill = os.kill
+        real_killpg = os.killpg
+        real_send = signal.pidfd_send_signal
+
+        def spy_kill(pid: int, sig: int) -> None:
+            if sig in (signal.SIGTERM, signal.SIGKILL):
+                numeric.append(("kill", pid, int(sig)))
+            real_kill(pid, sig)
+
+        def spy_killpg(pgid: int, sig: int) -> None:
+            if sig in (signal.SIGTERM, signal.SIGKILL):
+                numeric.append(("killpg", pgid, int(sig)))
+            real_killpg(pgid, sig)
+
+        def spy_send(
+            pidfd: int, sig: int, siginfo: None = None, flags: int = 0
+        ) -> None:
+            sends.append((pidfd, int(sig)))
+            try:
+                real_send(pidfd, sig, siginfo, flags)
+            except ProcessLookupError as error:
+                send_errors.append(error.errno)
+                raise
+            send_errors.append(None)
+
+        def retire_owned_generation(recorded: object, _fd: int) -> None:
+            if not isinstance(recorded, tuple) or len(recorded) < 2:
+                return
+            pid = int(recorded[0])
+            starttime = int(recorded[1])
+            if hang_ident is not None and (pid, starttime) == hang_ident:
+                _pidfd_reap_identity(hang_ident)
+            if owned_ident is not None and (pid, starttime) == owned_ident:
+                _reap_owned_popen(owned)
+                _pidfd_reap_identity(owned_ident)
+
+        try:
+            foreign = subprocess.Popen(
+                ["/usr/bin/sleep", "30"],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            assert foreign.pid is not None
+            foreign_ident = _identity(foreign.pid)
+            self.assertIsNotNone(foreign_ident)
+            assert foreign_ident is not None
+            with (
+                patch.object(os, "kill", spy_kill),
+                patch.object(os, "killpg", spy_killpg),
+                patch.object(signal, "pidfd_send_signal", spy_send),
+                ActivationFixture() as fixture,
+            ):
+                fixture.state["hang_once"] = "show"
+                fixture.save()
+                owned = fixture.spawn()
+                assert owned.pid is not None
+                owned_ident = _identity(owned.pid)
+                self.assertIsNotNone(owned_ident)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not fixture.child_pid_path.exists():
+                    time.sleep(0.02)
+                self.assertTrue(fixture.child_pid_path.exists())
+                hang_child = int(fixture.child_pid_path.read_text())
+                hang_ident = _identity(hang_child)
+                self.assertIsNotNone(hang_ident)
+                fixture._pin_gap = retire_owned_generation
+                fixture._reap_owned_groups()
+                self.assertEqual(_identity(foreign.pid), foreign_ident)
+                self.assertIsNone(foreign.poll())
+                self.assertFalse(
+                    any(target == foreign.pid for _kind, target, _sig in numeric)
+                )
+                self.assertTrue(sends)
+                self.assertIn(errno.ESRCH, send_errors)
+                self.assertTrue(
+                    all(sig in (0, signal.SIGTERM, signal.SIGKILL) for _fd, sig in sends)
+                )
+                self.assertTrue(
+                    any(sig in (signal.SIGTERM, signal.SIGKILL) for _fd, sig in sends)
+                )
+        finally:
+            _pidfd_reap_identity(hang_ident)
+            _reap_owned_popen(owned)
+            _pidfd_reap_identity(owned_ident)
+            _reap_owned_popen(foreign)
+
+    def test_pidfd_open_unavailable_does_not_numeric_signal_descendants(self) -> None:
+        foreign: subprocess.Popen[bytes] | None = None
+        owned: subprocess.Popen[str] | None = None
+        hang_child = 0
+        hang_ident: tuple[int, int] | None = None
+        foreign_ident: tuple[int, int] | None = None
+        owned_ident: tuple[int, int] | None = None
+        numeric: list[tuple[str, int, int]] = []
+        real_kill = os.kill
+        real_killpg = os.killpg
+        real_open = os.pidfd_open
+
+        def spy_kill(pid: int, sig: int) -> None:
+            if sig in (signal.SIGTERM, signal.SIGKILL):
+                numeric.append(("kill", pid, int(sig)))
+            real_kill(pid, sig)
+
+        def spy_killpg(pgid: int, sig: int) -> None:
+            if sig in (signal.SIGTERM, signal.SIGKILL):
+                numeric.append(("killpg", pgid, int(sig)))
+            real_killpg(pgid, sig)
+
+        try:
+            foreign = subprocess.Popen(
+                ["/usr/bin/sleep", "30"],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            assert foreign.pid is not None
+            foreign_ident = _identity(foreign.pid)
+            self.assertIsNotNone(foreign_ident)
+            assert foreign_ident is not None
+            with (
+                patch.object(os, "kill", spy_kill),
+                patch.object(os, "killpg", spy_killpg),
+                ActivationFixture() as fixture,
+            ):
+                fixture.state["hang_once"] = "show"
+                fixture.save()
+                owned = fixture.spawn()
+                assert owned.pid is not None
+                owned_ident = _identity(owned.pid)
+                self.assertIsNotNone(owned_ident)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not fixture.child_pid_path.exists():
+                    time.sleep(0.02)
+                self.assertTrue(fixture.child_pid_path.exists())
+                hang_child = int(fixture.child_pid_path.read_text())
+                hang_ident = _identity(hang_child)
+                self.assertIsNotNone(hang_ident)
+                with patch.object(
+                    os,
+                    "pidfd_open",
+                    side_effect=OSError(errno.EMFILE, os.strerror(errno.EMFILE)),
+                ):
+                    with self.assertRaises(ExceptionGroup):
+                        fixture._reap_owned_groups()
+                self.assertEqual(_identity(foreign.pid), foreign_ident)
+                self.assertIsNone(foreign.poll())
+                self.assertEqual(_identity(hang_child), hang_ident)
+                self.assertFalse(
+                    any(target == hang_child for _kind, target, _sig in numeric)
+                )
+                self.assertFalse(
+                    any(target == foreign.pid for _kind, target, _sig in numeric)
+                )
+                if owned is not None and owned.poll() is None:
+                    self.assertTrue(
+                        all(
+                            kind != "killpg" or target != owned.pid
+                            for kind, target, _sig in numeric
+                        )
+                    )
+                self.assertIn(owned.pid, fixture._owned_processes)
+                self.assertTrue(fixture.root.exists())
+                _pidfd_reap_identity(hang_ident)
+                _reap_owned_popen(owned)
+                fixture._owned_groups.clear()
+                fixture._owned_processes.clear()
+                fixture._unresolved_groups.clear()
+        finally:
+            os.pidfd_open = real_open
+            _pidfd_reap_identity(hang_ident)
+            _reap_owned_popen(owned)
+            _pidfd_reap_identity(owned_ident)
+            _reap_owned_popen(foreign)
+
+    def test_pre_pin_foreign_candidate_is_rejected_by_parent_edge(self) -> None:
+        foreign: subprocess.Popen[bytes] | None = None
+        owned: subprocess.Popen[str] | None = None
+        hang_ident: tuple[int, int] | None = None
+        try:
+            foreign = subprocess.Popen(
+                ["/usr/bin/sleep", "30"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            foreign_ident = _identity(foreign.pid)
+            self.assertIsNotNone(foreign_ident)
+            with ActivationFixture() as fixture:
+                fixture.state["hang_once"] = "show"
+                fixture.save()
+                owned = fixture.spawn()
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not fixture.child_pid_path.exists():
+                    time.sleep(0.02)
+                self.assertTrue(fixture.child_pid_path.exists())
+                hang_ident = _identity(int(fixture.child_pid_path.read_text()))
+                self.assertIsNotNone(hang_ident)
+                direct_children = fixture._direct_children
+
+                def inject_foreign(pid: int) -> list[int]:
+                    children = direct_children(pid)
+                    if pid == owned.pid:
+                        children.append(foreign.pid)
+                    return children
+
+                fixture._direct_children = inject_foreign
+                fixture._reap_owned_groups()
+                self.assertEqual(_identity(foreign.pid), foreign_ident)
+                self.assertIsNone(foreign.poll())
+        finally:
+            _pidfd_reap_identity(hang_ident)
+            _reap_owned_popen(owned)
+            _reap_owned_popen(foreign)
+
+    def test_dead_parent_edge_is_rejected_after_numeric_proc_reads(self) -> None:
+        process = MagicMock(spec=subprocess.Popen)
+        process.pid = 100
+        closed: list[int] = []
+        parent_liveness_checks = 0
+
+        def process_identity(pid: int) -> tuple[int, int] | None:
+            return {100: (100, 10), 200: (200, 20)}.get(pid)
+
+        def pidfd_send(fd: int, number: int) -> None:
+            nonlocal parent_liveness_checks
+            if fd == 10 and number == 0:
+                parent_liveness_checks += 1
+                if parent_liveness_checks > 1:
+                    raise ProcessLookupError(errno.ESRCH, "retired parent")
+
+        fixture = ActivationFixture()
+        try:
+            fixture._owned_groups = [(100, 10)]
+            fixture._owned_processes = {100: process}
+            with (
+                patch.object(fixture, "_process_identity", side_effect=process_identity),
+                patch.object(
+                    fixture,
+                    "_stat_process",
+                    side_effect=lambda pid: {100: (1, 10), 200: (100, 20)}.get(pid),
+                    create=True,
+                ),
+                patch.object(fixture, "_direct_children", side_effect=lambda pid: [200] if pid == 100 else []),
+                patch.object(fixture, "_open_pidfd", side_effect=lambda pid: pid // 10),
+                patch.object(fixture, "_pidfd_send", side_effect=pidfd_send),
+                patch.object(os, "close", side_effect=closed.append),
+            ):
+                pinned = fixture._owned_identities((100, 10))
+                for _pid, _starttime, fd in pinned:
+                    os.close(fd)
+            self.assertNotIn(200, [int(identity[0]) for identity in pinned])
+            self.assertIn(20, closed)
+        finally:
+            fixture._owned_groups.clear()
+            fixture._owned_processes.clear()
+            fixture.cleanup()
+
+    def test_root_is_reaped_when_initial_identity_capture_fails(self) -> None:
+        process = MagicMock(spec=subprocess.Popen)
+        process.pid = 424242
+        process.poll.side_effect = (None, -signal.SIGKILL)
+        process.stdout = io.StringIO()
+        process.stderr = io.StringIO()
+        fixture = ActivationFixture()
+        try:
+            with patch.object(
+                fixture,
+                "_process_identity",
+                side_effect=OSError(errno.EIO, "identity read failed"),
+            ):
+                fixture._remember_group(process)
+            with self.assertRaises(ExceptionGroup):
+                fixture._reap_owned_groups()
+            process.kill.assert_called_once_with()
+            process.wait.assert_called_once_with(timeout=2)
+            self.assertTrue(process.stdout.closed)
+            self.assertTrue(process.stderr.closed)
+            self.assertIn(process.pid, fixture._owned_processes)
+        finally:
+            fixture._owned_groups.clear()
+            fixture._owned_processes.clear()
+            fixture.cleanup()
+
+    def test_root_cleanup_failures_still_attempt_bounded_reap_and_retain_owner(self) -> None:
+        for failure in ("poll", "kill", "communicate", "wait"):
+            with self.subTest(failure=failure):
+                process = MagicMock(spec=subprocess.Popen)
+                process.pid = 424242
+                process.stdout = io.StringIO()
+                process.stderr = io.StringIO()
+                process.poll.side_effect = (
+                    (PermissionError("poll denied"), -signal.SIGKILL)
+                    if failure == "poll"
+                    else (None, None if failure == "wait" else -signal.SIGKILL)
+                )
+                if failure == "kill":
+                    process.kill.side_effect = PermissionError("kill denied")
+                if failure == "communicate":
+                    process.communicate.side_effect = OSError("communicate failed")
+                if failure == "wait":
+                    process.wait.side_effect = subprocess.TimeoutExpired(["owned"], 2)
+                fixture = ActivationFixture()
+                try:
+                    fixture._owned_groups = [(process.pid, 1)]
+                    fixture._owned_processes = {process.pid: process}
+                    with (
+                        patch.object(fixture, "_reap_tree"),
+                        self.assertRaises(ExceptionGroup),
+                    ):
+                        fixture._reap_owned_groups()
+                    process.kill.assert_called_once_with()
+                    process.communicate.assert_called_once_with(timeout=2)
+                    process.wait.assert_called_once_with(timeout=2)
+                    self.assertTrue(process.stdout.closed)
+                    self.assertTrue(process.stderr.closed)
+                    self.assertIn(process.pid, fixture._owned_processes)
+                finally:
+                    fixture._owned_groups.clear()
+                    fixture._owned_processes.clear()
+                    fixture._unresolved_groups.clear()
+                    fixture.cleanup()
+
+    def test_emergency_popen_cleanup_aggregates_failures_and_closes_streams(self) -> None:
+        for failure in ("poll", "kill", "communicate", "wait"):
+            with self.subTest(failure=failure):
+                process = MagicMock(spec=subprocess.Popen)
+                process.pid = 424242
+                process.stdout = io.StringIO()
+                process.stderr = io.StringIO()
+                process.poll.side_effect = (
+                    (PermissionError("poll denied"), -signal.SIGKILL)
+                    if failure == "poll"
+                    else (None, None if failure == "wait" else -signal.SIGKILL)
+                )
+                if failure == "kill":
+                    process.kill.side_effect = PermissionError("kill denied")
+                if failure == "communicate":
+                    process.communicate.side_effect = OSError("communicate failed")
+                if failure == "wait":
+                    process.wait.side_effect = subprocess.TimeoutExpired(["owned"], 2)
+                with self.assertRaises(ExceptionGroup):
+                    _reap_owned_popen(process)
+                process.kill.assert_called_once_with()
+                process.communicate.assert_called_once_with(timeout=2)
+                process.wait.assert_called_once_with(timeout=2)
+                self.assertTrue(process.stdout.closed)
+                self.assertTrue(process.stderr.closed)
+
+    def test_emergency_popen_cleanup_closes_streams_for_already_exited_process(self) -> None:
+        process = MagicMock(spec=subprocess.Popen)
+        process.poll.side_effect = (0, 0)
+        process.stdout = io.StringIO()
+        process.stderr = io.StringIO()
+        _reap_owned_popen(process)
+        process.kill.assert_not_called()
+        process.communicate.assert_called_once_with(timeout=2)
+        process.wait.assert_called_once_with(timeout=2)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+
+    def test_run_preserves_timeout_when_cleanup_also_fails(self) -> None:
+        timeout = subprocess.TimeoutExpired(["fake"], 0.01)
+        cleanup_error = ExceptionGroup("cleanup", [RuntimeError("unresolved")])
+        process = MagicMock(spec=subprocess.Popen)
+        process.pid = 424242
+        process.communicate.side_effect = timeout
+        fixture = ActivationFixture()
+        try:
+            with (
+                patch.object(subprocess, "Popen", return_value=process),
+                patch.object(fixture, "_remember_group"),
+                patch.object(fixture, "_reap_owned_groups", side_effect=cleanup_error),
+            ):
+                with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    fixture.run(timeout=0.01)
+            self.assertIs(caught.exception, timeout)
+            self.assertTrue(any("cleanup also failed" in note for note in timeout.__notes__))
+        finally:
+            fixture.cleanup()
+
+    def test_pidfd_send_and_proc_read_errors_are_reported_after_root_reap(self) -> None:
+        for failure_kind in ("open", "send", "proc"):
+            with self.subTest(failure_kind=failure_kind):
+                process = subprocess.Popen(
+                    ["/usr/bin/sleep", "30"],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                try:
+                    with ActivationFixture() as fixture:
+                        fixture._remember_group(process)
+                        if failure_kind == "open":
+                            failure = patch.object(
+                                os,
+                                "pidfd_open",
+                                side_effect=OSError(errno.EPERM, "denied"),
+                            )
+                        elif failure_kind == "send":
+                            failure = patch.object(
+                                fixture,
+                                "_pidfd_send",
+                                side_effect=OSError(errno.EPERM, "denied"),
+                            )
+                        else:
+                            failure = patch.object(
+                                fixture,
+                                "_stat_process",
+                                side_effect=OSError(errno.EIO, "proc read failed"),
+                            )
+                        caught: BaseException | None = None
+                        try:
+                            with failure:
+                                fixture._reap_owned_groups()
+                        except BaseException as error:
+                            caught = error
+                        self.assertIsNotNone(process.poll())
+                        self.assertIsInstance(caught, ExceptionGroup)
+                        self.assertIn(process.pid, fixture._owned_processes)
+                        self.assertTrue(fixture.root.exists())
+                        fixture._owned_groups.clear()
+                        fixture._owned_processes.clear()
+                        fixture._unresolved_groups.clear()
+                finally:
+                    _reap_owned_popen(process)
+
+    def test_outer_run_timeout_reaps_hang_once_group_before_next_fixture(self) -> None:
+        leaked: list[tuple[int, int]] = []
+        helper: ActivationFixture | None = None
+        try:
+            with ActivationFixture() as fixture:
+                helper = fixture
+                fixture.state["hang_once"] = "show"
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    fixture.run(timeout=1)
+                self.assertTrue(fixture.child_pid_path.exists())
+                child_pid = int(fixture.child_pid_path.read_text())
+                recorded = fixture._process_identity(child_pid)
+                if recorded is not None:
+                    leaked.append(recorded)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+            with ActivationFixture() as next_fixture:
+                result = next_fixture.run()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        finally:
+            if helper is not None:
+                for identity in leaked:
+                    helper._reap_tree(identity)
 
     def test_production_wrapper_has_no_test_or_environment_override_channel(self) -> None:
         source = ACTIVATOR.read_text()
