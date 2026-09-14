@@ -105,6 +105,10 @@ The release name declares vLLM v0.29.0-omni; source pinning does not establish
 model readiness or feature compatibility. Historical prior-generation claims
 and deployment evidence remain in their dated research records.
 
+For the next release, edit only `config/aeon-vllm-release.json`, then run
+`python3 scripts/update_aeon_vllm_release.py`; it regenerates every literal
+unit/contract pin and the embedding activation authority-hash chain.
+
 Capacity contracts and evidence:
 
 ```text

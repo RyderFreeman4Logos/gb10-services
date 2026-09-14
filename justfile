@@ -3,6 +3,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 # Fast, deterministic checks for every local commit.
 quick-check:
     @for script in scripts/*.sh; do bash -n "$script"; done
+    python3 scripts/update_aeon_vllm_release.py --check
     python3 -m unittest discover -s tests -p 'test_*.py' -v
     git diff --check
     git diff --cached --check
