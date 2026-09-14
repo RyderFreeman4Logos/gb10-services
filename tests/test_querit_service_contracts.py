@@ -318,11 +318,14 @@ class QueritServiceContractTests(unittest.TestCase):
     def test_guard_owns_runtime_concurrency_and_queues_bursts(self) -> None:
         config = tomllib.loads(CONFIG.read_text())
         server = config["server"]
-        self.assertEqual(server["max_in_flight_requests"], 4)
+        self.assertEqual(server["max_in_flight_requests"], 8)
         self.assertEqual(server["max_queued_generation_requests"], 128)
         self.assertEqual(server["generation_queue_timeout_ms"], 1_800_000)
 
         profiles = {profile["name"]: profile for profile in config["upstreams"]}
+        default_chat = profiles["aeon-default-no-think"]
+        self.assertEqual(default_chat["max_in_flight_requests"], 8)
+        self.assertEqual(default_chat["max_queued_generation_requests"], 56)
         # :18011 admits c8 directly while its empty post-body queue preserves
         # isolation from the default :18009 path.
         self.assertEqual(profiles["aeon-guard-max"]["max_in_flight_requests"], 8)

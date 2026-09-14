@@ -1,7 +1,7 @@
 [server]
 bind_host = "100.105.4.92"
 port = 18009
-max_in_flight_requests = 4
+max_in_flight_requests = 8
 max_queued_generation_requests = 128
 generation_queue_timeout_ms = 1800000
 generation_queue_full_status = 429
@@ -167,8 +167,8 @@ base_url = "http://100.105.4.92:18010/v1"
 upstream_model = "aeon-ultimate"
 match_models = ["abliterated-qwen-latest-27b-none", "abliterated-qwen-latest-27b-low", "abliterated-qwen-latest-27b-medium"]
 request_timeout_ms = 1800000
-max_in_flight_requests = 4
-max_queued_generation_requests = 64
+max_in_flight_requests = 8
+max_queued_generation_requests = 56
 
 [upstreams.metadata]
 discovery_enabled = true
