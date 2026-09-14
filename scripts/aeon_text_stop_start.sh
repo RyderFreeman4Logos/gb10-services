@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Cleanly recycle only the canonical AEON text unit for llm-guard-proxy local recovery.
-# Profile selection is the installed aeon-dflash-profiles/active.env symlink.
+# Recycles the canonical Ultimate :18010 owner; legacy 27B active.env is not a selector.
 set -euo pipefail
 
 readonly SYSTEMCTL="/usr/bin/systemctl"

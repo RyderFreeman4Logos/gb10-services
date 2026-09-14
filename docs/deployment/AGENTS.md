@@ -9,7 +9,7 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 * **Docker Environment**: Rootless Docker active at `unix:///run/user/1001/docker.sock`.
 * **Port Allocations**:
   * `18009`: `llm-guard-proxy.service` (stable OpenAI-compatible entrypoint for chat, embeddings, and rerank; default chat is force_disable)
-  * `18010`: `vllm-aeon-27b-dflash.service` (raw AEON chat backend)
+  * `18010`: `vllm-aeon-ultimate-uncensored-nvfp4.service` (raw AEON chat backend; 27B DFlash is an explicit non-default fallback)
   * `18011`: `llm-guard-proxy.service` experimental guarded max-thinking AEON chat
   * `18012`: `vllm-embedding.service` (raw Qwen3-Embedding-8B backend routed by guard)
   * `18013`: `vllm-querit-4b-reranker.service` (canonical raw Querit-4B backend routed by guard)
@@ -115,6 +115,7 @@ install -m 0644 scripts/gb10_bounded_process.py /home/obj/.local/bin/
 cp scripts/llm_guard_proxy_publish_cgroup_registration.sh /home/obj/.local/bin/
 install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py /home/obj/.local/bin/gb10_verify_vllm_no_swap_core.py
 install -m 0755 scripts/gb10_verify_vllm_no_swap.sh /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh
+install -m 0755 scripts/gb10_service_ready.sh /home/obj/.local/bin/gb10_service_ready.sh
 install -m 0755 scripts/gb10_lifecycle.sh /home/obj/.local/bin/gb10_lifecycle.sh
 install -m 0755 scripts/gb10_restart_text_safe.sh /home/obj/.local/bin/gb10_restart_text_safe.sh
 cp scripts/sysmon.sh /home/obj/.local/bin/
@@ -160,18 +161,16 @@ mkdir -p /home/obj/.config/systemd/user/
 install -m 0644 profile/llm-guard-proxy/llm-guard-proxy.service \
   profile/querit-4b-reranker/vllm-querit-4b-reranker.service \
   profile/sysmon/sysmon.service \
-  profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service \
+  profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service \
   profile/qwen3-embedding-8b/vllm-embedding.service \
   profile/qwen3-reranker-8b/vllm-qwen3-reranker-8b.service \
   /home/obj/.config/systemd/user/
 
-# Install the profile data and the source-tracked HiKV selection.
+# Install the Ultimate env. Do not point active.env here; that symlink is only
+# for the explicit non-default 27B DFlash fallback below.
 install -d -m 0755 /home/obj/.config/gb10/aeon-dflash-profiles
-install -m 0644 config/aeon-dflash-profiles/baseline.env config/aeon-dflash-profiles/hikv.env \
+install -m 0644 config/aeon-dflash-profiles/aeon-ultimate-uncensored-nvfp4.env \
   /home/obj/.config/gb10/aeon-dflash-profiles/
-ln -sfn hikv.env /home/obj/.config/gb10/aeon-dflash-profiles/active.env.new
-mv -Tf /home/obj/.config/gb10/aeon-dflash-profiles/active.env.new /home/obj/.config/gb10/aeon-dflash-profiles/active.env
-ln -sfn vllm-aeon-27b-dflash.service /home/obj/.config/systemd/user/vllm-aeon-27b-dflash-hikv.service
 
 # Reload systemd daemon
 systemctl --user daemon-reload
@@ -181,13 +180,12 @@ systemctl --user daemon-reload
 ```bash
 systemctl --user enable --now sysmon.service
 
-# Start model services and the proxy independently.
+# Start model services and the proxy independently. Authorized restart
+# order is embedding → reranker → text.
 systemctl --user enable --now vllm-embedding.service
-systemctl --user enable --now vllm-aeon-27b-dflash.service
-# To select baseline for a future authorized stop/start, atomically repoint
-# active.env to baseline.env; keep the canonical systemd unit enabled.
 systemctl --user disable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now vllm-querit-4b-reranker.service
+systemctl --user enable --now vllm-aeon-ultimate-uncensored-nvfp4.service
 systemctl --user enable --now llm-guard-proxy.service
 ```
 
@@ -238,10 +236,10 @@ An authorized maintenance cycle must use two separately auditable operations;
 
 ```bash
 /home/obj/.local/bin/gb10_lifecycle.sh stop \
-  --unit vllm-aeon-27b-dflash.service \
+  --unit vllm-aeon-ultimate-uncensored-nvfp4.service \
   --actor maintenance-agent --reason approved-maintenance
 /home/obj/.local/bin/gb10_lifecycle.sh start \
-  --unit vllm-aeon-27b-dflash.service \
+  --unit vllm-aeon-ultimate-uncensored-nvfp4.service \
   --actor maintenance-agent --reason approved-maintenance
 ```
 
@@ -358,6 +356,26 @@ requires that phase and is not a commit claim by itself. Evidence is owner-only 
 `$HOME/.local/state/gb10-embedding-activation/`. Never recover by cycling the
 stack or replaying copy/reload/restart fragments.
 
+### 27B DFlash fallback
+
+The old 27B DFlash unit is an explicit non-default fallback, not the live
+`:18010` owner. Do not enable it on a fresh install. Only after Ultimate is
+stopped, install its unit, HiKV `active.env`, and alias:
+
+```bash
+install -m 0644 profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service \
+  /home/obj/.config/systemd/user/
+install -m 0644 config/aeon-dflash-profiles/baseline.env config/aeon-dflash-profiles/hikv.env \
+  /home/obj/.config/gb10/aeon-dflash-profiles/
+ln -sfn hikv.env /home/obj/.config/gb10/aeon-dflash-profiles/active.env.new
+mv -Tf /home/obj/.config/gb10/aeon-dflash-profiles/active.env.new /home/obj/.config/gb10/aeon-dflash-profiles/active.env
+ln -sfn vllm-aeon-27b-dflash.service /home/obj/.config/systemd/user/vllm-aeon-27b-dflash-hikv.service
+systemctl --user daemon-reload
+# To select baseline for a future authorized stop/start, atomically repoint
+# active.env to baseline.env; keep the canonical systemd unit enabled.
+systemctl --user enable --now vllm-aeon-27b-dflash.service
+```
+
 ---
 
 ## Operational Monitoring & Verification
@@ -368,7 +386,7 @@ stack or replaying copy/reload/restart fragments.
 systemctl --user list-units --type=service --state=running
 
 # Check detailed status of core services
-systemctl --user status vllm-embedding vllm-aeon-27b-dflash vllm-querit-4b-reranker \
+systemctl --user status vllm-embedding vllm-aeon-ultimate-uncensored-nvfp4 vllm-querit-4b-reranker \
   llm-guard-proxy sysmon
 ```
 
@@ -387,7 +405,7 @@ nonterminated, duplicate, missing, or malformed input to `N/A`.
 ### View Live Service logs
 ```bash
 # View last 50 log lines for chat service
-journalctl --user -u vllm-aeon-27b-dflash.service -n 50 --no-pager
+journalctl --user -u vllm-aeon-ultimate-uncensored-nvfp4.service -n 50 --no-pager
 
 # View last 50 log lines for proxy wrapper
 journalctl --user -u llm-guard-proxy.service -n 50 --no-pager
@@ -464,17 +482,20 @@ the configured 5 GiB `MemAvailable` threshold during startup; serialized
 compilation is pressure reduction, not an exemption from that guard.
 
 ### 1. CUDA Hang or Service Crash
-If `vllm-aeon-27b-dflash.service` hangs or refuses to respond, preserve
-content-free evidence first. After explicit authorization and only when no
-investigation marker is active, use the audited tracked lifecycle so its
-generation-bound cleanup authority remains in control:
+If `vllm-aeon-ultimate-uncensored-nvfp4.service` hangs or refuses to respond, preserve
+content-free evidence first. After explicit authorization, temporarily stop Guard
+so its local-recovery helper cannot race the recycle. Do **not** disable Guard,
+and do **not** begin or end an investigation lock for this recovery. Recycle the
+canonical Ultimate unit through the audited lifecycle, then start Guard:
 ```bash
+systemctl --user stop llm-guard-proxy.service
 /home/obj/.local/bin/gb10_lifecycle.sh stop \
-  --unit vllm-aeon-27b-dflash.service \
+  --unit vllm-aeon-ultimate-uncensored-nvfp4.service \
   --actor recovery-operator --reason authorized-hang-recovery
 /home/obj/.local/bin/gb10_lifecycle.sh start \
-  --unit vllm-aeon-27b-dflash.service \
+  --unit vllm-aeon-ultimate-uncensored-nvfp4.service \
   --actor recovery-operator --reason authorized-hang-recovery
+systemctl --user start llm-guard-proxy.service
 ```
 Do not use `systemctl restart`.
 
@@ -487,8 +508,8 @@ cidfile's full CID and exact name-to-ID binding before bounded stop/remove. If i
 fails closed, preserve the evidence and inspect the unit journal rather than
 removing a possibly replacement container:
 ```bash
-systemctl --user status vllm-aeon-27b-dflash.service --no-pager
-journalctl --user -u vllm-aeon-27b-dflash.service -n 100 --no-pager
+systemctl --user status vllm-aeon-ultimate-uncensored-nvfp4.service --no-pager
+journalctl --user -u vllm-aeon-ultimate-uncensored-nvfp4.service -n 100 --no-pager
 ```
 
 ### 3. OOM / Swap Critical

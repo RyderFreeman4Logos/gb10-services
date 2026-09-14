@@ -259,24 +259,105 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         )
 
     def test_current_deployment_docs_install_the_canonical_aeon_unit_and_alias(self) -> None:
-        documents = (
-            (ROOT / "README.md").read_text(),
-            (ROOT / "docs" / "deployment" / "AGENTS.md").read_text(),
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn(
+            "profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service",
+            readme,
         )
-        for document in documents:
-            self.assertIn(
-                "profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service",
-                document,
-            )
-            self.assertIn(
-                "profile/qwen3-embedding-8b/vllm-embedding.service", document
-            )
-            self.assertIn(
-                "profile/querit-4b-reranker/vllm-querit-4b-reranker.service",
-                document,
-            )
-            self.assertIn("vllm-aeon-27b-dflash-hikv.service", document)
-            self.assertIn("active.env", document)
+        self.assertIn("profile/qwen3-embedding-8b/vllm-embedding.service", readme)
+        self.assertIn(
+            "profile/querit-4b-reranker/vllm-querit-4b-reranker.service",
+            readme,
+        )
+        self.assertIn("vllm-aeon-27b-dflash-hikv.service", readme)
+        self.assertIn("active.env", readme)
+
+        guide = (ROOT / "docs" / "deployment" / "AGENTS.md").read_text()
+        self.assertIn(
+            "profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service",
+            guide,
+        )
+        self.assertIn("profile/qwen3-embedding-8b/vllm-embedding.service", guide)
+        self.assertIn(
+            "profile/querit-4b-reranker/vllm-querit-4b-reranker.service",
+            guide,
+        )
+        self.assertIn(
+            "config/aeon-dflash-profiles/aeon-ultimate-uncensored-nvfp4.env",
+            guide,
+        )
+        self.assertIn(
+            "install -m 0755 scripts/gb10_service_ready.sh "
+            "/home/obj/.local/bin/gb10_service_ready.sh",
+            guide,
+        )
+        self.assertRegex(
+            guide,
+            r"(?m)^\s*\* `18010`: `vllm-aeon-ultimate-uncensored-nvfp4.service`",
+        )
+        enable_section = guide.split("### 6. Enable and Start Services", 1)[1].split(
+            "### Model lifecycle audit and investigation lock", 1
+        )[0]
+        self.assertIn(
+            "systemctl --user enable --now vllm-aeon-ultimate-uncensored-nvfp4.service",
+            enable_section,
+        )
+        self.assertNotIn(
+            "systemctl --user enable --now vllm-aeon-27b-dflash.service",
+            enable_section,
+        )
+        self.assertLess(
+            enable_section.find("systemctl --user enable --now vllm-embedding.service"),
+            enable_section.find(
+                "systemctl --user enable --now vllm-querit-4b-reranker.service"
+            ),
+        )
+        self.assertLess(
+            enable_section.find(
+                "systemctl --user enable --now vllm-querit-4b-reranker.service"
+            ),
+            enable_section.find(
+                "systemctl --user enable --now vllm-aeon-ultimate-uncensored-nvfp4.service"
+            ),
+        )
+        for command in (
+            "/home/obj/.local/bin/gb10_lifecycle.sh stop \\\n"
+            "  --unit vllm-aeon-ultimate-uncensored-nvfp4.service",
+            "systemctl --user status vllm-embedding vllm-aeon-ultimate-uncensored-nvfp4 "
+            "vllm-querit-4b-reranker",
+            "journalctl --user -u vllm-aeon-ultimate-uncensored-nvfp4.service -n 50 --no-pager",
+        ):
+            self.assertIn(command, guide)
+        recovery = guide.split("### 1. CUDA Hang or Service Crash", 1)[1].split(
+            "### 2. Generation-bound cleanup failures", 1
+        )[0]
+        self.assertIn("systemctl --user stop llm-guard-proxy.service", recovery)
+        self.assertNotIn("systemctl --user disable", recovery)
+        self.assertNotIn("investigation-", recovery)
+        self.assertIn(
+            "/home/obj/.local/bin/gb10_lifecycle.sh stop \\\n"
+            "  --unit vllm-aeon-ultimate-uncensored-nvfp4.service",
+            recovery,
+        )
+        self.assertIn("systemctl --user start llm-guard-proxy.service", recovery)
+        fallback = guide.split("### 27B DFlash fallback", 1)[1].split("### ", 1)[0]
+        self.assertIn(
+            "profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service",
+            fallback,
+        )
+        self.assertIn("vllm-aeon-27b-dflash-hikv.service", fallback)
+        self.assertIn("active.env", fallback)
+        self.assertIn("explicit non-default fallback", fallback)
+
+        helper = (ROOT / "scripts" / "aeon_text_stop_start.sh").read_text()
+        self.assertIn(
+            "# Recycles the canonical Ultimate :18010 owner; legacy 27B active.env is not a selector.",
+            helper,
+        )
+        self.assertNotIn(
+            "Profile selection is the installed aeon-dflash-profiles/active.env symlink.",
+            helper,
+        )
 
     def test_aeon_tracked_runtime_profile_matches_deployment_reference(self) -> None:
         unit = UNIT_PATHS["vllm-aeon-27b-dflash.service"]
