@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -12,6 +14,9 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+
+_PIDFD_OPEN = 434
+_PIDFD_SEND_SIGNAL = 424
 
 ROOT = Path(__file__).resolve().parents[1]
 UNIT = "vllm-embedding.service"
@@ -323,7 +328,8 @@ class ActivationFixture:
         self.marker = self.root / "pause.marker"
         self.release = self.root / "pause.release"
         self.child_pid_path = self.root / "child.pid"
-        self._owned_groups: list[tuple[int, int, int]] = []
+        self._owned_groups: list[tuple[int, int]] = []
+        self._owned_processes: dict[int, subprocess.Popen[str]] = {}
         self.cgroup_root = self.root / "cgroup"
         for directory, mode in (
             (self.source_unit.parent, 0o755),
@@ -491,34 +497,40 @@ class ActivationFixture:
         argv.extend([str(ACTIVATION_ENGINE), "--test-only", str(self.config)])
         return argv
 
-    def _remember_group(self, pid: int) -> None:
+    def _remember_group(self, process: subprocess.Popen[str]) -> None:
+        pid = process.pid
+        if pid is None:
+            return
         identity = self._process_identity(pid)
         if identity is not None and identity not in self._owned_groups:
             self._owned_groups.append(identity)
+        self._owned_processes[pid] = process
 
     def _forget_group(self, pid: int) -> None:
         self._owned_groups = [identity for identity in self._owned_groups if identity[0] != pid]
+        self._owned_processes.pop(pid, None)
 
-    def _process_identity(self, pid: int) -> tuple[int, int, int] | None:
-        parsed = self._stat_ids(pid)
-        if parsed is None:
+    def _process_identity(self, pid: int) -> tuple[int, int] | None:
+        starttime = self._stat_starttime(pid)
+        if starttime is None:
             return None
-        starttime, pgid = parsed
-        return pid, starttime, pgid
+        return pid, starttime
 
-    def _matching_identity(self, recorded: object) -> tuple[int, int, int] | None:
-        if not isinstance(recorded, tuple) or len(recorded) != 3:
+    def _matching_identity(self, recorded: object) -> tuple[int, int] | None:
+        if not isinstance(recorded, tuple) or len(recorded) != 2:
             return None
         try:
-            pid, starttime, pgid = (int(recorded[0]), int(recorded[1]), int(recorded[2]))
+            pid, starttime = int(recorded[0]), int(recorded[1])
         except (TypeError, ValueError):
             return None
+        if pid <= 1 or pid == os.getpid():
+            return None
         current = self._process_identity(pid)
-        if current is None or current != (pid, starttime, pgid):
+        if current is None or current != (pid, starttime):
             return None
         return current
 
-    def _stat_ids(self, pid: int) -> tuple[int, int] | None:
+    def _stat_starttime(self, pid: int) -> int | None:
         try:
             payload = Path(f"/proc/{pid}/stat").read_text()
         except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
@@ -530,7 +542,7 @@ class ActivationFixture:
         if len(fields) < 20:
             return None
         try:
-            return int(fields[19]), int(fields[2])
+            return int(fields[19])
         except ValueError:
             return None
 
@@ -549,7 +561,7 @@ class ActivationFixture:
             children.extend(int(token) for token in payload.split() if token.isdigit())
         return children
 
-    def _owned_identities(self, leader: object) -> list[tuple[int, int, int]]:
+    def _owned_identities(self, leader: object) -> list[tuple[int, int]]:
         current = self._matching_identity(leader)
         if current is None:
             return []
@@ -569,23 +581,77 @@ class ActivationFixture:
                 found.append(child_ident)
         return found
 
-    def _signal_identities(self, identities: list[tuple[int, int, int]], number: int) -> None:
-        owner = os.getpgrp()
-        signaled: set[int] = set()
-        for recorded in identities:
-            current = self._matching_identity(recorded)
-            if current is None:
-                continue
-            pgid = current[2]
-            if pgid <= 1 or pgid == owner or pgid in signaled:
+    def _pin_gap(self, recorded: object, fd: int) -> None:
+        return None
+
+    def _open_pidfd(self, pid: int) -> int | None:
+        if hasattr(os, "pidfd_open"):
+            try:
+                return os.pidfd_open(pid, 0)
+            except OSError:
+                return None
+        if os.uname().machine != "x86_64":
+            return None
+        libc = ctypes.CDLL(None, use_errno=True)
+        fd = libc.syscall(_PIDFD_OPEN, ctypes.c_int(pid), ctypes.c_uint(0))
+        if fd < 0:
+            return None
+        return int(fd)
+
+    def _pidfd_send(self, fd: int, number: int) -> None:
+        if hasattr(signal, "pidfd_send_signal"):
+            signal.pidfd_send_signal(fd, number, None, 0)
+            return
+        if os.uname().machine != "x86_64":
+            raise OSError(errno.ENOSYS, "pidfd_send_signal unavailable")
+        libc = ctypes.CDLL(None, use_errno=True)
+        rc = libc.syscall(
+            _PIDFD_SEND_SIGNAL,
+            ctypes.c_int(fd),
+            ctypes.c_int(number),
+            ctypes.c_void_p(),
+            ctypes.c_uint(0),
+        )
+        if rc < 0:
+            err = ctypes.get_errno()
+            if err == errno.ESRCH:
+                raise ProcessLookupError(err, "No such process")
+            raise OSError(err, "pidfd_send_signal")
+
+    def _pin_pidfd(self, recorded: object) -> int | None:
+        current = self._matching_identity(recorded)
+        if current is None:
+            return None
+        fd = self._open_pidfd(current[0])
+        if fd is None:
+            return None
+        if self._matching_identity(recorded) is None:
+            os.close(fd)
+            return None
+        return fd
+
+    def _signal_identities(self, identities: list[tuple[int, int]], number: int) -> int:
+        sent = 0
+        if not identities:
+            return sent
+        ordered = list(reversed(identities[1:])) + identities[:1]
+        for recorded in ordered:
+            fd = self._pin_pidfd(recorded)
+            if fd is None:
                 continue
             try:
-                os.killpg(pgid, number)
+                self._pin_gap(recorded, fd)
+                self._pidfd_send(fd, number)
+                sent += 1
             except ProcessLookupError:
-                continue
-            signaled.add(pgid)
+                sent += 1
+            except OSError:
+                pass
+            finally:
+                os.close(fd)
+        return sent
 
-    def _live_identities(self, identities: list[tuple[int, int, int]]) -> bool:
+    def _live_identities(self, identities: list[tuple[int, int]]) -> bool:
         for recorded in identities:
             if self._matching_identity(recorded) is not None:
                 return True
@@ -595,24 +661,41 @@ class ActivationFixture:
         identities = self._owned_identities(leader)
         if not identities:
             return
-        self._signal_identities(identities, signal.SIGTERM)
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and self._live_identities(identities):
-            time.sleep(0.02)
-        if not self._live_identities(identities):
+        if self._signal_identities(identities, signal.SIGTERM):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline and self._live_identities(identities):
+                time.sleep(0.02)
+            if not self._live_identities(identities):
+                return
+        if self._signal_identities(identities, signal.SIGKILL):
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline and self._live_identities(identities):
+                time.sleep(0.02)
+
+    def _kill_unreaped(self, process: subprocess.Popen[str] | None) -> None:
+        if process is None:
             return
-        self._signal_identities(identities, signal.SIGKILL)
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline and self._live_identities(identities):
-            time.sleep(0.02)
+        if process.poll() is None:
+            process.kill()
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
 
     def _reap_owned_groups(self) -> None:
         groups = list(self._owned_groups)
+        processes = dict(self._owned_processes)
         self._owned_groups.clear()
+        self._owned_processes.clear()
         for leader in groups:
             self._reap_tree(leader)
+            if isinstance(leader, tuple) and leader:
+                self._kill_unreaped(processes.get(int(leader[0])))
 
-    def _recorded_identity(self, pid: int) -> tuple[int, int, int] | None:
+    def _recorded_identity(self, pid: int) -> tuple[int, int] | None:
         for identity in self._owned_groups:
             if identity[0] == pid:
                 return identity
@@ -628,11 +711,12 @@ class ActivationFixture:
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        self._remember_group(process.pid)
+        self._remember_group(process)
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as error:
             self._reap_tree(self._recorded_identity(process.pid))
+            self._kill_unreaped(process)
             try:
                 process.communicate(timeout=2)
             except subprocess.TimeoutExpired:
@@ -641,6 +725,7 @@ class ActivationFixture:
             raise error
         except BaseException:
             self._reap_tree(self._recorded_identity(process.pid))
+            self._kill_unreaped(process)
             try:
                 process.communicate(timeout=2)
             except subprocess.TimeoutExpired:
@@ -659,7 +744,7 @@ class ActivationFixture:
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        self._remember_group(process.pid)
+        self._remember_group(process)
         return process
 
     def wait_for_marker(self, timeout: float = 5) -> None:

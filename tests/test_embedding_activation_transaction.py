@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import ctypes
+import errno
 import hashlib
 import importlib.util
 import json
@@ -50,6 +51,66 @@ def _literal_string_map(path: Path, name: str) -> dict[str, str]:
     ):
         raise AssertionError(f"missing literal string-map authority {name} in {path}")
     return value
+
+
+def _stat_starttime(pid: int) -> int | None:
+    try:
+        payload = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+    closing = payload.rfind(")")
+    if closing <= 1:
+        return None
+    fields = payload[closing + 2 :].split()
+    if len(fields) < 20:
+        return None
+    try:
+        return int(fields[19])
+    except ValueError:
+        return None
+
+
+def _identity(pid: int) -> tuple[int, int] | None:
+    starttime = _stat_starttime(pid)
+    if starttime is None:
+        return None
+    return pid, starttime
+
+
+def _pidfd_reap_identity(recorded: tuple[int, int] | None) -> None:
+    if recorded is None:
+        return
+    pid, starttime = recorded
+    if pid <= 1 or pid == os.getpid():
+        return
+    if _identity(pid) != (pid, starttime):
+        return
+    try:
+        fd = os.pidfd_open(pid, 0)
+    except OSError:
+        return
+    try:
+        if _identity(pid) != (pid, starttime):
+            return
+        try:
+            signal.pidfd_send_signal(fd, signal.SIGKILL, None, 0)
+        except ProcessLookupError:
+            return
+    finally:
+        os.close(fd)
+
+
+def _reap_owned_popen(process: subprocess.Popen[str] | subprocess.Popen[bytes] | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    process.kill()
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
+    try:
+        process.wait(timeout=2)
+    except Exception:
+        pass
 
 
 class EmbeddingActivationTransactionTests(unittest.TestCase):
@@ -772,45 +833,21 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
         foreign: subprocess.Popen[bytes] | None = None
         owned: subprocess.Popen[str] | None = None
         hang_child = 0
-        hang_ident: tuple[int, int, int] | None = None
-        foreign_ident: tuple[int, int, int] | None = None
-        owned_ident: tuple[int, int, int] | None = None
+        hang_ident: tuple[int, int] | None = None
+        foreign_ident: tuple[int, int] | None = None
+        owned_ident: tuple[int, int] | None = None
+        numeric: list[tuple[str, int, int]] = []
+        real_kill = os.kill
         real_killpg = os.killpg
-        signaled: list[tuple[int, int]] = []
 
-        def identity(pid: int) -> tuple[int, int, int] | None:
-            try:
-                payload = Path(f"/proc/{pid}/stat").read_text()
-            except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
-                return None
-            closing = payload.rfind(")")
-            if closing <= 1:
-                return None
-            fields = payload[closing + 2 :].split()
-            if len(fields) < 20:
-                return None
-            try:
-                return pid, int(fields[19]), int(fields[2])
-            except ValueError:
-                return None
-
-        def reap_if_same(pid: int, recorded: tuple[int, int, int] | None) -> None:
-            if recorded is None or pid <= 1:
-                return
-            current = identity(pid)
-            if current is None or current != recorded:
-                return
-            try:
-                real_killpg(current[2], signal.SIGKILL)
-            except ProcessLookupError:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    return
+        def spy_kill(pid: int, sig: int) -> None:
+            if sig in (signal.SIGTERM, signal.SIGKILL):
+                numeric.append(("kill", pid, int(sig)))
+            real_kill(pid, sig)
 
         def spy_killpg(pgid: int, sig: int) -> None:
             if sig in (signal.SIGTERM, signal.SIGKILL):
-                signaled.append((pgid, int(sig)))
+                numeric.append(("killpg", pgid, int(sig)))
             real_killpg(pgid, sig)
 
         try:
@@ -821,35 +858,40 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 stderr=subprocess.DEVNULL,
             )
             assert foreign.pid is not None
-            foreign_ident = identity(foreign.pid)
+            foreign_ident = _identity(foreign.pid)
             self.assertIsNotNone(foreign_ident)
             assert foreign_ident is not None
-            os.killpg = spy_killpg
-            with ActivationFixture() as fixture:
+            with (
+                patch.object(os, "kill", spy_kill),
+                patch.object(os, "killpg", spy_killpg),
+                ActivationFixture() as fixture,
+            ):
                 fixture.state["hang_once"] = "show"
                 fixture.save()
                 owned = fixture.spawn()
                 assert owned.pid is not None
-                owned_ident = identity(owned.pid)
+                owned_ident = _identity(owned.pid)
                 self.assertIsNotNone(owned_ident)
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline and not fixture.child_pid_path.exists():
                     time.sleep(0.02)
                 self.assertTrue(fixture.child_pid_path.exists())
                 hang_child = int(fixture.child_pid_path.read_text())
-                hang_ident = identity(hang_child)
+                hang_ident = _identity(hang_child)
                 self.assertIsNotNone(hang_ident)
                 original_child_pid = fixture.child_pid_path.read_text()
                 recorded: list[object] = list(getattr(fixture, "_owned_groups"))
                 recorded.append(foreign.pid)
-                recorded.append((foreign.pid, 1, foreign_ident[2]))
+                recorded.append((foreign.pid, 1, foreign_ident[0]))
                 setattr(fixture, "_owned_groups", recorded)
                 fixture.child_pid_path.write_text(str(foreign.pid))
                 fixture._reap_owned_groups()
                 fixture.child_pid_path.write_text(original_child_pid)
-                self.assertEqual(identity(foreign.pid), foreign_ident)
+                self.assertEqual(_identity(foreign.pid), foreign_ident)
                 self.assertIsNone(foreign.poll())
-                self.assertNotIn(foreign_ident[2], [pgid for pgid, _sig in signaled])
+                self.assertFalse(
+                    any(target == foreign.pid for _kind, target, _sig in numeric)
+                )
                 if owned.poll() is None:
                     try:
                         owned.wait(timeout=2)
@@ -859,27 +901,186 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 with self.assertRaises(ProcessLookupError):
                     os.kill(hang_child, 0)
         finally:
-            os.killpg = real_killpg
-            if hang_ident is not None:
-                reap_if_same(hang_child, hang_ident)
-            if owned is not None:
-                reap_if_same(owned.pid, owned_ident)
-                for stream in (owned.stdout, owned.stderr):
-                    if stream is not None:
-                        stream.close()
-                try:
-                    owned.wait(timeout=2)
-                except Exception:
-                    pass
-            if foreign is not None:
-                reap_if_same(foreign.pid, foreign_ident)
-                try:
-                    foreign.wait(timeout=2)
-                except Exception:
-                    pass
+            _pidfd_reap_identity(hang_ident)
+            _reap_owned_popen(owned)
+            _pidfd_reap_identity(owned_ident)
+            _reap_owned_popen(foreign)
+
+    def test_held_pidfd_send_is_esrch_after_owned_generation_retires(self) -> None:
+        foreign: subprocess.Popen[bytes] | None = None
+        owned: subprocess.Popen[str] | None = None
+        hang_child = 0
+        hang_ident: tuple[int, int] | None = None
+        foreign_ident: tuple[int, int] | None = None
+        owned_ident: tuple[int, int] | None = None
+        numeric: list[tuple[str, int, int]] = []
+        sends: list[tuple[int, int]] = []
+        send_errors: list[int | None] = []
+        real_kill = os.kill
+        real_killpg = os.killpg
+        real_send = signal.pidfd_send_signal
+
+        def spy_kill(pid: int, sig: int) -> None:
+            if sig in (signal.SIGTERM, signal.SIGKILL):
+                numeric.append(("kill", pid, int(sig)))
+            real_kill(pid, sig)
+
+        def spy_killpg(pgid: int, sig: int) -> None:
+            if sig in (signal.SIGTERM, signal.SIGKILL):
+                numeric.append(("killpg", pgid, int(sig)))
+            real_killpg(pgid, sig)
+
+        def spy_send(
+            pidfd: int, sig: int, siginfo: None = None, flags: int = 0
+        ) -> None:
+            sends.append((pidfd, int(sig)))
+            try:
+                real_send(pidfd, sig, siginfo, flags)
+            except ProcessLookupError as error:
+                send_errors.append(error.errno)
+                raise
+            send_errors.append(None)
+
+        def retire_owned_generation(recorded: object, _fd: int) -> None:
+            if not isinstance(recorded, tuple) or len(recorded) < 2:
+                return
+            pid = int(recorded[0])
+            starttime = int(recorded[1])
+            if hang_ident is not None and (pid, starttime) == hang_ident:
+                _pidfd_reap_identity(hang_ident)
+            if owned_ident is not None and (pid, starttime) == owned_ident:
+                _reap_owned_popen(owned)
+                _pidfd_reap_identity(owned_ident)
+
+        try:
+            foreign = subprocess.Popen(
+                ["/usr/bin/sleep", "30"],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            assert foreign.pid is not None
+            foreign_ident = _identity(foreign.pid)
+            self.assertIsNotNone(foreign_ident)
+            assert foreign_ident is not None
+            with (
+                patch.object(os, "kill", spy_kill),
+                patch.object(os, "killpg", spy_killpg),
+                patch.object(signal, "pidfd_send_signal", spy_send),
+                ActivationFixture() as fixture,
+            ):
+                fixture.state["hang_once"] = "show"
+                fixture.save()
+                owned = fixture.spawn()
+                assert owned.pid is not None
+                owned_ident = _identity(owned.pid)
+                self.assertIsNotNone(owned_ident)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not fixture.child_pid_path.exists():
+                    time.sleep(0.02)
+                self.assertTrue(fixture.child_pid_path.exists())
+                hang_child = int(fixture.child_pid_path.read_text())
+                hang_ident = _identity(hang_child)
+                self.assertIsNotNone(hang_ident)
+                fixture._pin_gap = retire_owned_generation
+                fixture._reap_owned_groups()
+                self.assertEqual(_identity(foreign.pid), foreign_ident)
+                self.assertIsNone(foreign.poll())
+                self.assertFalse(
+                    any(target == foreign.pid for _kind, target, _sig in numeric)
+                )
+                self.assertTrue(sends)
+                self.assertIn(errno.ESRCH, send_errors)
+                self.assertTrue(
+                    all(sig in (signal.SIGTERM, signal.SIGKILL) for _fd, sig in sends)
+                )
+        finally:
+            _pidfd_reap_identity(hang_ident)
+            _reap_owned_popen(owned)
+            _pidfd_reap_identity(owned_ident)
+            _reap_owned_popen(foreign)
+
+    def test_pidfd_open_unavailable_does_not_numeric_signal_descendants(self) -> None:
+        foreign: subprocess.Popen[bytes] | None = None
+        owned: subprocess.Popen[str] | None = None
+        hang_child = 0
+        hang_ident: tuple[int, int] | None = None
+        foreign_ident: tuple[int, int] | None = None
+        owned_ident: tuple[int, int] | None = None
+        numeric: list[tuple[str, int, int]] = []
+        real_kill = os.kill
+        real_killpg = os.killpg
+        real_open = os.pidfd_open
+
+        def spy_kill(pid: int, sig: int) -> None:
+            if sig in (signal.SIGTERM, signal.SIGKILL):
+                numeric.append(("kill", pid, int(sig)))
+            real_kill(pid, sig)
+
+        def spy_killpg(pgid: int, sig: int) -> None:
+            if sig in (signal.SIGTERM, signal.SIGKILL):
+                numeric.append(("killpg", pgid, int(sig)))
+            real_killpg(pgid, sig)
+
+        def fail_open(pid: int, flags: int = 0) -> int:
+            raise OSError(errno.EMFILE, "Too many open files")
+
+        try:
+            foreign = subprocess.Popen(
+                ["/usr/bin/sleep", "30"],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            assert foreign.pid is not None
+            foreign_ident = _identity(foreign.pid)
+            self.assertIsNotNone(foreign_ident)
+            assert foreign_ident is not None
+            with (
+                patch.object(os, "kill", spy_kill),
+                patch.object(os, "killpg", spy_killpg),
+                patch.object(os, "pidfd_open", fail_open),
+                ActivationFixture() as fixture,
+            ):
+                fixture.state["hang_once"] = "show"
+                fixture.save()
+                owned = fixture.spawn()
+                assert owned.pid is not None
+                owned_ident = _identity(owned.pid)
+                self.assertIsNotNone(owned_ident)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not fixture.child_pid_path.exists():
+                    time.sleep(0.02)
+                self.assertTrue(fixture.child_pid_path.exists())
+                hang_child = int(fixture.child_pid_path.read_text())
+                hang_ident = _identity(hang_child)
+                self.assertIsNotNone(hang_ident)
+                fixture._reap_owned_groups()
+                self.assertEqual(_identity(foreign.pid), foreign_ident)
+                self.assertIsNone(foreign.poll())
+                self.assertEqual(_identity(hang_child), hang_ident)
+                self.assertFalse(
+                    any(target == hang_child for _kind, target, _sig in numeric)
+                )
+                self.assertFalse(
+                    any(target == foreign.pid for _kind, target, _sig in numeric)
+                )
+                if owned is not None and owned.poll() is None:
+                    self.assertTrue(
+                        all(
+                            kind != "killpg" or target != owned.pid
+                            for kind, target, _sig in numeric
+                        )
+                    )
+        finally:
+            os.pidfd_open = real_open
+            _pidfd_reap_identity(hang_ident)
+            _reap_owned_popen(owned)
+            _pidfd_reap_identity(owned_ident)
+            _reap_owned_popen(foreign)
 
     def test_outer_run_timeout_reaps_hang_once_group_before_next_fixture(self) -> None:
-        leaked: list[tuple[int, int, int]] = []
+        leaked: list[tuple[int, int]] = []
         helper: ActivationFixture | None = None
         try:
             with ActivationFixture() as fixture:
