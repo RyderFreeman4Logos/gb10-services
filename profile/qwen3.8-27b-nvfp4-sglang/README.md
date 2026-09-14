@@ -7,7 +7,7 @@ This directory is not that alias.
 ## Status
 
 - Profile is source-prepared only. It is **not enabled or started**: live
-  AEON/Guard stay on the current v0.26.0/v0.27.1 generation.
+  AEON/Guard stay on the current v0.29.0 generation.
 - Do not `systemctl enable/start` the unit here; a lifecycle cutover is a
   separate, authorized operation.
 - Live Guard still reads `/home/obj/.config/llm-guard-proxy/config.toml`; this
