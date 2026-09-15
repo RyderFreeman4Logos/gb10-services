@@ -98,6 +98,7 @@ class VllmNoSwapFixture(unittest.TestCase):
         *,
         application: list[str] | None = None,
         environment_files: tuple[str, ...] = (),
+        image: str | None = None,
     ) -> None:
         command = application or [
             "/usr/local/bin/vllm",
@@ -116,7 +117,7 @@ class VllmNoSwapFixture(unittest.TestCase):
             + f"ExecStart={launcher} --rm "
             f"--cidfile={cidfile} --name {name} "
             "--memory 18g --memory-swap 18g --memory-swappiness 0 --entrypoint python3 "
-            f"{self.image} "
+            f"{image if image is not None else self.image} "
             + " ".join(shlex.quote(token) for token in command)
             + "\n"
         )

@@ -91,12 +91,16 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
             _copy_fixture(target)
 
             old = json.loads((target / CONFIG).read_text())
+            new_override = "sha256:" + "c" * 64
             new = {
                 **old,
                 "tag": "2026-10-01-v0.30.1-omni",
                 "repository_digest": "sha256:" + "a" * 64,
                 "arm64_digest": "sha256:" + "b" * 64,
                 "runtime_version": "v0.30.1-omni",
+                "overrides": {
+                    "vllm-aeon-ultimate-uncensored-nvfp4.service": new_override
+                },
             }
             (target / CONFIG).write_text(json.dumps(new, indent=2) + "\n")
             result = _run_updater(target)
@@ -127,11 +131,12 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
                     self.assertIn(new["runtime_version"], description)
                     self.assertNotIn(old["repository_digest"], text)
             ultimate = (target / ULTIMATE_UNIT).read_text()
-            self.assertEqual(ultimate.count(ULTIMATE_OVERRIDE_DIGEST), 2)
+            self.assertEqual(ultimate.count(new_override), 2)
+            self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, ultimate)
             self.assertNotIn(new["repository_digest"], ultimate)
             self.assertIn(
                 "# AEON image release: "
-                f"{new['tag']}; immutable digest: {ULTIMATE_OVERRIDE_DIGEST}",
+                f"{new['tag']}; immutable digest: {new_override}",
                 ultimate,
             )
 
@@ -214,7 +219,7 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
         self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, embedding)
         self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, querit)
 
-    def test_future_generation_keeps_ultimate_override_when_central_digest_moves(self) -> None:
+    def test_future_generation_rejects_stale_ultimate_override_when_central_digest_moves(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             target = Path(raw_tmp)
             _copy_fixture(target)
@@ -228,13 +233,14 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
             }
             (target / CONFIG).write_text(json.dumps(new, indent=2) + "\n")
             result = _run_updater(target)
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Ultimate derived override is still bound", result.stderr)
             ultimate = (target / ULTIMATE_UNIT).read_text()
             self.assertIn(ULTIMATE_OVERRIDE_DIGEST, ultimate)
             self.assertNotIn(new["repository_digest"], ultimate)
             embedding = (target / UNITS[2]).read_text()
-            self.assertIn(new["repository_digest"], embedding)
-            self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, embedding)
+            self.assertIn(old["repository_digest"], embedding)
+            self.assertNotIn(new["repository_digest"], embedding)
 
     def test_current_cache_guidance_matches_release_namespace(self) -> None:
         release = json.loads((ROOT / CONFIG).read_text())

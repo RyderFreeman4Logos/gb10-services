@@ -151,6 +151,27 @@ The proxy config must enable only `aeon-text` with `mem_threshold_gib = 5`,
 `registration_file = "text-cgroup.v1"`. The guardian is built into the proxy;
 there is no separate guardian binary or service to install.
 
+### 4b. Admit the Ultimate derived local image
+
+The canonical Ultimate unit pins host-local image ID
+`sha256:26c62d60a7cce96b279d768eaafc20189f7a38e125f9183e11ba6d5f9d4a53e0`.
+A fresh Docker host cannot pull a bare local ID. Before installing or
+starting that unit, admit the image from this repository's exact context:
+
+```bash
+python3 scripts/gb10_prepare_aeon_ultimate_image.py --build --iidfile /tmp/aeon-ultimate.iid
+# or, if a verified artifact already exists:
+# python3 scripts/gb10_prepare_aeon_ultimate_image.py --load /path/to/verified.tar --iidfile /tmp/aeon-ultimate.iid
+```
+
+The helper uses `profile/aeon-ultimate-uncensored-nvfp4/image` as the
+build context, `--network=none --pull=false`, writes `--iidfile`, and
+fail-closed compares that ID to the configured override. Rebuild image IDs
+are not assumed deterministic: if the iidfile does not match
+`sha256:26c62d60a7cce96b279d768eaafc20189f7a38e125f9183e11ba6d5f9d4a53e0`,
+`docker load` a previously verified artifact (`--load`) instead of starting
+the unit.
+
 ### 5. Systemd User Services Installation
 ```bash
 # Create user-level systemd directory if missing

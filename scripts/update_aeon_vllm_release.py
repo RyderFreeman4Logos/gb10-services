@@ -119,6 +119,18 @@ def _load_release(root: Path) -> dict:
         raise ValueError("Ultimate override must be a full sha256 digest")
     if override_digest == release["repository_digest"]:
         raise ValueError("Ultimate override must differ from the central digest")
+    derived_image = (
+        "sha256:26c62d60a7cce96b279d768eaafc20189f7a38e125f9183e11ba6d5f9d4a53e0"
+    )
+    derived_base = (
+        "sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7"
+    )
+    if override_digest == derived_image and release["repository_digest"] != derived_base:
+        raise ValueError(
+            "Ultimate derived override is still bound to "
+            f"{derived_base}; rebuild or retarget the override before moving "
+            "the central release"
+        )
     _cache_key(release["runtime_version"])
     return release
 
