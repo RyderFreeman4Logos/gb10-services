@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -37,7 +39,11 @@ class SparkdashProfileTests(unittest.TestCase):
 
     def test_unit_does_not_couple_to_model_services(self) -> None:
         unit = (PROFILE / "sparkdash.service").read_text()
-        self.assertIn("ExecStart=/home/obj/.local/share/mise/installs/node/22.23.2/bin/node server/index.js", unit)
+        self.assertIn(
+            "ExecStart=/usr/bin/env SPARKDASH_READ_ONLY=1 "
+            "/home/obj/.local/share/mise/installs/node/22.23.2/bin/node server/index.js",
+            unit,
+        )
         self.assertIn("EnvironmentFile=/home/obj/.config/sparkdash/sparkdash.env", unit)
         self.assertNotRegex(unit, r"(?m)^Requires=")
         self.assertNotIn("vllm-", unit)
@@ -143,11 +149,14 @@ def _git_env() -> dict[str, str]:
     }
 
 
-def _prepare_installer_fixture(tmp: Path) -> tuple[Path, Path, Path, dict[str, str], str]:
+def _prepare_installer_fixture(
+    tmp: Path,
+) -> tuple[Path, Path, Path, Path, dict[str, str], str]:
     checkout = tmp / "sparkDash"
     home = tmp / "home"
     bin_dir = tmp / "bin"
     npm_log = tmp / "npm.log"
+    action_log = tmp / "actions.log"
     checkout.mkdir()
     home.mkdir()
     bin_dir.mkdir()
@@ -170,20 +179,65 @@ def _prepare_installer_fixture(tmp: Path) -> tuple[Path, Path, Path, dict[str, s
         capture_output=True,
     )
     pin = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
+    baseline_llm = checkout / "server" / "collectors" / "llmHost.js"
+    backup_llm = baseline_llm.with_name("llmHost.js.upstream-bbec3bb")
+    backup_llm.write_bytes(baseline_llm.read_bytes())
+    backup_llm.chmod(0o664)
+    baseline_llm.write_bytes((PROFILE / "llmHost.js").read_bytes())
+    baseline_llm.chmod(0o600)
+    (checkout / "server" / "auth.js").chmod(0o664)
+    sparks = checkout / "config" / "sparks.json"
+    sparks.write_bytes((PROFILE / "sparks.legacy-bbec3bb.json").read_bytes())
+    sparks.chmod(0o644)
     (checkout / "node_modules").mkdir()
     (checkout / "dist").mkdir()
-    (bin_dir / "node").write_text("#!/bin/sh\nexit 0\n")
+    node = shutil.which("node")
+    if not node:
+        raise unittest.SkipTest("node is required for sparkDash installer tests")
+    (bin_dir / "node").symlink_to(node)
     (bin_dir / "npm").write_text(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${NPM_LOG}\"\nexit 0\n"
+        "#!/bin/sh\n"
+        "printf 'npm:%s\\n' \"$*\" >> \"${ACTION_LOG}\"\n"
+        "printf '%s\\n' \"$*\" >> \"${NPM_LOG}\"\n"
+        "exit 0\n"
     )
-    for name in ("node", "npm"):
+    for name in ("mkdir", "install", "cp"):
+        real = shutil.which(name)
+        if not real:
+            raise unittest.SkipTest(f"{name} is required for sparkDash installer tests")
+        (bin_dir / name).write_text(
+            "#!/bin/sh\n"
+            f"printf '{name}:%s\\n' \"$*\" >> \"${{ACTION_LOG}}\"\n"
+            f"exec {shlex.quote(real)} \"$@\"\n"
+        )
+    real_git = shutil.which("git")
+    if not real_git:
+        raise unittest.SkipTest("git is required for sparkDash installer tests")
+    (bin_dir / "git").write_text(
+        "#!/bin/sh\n"
+        "for arg in \"$@\"; do\n"
+        "  case \"$arg\" in\n"
+        "    clone|fetch|checkout|reset|switch) "
+        "printf 'git:%s\\n' \"$*\" >> \"${ACTION_LOG}\"; break ;;\n"
+        "  esac\n"
+        "done\n"
+        f"exec {shlex.quote(real_git)} \"$@\"\n"
+    )
+    for name in ("npm", "mkdir", "install", "cp", "git"):
         (bin_dir / name).chmod(stat.S_IRWXU)
     root = tmp / "gb10-services"
     profile = root / "profile" / "sparkdash"
     scripts = root / "scripts"
     profile.mkdir(parents=True)
     scripts.mkdir()
-    for name in ("llmHost.js", "sparks.json", "sparkdash.env", "sparkdash.service", "auth.js"):
+    for name in (
+        "llmHost.js",
+        "sparks.json",
+        "sparks.legacy-bbec3bb.json",
+        "sparkdash.env",
+        "sparkdash.service",
+        "auth.js",
+    ):
         src = PROFILE / name
         if src.is_file():
             (profile / name).write_bytes(src.read_bytes())
@@ -207,17 +261,22 @@ def _prepare_installer_fixture(tmp: Path) -> tuple[Path, Path, Path, dict[str, s
         "HOME": str(home),
         "SPARKDASH_CHECKOUT": str(checkout),
         "NPM_LOG": str(npm_log),
+        "ACTION_LOG": str(action_log),
         "PATH": f"{bin_dir}:/usr/bin:/bin",
         "TMPDIR": str(tmp / "tmp"),
     }
-    return checkout, home, npm_log, env, pin
+    return checkout, home, npm_log, action_log, env, pin
+
+
+def _snapshot(paths: list[Path]) -> dict[Path, tuple[bytes, int]]:
+    return {path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode)) for path in paths}
 
 
 class SparkdashInstallerAttestationTests(unittest.TestCase):
     def test_installer_rejects_unexpected_dirty_tracked_source(self) -> None:
         with tempfile.TemporaryDirectory(prefix="sparkdash-install-") as raw:
             tmp = Path(raw)
-            checkout, home, npm_log, env, _pin = _prepare_installer_fixture(tmp)
+            checkout, home, npm_log, action_log, env, _pin = _prepare_installer_fixture(tmp)
             dirty = "console.log('DIRTY');\n"
             (checkout / "server" / "index.js").write_text(dirty)
             pin_llm = (checkout / "server" / "collectors" / "llmHost.js").read_text()
@@ -232,18 +291,17 @@ class SparkdashInstallerAttestationTests(unittest.TestCase):
             self.assertEqual((checkout / "server" / "index.js").read_text(), dirty)
             self.assertEqual((checkout / "server" / "collectors" / "llmHost.js").read_text(), pin_llm)
             self.assertFalse(npm_log.exists())
+            self.assertFalse(action_log.exists())
             self.assertFalse((home / ".config" / "sparkdash" / "sparkdash.env").exists())
 
-    def test_installer_rebuilds_clean_and_known_overlay_checkout(self) -> None:
+    def test_old_install_upgrade_forces_readonly_and_serves_metadata(self) -> None:
         with tempfile.TemporaryDirectory(prefix="sparkdash-install-") as raw:
             tmp = Path(raw)
-            checkout, home, npm_log, env, _pin = _prepare_installer_fixture(tmp)
+            checkout, home, npm_log, _action_log, env, _pin = _prepare_installer_fixture(tmp)
             user_env = home / ".config" / "sparkdash" / "sparkdash.env"
             user_env.parent.mkdir(parents=True)
-            user_env.write_text("USER_RUNTIME=keep\n")
-            (checkout / "server" / "collectors" / "llmHost.js").write_text(
-                "export function llmProbeHost() { return 'overlay-dirty'; }\n"
-            )
+            old_env = b"USER_RUNTIME=keep\nSPARKDASH_TOKEN=fixture-secret\n"
+            user_env.write_bytes(old_env)
             installer = tmp / "gb10-services" / "scripts" / "sparkdash_install.sh"
             completed = subprocess.run(
                 ["bash", str(installer)],
@@ -259,10 +317,143 @@ class SparkdashInstallerAttestationTests(unittest.TestCase):
             self.assertIn("run build", log)
             overlay = (checkout / "server" / "collectors" / "llmHost.js").read_text()
             self.assertIn("if (ip) return ip;", overlay)
-            self.assertEqual(user_env.read_text(), "USER_RUNTIME=keep\n")
+            self.assertEqual(
+                stat.S_IMODE((checkout / "server" / "collectors" / "llmHost.js").stat().st_mode),
+                0o644,
+            )
+            self.assertEqual(
+                stat.S_IMODE(
+                    (checkout / "server" / "collectors" / "llmHost.js.upstream-bbec3bb").stat().st_mode
+                ),
+                0o644,
+            )
+            self.assertEqual(user_env.read_bytes(), old_env)
             auth = (checkout / "server" / "auth.js").read_text()
             self.assertIn("createAuthMiddleware", auth)
             self.assertIn("SPARKDASH_READ_ONLY", auth)
+
+            unit = (home / ".config" / "systemd" / "user" / "sparkdash.service").read_text()
+            exec_start = next(
+                line.removeprefix("ExecStart=")
+                for line in unit.splitlines()
+                if line.startswith("ExecStart=")
+            )
+            argv = shlex.split(exec_start)
+            self.assertEqual(argv[:2], ["/usr/bin/env", "SPARKDASH_READ_ONLY=1"])
+            argv[2] = shutil.which("node") or self.fail("node is required")
+            witness = tmp / "benchmark-launched"
+            (checkout / "server" / "index.js").write_text(
+                """
+import http from "node:http";
+import { createAuthMiddleware } from "./auth.js";
+import { writeFileSync } from "node:fs";
+const middleware = createAuthMiddleware();
+const server = http.createServer((req, response) => {
+  const res = {
+    status(code) { response.statusCode = code; return this; },
+    json(payload) { response.setHeader("content-type", "application/json"); response.end(JSON.stringify(payload)); },
+  };
+  middleware(req, res, () => {
+    if (req.method === "POST") writeFileSync(process.env.BENCHMARK_WITNESS, "launched");
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ ok: true, metadata: "fixture" }));
+  });
+});
+server.listen(0, "127.0.0.1", async () => {
+  const port = server.address().port;
+  const get = await fetch(`http://127.0.0.1:${port}/api/health`);
+  const metadata = await get.json();
+  const post = await fetch(`http://127.0.0.1:${port}/api/benchmark`, { method: "POST" });
+  const rejected = await post.json();
+  server.close();
+  if (get.status !== 200 || metadata.metadata !== "fixture") throw new Error("metadata failed");
+  if (post.status !== 403 || !rejected.error?.includes("read-only")) throw new Error("mutation was not read-only rejected");
+});
+"""
+            )
+            runtime_env = {
+                **env,
+                "BENCHMARK_WITNESS": str(witness),
+                "SPARKDASH_TOKEN": "fixture-secret",
+                "USER_RUNTIME": "keep",
+            }
+            for inherited_readonly in (None, "0"):
+                if inherited_readonly is None:
+                    runtime_env.pop("SPARKDASH_READ_ONLY", None)
+                else:
+                    runtime_env["SPARKDASH_READ_ONLY"] = inherited_readonly
+                runtime = subprocess.run(
+                    argv,
+                    cwd=checkout,
+                    env=runtime_env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                self.assertEqual(runtime.returncode, 0, runtime.stderr + runtime.stdout)
+                self.assertFalse(witness.exists(), "mutating handler launched benchmark work")
+
+    def test_arbitrary_managed_bytes_and_modes_reject_before_any_write(self) -> None:
+        cases = (
+            ("llm-bytes", "server/collectors/llmHost.js", b"arbitrary-overlay\n", None),
+            ("auth-bytes", "server/auth.js", b"arbitrary-auth\n", None),
+            ("sparks-bytes", "config/sparks.json", b"{}\n", None),
+            ("llm-backup-bytes", "server/collectors/llmHost.js.upstream-bbec3bb", b"arbitrary-backup\n", None),
+            ("auth-backup-bytes", "server/auth.js.upstream-bbec3bb", b"arbitrary-backup\n", None),
+            ("llm-mode", "server/collectors/llmHost.js", None, 0o755),
+            ("auth-mode", "server/auth.js", None, 0o755),
+            ("sparks-mode", "config/sparks.json", None, 0o600),
+            ("llm-backup-mode", "server/collectors/llmHost.js.upstream-bbec3bb", None, 0o755),
+            ("auth-backup-mode", "server/auth.js.upstream-bbec3bb", None, 0o755),
+        )
+        for name, relative, content, mode in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory(
+                prefix="sparkdash-install-"
+            ) as raw:
+                tmp = Path(raw)
+                checkout, home, npm_log, action_log, env, _pin = _prepare_installer_fixture(tmp)
+                user_env = home / ".config" / "sparkdash" / "sparkdash.env"
+                user_env.parent.mkdir(parents=True)
+                user_env.write_bytes(b"USER_RUNTIME=keep\nSPARKDASH_TOKEN=fixture-secret\n")
+                target = checkout / relative
+                if relative == "server/auth.js.upstream-bbec3bb":
+                    target.write_bytes(
+                        subprocess.check_output(
+                            ["git", "show", "HEAD:server/auth.js"], cwd=checkout
+                        )
+                    )
+                    target.chmod(0o664)
+                if content is not None:
+                    target.write_bytes(content)
+                if mode is not None:
+                    target.chmod(mode)
+                managed = [
+                    checkout / "server" / "collectors" / "llmHost.js",
+                    checkout / "server" / "auth.js",
+                    checkout / "config" / "sparks.json",
+                    checkout / "server" / "collectors" / "llmHost.js.upstream-bbec3bb",
+                    user_env,
+                ]
+                if target.name == "auth.js.upstream-bbec3bb":
+                    managed.append(target)
+                before = _snapshot(managed)
+                completed = subprocess.run(
+                    ["bash", str(tmp / "gb10-services" / "scripts" / "sparkdash_install.sh")],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+                self.assertEqual(_snapshot(managed), before)
+                self.assertFalse(
+                    action_log.exists(), action_log.read_text() if action_log.exists() else ""
+                )
+                self.assertFalse(npm_log.exists())
+                self.assertFalse(
+                    (home / ".config" / "systemd" / "user" / "sparkdash.service").exists()
+                )
 
 
 if __name__ == "__main__":

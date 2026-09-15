@@ -1,0 +1,36 @@
+{
+  "sparks": [
+    {
+      "id": "gb10-promax",
+      "name": "GB10 promaxgb10-e659",
+      "kind": "spark",
+      "lanIp": "100.105.4.92",
+      "cx7Ip": null,
+      "macAddress": null,
+      "detectedMacAddress": "fc:4c:ea:f8:e6:59",
+      "isLocal": true,
+      "ssh": {
+        "host": "",
+        "user": "obj",
+        "auth": "key"
+      },
+      "llmPorts": [
+        18010,
+        18012,
+        18013
+      ],
+      "role": "standalone",
+      "workerNode": false,
+      "workerLabel": null,
+      "workerHeadId": null,
+      "llmMonitoring": true,
+      "comfyMonitoring": false,
+      "comfyPort": 8188,
+      "tailscaleMonitoring": false,
+      "hermesMonitoring": false,
+      "disabledDevices": [],
+      "disabledInterfaces": [],
+      "storagePollDisabled": true
+    }
+  ]
+}

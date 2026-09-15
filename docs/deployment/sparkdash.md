@@ -2,8 +2,9 @@
 
 Read-only MiaAI-Lab/sparkDash dashboard for this GB10 host. Not a model unit.
 Mutating HTTP (bench, shutdown, config, Hermes/Comfy actions) is rejected in
-`createAuthMiddleware()` when `SPARKDASH_READ_ONLY=1`. Loopback bind is not
-enough: tokenless loopback POSTs from a hostile Origin would otherwise start
+`createAuthMiddleware()`. The unit's `ExecStart` forces
+`SPARKDASH_READ_ONLY=1`, so a preserved legacy/user env cannot reopen writes.
+Loopback bind is not enough: tokenless loopback POSTs from a hostile Origin would otherwise start
 real model work. Do not set a `SPARKDASH_TOKEN` in the tracked env.
 
 ## Pin
@@ -42,7 +43,8 @@ Disabled: Comfy cancel, Hermes update, decode/prefill/showcase benches, shutdown
 # on GB10, after rsync of committed profile files
 bash scripts/sparkdash_install.sh
 systemctl --user daemon-reload
-systemctl --user enable --now sparkdash.service
+systemctl --user stop sparkdash.service
+systemctl --user start sparkdash.service
 ```
 
 Do not `Requires=` any vLLM/Guard unit. Do not restart models.
@@ -84,6 +86,7 @@ Does not touch model units or PIDs.
 - `profile/sparkdash/sparkdash.service` → `~/.config/systemd/user/sparkdash.service`
 - `profile/sparkdash/sparkdash.env` → `~/.config/sparkdash/sparkdash.env`
 - `profile/sparkdash/sparks.json` → `/home/obj/src/sparkDash/config/sparks.json`
+- `profile/sparkdash/sparks.legacy-bbec3bb.json` — exact admitted pre-upgrade runtime state
 - `profile/sparkdash/llmHost.js` → `/home/obj/src/sparkDash/server/collectors/llmHost.js`
 - `profile/sparkdash/auth.js` → `/home/obj/src/sparkDash/server/auth.js`
 - `profile/sparkdash/PIN`

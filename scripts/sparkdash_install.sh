@@ -10,77 +10,117 @@ CHECKOUT="${SPARKDASH_CHECKOUT:-/home/obj/src/sparkDash}"
 PINNED_COMMIT="$(awk -F= '/^commit=/{print $2}' "${PIN_FILE}")"
 PINNED_REPO="$(awk -F= '/^repo=/{print $2}' "${PIN_FILE}")"
 NODE_BIN="$(awk -F= '/^node_bin=/{print $2}' "${PIN_FILE}")"
+TMPDIR="${TMPDIR:-${HOME}/tmp}"
+
+fail() {
+  echo "sparkdash: $*" >&2
+  exit 1
+}
 
 if [[ -z "${PINNED_COMMIT}" || -z "${PINNED_REPO}" ]]; then
-  echo "sparkdash: missing pin in ${PIN_FILE}" >&2
-  exit 1
+  fail "missing pin in ${PIN_FILE}"
 fi
 
-mkdir -p "${CHECKOUT%/*}"
-export TMPDIR="${TMPDIR:-${HOME}/tmp}"
-mkdir -p "${TMPDIR}"
-
-is_known_overlay() {
-  case "$1" in
-    server/collectors/llmHost.js|server/auth.js|config/sparks.json|\
-    server/collectors/llmHost.js.upstream-bbec3bb|server/auth.js.upstream-bbec3bb)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+file_matches() {
+  local path="$1" expected_hash="$2" mode actual_mode
+  shift 2
+  [[ -f "${path}" && ! -L "${path}" ]] || return 1
+  [[ "$(sha256sum -- "${path}" | awk '{print $1}')" == "${expected_hash}" ]] || return 1
+  actual_mode="$(stat -c '%a' -- "${path}")"
+  for mode in "$@"; do
+    [[ "${actual_mode}" == "${mode}" ]] && return 0
+  done
+  return 1
 }
 
-reject_unexpected_dirt() {
-  local dirty line path unexpected
-  dirty="$(git -C "${CHECKOUT}" status --porcelain --untracked-files=no)"
-  unexpected=""
+pin_hash() {
+  git -C "${CHECKOUT}" show "${PINNED_COMMIT}:$1" | sha256sum | awk '{print $1}'
+}
+
+preflight_existing_checkout() {
+  local head dirty line index_status path llm_base auth_base llm_overlay auth_overlay
+  local sparks_overlay sparks_legacy llm_backup auth_backup sparks
+
+  git -C "${CHECKOUT}" cat-file -e "${PINNED_COMMIT}^{commit}" 2>/dev/null ||
+    fail "existing checkout lacks pinned commit ${PINNED_COMMIT}; refusing network or source writes"
+  head="$(git -C "${CHECKOUT}" rev-parse HEAD)"
+  [[ "${head}" == "${PINNED_COMMIT}" ]] ||
+    fail "checkout HEAD ${head} != pin ${PINNED_COMMIT}; refusing checkout or fetch"
+
+  llm_base="$(pin_hash server/collectors/llmHost.js)"
+  auth_base="$(pin_hash server/auth.js)"
+  llm_overlay="$(sha256sum -- "${PROFILE}/llmHost.js" | awk '{print $1}')"
+  auth_overlay="$(sha256sum -- "${PROFILE}/auth.js" | awk '{print $1}')"
+  sparks_overlay="$(sha256sum -- "${PROFILE}/sparks.json" | awk '{print $1}')"
+  sparks_legacy="$(sha256sum -- "${PROFILE}/sparks.legacy-bbec3bb.json" | awk '{print $1}')"
+
+  # 0664 baseline and 0600 llmHost overlay are exact observed pre-upgrade states.
+  # Every published managed file is normalized to 0644 below.
+  if ! file_matches "${CHECKOUT}/server/collectors/llmHost.js" "${llm_base}" 644 664 &&
+    ! file_matches "${CHECKOUT}/server/collectors/llmHost.js" "${llm_overlay}" 600 644; then
+    fail "refusing unknown bytes or mode at server/collectors/llmHost.js"
+  fi
+  if ! file_matches "${CHECKOUT}/server/auth.js" "${auth_base}" 644 664 &&
+    ! file_matches "${CHECKOUT}/server/auth.js" "${auth_overlay}" 644; then
+    fail "refusing unknown bytes or mode at server/auth.js"
+  fi
+
+  sparks="${CHECKOUT}/config/sparks.json"
+  if [[ -e "${sparks}" || -L "${sparks}" ]]; then
+    if ! file_matches "${sparks}" "${sparks_overlay}" 644 &&
+      ! file_matches "${sparks}" "${sparks_legacy}" 644; then
+      fail "refusing unknown bytes or mode at config/sparks.json"
+    fi
+  fi
+
+  llm_backup="${CHECKOUT}/server/collectors/llmHost.js.upstream-bbec3bb"
+  if [[ -e "${llm_backup}" || -L "${llm_backup}" ]]; then
+    file_matches "${llm_backup}" "${llm_base}" 644 664 ||
+      fail "refusing unknown bytes or mode at server/collectors/llmHost.js.upstream-bbec3bb"
+  fi
+  auth_backup="${CHECKOUT}/server/auth.js.upstream-bbec3bb"
+  if [[ -e "${auth_backup}" || -L "${auth_backup}" ]]; then
+    file_matches "${auth_backup}" "${auth_base}" 644 664 ||
+      fail "refusing unknown bytes or mode at server/auth.js.upstream-bbec3bb"
+  fi
+
+  dirty="$(GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C "${CHECKOUT}" status --porcelain=v1 --untracked-files=no)"
   while IFS= read -r line; do
     [[ -z "${line}" ]] && continue
+    index_status="${line:0:1}"
     path="${line:3}"
-    if [[ "${path}" == *" -> "* ]]; then
-      path="${path##* -> }"
-    fi
-    if ! is_known_overlay "${path}"; then
-      unexpected+="${line}"$'\n'
-    fi
+    [[ "${index_status}" == " " ]] || fail "refusing staged source change: ${path}"
+    case "${path}" in
+      server/collectors/llmHost.js|server/auth.js) ;;
+      *) fail "refusing unexpected tracked edit: ${path}" ;;
+    esac
   done <<< "${dirty}"
-  if [[ -n "${unexpected}" ]]; then
-    echo "sparkdash: refusing to overwrite unexpected tracked edits in ${CHECKOUT}" >&2
-    printf '%s' "${unexpected}" >&2
-    exit 1
-  fi
 }
 
-if [[ ! -d "${CHECKOUT}/.git" ]]; then
-  if [[ -e "${CHECKOUT}" ]]; then
-    echo "sparkdash: ${CHECKOUT} exists and is not a git checkout; refusing to overwrite" >&2
-    exit 1
-  fi
+new_checkout=0
+if [[ -d "${CHECKOUT}/.git" ]]; then
+  preflight_existing_checkout
+else
+  [[ ! -e "${CHECKOUT}" && ! -L "${CHECKOUT}" ]] ||
+    fail "${CHECKOUT} exists and is not a git checkout; refusing to overwrite"
+  new_checkout=1
+fi
+
+existing_env="${HOME}/.config/sparkdash/sparkdash.env"
+if [[ -e "${existing_env}" || -L "${existing_env}" ]]; then
+  [[ -f "${existing_env}" && ! -L "${existing_env}" ]] ||
+    fail "existing sparkdash.env is not a regular file; refusing to overwrite"
+fi
+
+mkdir -p "${CHECKOUT%/*}" "${TMPDIR}"
+if (( new_checkout )); then
   git clone --filter=blob:none "${PINNED_REPO}" "${CHECKOUT}"
-fi
-if git -C "${CHECKOUT}" remote get-url origin >/dev/null 2>&1; then
-  git -C "${CHECKOUT}" fetch --filter=blob:none origin
-fi
-
-reject_unexpected_dirt
-
-HEAD="$(git -C "${CHECKOUT}" rev-parse HEAD)"
-if [[ "${HEAD}" != "${PINNED_COMMIT}" ]]; then
-  git -C "${CHECKOUT}" checkout "${PINNED_COMMIT}" -- .
   git -C "${CHECKOUT}" checkout --detach "${PINNED_COMMIT}"
-  HEAD="$(git -C "${CHECKOUT}" rev-parse HEAD)"
-fi
-if [[ "${HEAD}" != "${PINNED_COMMIT}" ]]; then
-  echo "sparkdash: checkout HEAD ${HEAD} != pin ${PINNED_COMMIT}" >&2
-  exit 1
+  preflight_existing_checkout
 fi
 
-if [[ ! -x "${NODE_BIN}" ]]; then
-  echo "sparkdash: node binary missing at ${NODE_BIN}; install mise node@22.23.2 first" >&2
-  exit 1
-fi
+[[ -x "${NODE_BIN}" ]] ||
+  fail "node binary missing at ${NODE_BIN}; install mise node@22.23.2 first"
 
 (
   cd "${CHECKOUT}"
@@ -89,22 +129,36 @@ fi
   npm run build
 )
 
+# npm/build may not widen the already-attested source state.
+preflight_existing_checkout
+
 install -d -m 0755 "${HOME}/.config/sparkdash" "${HOME}/.config/systemd/user"
-if [[ ! -f "${CHECKOUT}/server/collectors/llmHost.js.upstream-bbec3bb" ]]; then
-  cp -a "${CHECKOUT}/server/collectors/llmHost.js" "${CHECKOUT}/server/collectors/llmHost.js.upstream-bbec3bb"
-fi
-if [[ ! -f "${CHECKOUT}/server/auth.js.upstream-bbec3bb" ]]; then
-  cp -a "${CHECKOUT}/server/auth.js" "${CHECKOUT}/server/auth.js.upstream-bbec3bb"
-fi
+llm_tmp="$(mktemp "${TMPDIR}/sparkdash-llm-upstream.XXXXXX")"
+auth_tmp="$(mktemp "${TMPDIR}/sparkdash-auth-upstream.XXXXXX")"
+trap 'rm -f "${llm_tmp}" "${auth_tmp}"' EXIT
+git -C "${CHECKOUT}" show "${PINNED_COMMIT}:server/collectors/llmHost.js" >"${llm_tmp}"
+git -C "${CHECKOUT}" show "${PINNED_COMMIT}:server/auth.js" >"${auth_tmp}"
+install -m 0644 "${llm_tmp}" "${CHECKOUT}/server/collectors/llmHost.js.upstream-bbec3bb"
+install -m 0644 "${auth_tmp}" "${CHECKOUT}/server/auth.js.upstream-bbec3bb"
 install -m 0644 "${PROFILE}/llmHost.js" "${CHECKOUT}/server/collectors/llmHost.js"
 install -m 0644 "${PROFILE}/auth.js" "${CHECKOUT}/server/auth.js"
 install -m 0644 "${PROFILE}/sparks.json" "${CHECKOUT}/config/sparks.json"
-if [[ ! -e "${HOME}/.config/sparkdash/sparkdash.env" ]]; then
-  install -m 0644 "${PROFILE}/sparkdash.env" "${HOME}/.config/sparkdash/sparkdash.env"
+if [[ ! -e "${existing_env}" ]]; then
+  install -m 0644 "${PROFILE}/sparkdash.env" "${existing_env}"
 fi
 install -m 0644 "${PROFILE}/sparkdash.service" "${HOME}/.config/systemd/user/sparkdash.service"
 
+# Read back the published source contract; user env bytes/mode are intentionally untouched.
+preflight_existing_checkout
+file_matches "${HOME}/.config/systemd/user/sparkdash.service" \
+  "$(sha256sum -- "${PROFILE}/sparkdash.service" | awk '{print $1}')" 644 ||
+  fail "installed unit failed byte/mode verification"
+
+rm -f "${llm_tmp}" "${auth_tmp}"
+trap - EXIT
+
 echo "sparkdash: installed pin ${PINNED_COMMIT} at ${CHECKOUT}"
+echo "sparkdash: preserved existing env when present; unit forces SPARKDASH_READ_ONLY=1"
 echo "sparkdash: unit ${HOME}/.config/systemd/user/sparkdash.service"
 echo "sparkdash: enable with: systemctl --user daemon-reload && systemctl --user enable --now sparkdash.service"
 echo "sparkdash: never Requires= model units; stop/start this unit only"
