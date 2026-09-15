@@ -503,6 +503,7 @@ def _rollback_uninterrupted(config: RuntimeConfig, deadline: float) -> bool:
                 and failed_generation.stable == prior_generation.stable
                 else config.transaction / "unit.source"
             )
+        _restore_prior_unit(config, manifest)
         _bind_reload_stable_scopes(
             config,
             deadline,
@@ -511,7 +512,6 @@ def _rollback_uninterrupted(config: RuntimeConfig, deadline: float) -> bool:
             helper_path=config.installed_no_swap_helper,
             expected_artifact_sha256=no_swap_authority,
         )
-        _restore_prior_unit(config, manifest)
         _run_systemctl(config, deadline, "daemon-reload")
         if not prior_generation.running:
             raise TransactionError("transaction prior generation was not active/running")
