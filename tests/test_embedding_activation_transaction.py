@@ -29,6 +29,26 @@ from embedding_activation_fixtures import (  # noqa: E402
 )
 
 
+def _failure_detail(
+    *,
+    stderr: str = "",
+    stdout: str = "",
+    phase: str = "",
+    errno_value: int | None = None,
+) -> str:
+    parts: list[str] = []
+    if errno_value is not None:
+        name = errno.errorcode.get(errno_value, "?")
+        parts.append(f"errno={errno_value} ({name}) {os.strerror(errno_value)}")
+    if phase:
+        parts.append(f"rollback_stage={phase!r}")
+    if stderr:
+        parts.append(f"stderr={stderr}")
+    if stdout:
+        parts.append(f"stdout={stdout}")
+    return " | ".join(parts)
+
+
 def _literal_string_map(path: Path, name: str) -> dict[str, str]:
     tree = ast.parse(path.read_text(), filename=str(path))
     value: object | None = None
@@ -144,6 +164,19 @@ def _reap_owned_popen(process: subprocess.Popen[str] | subprocess.Popen[bytes] |
 
 
 class EmbeddingActivationTransactionTests(unittest.TestCase):
+    def test_failure_detail_retains_errno_stderr_and_rollback_stage(self) -> None:
+        detail = _failure_detail(
+            errno_value=errno.EMFILE,
+            stderr="embedding rollback failed: bind failed",
+            stdout="kept",
+            phase="rollback_failed",
+        )
+        self.assertIn("errno=24 (EMFILE)", detail)
+        self.assertIn(os.strerror(errno.EMFILE), detail)
+        self.assertIn("rollback_stage='rollback_failed'", detail)
+        self.assertIn("embedding rollback failed: bind failed", detail)
+        self.assertIn("stdout=kept", detail)
+
     def assert_restored(
         self,
         fixture: ActivationFixture,
@@ -151,39 +184,56 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
         present: bool = True,
         helper_present: bool = True,
         core_present: bool | None = None,
+        result: subprocess.CompletedProcess[str] | None = None,
+        stdout: str = "",
+        stderr: str = "",
     ) -> None:
+        if result is not None:
+            stdout = result.stdout
+            stderr = result.stderr
+        phase_path = fixture.transaction() / "phase"
+        phase = phase_path.read_text().strip() if phase_path.is_file() else ""
+        detail = _failure_detail(stderr=stderr, stdout=stdout, phase=phase)
         if core_present is None:
             core_present = helper_present
         if present:
-            self.assertEqual(fixture.installed_unit.read_bytes(), fixture.prior_bytes)
-            self.assertEqual(fixture.installed_unit.stat().st_mode & 0o777, fixture.prior_mode)
+            self.assertEqual(
+                fixture.installed_unit.read_bytes(), fixture.prior_bytes, detail
+            )
+            self.assertEqual(
+                fixture.installed_unit.stat().st_mode & 0o777, fixture.prior_mode, detail
+            )
         else:
-            self.assertFalse(fixture.installed_unit.exists())
+            self.assertFalse(fixture.installed_unit.exists(), detail)
         if helper_present:
             self.assertEqual(
-                fixture.installed_helper.read_bytes(), fixture.prior_helper_bytes
+                fixture.installed_helper.read_bytes(),
+                fixture.prior_helper_bytes,
+                detail,
             )
             self.assertEqual(
                 fixture.installed_helper.stat().st_mode & 0o777,
                 fixture.prior_helper_mode,
+                detail,
             )
         else:
-            self.assertFalse(fixture.installed_helper.exists())
+            self.assertFalse(fixture.installed_helper.exists(), detail)
         if core_present:
             self.assertEqual(
-                fixture.installed_core.read_bytes(), fixture.prior_core_bytes
+                fixture.installed_core.read_bytes(), fixture.prior_core_bytes, detail
             )
             self.assertEqual(
                 fixture.installed_core.stat().st_mode & 0o777,
                 fixture.prior_core_mode,
+                detail,
             )
         else:
-            self.assertFalse(fixture.installed_core.exists())
-        self.assertFalse(fixture.transaction().exists())
+            self.assertFalse(fixture.installed_core.exists(), detail)
+        self.assertFalse(fixture.transaction().exists(), detail)
         receipt = fixture.state_root / "rollback.receipt.json"
-        self.assertTrue(receipt.is_file())
-        self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(json.loads(receipt.read_text())["rollback"], "passed")
+        self.assertTrue(receipt.is_file(), detail)
+        self.assertEqual(receipt.stat().st_mode & 0o777, 0o600, detail)
+        self.assertEqual(json.loads(receipt.read_text())["rollback"], "passed", detail)
 
     def terminate_at_pause(
         self, fixture: ActivationFixture, signum: int
@@ -315,7 +365,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                     fixture.state[field] = value
                 result = fixture.run(optimized=True)
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assert_restored(fixture)
+                self.assert_restored(fixture, result=result)
                 self.assertFalse((fixture.state_root / "activation.receipt.json").exists())
                 self.assertGreaterEqual(fixture.log().count(f"restart {UNIT}"), 2)
                 self.assertGreaterEqual(
@@ -806,23 +856,38 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 failed = fixture.run()
                 self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
                 self.assertIn("embedding rollback failed:", failed.stderr)
-                self.assertEqual(fixture.installed_unit.read_bytes(), fixture.prior_bytes)
+                bind_detail = _failure_detail(
+                    stderr=failed.stderr,
+                    stdout=failed.stdout,
+                    phase=(fixture.transaction() / "phase").read_text()
+                    if (fixture.transaction() / "phase").is_file()
+                    else "",
+                )
                 self.assertEqual(
-                    fixture.installed_unit.stat().st_mode & 0o777, fixture.prior_mode
+                    fixture.installed_unit.read_bytes(), fixture.prior_bytes, bind_detail
+                )
+                self.assertEqual(
+                    fixture.installed_unit.stat().st_mode & 0o777,
+                    fixture.prior_mode,
+                    bind_detail,
                 )
                 self.assertNotEqual(
-                    fixture.installed_unit.read_bytes(), CANONICAL_UNIT.read_bytes()
+                    fixture.installed_unit.read_bytes(),
+                    CANONICAL_UNIT.read_bytes(),
+                    bind_detail,
                 )
-                self.assertTrue(fixture.transaction().is_dir())
+                self.assertTrue(fixture.transaction().is_dir(), bind_detail)
                 self.assertEqual(
-                    (fixture.transaction() / "phase").read_text(), "rollback_failed\n"
+                    (fixture.transaction() / "phase").read_text(),
+                    "rollback_failed\n",
+                    bind_detail,
                 )
                 fixture.state.update({"verify_status": 0, "fail_no_swap_at": 0})
                 recovered = fixture.run()
                 self.assertNotEqual(
                     recovered.returncode, 0, recovered.stdout + recovered.stderr
                 )
-                self.assert_restored(fixture)
+                self.assert_restored(fixture, result=recovered)
 
     def test_no_swap_helper_prior_absence_is_restored_after_post_start_failure(self) -> None:
         with ActivationFixture(prior_helper_present=False) as fixture:
@@ -1517,9 +1582,14 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
 
             libc = ctypes.CDLL(None, use_errno=True)
             inotify_fd = libc.inotify_init1(os.O_CLOEXEC)
-            self.assertGreaterEqual(inotify_fd, 0)
+            init_errno = ctypes.get_errno()
             self.assertGreaterEqual(
-                libc.inotify_add_watch(inotify_fd, os.fsencode(engine), 0x10), 0
+                inotify_fd, 0, _failure_detail(errno_value=init_errno)
+            )
+            watch_fd = libc.inotify_add_watch(inotify_fd, os.fsencode(engine), 0x10)
+            watch_errno = ctypes.get_errno()
+            self.assertGreaterEqual(
+                watch_fd, 0, _failure_detail(errno_value=watch_errno)
             )  # IN_CLOSE_NOWRITE
 
             def replace_after_hash() -> None:
