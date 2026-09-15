@@ -799,6 +799,31 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                     os.killpg(process.pid, signal.SIGKILL)
                     process.communicate(timeout=5)
 
+    def test_rollback_bind_failure_still_restores_prior_unit(self) -> None:
+        for fail_at in (6, 7, 8):
+            with self.subTest(fail_no_swap_at=fail_at), ActivationFixture() as fixture:
+                fixture.state.update({"verify_status": 9, "fail_no_swap_at": fail_at})
+                failed = fixture.run()
+                self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+                self.assertIn("embedding rollback failed:", failed.stderr)
+                self.assertEqual(fixture.installed_unit.read_bytes(), fixture.prior_bytes)
+                self.assertEqual(
+                    fixture.installed_unit.stat().st_mode & 0o777, fixture.prior_mode
+                )
+                self.assertNotEqual(
+                    fixture.installed_unit.read_bytes(), CANONICAL_UNIT.read_bytes()
+                )
+                self.assertTrue(fixture.transaction().is_dir())
+                self.assertEqual(
+                    (fixture.transaction() / "phase").read_text(), "rollback_failed\n"
+                )
+                fixture.state.update({"verify_status": 0, "fail_no_swap_at": 0})
+                recovered = fixture.run()
+                self.assertNotEqual(
+                    recovered.returncode, 0, recovered.stdout + recovered.stderr
+                )
+                self.assert_restored(fixture)
+
     def test_no_swap_helper_prior_absence_is_restored_after_post_start_failure(self) -> None:
         with ActivationFixture(prior_helper_present=False) as fixture:
             fixture.state["fail_no_swap_at"] = 5
@@ -811,7 +836,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             self.assertFalse(receipt["restored_no_swap_helper_presence"])
             self.assertFalse(receipt["restored_no_swap_core_presence"])
             self.assertIn(
-                f"core={fixture.installed_core}",
+                f"core={fixture.installed_core.resolve()}",
                 fixture.log(),
             )
             for neighbor in (
