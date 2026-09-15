@@ -11,9 +11,13 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("VLLM_SKIP_CUDA_CHECK", "1")
 os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
 
+import inspect
+
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import modelopt as mo
 from vllm.config import vllm as vc
+from vllm.model_executor.models import qwen3_dflash as dflash
+from vllm.model_executor.models import qwen3_dflash2 as dflash2
 
 
 class DummyLinear(LinearBase):
@@ -97,6 +101,57 @@ def _dflash2_v2_path() -> dict:
     }
 
 
+def _dflash2_layer_type_forward() -> dict:
+    cls = dflash2.DFlash2Qwen3DecoderLayer
+    sig = inspect.signature(cls.__init__)
+    params = sig.parameters
+    has_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    captured: dict[str, object] = {}
+    orig = dflash.DFlashQwen3DecoderLayer.__init__
+
+    def spy(self, *args: object, **kwargs: object) -> None:
+        captured["kwargs"] = dict(kwargs)
+
+    dflash.DFlashQwen3DecoderLayer.__init__ = spy  # type: ignore[method-assign]
+    unexpected_rejected = False
+    try:
+        obj = cls.__new__(cls)
+        try:
+            cls.__init__(
+                obj,
+                object(),
+                config=object(),
+                layer_idx=0,
+                cache_config=None,
+                quant_config=None,
+                layer_type="sliding_attention",
+                prefix="model.layers.0",
+            )
+        except Exception:
+            pass
+        try:
+            cls.__init__(
+                obj,
+                object(),
+                config=object(),
+                layer_idx=0,
+                unexpected_kw=1,
+            )
+        except TypeError as error:
+            unexpected_rejected = "unexpected_kw" in str(error)
+    finally:
+        dflash.DFlashQwen3DecoderLayer.__init__ = orig  # type: ignore[method-assign]
+    forwarded = captured.get("kwargs")
+    forwarded_type = forwarded.get("layer_type") if isinstance(forwarded, dict) else None
+    return {
+        "has_layer_type": "layer_type" in params,
+        "layer_type_default": params["layer_type"].default if "layer_type" in params else None,
+        "has_var_kw": has_var_kw,
+        "captured": forwarded_type,
+        "unexpected_rejected": unexpected_rejected,
+    }
+
+
 def _patch_current_vllm_config() -> None:
     import torch
 
@@ -133,6 +188,7 @@ def main() -> int:
         pcpt = cfg.get_quant_method(layer, "model.layers.0.self_attn.in_proj_qkv")
         fused = cfg.get_quant_method(layer, "model.layers.0.self_attn.in_proj_qkvz")
         dflash = _dflash2_v2_path()
+        layer_type = _dflash2_layer_type_forward()
         results = {
             "label": label,
             "expect_pcpt_dispatch": expect_pcpt_dispatch,
@@ -147,6 +203,7 @@ def main() -> int:
             "fused_unquant": isinstance(fused, UnquantizedLinearMethod),
             "nvfp4_ok": nvfp4_algo == "NVFP4",
             "dflash": dflash,
+            "layer_type": layer_type,
             "has_class_pcpt": hasattr(mo, "ModelOptFp8PcPtLinearMethod"),
         }
         checks = []
@@ -172,6 +229,17 @@ def main() -> int:
         checks.append(("v1_rejects_dflash2", dflash["v1_lists_dflash2"] is True))
         checks.append(
             ("v2_does_not_reject_dflash2", dflash["v2_lists_dflash2"] is False)
+        )
+        checks.append(("dflash2_accepts_layer_type", layer_type["has_layer_type"] is True))
+        checks.append(
+            ("dflash2_layer_type_default", layer_type["layer_type_default"] == "full_attention")
+        )
+        checks.append(("dflash2_no_var_kw", layer_type["has_var_kw"] is False))
+        checks.append(
+            ("dflash2_forwards_sliding_attention", layer_type["captured"] == "sliding_attention")
+        )
+        checks.append(
+            ("dflash2_rejects_unknown_kw", layer_type["unexpected_rejected"] is True)
         )
         results["checks"] = [(n, bool(v)) for n, v in checks]
         failed = [n for n, v in checks if not v]

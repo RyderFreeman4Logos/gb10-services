@@ -16,13 +16,15 @@ ROOT = Path(__file__).resolve().parents[1]
 IMAGE_DIR = ROOT / "profile/aeon-ultimate-uncensored-nvfp4/image"
 DOCKERFILE = IMAGE_DIR / "Dockerfile.aeon-v029-modelopt-54367"
 PATCH = IMAGE_DIR / "modelopt-54367-v029-adapted.patch"
+DFLASH2_PATCH = IMAGE_DIR / "qwen3-dflash2-layer-type.patch"
 CPU_REGRESSION = IMAGE_DIR / "cpu_dispatcher_regression.py"
 BASE = "sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7"
-EXPECTED_IMAGE = "sha256:26c62d60a7cce96b279d768eaafc20189f7a38e125f9183e11ba6d5f9d4a53e0"
+EXPECTED_IMAGE = "sha256:112e96dae5543672afcfe2511193db4e095c222b5bea0dab9e109b84e9626b11"
 PROVENANCE_SHA256 = {
-    DOCKERFILE: "479c5518df6b6be8d24e8f6691f0cb94698c3a4e5e8d0ab618e82e585b998f9a",
+    DOCKERFILE: "6cbbd94d6cb7778da866cb22db411c489d5ee660ff6da4b204fa0d66325547c1",
     PATCH: "7d2ff70d56dc0910197749c8e42b5ed95fc598bffb1fad01f2fa94eeab1ab4cb",
-    CPU_REGRESSION: "c6a55f872bf96560642974bed4f149199d109a0497bec634bb75c1edcf8ca62a",
+    DFLASH2_PATCH: "8b2f477f1dc1edfdefb22daf1d1075bc282ab5bd39bb6c875685ec453f94370b",
+    CPU_REGRESSION: "50361d638face3f29440556889851debded4e4473c661ed7650ee6e8c9ef808f",
 }
 
 
@@ -43,6 +45,25 @@ class AeonUltimateDerivedImageProvenanceTests(unittest.TestCase):
         self.assertIn(PATCH.name, text)
         self.assertIn(PROVENANCE_SHA256[PATCH], text)
         self.assertIn("aeon.layer=\"modelopt-54367-v029-adapted\"", text)
+        self.assertIn(DFLASH2_PATCH.name, text)
+        self.assertIn(CPU_REGRESSION.name, text)
+        self.assertIn("aeon.dflash2.patch", text)
+
+    def test_modelopt_patch_retains_exactly_two_hunks(self) -> None:
+        text = PATCH.read_text()
+        self.assertEqual(text.count("@@ -"), 2)
+        self.assertIn("in_proj_qkvz", text)
+        self.assertIn("FP8_PER_CHANNEL_PER_TOKEN", text)
+        self.assertNotIn("layer_type", text)
+
+    def test_dflash2_patch_forwards_explicit_layer_type_not_kwargs(self) -> None:
+        text = DFLASH2_PATCH.read_text()
+        self.assertIn('layer_type: str = "full_attention"', text)
+        self.assertIn("layer_type=layer_type", text)
+        self.assertNotIn("**kwargs", text)
+        self.assertNotIn("** kw", text)
+        self.assertIn("qwen3_dflash2.py", text)
+        self.assertIn("DFlash2Qwen3DecoderLayer", text)
 
     def test_cpu_dispatcher_regression_is_the_existing_runnable_script(self) -> None:
         py_compile.compile(str(CPU_REGRESSION), doraise=True)
@@ -50,6 +71,12 @@ class AeonUltimateDerivedImageProvenanceTests(unittest.TestCase):
         self.assertIn("EXPECT_PCPT_DISPATCH", source)
         self.assertIn("ModelOptFp8PcPtLinearMethod", source)
         self.assertIn("in_proj_qkvz", source)
+        self.assertIn("DFlash2Qwen3DecoderLayer", source)
+        self.assertIn("sliding_attention", source)
+        self.assertIn("layer_type", source)
+        self.assertIn("captured", source)
+        self.assertIn("dflash2_no_var_kw", source)
+        self.assertIn("dflash2_forwards_sliding_attention", source)
 
     def test_canonical_offline_build_compares_iidfile_before_unit_start(self) -> None:
         helper = ROOT / "scripts" / "gb10_prepare_aeon_ultimate_image.py"
@@ -61,7 +88,7 @@ class AeonUltimateDerivedImageProvenanceTests(unittest.TestCase):
         self.assertIn("--iidfile", source)
         self.assertIn(str(IMAGE_DIR.relative_to(ROOT)), source)
         self.assertIn(DOCKERFILE.name, source)
-        self.assertIn("26c62d60a7cce96b279d768eaafc20189f7a38e125f9183e11ba6d5f9d4a53e0", source)
+        self.assertIn("112e96dae5543672afcfe2511193db4e095c222b5bea0dab9e109b84e9626b11", source)
         self.assertIn("not assumed deterministic", source)
         prepare_at = guide.find("gb10_prepare_aeon_ultimate_image.py")
         install_at = guide.find("### 5. Systemd User Services Installation")

@@ -120,7 +120,7 @@ def _load_release(root: Path) -> dict:
     if override_digest == release["repository_digest"]:
         raise ValueError("Ultimate override must differ from the central digest")
     derived_image = (
-        "sha256:26c62d60a7cce96b279d768eaafc20189f7a38e125f9183e11ba6d5f9d4a53e0"
+        "sha256:112e96dae5543672afcfe2511193db4e095c222b5bea0dab9e109b84e9626b11"
     )
     derived_base = (
         "sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7"
