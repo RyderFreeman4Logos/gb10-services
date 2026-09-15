@@ -56,12 +56,21 @@ def compare_iidfile(path: Path, expected: str) -> str:
     return observed
 
 
+DOCKER_ENV = {
+    "HOME": "/home/obj",
+    "PATH": "/usr/bin:/bin",
+    "LC_ALL": "C",
+    "DOCKER_HOST": "unix:///run/user/1001/docker.sock",
+}
+
+
 def _run_docker(args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["/usr/bin/docker", *args],
         check=False,
         capture_output=True,
         text=True,
+        env=DOCKER_ENV,
     )
 
 

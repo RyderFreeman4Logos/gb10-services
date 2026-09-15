@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+import os
 import py_compile
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -91,6 +95,104 @@ class AeonUltimateDerivedImageProvenanceTests(unittest.TestCase):
             self.assertNotEqual(mismatched.returncode, 0, mismatched.stdout)
             self.assertIn("does not match configured override", mismatched.stderr)
             self.assertIn("not assumed deterministic", mismatched.stderr)
+
+    def test_run_docker_uses_scrubbed_production_daemon_under_hostile_ambient_selectors(
+        self,
+    ) -> None:
+        helper = ROOT / "scripts" / "gb10_prepare_aeon_ultimate_image.py"
+        spec = importlib.util.spec_from_file_location(
+            "gb10_prepare_aeon_ultimate_image_under_test", helper
+        )
+        if spec is None or spec.loader is None:
+            self.fail("could not load Ultimate image admission helper")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        production_env = {
+            "HOME": "/home/obj",
+            "PATH": "/usr/bin:/bin",
+            "LC_ALL": "C",
+            "DOCKER_HOST": "unix:///run/user/1001/docker.sock",
+        }
+        hostile = {
+            "DOCKER_HOST": "tcp://127.0.0.1:2375",
+            "DOCKER_CONTEXT": "hostile-context",
+            "DOCKER_TLS_VERIFY": "1",
+            "DOCKER_CERT_PATH": "/hostile/certs",
+            "BUILDX_BUILDER": "hostile-builder",
+            "BUILDX_CONFIG": "/hostile/buildx",
+            "DOCKER_BUILDKIT": "1",
+        }
+        calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+        def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            env = kwargs.get("env")
+            recorded_env = dict(env) if isinstance(env, dict) else None
+            calls.append((list(argv), recorded_env))
+            args = list(argv)
+            stdout = ""
+            if len(args) >= 2 and args[0] == "/usr/bin/docker" and args[1] == "build":
+                iidfile = Path(args[args.index("--iidfile") + 1])
+                iidfile.write_text(EXPECTED_IMAGE + "\n")
+            elif (
+                len(args) >= 4
+                and args[0] == "/usr/bin/docker"
+                and args[1] == "image"
+                and args[2] == "inspect"
+            ):
+                stdout = EXPECTED_IMAGE + "\n"
+            return subprocess.CompletedProcess(args, 0, stdout, "")
+
+        def run_main(extra: list[str]) -> int:
+            argv = ["gb10_prepare_aeon_ultimate_image.py", "--root", str(ROOT), *extra]
+            with mock.patch.object(sys, "argv", argv):
+                return module.main()
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            load_tar = tmp / "verified.tar"
+            load_tar.write_bytes(b"")
+            with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                with mock.patch.dict(os.environ, hostile, clear=False):
+                    self.assertEqual(
+                        run_main(["--iidfile", str(tmp / "build.iid"), "--build"]), 0
+                    )
+                    self.assertEqual(
+                        run_main(
+                            [
+                                "--iidfile",
+                                str(tmp / "load.iid"),
+                                "--load",
+                                str(load_tar),
+                            ]
+                        ),
+                        0,
+                    )
+                    self.assertEqual(
+                        run_main(["--iidfile", str(tmp / "inspect.iid")]), 0
+                    )
+
+        self.assertEqual(len(calls), 4)
+        shapes = [tuple(argv[1:3] if argv[1] == "image" else argv[1:2]) for argv, _env in calls]
+        self.assertEqual(
+            shapes, [("build",), ("load",), ("image", "inspect"), ("image", "inspect")]
+        )
+        build_argv = calls[0][0]
+        self.assertEqual(build_argv[0], "/usr/bin/docker")
+        self.assertIn("--network=none", build_argv)
+        self.assertIn("--pull=false", build_argv)
+        self.assertIn("--iidfile", build_argv)
+        self.assertIn(str(ROOT / IMAGE_DIR.relative_to(ROOT)), build_argv)
+        self.assertIn(str(ROOT / DOCKERFILE.relative_to(ROOT)), build_argv)
+        for argv, env in calls:
+            self.assertEqual(argv[0], "/usr/bin/docker")
+            self.assertEqual(env, production_env)
+            self.assertNotIn("DOCKER_CONTEXT", env or {})
+            self.assertNotIn("DOCKER_TLS_VERIFY", env or {})
+            self.assertNotIn("DOCKER_CERT_PATH", env or {})
+            self.assertNotIn("BUILDX_BUILDER", env or {})
+            self.assertNotIn("BUILDX_CONFIG", env or {})
+            self.assertNotIn("DOCKER_BUILDKIT", env or {})
+            self.assertNotEqual((env or {}).get("DOCKER_HOST"), hostile["DOCKER_HOST"])
 
 
 if __name__ == "__main__":
