@@ -18,14 +18,18 @@ QWEN36_UNIT = Path(
     "profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service"
 )
 EMBEDDING_UNIT = Path("profile/qwen3-embedding-8b/vllm-embedding.service")
+ULTIMATE_UNIT = Path(
+    "profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service"
+)
 UNIT_PATHS = (
-    Path("profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service"),
+    ULTIMATE_UNIT,
     Path("profile/querit-4b-reranker/vllm-querit-4b-reranker.service"),
     EMBEDDING_UNIT,
     Path("profile/qwen3-reranker-8b/vllm-qwen3-reranker-8b.service"),
     QWEN36_UNIT,
     Path("profile/qwen3.8-27b-nvfp4-vllm/vllm-aeon-qwen38-dflash.service"),
 )
+BARE_IMAGE = re.compile(r"(?m)^  sha256:[0-9a-f]{64} \\$")
 ALIASES = {
     Path("profile/abliterated-qwen-latest-27b"): Path("aeon-ultimate-uncensored-nvfp4"),
     Path("profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash-hikv.service"): Path(
@@ -85,7 +89,7 @@ def _cache_key(version: str) -> str:
     return f"v{major}{minor:02d}{patch}"
 
 
-def _load_release(root: Path) -> dict[str, str]:
+def _load_release(root: Path) -> dict:
     release = json.loads((root / CONFIG).read_text())
     expected = {
         "repository",
@@ -93,11 +97,16 @@ def _load_release(root: Path) -> dict[str, str]:
         "repository_digest",
         "arm64_digest",
         "runtime_version",
+        "overrides",
     }
-    if set(release) != expected or not all(
-        isinstance(release[key], str) and release[key] for key in expected
-    ):
+    if set(release) != expected:
         raise ValueError(f"{CONFIG}: expected exactly {sorted(expected)}")
+    for key in ("repository", "tag", "repository_digest", "arm64_digest", "runtime_version"):
+        if not isinstance(release[key], str) or not release[key]:
+            raise ValueError(f"{CONFIG}: expected exactly {sorted(expected)}")
+    overrides = release["overrides"]
+    if not isinstance(overrides, dict) or set(overrides) != {ULTIMATE_UNIT.name}:
+        raise ValueError("overrides must pin only the Ultimate unit")
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}-v[^\s]+", release["tag"]) is None:
         raise ValueError("tag must be a dated AEON release tag")
     if not release["tag"].endswith("-" + release["runtime_version"]):
@@ -105,6 +114,11 @@ def _load_release(root: Path) -> dict[str, str]:
     for key in ("repository_digest", "arm64_digest"):
         if DIGEST.fullmatch(release[key]) is None:
             raise ValueError(f"{key} must be a full sha256 digest")
+    override_digest = overrides[ULTIMATE_UNIT.name]
+    if DIGEST.fullmatch(override_digest) is None:
+        raise ValueError("Ultimate override must be a full sha256 digest")
+    if override_digest == release["repository_digest"]:
+        raise ValueError("Ultimate override must differ from the central digest")
     _cache_key(release["runtime_version"])
     return release
 
@@ -194,8 +208,49 @@ def _render(root: Path) -> dict[Path, str]:
         f"{release['repository_digest']}"
     )
     expected_image = f"{release['repository']}@{release['repository_digest']}"
+    override_digest = release["overrides"][ULTIMATE_UNIT.name]
+    expected_ultimate_annotation = (
+        f"# AEON image release: {release['tag']}; immutable digest: {override_digest}"
+    )
     for path in UNIT_PATHS:
         text = texts[path]
+        if path == ULTIMATE_UNIT:
+            text = _replace(text, old["tag"], release["tag"], str(path))
+            text = _replace(
+                text, old["runtime_version"], release["runtime_version"], str(path)
+            )
+            repo_images = IMAGE.findall(text)
+            bare_images = BARE_IMAGE.findall(text)
+            if repo_images and not bare_images:
+                if len(repo_images) != 1:
+                    raise ValueError(f"{path}: generated unit release identity is ambiguous")
+                text = text.replace(repo_images[0], override_digest)
+            elif bare_images and not repo_images:
+                if len(bare_images) != 1:
+                    raise ValueError(f"{path}: generated unit release identity is ambiguous")
+                text = text.replace(bare_images[0], f"  {override_digest} \\", 1)
+            else:
+                raise ValueError(f"{path}: generated unit release identity is ambiguous")
+            annotations = [match.group(0) for match in ANNOTATION.finditer(text)]
+            if len(annotations) != 1:
+                raise ValueError(f"{path}: generated unit release identity is ambiguous")
+            text = text.replace(annotations[0], expected_ultimate_annotation)
+            annotations = [match.group(0) for match in ANNOTATION.finditer(text)]
+            images = IMAGE.findall(text)
+            bares = BARE_IMAGE.findall(text)
+            descriptions = [line for line in text.splitlines() if line.startswith("Description=")]
+            if (
+                annotations != [expected_ultimate_annotation]
+                or images
+                or bares != [f"  {override_digest} \\"]
+                or len(descriptions) != 1
+            ):
+                raise ValueError(f"{path}: generated unit release identity is ambiguous")
+            versions = re.findall(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?", descriptions[0])
+            if versions != [release["runtime_version"]]:
+                raise ValueError(f"{path}: Description does not identify the generated release")
+            texts[path] = text
+            continue
         for key in ("repository", "tag", "repository_digest", "runtime_version"):
             text = _replace(text, old[key], release[key], str(path))
         if path == QWEN36_UNIT:

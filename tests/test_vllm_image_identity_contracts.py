@@ -52,6 +52,11 @@ CURRENT_RELEASE = ImageRelease(
     version="v0.29.0-omni",
     digest="sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7",
 )
+ULTIMATE_DERIVED_RELEASE = ImageRelease(
+    date="2026-09-11",
+    version="v0.29.0-omni",
+    digest="sha256:26c62d60a7cce96b279d768eaafc20189f7a38e125f9183e11ba6d5f9d4a53e0",
+)
 PREVIOUS_RELEASE = ImageRelease(
     date="2026-07-16",
     version="v0.25.1",
@@ -145,7 +150,11 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         aeon_units = [
             path
             for path in units
-            if not path.is_symlink() and "aeon-vllm-ultimate" in path.read_text()
+            if not path.is_symlink()
+            and (
+                "aeon-vllm-ultimate" in path.read_text()
+                or path.name == "vllm-aeon-ultimate-uncensored-nvfp4.service"
+            )
         ]
         self.assertEqual(
             {path.name for path in aeon_units},
@@ -162,14 +171,30 @@ class VllmImageIdentityContractTests(unittest.TestCase):
             text = path.read_text()
             with self.subTest(path=path.relative_to(ROOT)):
                 annotations = _release_annotations(text)
-                self.assertEqual(annotations, [CURRENT_RELEASE])
-                self.assertEqual(
-                    re.findall(
-                        rf"{re.escape(IMAGE_REPOSITORY)}@sha256:[0-9a-f]{{64}}",
-                        text,
-                    ),
-                    [CURRENT_RELEASE.image_reference],
-                )
+                if path.name == "vllm-aeon-ultimate-uncensored-nvfp4.service":
+                    self.assertEqual(annotations, [ULTIMATE_DERIVED_RELEASE])
+                    self.assertEqual(
+                        re.findall(
+                            rf"{re.escape(IMAGE_REPOSITORY)}@sha256:[0-9a-f]{{64}}",
+                            text,
+                        ),
+                        [],
+                    )
+                    self.assertEqual(
+                        re.findall(r"(?m)^  sha256:[0-9a-f]{64} \\$", text),
+                        [f"  {ULTIMATE_DERIVED_RELEASE.digest} \\"],
+                    )
+                    self.assertNotIn(CURRENT_RELEASE.digest, text)
+                else:
+                    self.assertEqual(annotations, [CURRENT_RELEASE])
+                    self.assertEqual(
+                        re.findall(
+                            rf"{re.escape(IMAGE_REPOSITORY)}@sha256:[0-9a-f]{{64}}",
+                            text,
+                        ),
+                        [CURRENT_RELEASE.image_reference],
+                    )
+                    self.assertNotIn(ULTIMATE_DERIVED_RELEASE.digest, text)
                 descriptions = [
                     line
                     for line in text.splitlines()
@@ -246,6 +271,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                 rf"friendly tag: {re.escape(IMAGE_REPOSITORY)}:"
                 rf"{re.escape(CURRENT_RELEASE.tag)}\n"
                 rf"repository digest: {re.escape(CURRENT_RELEASE.digest)}\n"
+                rf"ultimate override: {re.escape(ULTIMATE_DERIVED_RELEASE.digest)}\n"
                 r"rollback/superseded: .*\n"
                 rf"runtime version: {re.escape(CURRENT_RELEASE.version)}\b"
             ),

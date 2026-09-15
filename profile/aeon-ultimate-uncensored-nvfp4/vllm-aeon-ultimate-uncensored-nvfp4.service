@@ -1,4 +1,4 @@
-# AEON image release: 2026-09-11-v0.29.0-omni; immutable digest: sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7
+# AEON image release: 2026-09-11-v0.29.0-omni; immutable digest: sha256:26c62d60a7cce96b279d768eaafc20189f7a38e125f9183e11ba6d5f9d4a53e0
 # AEON MIXED NVFP4 + DFlash2 n=7 on one GB10. Same seat as the previous beta unit.
 # Model: /home/obj/models/AEON-7--Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-NVFP4-MIXED--8b185f4e3c97dfba1b015e652deba6be179ef5f0
 # Draft: /home/obj/models/z-lab/Qwen3.8-27B-DFlash2
@@ -47,7 +47,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
   --memory-swap 72g \
   --oom-score-adj 800 \
   --entrypoint python3 \
-  ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7 \
+  sha256:26c62d60a7cce96b279d768eaafc20189f7a38e125f9183e11ba6d5f9d4a53e0 \
   /usr/local/bin/vllm \
   serve \
     --model /model \

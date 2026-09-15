@@ -30,10 +30,7 @@ BACKEND_ALIASES = {
     "aeon-ultimate",
     "abliterated-qwen-latest-27b-nvfp4",
 }
-IMAGE = (
-    "ghcr.io/aeon-7/aeon-vllm-ultimate@"
-    "sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7"
-)
+IMAGE = "sha256:26c62d60a7cce96b279d768eaafc20189f7a38e125f9183e11ba6d5f9d4a53e0"
 MIXED_MODEL = (
     "/home/obj/models/"
     "AEON-7--Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-NVFP4-MIXED--"
@@ -84,6 +81,7 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
         unit = _unit_text()
         argv = _argv()
         self.assertIn(IMAGE, unit)
+        self.assertNotIn("2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7", unit)
         self.assertIn(f"-v {MIXED_MODEL}:/model:ro", unit)
         self.assertNotIn("AEON-ULTIMATE-UNCENSORED-NVFP4-beta-version", unit)
         self.assertIn(
