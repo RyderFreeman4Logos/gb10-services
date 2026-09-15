@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""sparkDash profile contracts: pin, loopback bind, llmHost overlay, no Docker."""
+"""sparkDash profile contracts: pin, loopback bind, read-only CSRF, installer bytes."""
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE = ROOT / "profile" / "sparkdash"
+INSTALLER = ROOT / "scripts" / "sparkdash_install.sh"
+AGENT_PLAYBOOK = ROOT / "docs" / "deployment" / "AGENTS.md"
 
 
 class SparkdashProfileTests(unittest.TestCase):
@@ -24,8 +30,10 @@ class SparkdashProfileTests(unittest.TestCase):
         self.assertIn("BIND_HOST=127.0.0.1", env)
         self.assertIn("PORT=20080", env)
         self.assertIn("SPARKDASH_ALLOW_OPEN_REMOTE=0", env)
+        self.assertIn("SPARKDASH_READ_ONLY=1", env)
         self.assertIn("HOST_PROC_PATH=/proc", env)
         self.assertNotRegex(env, r"(?m)^BIND_HOST=0\.0\.0\.0$")
+        self.assertNotRegex(env, r"(?m)^SPARKDASH_TOKEN=")
 
     def test_unit_does_not_couple_to_model_services(self) -> None:
         unit = (PROFILE / "sparkdash.service").read_text()
@@ -49,13 +57,169 @@ class SparkdashProfileTests(unittest.TestCase):
     def test_llm_host_prefers_lan_ip(self) -> None:
         src = (PROFILE / "llmHost.js").read_text()
         self.assertIn("if (ip) return ip;", src)
-        self.assertIn("if (spark?.isLocal) return \"127.0.0.1\";", src)
+        self.assertIn('if (spark?.isLocal) return "127.0.0.1";', src)
         self.assertTrue(re.search(r"export function llmProbeHost", src))
 
-    def test_install_script_is_syntax_valid(self) -> None:
-        script = ROOT / "scripts" / "sparkdash_install.sh"
-        self.assertTrue(script.is_file())
-        self.assertIn("checkout --detach", script.read_text())
+    def test_fresh_stack_docs_do_not_install_optional_dashboard_unit(self) -> None:
+        agents = AGENT_PLAYBOOK.read_text()
+        block = agents.split("### 5. Systemd User Services Installation", 1)[1]
+        block = block.split("systemctl --user daemon-reload", 1)[0]
+        self.assertNotIn("profile/sparkdash/sparkdash.service", block)
+        self.assertIn("scripts/sparkdash_install.sh", agents)
+
+    def test_install_script_attests_pin_bytes_and_rebuilds(self) -> None:
+        script = INSTALLER.read_text()
+        self.assertTrue(INSTALLER.is_file())
+        self.assertIn("checkout --detach", script)
+        self.assertIn("reset --hard", script)
+        self.assertIn("status --porcelain", script)
+        self.assertIn("npm ci --no-audit --no-fund", script)
+        self.assertIn("npm run build", script)
+        self.assertNotIn('! -d "${CHECKOUT}/node_modules"', script)
+        self.assertIn("${PROFILE}/auth.js", script)
+
+
+def _node_bin() -> str:
+    found = subprocess.check_output(["bash", "-lc", "command -v node"], text=True).strip()
+    if not found:
+        raise unittest.SkipTest("node is required for sparkDash auth overlay tests")
+    return found
+
+
+class SparkdashReadOnlyAuthTests(unittest.TestCase):
+    def test_readonly_rejects_hostile_origin_post_not_get(self) -> None:
+        node = _node_bin()
+        auth = PROFILE / "auth.js"
+        self.assertTrue(auth.is_file(), "profile overlay auth.js is required")
+        probe = r"""
+import { pathToFileURL } from "node:url";
+const { createAuthMiddleware } = await import(pathToFileURL(process.env.SPARKDASH_AUTH_JS).href);
+const mw = createAuthMiddleware();
+function call(method, origin) {
+  const req = { method, headers: origin ? { origin } : {}, query: {} };
+  let status = 200;
+  let body = null;
+  let nexted = false;
+  const res = {
+    status(code) { status = code; return this; },
+    json(payload) { body = payload; return this; },
+  };
+  mw(req, res, () => { nexted = true; });
+  return { status, body, nexted };
+}
+const post = call("POST", "https://evil.example");
+const get = call("GET", "https://evil.example");
+if (post.nexted || post.status !== 403) {
+  throw new Error(`POST not blocked: ${JSON.stringify(post)}`);
+}
+if (!get.nexted || get.status !== 200) {
+  throw new Error(`GET telemetry blocked: ${JSON.stringify(get)}`);
+}
+"""
+        env = os.environ.copy()
+        env["SPARKDASH_READ_ONLY"] = "1"
+        env["SPARKDASH_ALLOW_OPEN_REMOTE"] = "0"
+        env["BIND_HOST"] = "127.0.0.1"
+        env["SPARKDASH_AUTH_JS"] = str(auth)
+        completed = subprocess.run(
+            [node, "--input-type=module", "-e", probe],
+            env=env,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+
+
+class SparkdashInstallerAttestationTests(unittest.TestCase):
+    def test_installer_rejects_dirty_tracked_source_and_rebuilds(self) -> None:
+        git_env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "sparkdash-test",
+            "GIT_AUTHOR_EMAIL": "sparkdash-test@example.invalid",
+            "GIT_COMMITTER_NAME": "sparkdash-test",
+            "GIT_COMMITTER_EMAIL": "sparkdash-test@example.invalid",
+        }
+        with tempfile.TemporaryDirectory(prefix="sparkdash-install-") as raw:
+            tmp = Path(raw)
+            checkout = tmp / "sparkDash"
+            home = tmp / "home"
+            bin_dir = tmp / "bin"
+            npm_log = tmp / "npm.log"
+            checkout.mkdir()
+            home.mkdir()
+            bin_dir.mkdir()
+            (checkout / "server" / "collectors").mkdir(parents=True)
+            (checkout / "config").mkdir()
+            (checkout / "server" / "index.js").write_text("console.log('pin');\n")
+            (checkout / "server" / "collectors" / "llmHost.js").write_text("export function llmProbeHost() {}\n")
+            (checkout / "server" / "auth.js").write_text("export function createAuthMiddleware() {}\n")
+            (checkout / "package.json").write_text("{}\n")
+            subprocess.run(["git", "init"], cwd=checkout, env=git_env, check=True, capture_output=True)
+            subprocess.run(["git", "add", "."], cwd=checkout, env=git_env, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "commit", "-m", "pin"],
+                cwd=checkout,
+                env=git_env,
+                check=True,
+                capture_output=True,
+            )
+            pin = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
+            (checkout / "server" / "index.js").write_text("console.log('DIRTY');\n")
+            (checkout / "node_modules").mkdir()
+            (checkout / "dist").mkdir()
+            (bin_dir / "node").write_text("#!/bin/sh\nexit 0\n")
+            (bin_dir / "npm").write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${NPM_LOG}\"\nexit 0\n"
+            )
+            for name in ("node", "npm"):
+                (bin_dir / name).chmod(stat.S_IRWXU)
+            root = tmp / "gb10-services"
+            profile = root / "profile" / "sparkdash"
+            scripts = root / "scripts"
+            profile.mkdir(parents=True)
+            scripts.mkdir()
+            for name in ("llmHost.js", "sparks.json", "sparkdash.env", "sparkdash.service", "auth.js"):
+                src = PROFILE / name
+                if src.is_file():
+                    (profile / name).write_bytes(src.read_bytes())
+            (profile / "PIN").write_text(
+                "\n".join(
+                    [
+                        "repo=https://github.com/MiaAI-Lab/sparkDash",
+                        f"commit={pin}",
+                        f"node_bin={bin_dir / 'node'}",
+                        "bind=127.0.0.1:20080",
+                        "",
+                    ]
+                )
+            )
+            (scripts / "sparkdash_install.sh").write_bytes(INSTALLER.read_bytes())
+            (scripts / "sparkdash_install.sh").chmod(stat.S_IRWXU)
+            env = {
+                **os.environ,
+                "HOME": str(home),
+                "SPARKDASH_CHECKOUT": str(checkout),
+                "NPM_LOG": str(npm_log),
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "TMPDIR": str(tmp / "tmp"),
+            }
+            (tmp / "tmp").mkdir()
+            completed = subprocess.run(
+                ["bash", str(scripts / "sparkdash_install.sh")],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            self.assertNotIn("DIRTY", (checkout / "server" / "index.js").read_text())
+            log = npm_log.read_text()
+            self.assertIn("ci --no-audit --no-fund", log)
+            self.assertIn("run build", log)
+            overlay = (checkout / "server" / "collectors" / "llmHost.js").read_text()
+            self.assertIn("if (ip) return ip;", overlay)
 
 
 if __name__ == "__main__":

@@ -23,11 +23,20 @@ mkdir -p "${TMPDIR}"
 if [[ ! -d "${CHECKOUT}/.git" ]]; then
   git clone --filter=blob:none "${PINNED_REPO}" "${CHECKOUT}"
 fi
-git -C "${CHECKOUT}" fetch --filter=blob:none origin
+if git -C "${CHECKOUT}" remote get-url origin >/dev/null 2>&1; then
+  git -C "${CHECKOUT}" fetch --filter=blob:none origin
+fi
 git -C "${CHECKOUT}" checkout --detach "${PINNED_COMMIT}"
+git -C "${CHECKOUT}" reset --hard "${PINNED_COMMIT}"
 HEAD="$(git -C "${CHECKOUT}" rev-parse HEAD)"
 if [[ "${HEAD}" != "${PINNED_COMMIT}" ]]; then
   echo "sparkdash: checkout HEAD ${HEAD} != pin ${PINNED_COMMIT}" >&2
+  exit 1
+fi
+DIRTY="$(git -C "${CHECKOUT}" status --porcelain --untracked-files=no)"
+if [[ -n "${DIRTY}" ]]; then
+  echo "sparkdash: tracked source is dirty after reset --hard ${PINNED_COMMIT}" >&2
+  echo "${DIRTY}" >&2
   exit 1
 fi
 
@@ -36,20 +45,22 @@ if [[ ! -x "${NODE_BIN}" ]]; then
   exit 1
 fi
 
-if [[ ! -d "${CHECKOUT}/node_modules" || ! -d "${CHECKOUT}/dist" ]]; then
-  (
-    cd "${CHECKOUT}"
-    PATH="$(dirname "${NODE_BIN}"):${PATH}"
-    npm ci --no-audit --no-fund
-    npm run build
-  )
-fi
+(
+  cd "${CHECKOUT}"
+  PATH="$(dirname "${NODE_BIN}"):${PATH}"
+  npm ci --no-audit --no-fund
+  npm run build
+)
 
 install -d -m 0755 "${HOME}/.config/sparkdash" "${HOME}/.config/systemd/user"
 if [[ ! -f "${CHECKOUT}/server/collectors/llmHost.js.upstream-bbec3bb" ]]; then
   cp -a "${CHECKOUT}/server/collectors/llmHost.js" "${CHECKOUT}/server/collectors/llmHost.js.upstream-bbec3bb"
 fi
+if [[ ! -f "${CHECKOUT}/server/auth.js.upstream-bbec3bb" ]]; then
+  cp -a "${CHECKOUT}/server/auth.js" "${CHECKOUT}/server/auth.js.upstream-bbec3bb"
+fi
 install -m 0644 "${PROFILE}/llmHost.js" "${CHECKOUT}/server/collectors/llmHost.js"
+install -m 0644 "${PROFILE}/auth.js" "${CHECKOUT}/server/auth.js"
 install -m 0644 "${PROFILE}/sparks.json" "${CHECKOUT}/config/sparks.json"
 install -m 0644 "${PROFILE}/sparkdash.env" "${HOME}/.config/sparkdash/sparkdash.env"
 install -m 0644 "${PROFILE}/sparkdash.service" "${HOME}/.config/systemd/user/sparkdash.service"

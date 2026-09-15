@@ -185,7 +185,6 @@ install -m 0644 profile/llm-guard-proxy/llm-guard-proxy.service \
   profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service \
   profile/qwen3-embedding-8b/vllm-embedding.service \
   profile/qwen3-reranker-8b/vllm-qwen3-reranker-8b.service \
-  profile/sparkdash/sparkdash.service \
   /home/obj/.config/systemd/user/
 
 # Install the Ultimate env. Do not point active.env here; that symlink is only

@@ -1,6 +1,10 @@
 # sparkDash (loopback :20080)
 
 Read-only MiaAI-Lab/sparkDash dashboard for this GB10 host. Not a model unit.
+Mutating HTTP (bench, shutdown, config, Hermes/Comfy actions) is rejected in
+`createAuthMiddleware()` when `SPARKDASH_READ_ONLY=1`. Loopback bind is not
+enough: tokenless loopback POSTs from a hostile Origin would otherwise start
+real model work. Do not set a `SPARKDASH_TOKEN` in the tracked env.
 
 ## Pin
 
@@ -28,7 +32,7 @@ Guard `:18009` is **not** an `llmPorts` target (not a generation engine). Its `/
 
 Overlay `profile/sparkdash/llmHost.js`: if `lanIp` is set, probe that host even when `isLocal` is true. Upstream probes `127.0.0.1` for local Sparks and would miss Tailnet-bound vLLM.
 
-Disabled: Comfy cancel, Hermes update, decode/prefill/showcase benches, shutdown/WoL (`hermesMonitoring=false`, `comfyMonitoring=false`). UI still exposes those routes on loopback; keep the tunnel private.
+Disabled: Comfy cancel, Hermes update, decode/prefill/showcase benches, shutdown/WoL (`hermesMonitoring=false`, `comfyMonitoring=false`). The overlay still rejects those mutating routes server-side; hiding UI buttons is not the control. GET `/api/health` and metrics remain available.
 
 `gpuMemoryUtilization=1` in sparkDash means engine-active/sleep flag, **not** AEON `--gpu-memory-utilization 0.515`.
 
@@ -81,5 +85,6 @@ Does not touch model units or PIDs.
 - `profile/sparkdash/sparkdash.env` → `~/.config/sparkdash/sparkdash.env`
 - `profile/sparkdash/sparks.json` → `/home/obj/src/sparkDash/config/sparks.json`
 - `profile/sparkdash/llmHost.js` → `/home/obj/src/sparkDash/server/collectors/llmHost.js`
+- `profile/sparkdash/auth.js` → `/home/obj/src/sparkDash/server/auth.js`
 - `profile/sparkdash/PIN`
 - `scripts/sparkdash_install.sh`
