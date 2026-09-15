@@ -70,8 +70,9 @@ class SparkdashProfileTests(unittest.TestCase):
     def test_install_script_attests_pin_bytes_and_rebuilds(self) -> None:
         script = INSTALLER.read_text()
         self.assertTrue(INSTALLER.is_file())
-        self.assertIn("checkout --detach", script)
-        self.assertIn("reset --hard", script)
+        self.assertNotIn("reset --hard", script)
+        self.assertNotIn("git clean", script)
+        self.assertNotIn("git stash", script)
         self.assertIn("status --porcelain", script)
         self.assertIn("npm ci --no-audit --no-fund", script)
         self.assertIn("npm run build", script)
@@ -132,94 +133,136 @@ if (!get.nexted || get.status !== 200) {
         self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
 
 
+def _git_env() -> dict[str, str]:
+    return {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "sparkdash-test",
+        "GIT_AUTHOR_EMAIL": "sparkdash-test@example.invalid",
+        "GIT_COMMITTER_NAME": "sparkdash-test",
+        "GIT_COMMITTER_EMAIL": "sparkdash-test@example.invalid",
+    }
+
+
+def _prepare_installer_fixture(tmp: Path) -> tuple[Path, Path, Path, dict[str, str], str]:
+    checkout = tmp / "sparkDash"
+    home = tmp / "home"
+    bin_dir = tmp / "bin"
+    npm_log = tmp / "npm.log"
+    checkout.mkdir()
+    home.mkdir()
+    bin_dir.mkdir()
+    (checkout / "server" / "collectors").mkdir(parents=True)
+    (checkout / "config").mkdir()
+    (checkout / "server" / "index.js").write_text("console.log('pin');\n")
+    (checkout / "server" / "collectors" / "llmHost.js").write_text(
+        "export function llmProbeHost() {}\n"
+    )
+    (checkout / "server" / "auth.js").write_text("export function createAuthMiddleware() {}\n")
+    (checkout / "package.json").write_text("{}\n")
+    git_env = _git_env()
+    subprocess.run(["git", "init"], cwd=checkout, env=git_env, check=True, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=checkout, env=git_env, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "pin"],
+        cwd=checkout,
+        env=git_env,
+        check=True,
+        capture_output=True,
+    )
+    pin = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
+    (checkout / "node_modules").mkdir()
+    (checkout / "dist").mkdir()
+    (bin_dir / "node").write_text("#!/bin/sh\nexit 0\n")
+    (bin_dir / "npm").write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${NPM_LOG}\"\nexit 0\n"
+    )
+    for name in ("node", "npm"):
+        (bin_dir / name).chmod(stat.S_IRWXU)
+    root = tmp / "gb10-services"
+    profile = root / "profile" / "sparkdash"
+    scripts = root / "scripts"
+    profile.mkdir(parents=True)
+    scripts.mkdir()
+    for name in ("llmHost.js", "sparks.json", "sparkdash.env", "sparkdash.service", "auth.js"):
+        src = PROFILE / name
+        if src.is_file():
+            (profile / name).write_bytes(src.read_bytes())
+    (profile / "PIN").write_text(
+        "\n".join(
+            [
+                "repo=https://github.com/MiaAI-Lab/sparkDash",
+                f"commit={pin}",
+                f"node_bin={bin_dir / 'node'}",
+                "bind=127.0.0.1:20080",
+                "",
+            ]
+        )
+    )
+    installer = scripts / "sparkdash_install.sh"
+    installer.write_bytes(INSTALLER.read_bytes())
+    installer.chmod(stat.S_IRWXU)
+    (tmp / "tmp").mkdir()
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "SPARKDASH_CHECKOUT": str(checkout),
+        "NPM_LOG": str(npm_log),
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "TMPDIR": str(tmp / "tmp"),
+    }
+    return checkout, home, npm_log, env, pin
+
+
 class SparkdashInstallerAttestationTests(unittest.TestCase):
-    def test_installer_rejects_dirty_tracked_source_and_rebuilds(self) -> None:
-        git_env = {
-            **os.environ,
-            "GIT_AUTHOR_NAME": "sparkdash-test",
-            "GIT_AUTHOR_EMAIL": "sparkdash-test@example.invalid",
-            "GIT_COMMITTER_NAME": "sparkdash-test",
-            "GIT_COMMITTER_EMAIL": "sparkdash-test@example.invalid",
-        }
+    def test_installer_rejects_unexpected_dirty_tracked_source(self) -> None:
         with tempfile.TemporaryDirectory(prefix="sparkdash-install-") as raw:
             tmp = Path(raw)
-            checkout = tmp / "sparkDash"
-            home = tmp / "home"
-            bin_dir = tmp / "bin"
-            npm_log = tmp / "npm.log"
-            checkout.mkdir()
-            home.mkdir()
-            bin_dir.mkdir()
-            (checkout / "server" / "collectors").mkdir(parents=True)
-            (checkout / "config").mkdir()
-            (checkout / "server" / "index.js").write_text("console.log('pin');\n")
-            (checkout / "server" / "collectors" / "llmHost.js").write_text("export function llmProbeHost() {}\n")
-            (checkout / "server" / "auth.js").write_text("export function createAuthMiddleware() {}\n")
-            (checkout / "package.json").write_text("{}\n")
-            subprocess.run(["git", "init"], cwd=checkout, env=git_env, check=True, capture_output=True)
-            subprocess.run(["git", "add", "."], cwd=checkout, env=git_env, check=True, capture_output=True)
-            subprocess.run(
-                ["git", "commit", "-m", "pin"],
-                cwd=checkout,
-                env=git_env,
-                check=True,
-                capture_output=True,
-            )
-            pin = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
-            (checkout / "server" / "index.js").write_text("console.log('DIRTY');\n")
-            (checkout / "node_modules").mkdir()
-            (checkout / "dist").mkdir()
-            (bin_dir / "node").write_text("#!/bin/sh\nexit 0\n")
-            (bin_dir / "npm").write_text(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${NPM_LOG}\"\nexit 0\n"
-            )
-            for name in ("node", "npm"):
-                (bin_dir / name).chmod(stat.S_IRWXU)
-            root = tmp / "gb10-services"
-            profile = root / "profile" / "sparkdash"
-            scripts = root / "scripts"
-            profile.mkdir(parents=True)
-            scripts.mkdir()
-            for name in ("llmHost.js", "sparks.json", "sparkdash.env", "sparkdash.service", "auth.js"):
-                src = PROFILE / name
-                if src.is_file():
-                    (profile / name).write_bytes(src.read_bytes())
-            (profile / "PIN").write_text(
-                "\n".join(
-                    [
-                        "repo=https://github.com/MiaAI-Lab/sparkDash",
-                        f"commit={pin}",
-                        f"node_bin={bin_dir / 'node'}",
-                        "bind=127.0.0.1:20080",
-                        "",
-                    ]
-                )
-            )
-            (scripts / "sparkdash_install.sh").write_bytes(INSTALLER.read_bytes())
-            (scripts / "sparkdash_install.sh").chmod(stat.S_IRWXU)
-            env = {
-                **os.environ,
-                "HOME": str(home),
-                "SPARKDASH_CHECKOUT": str(checkout),
-                "NPM_LOG": str(npm_log),
-                "PATH": f"{bin_dir}:/usr/bin:/bin",
-                "TMPDIR": str(tmp / "tmp"),
-            }
-            (tmp / "tmp").mkdir()
+            checkout, home, npm_log, env, _pin = _prepare_installer_fixture(tmp)
+            dirty = "console.log('DIRTY');\n"
+            (checkout / "server" / "index.js").write_text(dirty)
+            pin_llm = (checkout / "server" / "collectors" / "llmHost.js").read_text()
             completed = subprocess.run(
-                ["bash", str(scripts / "sparkdash_install.sh")],
+                ["bash", str(tmp / "gb10-services" / "scripts" / "sparkdash_install.sh")],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            self.assertEqual((checkout / "server" / "index.js").read_text(), dirty)
+            self.assertEqual((checkout / "server" / "collectors" / "llmHost.js").read_text(), pin_llm)
+            self.assertFalse(npm_log.exists())
+            self.assertFalse((home / ".config" / "sparkdash" / "sparkdash.env").exists())
+
+    def test_installer_rebuilds_clean_and_known_overlay_checkout(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sparkdash-install-") as raw:
+            tmp = Path(raw)
+            checkout, home, npm_log, env, _pin = _prepare_installer_fixture(tmp)
+            user_env = home / ".config" / "sparkdash" / "sparkdash.env"
+            user_env.parent.mkdir(parents=True)
+            user_env.write_text("USER_RUNTIME=keep\n")
+            (checkout / "server" / "collectors" / "llmHost.js").write_text(
+                "export function llmProbeHost() { return 'overlay-dirty'; }\n"
+            )
+            installer = tmp / "gb10-services" / "scripts" / "sparkdash_install.sh"
+            completed = subprocess.run(
+                ["bash", str(installer)],
                 env=env,
                 capture_output=True,
                 text=True,
                 check=False,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
-            self.assertNotIn("DIRTY", (checkout / "server" / "index.js").read_text())
+            self.assertEqual((checkout / "server" / "index.js").read_text(), "console.log('pin');\n")
             log = npm_log.read_text()
             self.assertIn("ci --no-audit --no-fund", log)
             self.assertIn("run build", log)
             overlay = (checkout / "server" / "collectors" / "llmHost.js").read_text()
             self.assertIn("if (ip) return ip;", overlay)
+            self.assertEqual(user_env.read_text(), "USER_RUNTIME=keep\n")
+            auth = (checkout / "server" / "auth.js").read_text()
+            self.assertIn("createAuthMiddleware", auth)
+            self.assertIn("SPARKDASH_READ_ONLY", auth)
 
 
 if __name__ == "__main__":
