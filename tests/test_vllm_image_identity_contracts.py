@@ -211,7 +211,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                 UNIT_PATHS[unit_name].read_text(),
             )
 
-    def test_aeon_ultimate_uses_the_v1_runner_for_native_thinking_budgets(self) -> None:
+    def test_aeon_ultimate_uses_the_v2_runner_for_native_thinking_budgets(self) -> None:
         unit = (
             ROOT
             / "profile"
@@ -221,7 +221,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         self.assertRegex(
             unit,
             re.compile(
-                r"(?m)^  -e VLLM_USE_V2_MODEL_RUNNER=0 \\\n"
+                r"(?m)^  -e VLLM_USE_V2_MODEL_RUNNER=1 \\\n"
                 r"  --memory-swappiness 0"
             ),
         )
@@ -229,11 +229,11 @@ class VllmImageIdentityContractTests(unittest.TestCase):
             re.findall(
                 r"(?m)^\s*-e (VLLM_USE_V2_MODEL_RUNNER=[^\s\\]+)\s*\\$", unit
             ),
-            ["VLLM_USE_V2_MODEL_RUNNER=0"],
+            ["VLLM_USE_V2_MODEL_RUNNER=1"],
         )
 
         guide = (ROOT / "docs" / "deployment" / "AGENTS.md").read_text()
-        self.assertIn("`VLLM_USE_V2_MODEL_RUNNER=0`", guide)
+        self.assertIn("`VLLM_USE_V2_MODEL_RUNNER=1`", guide)
         self.assertIn("`thinking_token_budget`", guide)
 
     def test_current_docs_publish_one_coherent_release_identity(self) -> None:
