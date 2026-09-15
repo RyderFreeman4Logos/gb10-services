@@ -13,11 +13,20 @@ os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
 
 import inspect
 
+import torch
+from transformers import Qwen3Config
+
+from vllm.config import set_current_vllm_config
+from vllm.config.compilation import CompilationConfig
+from vllm.model_executor.layers import linear as linear_mod
+from vllm.model_executor.layers.attention import attention as attention_mod
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import modelopt as mo
+from vllm.model_executor import parameter as parameter_mod
 from vllm.config import vllm as vc
 from vllm.model_executor.models import qwen3_dflash as dflash
 from vllm.model_executor.models import qwen3_dflash2 as dflash2
+from vllm.v1.attention.backends import triton_attn
 
 
 class DummyLinear(LinearBase):
@@ -152,6 +161,113 @@ def _dflash2_layer_type_forward() -> dict:
     }
 
 
+class CPUHardwareBoundary:
+    """Only the unavailable device/backend-selection boundary is stubbed."""
+
+    @staticmethod
+    def is_cuda() -> bool:
+        return False
+
+    @staticmethod
+    def is_xpu() -> bool:
+        return False
+
+    @staticmethod
+    def opaque_attention_op() -> bool:
+        return False
+
+    @staticmethod
+    def fp8_dtype() -> torch.dtype:
+        return torch.float8_e4m3fn
+
+    @staticmethod
+    def make_synced_weight_loader(loader):
+        return loader
+
+
+def _dflash2_triton_constructor() -> dict:
+    """Real Attention -> Triton constructor. CPU tests do not prove GPU kernels."""
+    attention_mod.current_platform = CPUHardwareBoundary()
+    triton_attn.current_platform = CPUHardwareBoundary()
+    attention_mod.get_attn_backend = lambda *args, **kwargs: triton_attn.TritonAttentionBackend
+    dflash.get_tensor_model_parallel_world_size = lambda: 1
+    dflash.get_tensor_model_parallel_rank = lambda: 0
+    linear_mod.get_tensor_model_parallel_world_size = lambda: 1
+    linear_mod.get_tensor_model_parallel_rank = lambda: 0
+    parameter_mod.get_tensor_model_parallel_world_size = lambda: 1
+    parameter_mod.get_tensor_model_parallel_rank = lambda: 0
+    parameter_mod.current_platform = CPUHardwareBoundary()
+
+    runtime = SimpleNamespace(
+        model_config=SimpleNamespace(dtype=torch.bfloat16, is_mm_prefix_lm=False),
+        attention_config=SimpleNamespace(flex_attn_block_m=None, flex_attn_block_n=None),
+        compilation_config=CompilationConfig(custom_ops=["none"]),
+        kernel_config=SimpleNamespace(linear_backend="auto"),
+    )
+    attention_mod.get_current_vllm_config = lambda: runtime
+
+    config = Qwen3Config(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=5,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        attention_bias=False,
+        layer_types=["sliding_attention"] * 5,
+        sliding_window=2048,
+        is_causal=False,
+    )
+    config.rope_parameters = {"rope_theta": 10_000_000, "rope_type": "default"}
+    config.layer_types = ["sliding_attention"] * 5
+    config.sliding_window = 2048
+    config.is_causal = False
+    config.dflash_config = {
+        "block_size": 8,
+        "conv_group_size": 16,
+        "conv_kernel_size": 2,
+        "mask_token_id": 63,
+        "selector_rank": 8,
+        "selector_top_k": 16,
+        "target_layer_ids": [5, 19, 33, 47, 61],
+    }
+    vcfg = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        cache_config=SimpleNamespace(block_size=16, skip_page_size_padded=None),
+    )
+    kwargs = dict(
+        config=config,
+        layer_idx=0,
+        cache_config=None,
+        quant_config=None,
+        layer_type="sliding_attention",
+        prefix="model.layers.64",
+    )
+    runtime.compilation_config.static_forward_context.clear()
+    with set_current_vllm_config(runtime, check_compile=False):
+        layer = dflash2.DFlash2Qwen3DecoderLayer(vcfg, **kwargs)
+    attn = layer.self_attn.attn
+    spec = attn.get_kv_cache_spec(vcfg)
+    return {
+        "impl": type(attn.impl).__name__,
+        "impl_type": type(attn.impl),
+        "layer_type": layer.layer_type,
+        "attn_window": attn.sliding_window,
+        "compute_window": attn.impl.sliding_window,
+        "kv_spec": type(spec).__name__,
+        "kv_block": spec.block_size,
+        "query_block": layer.attention_conv.block_size,
+        "use_mm_prefix": attn.use_mm_prefix,
+        "resolved_causal": dflash._dflash_layer_causal(config, 0),
+        "layer_causal": layer.self_attn.causal,
+        "owns_init": "__init__" in dflash.DFlashAttention.__dict__,
+    }
+
+
 def _patch_current_vllm_config() -> None:
     import torch
 
@@ -189,6 +305,7 @@ def main() -> int:
         fused = cfg.get_quant_method(layer, "model.layers.0.self_attn.in_proj_qkvz")
         dflash = _dflash2_v2_path()
         layer_type = _dflash2_layer_type_forward()
+        triton = _dflash2_triton_constructor()
         results = {
             "label": label,
             "expect_pcpt_dispatch": expect_pcpt_dispatch,
@@ -204,6 +321,15 @@ def main() -> int:
             "nvfp4_ok": nvfp4_algo == "NVFP4",
             "dflash": dflash,
             "layer_type": layer_type,
+            "triton": {
+                "impl": triton["impl"],
+                "layer_type": triton["layer_type"],
+                "compute_window": triton["compute_window"],
+                "kv_spec": triton["kv_spec"],
+                "query_block": triton["query_block"],
+                "use_mm_prefix": triton["use_mm_prefix"],
+                "layer_causal": triton["layer_causal"],
+            },
             "has_class_pcpt": hasattr(mo, "ModelOptFp8PcPtLinearMethod"),
         }
         checks = []
@@ -241,6 +367,14 @@ def main() -> int:
         checks.append(
             ("dflash2_rejects_unknown_kw", layer_type["unexpected_rejected"] is True)
         )
+        checks.append(("triton_impl", triton["impl_type"] is triton_attn.TritonAttentionImpl))
+        checks.append(("sliding_compute_window", triton["compute_window"] == (2047, 0)))
+        checks.append(("full_kv_spec", triton["kv_spec"] == "FullAttentionSpec"))
+        checks.append(("query_block8", triton["query_block"] == 8))
+        checks.append(("no_mm_prefix", triton["use_mm_prefix"] is False))
+        checks.append(("resolved_causal_false", triton["resolved_causal"] is False))
+        checks.append(("layer.self_attn.causal is False", triton["layer_causal"] is False))
+        checks.append(("parent_init_deleted", triton["owns_init"] is False))
         results["checks"] = [(n, bool(v)) for n, v in checks]
         failed = [n for n, v in checks if not v]
         results["failed"] = failed

@@ -95,7 +95,7 @@ until a separately authorized deployment changes them.
 ```text
 friendly tag: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-09-11-v0.29.0-omni
 repository digest: sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7
-ultimate override: sha256:112e96dae5543672afcfe2511193db4e095c222b5bea0dab9e109b84e9626b11
+ultimate override: sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e
 rollback/superseded: 2026-08-24-v0.27.1-omni @ sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee; 2026-08-17-v0.27.1-slim @ sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f
 runtime version: v0.29.0-omni
 ```

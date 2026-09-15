@@ -561,7 +561,7 @@ def parse_unit(path_raw: str) -> UnitContract:
     image = argv[index]
     command = argv[index + 1 :]
     approved_ultimate_image = (
-        "sha256:112e96dae5543672afcfe2511193db4e095c222b5bea0dab9e109b84e9626b11"
+        "sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e"
     )
     if re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         if (

@@ -40,6 +40,8 @@ CONTRACT = Path("scripts/gb10_embedding_profile_contract.py")
 STORAGE = Path("scripts/gb10_embedding_activation_storage.py")
 ACTIVATION = Path("scripts/gb10_embedding_activation.py")
 WRAPPER = Path("scripts/gb10_activate_embedding_profile.sh")
+NO_SWAP_CORE = Path("scripts/gb10_verify_vllm_no_swap_core.py")
+NO_SWAP_WRAPPER = Path("scripts/gb10_verify_vllm_no_swap.sh")
 CURRENT_SURFACES = (
     README,
     GUIDE,
@@ -52,6 +54,13 @@ CURRENT_SURFACES = (
     Path("tests/test_querit_service_contracts.py"),
     Path("tests/test_querit_vllm_production_contracts.py"),
     Path("tests/test_vllm_image_identity_contracts.py"),
+)
+ULTIMATE_OVERRIDE_SURFACES = (
+    Path("scripts/gb10_prepare_aeon_ultimate_image.py"),
+    Path("scripts/gb10_verify_vllm_no_swap_core.py"),
+    Path("tests/test_aeon_ultimate_derived_image.py"),
+    Path("tests/test_update_aeon_vllm_release.py"),
+    Path("tests/test_vllm_no_swap_verifier.py"),
 )
 ANNOTATION = re.compile(
     r"^# AEON image release: (?P<tag>\d{4}-\d{2}-\d{2}-(?P<version>v[^;]+)); "
@@ -120,7 +129,7 @@ def _load_release(root: Path) -> dict:
     if override_digest == release["repository_digest"]:
         raise ValueError("Ultimate override must differ from the central digest")
     derived_image = (
-        "sha256:112e96dae5543672afcfe2511193db4e095c222b5bea0dab9e109b84e9626b11"
+        "sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e"
     )
     derived_base = (
         "sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7"
@@ -190,7 +199,17 @@ def _render(root: Path) -> dict[Path, str]:
         extra = sorted(discovered - set(UNIT_PATHS))
         raise ValueError(f"AEON unit inventory mismatch: missing={missing}, extra={extra}")
 
-    paths = set((*UNIT_PATHS, *CURRENT_SURFACES, STORAGE, ACTIVATION, WRAPPER))
+    paths = set(
+        (
+            *UNIT_PATHS,
+            *CURRENT_SURFACES,
+            *ULTIMATE_OVERRIDE_SURFACES,
+            STORAGE,
+            ACTIVATION,
+            WRAPPER,
+            NO_SWAP_WRAPPER,
+        )
+    )
     texts = {path: (root / path).read_text() for path in paths}
     canonical = texts[QWEN36_UNIT]
     match = ANNOTATION.search(canonical)
@@ -221,6 +240,15 @@ def _render(root: Path) -> dict[Path, str]:
     )
     expected_image = f"{release['repository']}@{release['repository_digest']}"
     override_digest = release["overrides"][ULTIMATE_UNIT.name]
+    old_override_match = BARE_IMAGE.search(texts[ULTIMATE_UNIT])
+    if old_override_match is None:
+        raise ValueError(f"{ULTIMATE_UNIT}: current Ultimate override is missing")
+    old_override = old_override_match.group(0).strip().rstrip("\\").strip()
+    if DIGEST.fullmatch(old_override) is None:
+        raise ValueError(f"{ULTIMATE_UNIT}: current Ultimate override is not a digest")
+    if old_override != override_digest:
+        for path in (*CURRENT_SURFACES, *ULTIMATE_OVERRIDE_SURFACES):
+            texts[path] = texts[path].replace(old_override, override_digest)
     expected_ultimate_annotation = (
         f"# AEON image release: {release['tag']}; immutable digest: {override_digest}"
     )
@@ -356,10 +384,31 @@ def _render(root: Path) -> dict[Path, str]:
     )
     texts[CONTRACT] = contract
     contract_sha = _sha256(contract)
+    no_swap_core_sha = _sha256(texts[NO_SWAP_CORE])
+    no_swap_wrapper = _replace_regex(
+        texts[NO_SWAP_WRAPPER],
+        r"^EXPECTED_CORE_SHA256=[0-9a-f]{64}$",
+        f"EXPECTED_CORE_SHA256={no_swap_core_sha}",
+        str(NO_SWAP_WRAPPER),
+    )
+    texts[NO_SWAP_WRAPPER] = no_swap_wrapper
+    storage = texts[STORAGE]
     storage = _replace_regex(
-        texts[STORAGE],
+        storage,
         r'^(\s*"gb10_embedding_profile_contract\.py": ")[0-9a-f]{64}(".*)$',
-        rf'\g<1>{contract_sha}\g<2>',
+        rf"\g<1>{contract_sha}\g<2>",
+        str(STORAGE),
+    )
+    storage = _replace_regex(
+        storage,
+        r'^(\s*"core": ")[0-9a-f]{64}(".*)$',
+        rf"\g<1>{no_swap_core_sha}\g<2>",
+        str(STORAGE),
+    )
+    storage = _replace_regex(
+        storage,
+        r'^(\s*"wrapper": ")[0-9a-f]{64}(".*)$',
+        rf"\g<1>{_sha256(no_swap_wrapper)}\g<2>",
         str(STORAGE),
     )
     texts[STORAGE] = storage

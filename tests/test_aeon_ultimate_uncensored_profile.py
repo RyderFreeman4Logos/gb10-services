@@ -30,7 +30,7 @@ BACKEND_ALIASES = {
     "aeon-ultimate",
     "abliterated-qwen-latest-27b-nvfp4",
 }
-IMAGE = "sha256:112e96dae5543672afcfe2511193db4e095c222b5bea0dab9e109b84e9626b11"
+IMAGE = "sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e"
 MIXED_MODEL = (
     "/home/obj/models/"
     "AEON-7--Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-NVFP4-MIXED--"

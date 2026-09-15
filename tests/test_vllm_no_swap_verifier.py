@@ -969,7 +969,7 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
 
     def test_production_parser_admits_approved_ultimate_bare_image_id_only(self) -> None:
         approved = (
-            "sha256:112e96dae5543672afcfe2511193db4e095c222b5bea0dab9e109b84e9626b11"
+            "sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e"
         )
         profile = self.profile_dir / "aeon-ultimate-uncensored-nvfp4.env"
         profile.write_text("AEON_GPU_MEMORY_UTILIZATION=0.515\n")

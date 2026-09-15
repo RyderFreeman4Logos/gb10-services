@@ -55,7 +55,7 @@ CURRENT_RELEASE = ImageRelease(
 ULTIMATE_DERIVED_RELEASE = ImageRelease(
     date="2026-09-11",
     version="v0.29.0-omni",
-    digest="sha256:112e96dae5543672afcfe2511193db4e095c222b5bea0dab9e109b84e9626b11",
+    digest="sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e",
 )
 PREVIOUS_RELEASE = ImageRelease(
     date="2026-07-16",

@@ -26,7 +26,7 @@ UNITS = (
 )
 CENTRAL_UNITS = UNITS[1:]
 ULTIMATE_OVERRIDE_DIGEST = (
-    "sha256:112e96dae5543672afcfe2511193db4e095c222b5bea0dab9e109b84e9626b11"
+    "sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e"
 )
 ALIASES = {
     Path("profile/abliterated-qwen-latest-27b"): Path("aeon-ultimate-uncensored-nvfp4"),
@@ -42,7 +42,13 @@ DERIVED = UNITS + (
     Path("scripts/gb10_embedding_activation.py"),
     Path("scripts/gb10_embedding_activation_storage.py"),
     Path("scripts/gb10_embedding_profile_contract.py"),
+    Path("scripts/gb10_prepare_aeon_ultimate_image.py"),
+    Path("scripts/gb10_verify_vllm_no_swap_core.py"),
+    Path("scripts/gb10_verify_vllm_no_swap.sh"),
     Path("scripts/querit_replay_trust.py"),
+    Path("tests/test_aeon_ultimate_derived_image.py"),
+    Path("tests/test_update_aeon_vllm_release.py"),
+    Path("tests/test_vllm_no_swap_verifier.py"),
     Path("tests/embedding_profile_fixtures.py"),
     Path("tests/test_aeon_ultimate_uncensored_profile.py"),
     Path("tests/test_embedding_service_contracts.py"),
@@ -134,6 +140,23 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
             self.assertEqual(ultimate.count(new_override), 2)
             self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, ultimate)
             self.assertNotIn(new["repository_digest"], ultimate)
+            helper = (target / "scripts/gb10_prepare_aeon_ultimate_image.py").read_text()
+            parser = (target / "scripts/gb10_verify_vllm_no_swap_core.py").read_text()
+            no_swap = (target / "scripts/gb10_verify_vllm_no_swap.sh").read_text()
+            storage_text = (target / "scripts/gb10_embedding_activation_storage.py").read_text()
+            self.assertIn(new_override, helper)
+            self.assertIn(new_override, parser)
+            self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, helper)
+            self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, parser)
+            self.assertIn(f'EXPECTED_CORE_SHA256="{_sha256(target / "scripts/gb10_verify_vllm_no_swap_core.py")}"'.replace('"', ""), no_swap)
+            self.assertIn(
+                f'"core": "{_sha256(target / "scripts/gb10_verify_vllm_no_swap_core.py")}"',
+                storage_text,
+            )
+            self.assertIn(
+                f'"wrapper": "{_sha256(target / "scripts/gb10_verify_vllm_no_swap.sh")}"',
+                storage_text,
+            )
             self.assertIn(
                 "# AEON image release: "
                 f"{new['tag']}; immutable digest: {new_override}",
