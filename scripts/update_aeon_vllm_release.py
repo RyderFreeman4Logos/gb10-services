@@ -18,14 +18,18 @@ QWEN36_UNIT = Path(
     "profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service"
 )
 EMBEDDING_UNIT = Path("profile/qwen3-embedding-8b/vllm-embedding.service")
+ULTIMATE_UNIT = Path(
+    "profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service"
+)
 UNIT_PATHS = (
-    Path("profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service"),
+    ULTIMATE_UNIT,
     Path("profile/querit-4b-reranker/vllm-querit-4b-reranker.service"),
     EMBEDDING_UNIT,
     Path("profile/qwen3-reranker-8b/vllm-qwen3-reranker-8b.service"),
     QWEN36_UNIT,
     Path("profile/qwen3.8-27b-nvfp4-vllm/vllm-aeon-qwen38-dflash.service"),
 )
+BARE_IMAGE = re.compile(r"(?m)^  sha256:[0-9a-f]{64} \\$")
 ALIASES = {
     Path("profile/abliterated-qwen-latest-27b"): Path("aeon-ultimate-uncensored-nvfp4"),
     Path("profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash-hikv.service"): Path(
@@ -36,6 +40,8 @@ CONTRACT = Path("scripts/gb10_embedding_profile_contract.py")
 STORAGE = Path("scripts/gb10_embedding_activation_storage.py")
 ACTIVATION = Path("scripts/gb10_embedding_activation.py")
 WRAPPER = Path("scripts/gb10_activate_embedding_profile.sh")
+NO_SWAP_CORE = Path("scripts/gb10_verify_vllm_no_swap_core.py")
+NO_SWAP_WRAPPER = Path("scripts/gb10_verify_vllm_no_swap.sh")
 CURRENT_SURFACES = (
     README,
     GUIDE,
@@ -48,6 +54,13 @@ CURRENT_SURFACES = (
     Path("tests/test_querit_service_contracts.py"),
     Path("tests/test_querit_vllm_production_contracts.py"),
     Path("tests/test_vllm_image_identity_contracts.py"),
+)
+ULTIMATE_OVERRIDE_SURFACES = (
+    Path("scripts/gb10_prepare_aeon_ultimate_image.py"),
+    Path("scripts/gb10_verify_vllm_no_swap_core.py"),
+    Path("tests/test_aeon_ultimate_derived_image.py"),
+    Path("tests/test_update_aeon_vllm_release.py"),
+    Path("tests/test_vllm_no_swap_verifier.py"),
 )
 ANNOTATION = re.compile(
     r"^# AEON image release: (?P<tag>\d{4}-\d{2}-\d{2}-(?P<version>v[^;]+)); "
@@ -85,7 +98,7 @@ def _cache_key(version: str) -> str:
     return f"v{major}{minor:02d}{patch}"
 
 
-def _load_release(root: Path) -> dict[str, str]:
+def _load_release(root: Path) -> dict:
     release = json.loads((root / CONFIG).read_text())
     expected = {
         "repository",
@@ -93,11 +106,16 @@ def _load_release(root: Path) -> dict[str, str]:
         "repository_digest",
         "arm64_digest",
         "runtime_version",
+        "overrides",
     }
-    if set(release) != expected or not all(
-        isinstance(release[key], str) and release[key] for key in expected
-    ):
+    if set(release) != expected:
         raise ValueError(f"{CONFIG}: expected exactly {sorted(expected)}")
+    for key in ("repository", "tag", "repository_digest", "arm64_digest", "runtime_version"):
+        if not isinstance(release[key], str) or not release[key]:
+            raise ValueError(f"{CONFIG}: expected exactly {sorted(expected)}")
+    overrides = release["overrides"]
+    if not isinstance(overrides, dict) or set(overrides) != {ULTIMATE_UNIT.name}:
+        raise ValueError("overrides must pin only the Ultimate unit")
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}-v[^\s]+", release["tag"]) is None:
         raise ValueError("tag must be a dated AEON release tag")
     if not release["tag"].endswith("-" + release["runtime_version"]):
@@ -105,6 +123,23 @@ def _load_release(root: Path) -> dict[str, str]:
     for key in ("repository_digest", "arm64_digest"):
         if DIGEST.fullmatch(release[key]) is None:
             raise ValueError(f"{key} must be a full sha256 digest")
+    override_digest = overrides[ULTIMATE_UNIT.name]
+    if DIGEST.fullmatch(override_digest) is None:
+        raise ValueError("Ultimate override must be a full sha256 digest")
+    if override_digest == release["repository_digest"]:
+        raise ValueError("Ultimate override must differ from the central digest")
+    derived_image = (
+        "sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e"
+    )
+    derived_base = (
+        "sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7"
+    )
+    if override_digest == derived_image and release["repository_digest"] != derived_base:
+        raise ValueError(
+            "Ultimate derived override is still bound to "
+            f"{derived_base}; rebuild or retarget the override before moving "
+            "the central release"
+        )
     _cache_key(release["runtime_version"])
     return release
 
@@ -164,7 +199,17 @@ def _render(root: Path) -> dict[Path, str]:
         extra = sorted(discovered - set(UNIT_PATHS))
         raise ValueError(f"AEON unit inventory mismatch: missing={missing}, extra={extra}")
 
-    paths = set((*UNIT_PATHS, *CURRENT_SURFACES, STORAGE, ACTIVATION, WRAPPER))
+    paths = set(
+        (
+            *UNIT_PATHS,
+            *CURRENT_SURFACES,
+            *ULTIMATE_OVERRIDE_SURFACES,
+            STORAGE,
+            ACTIVATION,
+            WRAPPER,
+            NO_SWAP_WRAPPER,
+        )
+    )
     texts = {path: (root / path).read_text() for path in paths}
     canonical = texts[QWEN36_UNIT]
     match = ANNOTATION.search(canonical)
@@ -194,8 +239,58 @@ def _render(root: Path) -> dict[Path, str]:
         f"{release['repository_digest']}"
     )
     expected_image = f"{release['repository']}@{release['repository_digest']}"
+    override_digest = release["overrides"][ULTIMATE_UNIT.name]
+    old_override_match = BARE_IMAGE.search(texts[ULTIMATE_UNIT])
+    if old_override_match is None:
+        raise ValueError(f"{ULTIMATE_UNIT}: current Ultimate override is missing")
+    old_override = old_override_match.group(0).strip().rstrip("\\").strip()
+    if DIGEST.fullmatch(old_override) is None:
+        raise ValueError(f"{ULTIMATE_UNIT}: current Ultimate override is not a digest")
+    if old_override != override_digest:
+        for path in (*CURRENT_SURFACES, *ULTIMATE_OVERRIDE_SURFACES):
+            texts[path] = texts[path].replace(old_override, override_digest)
+    expected_ultimate_annotation = (
+        f"# AEON image release: {release['tag']}; immutable digest: {override_digest}"
+    )
     for path in UNIT_PATHS:
         text = texts[path]
+        if path == ULTIMATE_UNIT:
+            text = _replace(text, old["tag"], release["tag"], str(path))
+            text = _replace(
+                text, old["runtime_version"], release["runtime_version"], str(path)
+            )
+            repo_images = IMAGE.findall(text)
+            bare_images = BARE_IMAGE.findall(text)
+            if repo_images and not bare_images:
+                if len(repo_images) != 1:
+                    raise ValueError(f"{path}: generated unit release identity is ambiguous")
+                text = text.replace(repo_images[0], override_digest)
+            elif bare_images and not repo_images:
+                if len(bare_images) != 1:
+                    raise ValueError(f"{path}: generated unit release identity is ambiguous")
+                text = text.replace(bare_images[0], f"  {override_digest} \\", 1)
+            else:
+                raise ValueError(f"{path}: generated unit release identity is ambiguous")
+            annotations = [match.group(0) for match in ANNOTATION.finditer(text)]
+            if len(annotations) != 1:
+                raise ValueError(f"{path}: generated unit release identity is ambiguous")
+            text = text.replace(annotations[0], expected_ultimate_annotation)
+            annotations = [match.group(0) for match in ANNOTATION.finditer(text)]
+            images = IMAGE.findall(text)
+            bares = BARE_IMAGE.findall(text)
+            descriptions = [line for line in text.splitlines() if line.startswith("Description=")]
+            if (
+                annotations != [expected_ultimate_annotation]
+                or images
+                or bares != [f"  {override_digest} \\"]
+                or len(descriptions) != 1
+            ):
+                raise ValueError(f"{path}: generated unit release identity is ambiguous")
+            versions = re.findall(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?", descriptions[0])
+            if versions != [release["runtime_version"]]:
+                raise ValueError(f"{path}: Description does not identify the generated release")
+            texts[path] = text
+            continue
         for key in ("repository", "tag", "repository_digest", "runtime_version"):
             text = _replace(text, old[key], release[key], str(path))
         if path == QWEN36_UNIT:
@@ -289,10 +384,31 @@ def _render(root: Path) -> dict[Path, str]:
     )
     texts[CONTRACT] = contract
     contract_sha = _sha256(contract)
+    no_swap_core_sha = _sha256(texts[NO_SWAP_CORE])
+    no_swap_wrapper = _replace_regex(
+        texts[NO_SWAP_WRAPPER],
+        r"^EXPECTED_CORE_SHA256=[0-9a-f]{64}$",
+        f"EXPECTED_CORE_SHA256={no_swap_core_sha}",
+        str(NO_SWAP_WRAPPER),
+    )
+    texts[NO_SWAP_WRAPPER] = no_swap_wrapper
+    storage = texts[STORAGE]
     storage = _replace_regex(
-        texts[STORAGE],
+        storage,
         r'^(\s*"gb10_embedding_profile_contract\.py": ")[0-9a-f]{64}(".*)$',
-        rf'\g<1>{contract_sha}\g<2>',
+        rf"\g<1>{contract_sha}\g<2>",
+        str(STORAGE),
+    )
+    storage = _replace_regex(
+        storage,
+        r'^(\s*"core": ")[0-9a-f]{64}(".*)$',
+        rf"\g<1>{no_swap_core_sha}\g<2>",
+        str(STORAGE),
+    )
+    storage = _replace_regex(
+        storage,
+        r'^(\s*"wrapper": ")[0-9a-f]{64}(".*)$',
+        rf"\g<1>{_sha256(no_swap_wrapper)}\g<2>",
         str(STORAGE),
     )
     texts[STORAGE] = storage

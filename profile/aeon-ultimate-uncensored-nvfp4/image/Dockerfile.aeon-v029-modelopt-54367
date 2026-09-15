@@ -1,0 +1,23 @@
+# Thin derived layer: bake sidecar modelopt-54367 semantics onto already-pulled
+# v0.29.0-omni. Do NOT copy 0.27 overlay modelopt.py (clobbers 0.29 mixed tree).
+# Sidecar hunks are line-offset vs 0.29 (NVFP4_AWQ fused; extra FP8_PB_WO/MXFP8).
+# Build-only cwd fix: RUN python after patch must not keep CWD=quantization/
+# (that directory contains torchao.py and shadows the real torchao package).
+FROM ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7
+LABEL aeon.layer="modelopt-54367-v029-adapted" \
+      aeon.base="sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7" \
+      aeon.patch="modelopt-54367-v029-adapted.patch" \
+      aeon.patch.sha256="7d2ff70d56dc0910197749c8e42b5ed95fc598bffb1fad01f2fa94eeab1ab4cb" \
+      aeon.dflash2.patch="qwen3-dflash2-layer-type.patch" \
+      aeon.dflash2.patch.sha256="8b2f477f1dc1edfdefb22daf1d1075bc282ab5bd39bb6c875685ec453f94370b" \
+      aeon.dflash.parent.patch="qwen3-dflash-parent.patch" \
+      aeon.dflash.parent.patch.sha256="10ab934e220499676ba715205961494d75849f5bef5ed7ba970482033489627e" \
+      aeon.sidecar="modelopt-54367.patch" \
+      aeon.sidecar.sha256="d61e281faa5bc25b253bbbad099a00c177131b33d1cef5f384e3134658a7d98d"
+COPY modelopt-54367-v029-adapted.patch /tmp/modelopt-54367-v029-adapted.patch
+COPY qwen3-dflash2-layer-type.patch /tmp/qwen3-dflash2-layer-type.patch
+COPY qwen3-dflash-parent.patch /tmp/qwen3-dflash-parent.patch
+COPY cpu_dispatcher_regression.py /tmp/cpu_dispatcher_regression.py
+WORKDIR /usr/local/lib/python3.12/site-packages/vllm/model_executor/layers/quantization
+RUN patch -p0 --fuzz=0 < /tmp/modelopt-54367-v029-adapted.patch && cd / && patch -p1 --fuzz=0 < /tmp/qwen3-dflash2-layer-type.patch && patch -p1 --fuzz=0 < /tmp/qwen3-dflash-parent.patch && python3 -c "from pathlib import Path; import inspect; from vllm.model_executor.layers.quantization import modelopt as mo; src=inspect.getsource(mo.ModelOptMixedPrecisionConfig.get_quant_method); assert 'FP8_PER_CHANNEL_PER_TOKEN' in src and 'ModelOptFp8PcPtLinearMethod' in src; assert 'in_proj_qkvz' in Path(mo.__file__).read_text(); from vllm.config import vllm as vc; s=Path(vc.__file__).read_text(); assert 'dflash2 drafts' in s and 'DFlash2DraftModel' in s; print('derived smoke: PcPt mixed + DFlash2 V1-reject OK')" && CUDA_VISIBLE_DEVICES= VLLM_SKIP_CUDA_CHECK=1 VLLM_NO_USAGE_STATS=1 python3 /tmp/cpu_dispatcher_regression.py
+WORKDIR /

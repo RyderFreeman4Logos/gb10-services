@@ -1,0 +1,44 @@
+--- a/usr/local/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_dflash.py
++++ b/usr/local/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_dflash.py
+@@ -84,22 +84,16 @@
+ class DFlashAttention(Attention):
+     """Attention with DFlash-specific KV allocation semantics.
+ 
+     The compute path keeps the layer's configured sliding window. The KV cache
+     spec is widened to full attention because DFlash writes every context KV
+     before drafting and cannot evict old context blocks from draft layers.
+     """
+ 
+-    def __init__(self, *args, **kwargs) -> None:
+-        # DFlash draft attention runs over text/query tokens with prewritten K/V.
+-        # Do not inherit a multimodal-prefix mask requirement from the target.
+-        kwargs.setdefault("use_mm_prefix", False)
+-        super().__init__(*args, **kwargs)
+-
+     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+         spec = super().get_kv_cache_spec(vllm_config)
+         if isinstance(spec, SlidingWindowSpec):
+             return FullAttentionSpec(
+                 block_size=spec.block_size,
+                 num_kv_heads=spec.num_kv_heads,
+                 head_size=spec.head_size,
+                 head_size_v=getattr(spec, "head_size_v", spec.head_size),
+@@ -355,17 +349,17 @@
+         add_swa_attention_sink_bias = dflash_config.get(
+             "attention_sink_bias",
+             getattr(config, "add_swa_attention_sink_bias", False),
+         )
+         # `causal` is currently unused downstream (see DFlashQwen3Attention). SWA
+         # layers default causal, overridable via dflash_config.causal. The v0.25
+         # `_resolve_layer_attention` driver is intentionally NOT used: it raises on
+         # mixed sliding/full, which the #40898 layer_type path above supports.
+-        causal = dflash_config.get("causal", layer_type == "sliding_attention")
++        causal = _dflash_layer_causal(config, layer_idx)
+ 
+         # RoPE layout. The rotation applies to the draft's own Q/K, so this is
+         # fixed by how the head was distilled, not by the target: a neox-trained
+         # head on an interleaved target still needs neox. A mismatch is silent --
+         # acceptance collapses and nothing errors -- so a checkpoint that was
+         # distilled the other way has to say so here.
+         is_neox_style = getattr(config, "is_neox_style", True)
+ 

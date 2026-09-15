@@ -185,6 +185,10 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                     index
                     for index, token in enumerate(argv)
                     if "@sha256:" in token
+                    or (
+                        name == "vllm-aeon-ultimate-uncensored-nvfp4.service"
+                        and token.startswith("sha256:")
+                    )
                 )
                 application = argv[image_at + 1 :]
                 normalized_swap = [

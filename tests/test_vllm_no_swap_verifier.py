@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from vllm_no_swap_fixtures import (
+    ROOT,
     VERIFIER,
     VERIFIER_CORE,
     VllmNoSwapFixture,
@@ -965,3 +966,62 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
         self.assertFalse(self.command_log.exists())
         source = VERIFIER.read_text()
         self.assertIn("/usr/bin/python3 -I", source)
+
+    def test_production_parser_admits_approved_ultimate_bare_image_id_only(self) -> None:
+        approved = (
+            "sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e"
+        )
+        profile = self.profile_dir / "aeon-ultimate-uncensored-nvfp4.env"
+        profile.write_text("AEON_GPU_MEMORY_UTILIZATION=0.515\n")
+        profile.chmod(0o644)
+        source_unit = (
+            ROOT
+            / "profile/aeon-ultimate-uncensored-nvfp4"
+            / "vllm-aeon-ultimate-uncensored-nvfp4.service"
+        )
+        copied = self.root / "vllm-aeon-ultimate-uncensored-nvfp4.service"
+        copied.write_text(source_unit.read_text())
+        copied.chmod(0o644)
+
+        admitted = self._run(
+            units=(copied,),
+            containers=(),
+            profile_value="0.515",
+            ultimate_profile_path=profile,
+        )
+        self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+        self.assertIn("gb10_vllm_no_swap: verified", admitted.stdout)
+        self.assertNotIn("Docker image is not immutable", admitted.stderr)
+
+        self._write_unit(
+            self.unit,
+            "vllm-test",
+            str(self.cidfiles["vllm-test"]),
+            image=approved,
+        )
+        other_unit = self.assert_rejected(containers=())
+        self.assertIn("bare local image ID is reserved", other_unit.stderr)
+
+        self._write_unit(
+            copied,
+            "vllm-aeon-ultimate-uncensored-nvfp4",
+            "%t/gb10-memory-guardian/aeon-text.cid",
+            environment_files=(
+                "/home/obj/.config/gb10/aeon-dflash-profiles/"
+                "aeon-ultimate-uncensored-nvfp4.env",
+            ),
+            application=[
+                "/usr/local/bin/vllm",
+                "serve",
+                "--gpu-memory-utilization",
+                "${AEON_GPU_MEMORY_UTILIZATION}",
+            ],
+            image="sha256:" + "a" * 63,
+        )
+        malformed = self.assert_rejected(
+            units=(copied,),
+            containers=(),
+            profile_value="0.515",
+            ultimate_profile_path=profile,
+        )
+        self.assertIn("Docker image is not immutable by sha256 digest", malformed.stderr)

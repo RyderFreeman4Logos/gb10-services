@@ -545,18 +545,28 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
     def test_deployment_docs_install_all_lifecycle_helpers(self) -> None:
         runbook = " ".join(RUNBOOK.read_text().split())
         readme = " ".join(README.read_text().split())
-        destinations = (
+        current_destinations = (
             "install -m 0755 scripts/gb10_lifecycle.sh "
             "/home/obj/.local/bin/gb10_lifecycle.sh",
             "install -m 0755 scripts/aeon_text_stop_start.sh "
             "/home/obj/scripts/aeon_text_stop_start.sh",
-            "install -m 0755 scripts/gb10_restart_text_safe.sh "
-            "/home/obj/.local/bin/gb10_restart_text_safe.sh",
         )
+        legacy_restart_install = (
+            "install -m 0755 scripts/gb10_restart_text_safe.sh "
+            "/home/obj/.local/bin/gb10_restart_text_safe.sh"
+        )
+        historical_readme = readme.replace("~/.local", "/home/obj/.local")
 
-        for destination in destinations:
+        for destination in current_destinations:
             self.assertIn(destination, runbook)
-            self.assertIn(destination, readme.replace("~/.local", "/home/obj/.local"))
+            self.assertIn(destination, historical_readme)
+
+        self.assertNotIn(legacy_restart_install, runbook)
+        self.assertNotIn(
+            "aeon_text_stop_start.sh and gb10_restart_text_safe.sh",
+            runbook,
+        )
+        self.assertIn(legacy_restart_install, historical_readme)
 
         guard_config = GUARD_CONFIG.read_text()
         # The primary profile plus guarded, default-no-think, and legacy-bounded
@@ -821,13 +831,13 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             self.assertEqual(
                 commands_log.read_text().splitlines(),
                 [
-                    f"--user stop {UNIT}",
-                    f"--user start --no-block {UNIT}",
+                    f"--user stop {ULTIMATE_UNIT}",
+                    f"--user start --no-block {ULTIMATE_UNIT}",
                 ],
             )
             audit = (root / "state" / "lifecycle-audit.log").read_text()
             self.assertIn(
-                "event=request action=start unit=vllm-aeon-27b-dflash.service "
+                "event=request action=start unit=vllm-aeon-ultimate-uncensored-nvfp4.service "
                 "actor=llm-guard-proxy.local-recovery "
                 "reason=automatic-local-recovery outcome=accepted "
                 "reset_failed=false",
@@ -839,7 +849,7 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
         self,
         *,
         active_state: str,
-        requested_unit: str | None = UNIT,
+        requested_unit: str | None = ULTIMATE_UNIT,
         selected_value: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], list[str], str | None]:
         with tempfile.TemporaryDirectory() as temporary:
@@ -914,12 +924,12 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             events,
             [
                 "lifecycle stop --unit "
-                + UNIT
+                + ULTIMATE_UNIT
                 + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
                 "lifecycle start --unit "
-                + UNIT
+                + ULTIMATE_UNIT
                 + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
-                "systemctl --user show --property=ActiveState --value " + UNIT,
+                "systemctl --user show --property=ActiveState --value " + ULTIMATE_UNIT,
             ],
         )
 
@@ -931,8 +941,12 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIsNone(selected)
-        self.assertEqual(events[-1], "systemctl --user show --property=ActiveState --value " + UNIT)
+        self.assertEqual(
+            events[-1],
+            "systemctl --user show --property=ActiveState --value " + ULTIMATE_UNIT,
+        )
         self.assertNotIn(HIKV_UNIT, "\n".join(events))
+        self.assertNotIn(UNIT, "\n".join(events))
 
     def test_guard_helper_canonicalizes_hikv_alias_without_is_active(self) -> None:
         result, events, selected = self.run_guard_helper(
@@ -942,9 +956,26 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIsNone(selected)
-        self.assertEqual(events[-1], "systemctl --user show --property=ActiveState --value " + UNIT)
+        self.assertEqual(
+            events[-1],
+            "systemctl --user show --property=ActiveState --value " + ULTIMATE_UNIT,
+        )
         self.assertNotIn(HIKV_UNIT, "\n".join(events))
+        self.assertNotIn(UNIT, "\n".join(events))
         self.assertNotIn("is-active", "\n".join(events))
+
+    def test_guard_helper_recycles_ultimate_even_when_legacy_27b_is_allowlisted(
+        self,
+    ) -> None:
+        result, events, selected = self.run_guard_helper(
+            active_state="active",
+            requested_unit=UNIT,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIsNone(selected)
+        self.assertTrue(all(ULTIMATE_UNIT in event for event in events))
+        self.assertNotIn(UNIT, "\n".join(events))
 
     def test_guard_helper_ignores_obsolete_persisted_unit_selection(self) -> None:
         marker = HIKV_UNIT + "\n"
@@ -958,7 +989,8 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
         self.assertEqual(selected, marker)
         self.assertNotIn(HIKV_UNIT, "\n".join(events))
         self.assertNotIn("is-enabled", "\n".join(events))
-        self.assertTrue(all(UNIT in event for event in events))
+        self.assertTrue(all(ULTIMATE_UNIT in event for event in events))
+        self.assertNotIn(UNIT, "\n".join(events))
 
     def test_active_profile_publish_uses_atomic_rename(self) -> None:
         for source in (README, RUNBOOK):

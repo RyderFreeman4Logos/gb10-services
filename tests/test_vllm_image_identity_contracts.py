@@ -52,6 +52,11 @@ CURRENT_RELEASE = ImageRelease(
     version="v0.29.0-omni",
     digest="sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7",
 )
+ULTIMATE_DERIVED_RELEASE = ImageRelease(
+    date="2026-09-11",
+    version="v0.29.0-omni",
+    digest="sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e",
+)
 PREVIOUS_RELEASE = ImageRelease(
     date="2026-07-16",
     version="v0.25.1",
@@ -145,7 +150,11 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         aeon_units = [
             path
             for path in units
-            if not path.is_symlink() and "aeon-vllm-ultimate" in path.read_text()
+            if not path.is_symlink()
+            and (
+                "aeon-vllm-ultimate" in path.read_text()
+                or path.name == "vllm-aeon-ultimate-uncensored-nvfp4.service"
+            )
         ]
         self.assertEqual(
             {path.name for path in aeon_units},
@@ -162,14 +171,30 @@ class VllmImageIdentityContractTests(unittest.TestCase):
             text = path.read_text()
             with self.subTest(path=path.relative_to(ROOT)):
                 annotations = _release_annotations(text)
-                self.assertEqual(annotations, [CURRENT_RELEASE])
-                self.assertEqual(
-                    re.findall(
-                        rf"{re.escape(IMAGE_REPOSITORY)}@sha256:[0-9a-f]{{64}}",
-                        text,
-                    ),
-                    [CURRENT_RELEASE.image_reference],
-                )
+                if path.name == "vllm-aeon-ultimate-uncensored-nvfp4.service":
+                    self.assertEqual(annotations, [ULTIMATE_DERIVED_RELEASE])
+                    self.assertEqual(
+                        re.findall(
+                            rf"{re.escape(IMAGE_REPOSITORY)}@sha256:[0-9a-f]{{64}}",
+                            text,
+                        ),
+                        [],
+                    )
+                    self.assertEqual(
+                        re.findall(r"(?m)^  sha256:[0-9a-f]{64} \\$", text),
+                        [f"  {ULTIMATE_DERIVED_RELEASE.digest} \\"],
+                    )
+                    self.assertNotIn(CURRENT_RELEASE.digest, text)
+                else:
+                    self.assertEqual(annotations, [CURRENT_RELEASE])
+                    self.assertEqual(
+                        re.findall(
+                            rf"{re.escape(IMAGE_REPOSITORY)}@sha256:[0-9a-f]{{64}}",
+                            text,
+                        ),
+                        [CURRENT_RELEASE.image_reference],
+                    )
+                    self.assertNotIn(ULTIMATE_DERIVED_RELEASE.digest, text)
                 descriptions = [
                     line
                     for line in text.splitlines()
@@ -211,7 +236,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                 UNIT_PATHS[unit_name].read_text(),
             )
 
-    def test_aeon_ultimate_uses_the_v1_runner_for_native_thinking_budgets(self) -> None:
+    def test_aeon_ultimate_uses_the_v2_runner_for_native_thinking_budgets(self) -> None:
         unit = (
             ROOT
             / "profile"
@@ -221,7 +246,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         self.assertRegex(
             unit,
             re.compile(
-                r"(?m)^  -e VLLM_USE_V2_MODEL_RUNNER=0 \\\n"
+                r"(?m)^  -e VLLM_USE_V2_MODEL_RUNNER=1 \\\n"
                 r"  --memory-swappiness 0"
             ),
         )
@@ -229,11 +254,11 @@ class VllmImageIdentityContractTests(unittest.TestCase):
             re.findall(
                 r"(?m)^\s*-e (VLLM_USE_V2_MODEL_RUNNER=[^\s\\]+)\s*\\$", unit
             ),
-            ["VLLM_USE_V2_MODEL_RUNNER=0"],
+            ["VLLM_USE_V2_MODEL_RUNNER=1"],
         )
 
         guide = (ROOT / "docs" / "deployment" / "AGENTS.md").read_text()
-        self.assertIn("`VLLM_USE_V2_MODEL_RUNNER=0`", guide)
+        self.assertIn("`VLLM_USE_V2_MODEL_RUNNER=1`", guide)
         self.assertIn("`thinking_token_budget`", guide)
 
     def test_current_docs_publish_one_coherent_release_identity(self) -> None:
@@ -246,6 +271,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
                 rf"friendly tag: {re.escape(IMAGE_REPOSITORY)}:"
                 rf"{re.escape(CURRENT_RELEASE.tag)}\n"
                 rf"repository digest: {re.escape(CURRENT_RELEASE.digest)}\n"
+                rf"ultimate override: {re.escape(ULTIMATE_DERIVED_RELEASE.digest)}\n"
                 r"rollback/superseded: .*\n"
                 rf"runtime version: {re.escape(CURRENT_RELEASE.version)}\b"
             ),
@@ -259,24 +285,105 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         )
 
     def test_current_deployment_docs_install_the_canonical_aeon_unit_and_alias(self) -> None:
-        documents = (
-            (ROOT / "README.md").read_text(),
-            (ROOT / "docs" / "deployment" / "AGENTS.md").read_text(),
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn(
+            "profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service",
+            readme,
         )
-        for document in documents:
-            self.assertIn(
-                "profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service",
-                document,
-            )
-            self.assertIn(
-                "profile/qwen3-embedding-8b/vllm-embedding.service", document
-            )
-            self.assertIn(
-                "profile/querit-4b-reranker/vllm-querit-4b-reranker.service",
-                document,
-            )
-            self.assertIn("vllm-aeon-27b-dflash-hikv.service", document)
-            self.assertIn("active.env", document)
+        self.assertIn("profile/qwen3-embedding-8b/vllm-embedding.service", readme)
+        self.assertIn(
+            "profile/querit-4b-reranker/vllm-querit-4b-reranker.service",
+            readme,
+        )
+        self.assertIn("vllm-aeon-27b-dflash-hikv.service", readme)
+        self.assertIn("active.env", readme)
+
+        guide = (ROOT / "docs" / "deployment" / "AGENTS.md").read_text()
+        self.assertIn(
+            "profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service",
+            guide,
+        )
+        self.assertIn("profile/qwen3-embedding-8b/vllm-embedding.service", guide)
+        self.assertIn(
+            "profile/querit-4b-reranker/vllm-querit-4b-reranker.service",
+            guide,
+        )
+        self.assertIn(
+            "config/aeon-dflash-profiles/aeon-ultimate-uncensored-nvfp4.env",
+            guide,
+        )
+        self.assertIn(
+            "install -m 0755 scripts/gb10_service_ready.sh "
+            "/home/obj/.local/bin/gb10_service_ready.sh",
+            guide,
+        )
+        self.assertRegex(
+            guide,
+            r"(?m)^\s*\* `18010`: `vllm-aeon-ultimate-uncensored-nvfp4.service`",
+        )
+        enable_section = guide.split("### 6. Enable and Start Services", 1)[1].split(
+            "### Model lifecycle audit and investigation lock", 1
+        )[0]
+        self.assertIn(
+            "systemctl --user enable --now vllm-aeon-ultimate-uncensored-nvfp4.service",
+            enable_section,
+        )
+        self.assertNotIn(
+            "systemctl --user enable --now vllm-aeon-27b-dflash.service",
+            enable_section,
+        )
+        self.assertLess(
+            enable_section.find("systemctl --user enable --now vllm-embedding.service"),
+            enable_section.find(
+                "systemctl --user enable --now vllm-querit-4b-reranker.service"
+            ),
+        )
+        self.assertLess(
+            enable_section.find(
+                "systemctl --user enable --now vllm-querit-4b-reranker.service"
+            ),
+            enable_section.find(
+                "systemctl --user enable --now vllm-aeon-ultimate-uncensored-nvfp4.service"
+            ),
+        )
+        for command in (
+            "/home/obj/.local/bin/gb10_lifecycle.sh stop \\\n"
+            "  --unit vllm-aeon-ultimate-uncensored-nvfp4.service",
+            "systemctl --user status vllm-embedding vllm-aeon-ultimate-uncensored-nvfp4 "
+            "vllm-querit-4b-reranker",
+            "journalctl --user -u vllm-aeon-ultimate-uncensored-nvfp4.service -n 50 --no-pager",
+        ):
+            self.assertIn(command, guide)
+        recovery = guide.split("### 1. CUDA Hang or Service Crash", 1)[1].split(
+            "### 2. Generation-bound cleanup failures", 1
+        )[0]
+        self.assertIn("systemctl --user stop llm-guard-proxy.service", recovery)
+        self.assertNotIn("systemctl --user disable", recovery)
+        self.assertNotIn("investigation-", recovery)
+        self.assertIn(
+            "/home/obj/.local/bin/gb10_lifecycle.sh stop \\\n"
+            "  --unit vllm-aeon-ultimate-uncensored-nvfp4.service",
+            recovery,
+        )
+        self.assertIn("systemctl --user start llm-guard-proxy.service", recovery)
+        fallback = guide.split("### 27B DFlash fallback", 1)[1].split("### ", 1)[0]
+        self.assertIn(
+            "profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service",
+            fallback,
+        )
+        self.assertIn("vllm-aeon-27b-dflash-hikv.service", fallback)
+        self.assertIn("active.env", fallback)
+        self.assertIn("explicit non-default fallback", fallback)
+
+        helper = (ROOT / "scripts" / "aeon_text_stop_start.sh").read_text()
+        self.assertIn(
+            "# Recycles the canonical Ultimate :18010 owner; legacy 27B active.env is not a selector.",
+            helper,
+        )
+        self.assertNotIn(
+            "Profile selection is the installed aeon-dflash-profiles/active.env symlink.",
+            helper,
+        )
 
     def test_aeon_tracked_runtime_profile_matches_deployment_reference(self) -> None:
         unit = UNIT_PATHS["vllm-aeon-27b-dflash.service"]
@@ -333,7 +440,7 @@ class VllmImageIdentityContractTests(unittest.TestCase):
         self.assertEqual(len(reference_rows), 1)
         reference_row = reference_rows[0]
         for expected in (
-            "sole AEON text runtime owner",
+            "retained 27B DFlash fallback",
             "DFlash n=10",
             "kv-cache-dtype=fp8_e4m3",
             "attention-backend=TRITON_ATTN",

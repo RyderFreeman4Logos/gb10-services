@@ -510,11 +510,19 @@ class HostileEmbeddingUnitMutationTests(unittest.TestCase):
 
 
 class EmbeddingDeploymentContractTests(unittest.TestCase):
-    FRESH_STACK_UNITS = {
+    README_FRESH_STACK_UNITS = {
         "llm-guard-proxy.service",
         "vllm-querit-4b-reranker.service",
         "sysmon.service",
         "vllm-aeon-27b-dflash.service",
+        "vllm-embedding.service",
+        "vllm-qwen3-reranker-8b.service",
+    }
+    AGENTS_FRESH_STACK_UNITS = {
+        "llm-guard-proxy.service",
+        "vllm-querit-4b-reranker.service",
+        "sysmon.service",
+        "vllm-aeon-ultimate-uncensored-nvfp4.service",
         "vllm-embedding.service",
         "vllm-qwen3-reranker-8b.service",
     }
@@ -595,17 +603,22 @@ class EmbeddingDeploymentContractTests(unittest.TestCase):
 
     def test_fresh_stack_install_blocks_stage_every_managed_unit(self) -> None:
         documents = (
-            (README.read_text(), "### Step 2: Install Systemd Services"),
+            (
+                README.read_text(),
+                "### Step 2: Install Systemd Services",
+                self.README_FRESH_STACK_UNITS,
+            ),
             (
                 AGENT_PLAYBOOK.read_text(),
                 "### 5. Systemd User Services Installation",
+                self.AGENTS_FRESH_STACK_UNITS,
             ),
         )
-        for text, marker in documents:
+        for text, marker, expected in documents:
             with self.subTest(marker=marker):
                 self.assertEqual(
                     self.installed_units_before_reload(text, marker),
-                    self.FRESH_STACK_UNITS,
+                    expected,
                 )
 
     def test_current_embedding_memory_contract_has_no_obsolete_cap_claim(self) -> None:

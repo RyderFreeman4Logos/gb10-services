@@ -9,7 +9,7 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 * **Docker Environment**: Rootless Docker active at `unix:///run/user/1001/docker.sock`.
 * **Port Allocations**:
   * `18009`: `llm-guard-proxy.service` (stable OpenAI-compatible entrypoint for chat, embeddings, and rerank; default chat is force_disable)
-  * `18010`: `vllm-aeon-27b-dflash.service` (raw AEON chat backend)
+  * `18010`: `vllm-aeon-ultimate-uncensored-nvfp4.service` (raw AEON chat backend; 27B DFlash is an explicit non-default fallback)
   * `18011`: `llm-guard-proxy.service` experimental guarded max-thinking AEON chat
   * `18012`: `vllm-embedding.service` (raw Qwen3-Embedding-8B backend routed by guard)
   * `18013`: `vllm-querit-4b-reranker.service` (canonical raw Querit-4B backend routed by guard)
@@ -21,12 +21,12 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
 
 ## Current Reference Runtime
 
-* Tracked vLLM source image for every AEON-backed unit: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-09-11-v0.29.0-omni` (`sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7`; runtime `v0.29.0-omni`). The index selects Linux ARM64 manifest `sha256:1cc0e0921ebf535db40f42e9d0cdf5ac0f94e5e01ac359216b8a51b79811a336`; the second unknown-platform manifest is attestation metadata.
+* Tracked vLLM source image for central AEON-backed units: `ghcr.io/aeon-7/aeon-vllm-ultimate:2026-09-11-v0.29.0-omni` (`sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7`; runtime `v0.29.0-omni`). Ultimate `:18010` is an explicit derived local-image override `sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e`. The index selects Linux ARM64 manifest `sha256:1cc0e0921ebf535db40f42e9d0cdf5ac0f94e5e01ac359216b8a51b79811a336`; the second unknown-platform manifest is attestation metadata.
 * Rollback/superseded images remain retained: `2026-08-24-v0.27.1-omni` (`sha256:e62ac10d744ed7c8f3dd4d5631be0f7615870a88c327db9c1d382a27b36a61ee`), `2026-08-17-v0.27.1-slim` (`sha256:2fb855ffd6fbf4330cf9f4653c09d3e6584d197acba8e9e93a032da36bb4559f`), and `2026-08-16-v0.27.1` (`sha256:13c0df6a321ade60507a9026b0d2963ad51f0499a228de430eeba3bb74ad7954`).
 * The prior v0.25.1 AEON build's MRv2/torchcodec/TP>1 notes are historical release evidence. The v0.29.0-omni release name is not a feature contract; use the dated tag plus immutable digest above as authority and do not infer unverified feature parity or multi-Spark hardware validation.
 * `vllm-embedding.service` tracked source contract: BF16 Qwen3-Embedding-8B with 4,096-dimensional output, `max-model-len=32768`, `max-num-batched-tokens=8192`, `max-num-seqs=64`, and `kv-cache-memory-bytes=4800M`. It requests equal 128 GiB Docker memory/swap caps without imposing the obsolete 20 GiB service budget. Its post-start verifier binds full Docker ID/PID/`StartedAt`, `/proc` starttime and canonical Docker scope, scope dev/inode, and authoritative `cgroup.events`, then re-reads the unchanged identity and proves exact `memory.max`, zero `memory.swap.max`, and zero activation-time `memory.swap.current`. The validated 5,820 MiB baseline yielded 41,376 KV tokens; 4,800 MiB projects about 34,124 tokens (4.14% above 32,768) but is not production-verified until an authorized live restart prints at least 32,768 tokens.
-* `vllm-aeon-27b-dflash.service` is the sole AEON text runtime owner: DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-seqs=16`, and `max-num-batched-tokens=4096`. It reads `/home/obj/.config/gb10/aeon-dflash-profiles/active.env`; tracked `baseline.env` selects `gpu-memory-utilization=0.355` and `hikv.env` selects `0.45`. `active.env` currently links to HiKV. Historical clean-start baseline capacity was 286,962 KV tokens; record a v0.29.0 live receipt before making a capacity claim. Common unit bounds are `TimeoutStartSec=3000` and readiness deadline 2800. The HiKV-named unit is only a compatibility symlink to this canonical unit, never a profile selector. Guard `readiness_deadline_ms` remains `1500000` (25 minutes) and `restart_queue` timeouts remain 600 — cold start can take 15–20 minutes. See the unit header comment for deployment constraints.
-* Candidate `vllm-aeon-ultimate-uncensored-nvfp4.service` is the not deployed replacement for the :18010 text owner: `AEON-ULTIMATE-UNCENSORED-NVFP4-beta-version`, DFlash n=7, `max-model-len=262144`, and a 72G no-swap text cgroup; it sets `VLLM_USE_V2_MODEL_RUNNER=0` because native `thinking_token_budget` requires the V1 model runner.
+* `vllm-aeon-27b-dflash.service` is the retained 27B DFlash fallback (not the live :18010 owner): DFlash n=10, `kv-cache-dtype=fp8_e4m3`, `attention-backend=TRITON_ATTN`, `max-model-len=262144`, `max-num-seqs=16`, and `max-num-batched-tokens=4096`. It reads `/home/obj/.config/gb10/aeon-dflash-profiles/active.env`; tracked `baseline.env` selects `gpu-memory-utilization=0.355` and `hikv.env` selects `0.45`. `active.env` currently links to HiKV. Historical clean-start baseline capacity was 286,962 KV tokens; record a v0.29.0 live receipt before making a capacity claim. Common unit bounds are `TimeoutStartSec=3000` and readiness deadline 2800. The HiKV-named unit is only a compatibility symlink to this canonical unit, never a profile selector. Guard `readiness_deadline_ms` remains `1500000` (25 minutes) and `restart_queue` timeouts remain 600 — cold start can take 15–20 minutes. See the unit header comment for deployment constraints.
+* Canonical `:18010` owner is `vllm-aeon-ultimate-uncensored-nvfp4.service`: live mixed weights `/home/obj/models/AEON-7--Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-NVFP4-MIXED--8b185f4e3c97dfba1b015e652deba6be179ef5f0`, DFlash n=7, `max-model-len=262144`, util `0.515`, and a 72G no-swap text cgroup. Do not pass `--quantization`; `hf_quant_config.json` selects `modelopt_mixed`. Pin the derived local image ID `sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e` (v0.29.0-omni + modelopt-54367). Readiness `ExecStartPost` uses `env -i` with `XDG_RUNTIME_DIR=/run/user/1001`. It sets `VLLM_USE_V2_MODEL_RUNNER=1` because v0.29 DFlash2 requires V2, and native `thinking_token_budget` is supported on the V2 GPU sampler. `scripts/aeon_text_stop_start.sh` recycles this Ultimate unit; Guard `restart_command` remains `/home/obj/scripts/aeon_text_stop_start.sh`.
 * The v0.29.0-omni AEON text unit rotates compiled artifacts into `/home/obj/.cache/vllm-compile/aeon-qwen36-v0290-2421bb` (mounted as `/var/cache/vllm/aeon-qwen36-v0290`). The v0.27.1 namespace `/home/obj/.cache/vllm-compile/aeon-qwen36-v0271-2fb855` and prior v0.26.0 namespace `/home/obj/.cache/vllm-compile/aeon-qwen36-v0260-1aa473` remain rollback caches; retain their data.
 * `vllm-querit-4b-reranker.service`: single canonical BF16 pooling production owner on `18013`, with a 32,768-token context, 4,800 MiB KV cache, equal 18 GiB Docker memory/swap caps, and the live-proven AEON scheduler profile `--max-num-batched-tokens 16384` and `--max-num-seqs 32`. Every startup first binds the exact Docker generation, then runs the unit-owned strict no-swap verifier, and finally completes the bounded rerank-readiness probe; the verifier does not query the still-starting `Type=simple` service's active state.
 * `vllm-qwen3-reranker-8b.service`: BF16 pooling, `max-model-len=40960`, `max-num-batched-tokens=40960`, `kv-cache-memory-bytes=5820M`, verified 41,376 KV tokens.
@@ -115,8 +115,8 @@ install -m 0644 scripts/gb10_bounded_process.py /home/obj/.local/bin/
 cp scripts/llm_guard_proxy_publish_cgroup_registration.sh /home/obj/.local/bin/
 install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py /home/obj/.local/bin/gb10_verify_vllm_no_swap_core.py
 install -m 0755 scripts/gb10_verify_vllm_no_swap.sh /home/obj/.local/bin/gb10_verify_vllm_no_swap.sh
+install -m 0755 scripts/gb10_service_ready.sh /home/obj/.local/bin/gb10_service_ready.sh
 install -m 0755 scripts/gb10_lifecycle.sh /home/obj/.local/bin/gb10_lifecycle.sh
-install -m 0755 scripts/gb10_restart_text_safe.sh /home/obj/.local/bin/gb10_restart_text_safe.sh
 cp scripts/sysmon.sh /home/obj/.local/bin/
 
 # Make executable
@@ -151,6 +151,27 @@ The proxy config must enable only `aeon-text` with `mem_threshold_gib = 5`,
 `registration_file = "text-cgroup.v1"`. The guardian is built into the proxy;
 there is no separate guardian binary or service to install.
 
+### 4b. Admit the Ultimate derived local image
+
+The canonical Ultimate unit pins host-local image ID
+`sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e`.
+A fresh Docker host cannot pull a bare local ID. Before installing or
+starting that unit, admit the image from this repository's exact context:
+
+```bash
+python3 scripts/gb10_prepare_aeon_ultimate_image.py --build --iidfile /tmp/aeon-ultimate.iid
+# or, if a verified artifact already exists:
+# python3 scripts/gb10_prepare_aeon_ultimate_image.py --load /path/to/verified.tar --iidfile /tmp/aeon-ultimate.iid
+```
+
+The helper uses `profile/aeon-ultimate-uncensored-nvfp4/image` as the
+build context, `--network=none --pull=false`, writes `--iidfile`, and
+fail-closed compares that ID to the configured override. Rebuild image IDs
+are not assumed deterministic: if the iidfile does not match
+`sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e`,
+`docker load` a previously verified artifact (`--load`) instead of starting
+the unit.
+
 ### 5. Systemd User Services Installation
 ```bash
 # Create user-level systemd directory if missing
@@ -160,18 +181,16 @@ mkdir -p /home/obj/.config/systemd/user/
 install -m 0644 profile/llm-guard-proxy/llm-guard-proxy.service \
   profile/querit-4b-reranker/vllm-querit-4b-reranker.service \
   profile/sysmon/sysmon.service \
-  profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service \
+  profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service \
   profile/qwen3-embedding-8b/vllm-embedding.service \
   profile/qwen3-reranker-8b/vllm-qwen3-reranker-8b.service \
   /home/obj/.config/systemd/user/
 
-# Install the profile data and the source-tracked HiKV selection.
+# Install the Ultimate env. Do not point active.env here; that symlink is only
+# for the explicit non-default 27B DFlash fallback below.
 install -d -m 0755 /home/obj/.config/gb10/aeon-dflash-profiles
-install -m 0644 config/aeon-dflash-profiles/baseline.env config/aeon-dflash-profiles/hikv.env \
+install -m 0644 config/aeon-dflash-profiles/aeon-ultimate-uncensored-nvfp4.env \
   /home/obj/.config/gb10/aeon-dflash-profiles/
-ln -sfn hikv.env /home/obj/.config/gb10/aeon-dflash-profiles/active.env.new
-mv -Tf /home/obj/.config/gb10/aeon-dflash-profiles/active.env.new /home/obj/.config/gb10/aeon-dflash-profiles/active.env
-ln -sfn vllm-aeon-27b-dflash.service /home/obj/.config/systemd/user/vllm-aeon-27b-dflash-hikv.service
 
 # Reload systemd daemon
 systemctl --user daemon-reload
@@ -181,13 +200,12 @@ systemctl --user daemon-reload
 ```bash
 systemctl --user enable --now sysmon.service
 
-# Start model services and the proxy independently.
+# Start model services and the proxy independently. Authorized restart
+# order is embedding → reranker → text.
 systemctl --user enable --now vllm-embedding.service
-systemctl --user enable --now vllm-aeon-27b-dflash.service
-# To select baseline for a future authorized stop/start, atomically repoint
-# active.env to baseline.env; keep the canonical systemd unit enabled.
 systemctl --user disable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now vllm-querit-4b-reranker.service
+systemctl --user enable --now vllm-aeon-ultimate-uncensored-nvfp4.service
 systemctl --user enable --now llm-guard-proxy.service
 ```
 
@@ -238,10 +256,10 @@ An authorized maintenance cycle must use two separately auditable operations;
 
 ```bash
 /home/obj/.local/bin/gb10_lifecycle.sh stop \
-  --unit vllm-aeon-27b-dflash.service \
+  --unit vllm-aeon-ultimate-uncensored-nvfp4.service \
   --actor maintenance-agent --reason approved-maintenance
 /home/obj/.local/bin/gb10_lifecycle.sh start \
-  --unit vllm-aeon-27b-dflash.service \
+  --unit vllm-aeon-ultimate-uncensored-nvfp4.service \
   --actor maintenance-agent --reason approved-maintenance
 ```
 
@@ -252,10 +270,11 @@ cross-process transaction or lock protocol around the pair. Investigation-begin
 gates future submissions only; it does not guarantee lifecycle quiescence for an
 in-flight start job already submitted with `--no-block`.
 
-`aeon_text_stop_start.sh` and `gb10_restart_text_safe.sh` route their AEON and
-reranker stop/start calls through this wrapper. The independently locked,
-no-argument embedding activation transaction retains its own durable receipts;
-do not replace that transaction with manual lifecycle commands.
+`aeon_text_stop_start.sh` routes its AEON stop/start calls through this wrapper.
+The independently locked, no-argument embedding activation transaction retains
+its own durable receipts; do not replace that transaction with manual lifecycle
+commands. `gb10_restart_text_safe.sh` is legacy-27B-fallback-only and is not on
+the current install path.
 
 ### Generation-bound vLLM no-swap authority
 
@@ -358,6 +377,26 @@ requires that phase and is not a commit claim by itself. Evidence is owner-only 
 `$HOME/.local/state/gb10-embedding-activation/`. Never recover by cycling the
 stack or replaying copy/reload/restart fragments.
 
+### 27B DFlash fallback
+
+The old 27B DFlash unit is an explicit non-default fallback, not the live
+`:18010` owner. Do not enable it on a fresh install. Only after Ultimate is
+stopped, install its unit, HiKV `active.env`, and alias:
+
+```bash
+install -m 0644 profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service \
+  /home/obj/.config/systemd/user/
+install -m 0644 config/aeon-dflash-profiles/baseline.env config/aeon-dflash-profiles/hikv.env \
+  /home/obj/.config/gb10/aeon-dflash-profiles/
+ln -sfn hikv.env /home/obj/.config/gb10/aeon-dflash-profiles/active.env.new
+mv -Tf /home/obj/.config/gb10/aeon-dflash-profiles/active.env.new /home/obj/.config/gb10/aeon-dflash-profiles/active.env
+ln -sfn vllm-aeon-27b-dflash.service /home/obj/.config/systemd/user/vllm-aeon-27b-dflash-hikv.service
+systemctl --user daemon-reload
+# To select baseline for a future authorized stop/start, atomically repoint
+# active.env to baseline.env; keep the canonical systemd unit enabled.
+systemctl --user enable --now vllm-aeon-27b-dflash.service
+```
+
 ---
 
 ## Operational Monitoring & Verification
@@ -368,7 +407,7 @@ stack or replaying copy/reload/restart fragments.
 systemctl --user list-units --type=service --state=running
 
 # Check detailed status of core services
-systemctl --user status vllm-embedding vllm-aeon-27b-dflash vllm-querit-4b-reranker \
+systemctl --user status vllm-embedding vllm-aeon-ultimate-uncensored-nvfp4 vllm-querit-4b-reranker \
   llm-guard-proxy sysmon
 ```
 
@@ -387,7 +426,7 @@ nonterminated, duplicate, missing, or malformed input to `N/A`.
 ### View Live Service logs
 ```bash
 # View last 50 log lines for chat service
-journalctl --user -u vllm-aeon-27b-dflash.service -n 50 --no-pager
+journalctl --user -u vllm-aeon-ultimate-uncensored-nvfp4.service -n 50 --no-pager
 
 # View last 50 log lines for proxy wrapper
 journalctl --user -u llm-guard-proxy.service -n 50 --no-pager
@@ -464,17 +503,20 @@ the configured 5 GiB `MemAvailable` threshold during startup; serialized
 compilation is pressure reduction, not an exemption from that guard.
 
 ### 1. CUDA Hang or Service Crash
-If `vllm-aeon-27b-dflash.service` hangs or refuses to respond, preserve
-content-free evidence first. After explicit authorization and only when no
-investigation marker is active, use the audited tracked lifecycle so its
-generation-bound cleanup authority remains in control:
+If `vllm-aeon-ultimate-uncensored-nvfp4.service` hangs or refuses to respond, preserve
+content-free evidence first. After explicit authorization, temporarily stop Guard
+so its local-recovery helper cannot race the recycle. Do **not** disable Guard,
+and do **not** begin or end an investigation lock for this recovery. Recycle the
+canonical Ultimate unit through the audited lifecycle, then start Guard:
 ```bash
+systemctl --user stop llm-guard-proxy.service
 /home/obj/.local/bin/gb10_lifecycle.sh stop \
-  --unit vllm-aeon-27b-dflash.service \
+  --unit vllm-aeon-ultimate-uncensored-nvfp4.service \
   --actor recovery-operator --reason authorized-hang-recovery
 /home/obj/.local/bin/gb10_lifecycle.sh start \
-  --unit vllm-aeon-27b-dflash.service \
+  --unit vllm-aeon-ultimate-uncensored-nvfp4.service \
   --actor recovery-operator --reason authorized-hang-recovery
+systemctl --user start llm-guard-proxy.service
 ```
 Do not use `systemctl restart`.
 
@@ -487,8 +529,8 @@ cidfile's full CID and exact name-to-ID binding before bounded stop/remove. If i
 fails closed, preserve the evidence and inspect the unit journal rather than
 removing a possibly replacement container:
 ```bash
-systemctl --user status vllm-aeon-27b-dflash.service --no-pager
-journalctl --user -u vllm-aeon-27b-dflash.service -n 100 --no-pager
+systemctl --user status vllm-aeon-ultimate-uncensored-nvfp4.service --no-pager
+journalctl --user -u vllm-aeon-ultimate-uncensored-nvfp4.service -n 100 --no-pager
 ```
 
 ### 3. OOM / Swap Critical

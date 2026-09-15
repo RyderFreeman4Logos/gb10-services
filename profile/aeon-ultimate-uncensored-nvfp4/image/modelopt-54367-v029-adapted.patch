@@ -1,0 +1,19 @@
+--- modelopt.py
++++ modelopt.py
+@@ -2366,6 +2366,7 @@
+         fused_projection_shards = {
+             "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+             "gate_up_proj": ("gate_proj", "up_proj"),
++            "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+         }
+         shard_names = fused_projection_shards.get(proj_name)
+         if shard_names is not None:
+@@ -2427,6 +2428,8 @@
+         if isinstance(layer, (LinearBase, ParallelLMHead)):
+             if quant_algo == "FP8":
+                 return ModelOptFp8LinearMethod(self.fp8_config)
++            if quant_algo == "FP8_PER_CHANNEL_PER_TOKEN":
++                return ModelOptFp8PcPtLinearMethod(self.fp8_config)
+             if quant_algo == "FP8_PB_WO":
+                 return ModelOptFp8PbWoLinearMethod(self.fp8_config)
+             if quant_algo == "NVFP4":

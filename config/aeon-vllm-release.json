@@ -3,5 +3,8 @@
   "tag": "2026-09-11-v0.29.0-omni",
   "repository_digest": "sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7",
   "arm64_digest": "sha256:1cc0e0921ebf535db40f42e9d0cdf5ac0f94e5e01ac359216b8a51b79811a336",
-  "runtime_version": "v0.29.0-omni"
+  "runtime_version": "v0.29.0-omni",
+  "overrides": {
+    "vllm-aeon-ultimate-uncensored-nvfp4.service": "sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e"
+  }
 }

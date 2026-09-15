@@ -560,7 +560,16 @@ def parse_unit(path_raw: str) -> UnitContract:
         reject("Docker run image is missing")
     image = argv[index]
     command = argv[index + 1 :]
-    if re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image) is None:
+    approved_ultimate_image = (
+        "sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e"
+    )
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", image):
+        if (
+            path.name != "vllm-aeon-ultimate-uncensored-nvfp4.service"
+            or image != approved_ultimate_image
+        ):
+            reject("bare local image ID is reserved for the Ultimate Uncensored unit")
+    elif re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image) is None:
         reject("Docker image is not immutable by sha256 digest")
     if len(command) < 3:
         reject("container command is incomplete")

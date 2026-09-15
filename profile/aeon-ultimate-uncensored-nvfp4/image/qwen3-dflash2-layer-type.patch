@@ -1,0 +1,20 @@
+--- a/usr/local/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_dflash2.py
++++ b/usr/local/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_dflash2.py
+@@ -110,15 +110,17 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
+         layer_idx: int,
+         cache_config: CacheConfig | None = None,
+         quant_config: QuantizationConfig | None = None,
++        layer_type: str = "full_attention",
+         prefix: str = "",
+     ) -> None:
+         super().__init__(
+             vllm_config,
+             config=config,
+             layer_idx=layer_idx,
+             cache_config=cache_config,
+             quant_config=quant_config,
++            layer_type=layer_type,
+             prefix=prefix,
+         )
+         draft_config = config.dflash_config
+         speculative_config = vllm_config.speculative_config

@@ -13,13 +13,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = Path("config/aeon-vllm-release.json")
 UPDATER = Path("scripts/update_aeon_vllm_release.py")
+ULTIMATE_UNIT = Path(
+    "profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service"
+)
 UNITS = (
-    Path("profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service"),
+    ULTIMATE_UNIT,
     Path("profile/querit-4b-reranker/vllm-querit-4b-reranker.service"),
     Path("profile/qwen3-embedding-8b/vllm-embedding.service"),
     Path("profile/qwen3-reranker-8b/vllm-qwen3-reranker-8b.service"),
     Path("profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service"),
     Path("profile/qwen3.8-27b-nvfp4-vllm/vllm-aeon-qwen38-dflash.service"),
+)
+CENTRAL_UNITS = UNITS[1:]
+ULTIMATE_OVERRIDE_DIGEST = (
+    "sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e"
 )
 ALIASES = {
     Path("profile/abliterated-qwen-latest-27b"): Path("aeon-ultimate-uncensored-nvfp4"),
@@ -35,7 +42,13 @@ DERIVED = UNITS + (
     Path("scripts/gb10_embedding_activation.py"),
     Path("scripts/gb10_embedding_activation_storage.py"),
     Path("scripts/gb10_embedding_profile_contract.py"),
+    Path("scripts/gb10_prepare_aeon_ultimate_image.py"),
+    Path("scripts/gb10_verify_vllm_no_swap_core.py"),
+    Path("scripts/gb10_verify_vllm_no_swap.sh"),
     Path("scripts/querit_replay_trust.py"),
+    Path("tests/test_aeon_ultimate_derived_image.py"),
+    Path("tests/test_update_aeon_vllm_release.py"),
+    Path("tests/test_vllm_no_swap_verifier.py"),
     Path("tests/embedding_profile_fixtures.py"),
     Path("tests/test_aeon_ultimate_uncensored_profile.py"),
     Path("tests/test_embedding_service_contracts.py"),
@@ -84,12 +97,16 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
             _copy_fixture(target)
 
             old = json.loads((target / CONFIG).read_text())
+            new_override = "sha256:" + "c" * 64
             new = {
                 **old,
                 "tag": "2026-10-01-v0.30.1-omni",
                 "repository_digest": "sha256:" + "a" * 64,
                 "arm64_digest": "sha256:" + "b" * 64,
                 "runtime_version": "v0.30.1-omni",
+                "overrides": {
+                    "vllm-aeon-ultimate-uncensored-nvfp4.service": new_override
+                },
             }
             (target / CONFIG).write_text(json.dumps(new, indent=2) + "\n")
             result = _run_updater(target)
@@ -105,7 +122,7 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
             self.assertEqual(check.returncode, 0, check.stderr)
 
             image = f"{new['repository']}@{new['repository_digest']}"
-            for relative in UNITS:
+            for relative in CENTRAL_UNITS:
                 text = (target / relative).read_text()
                 with self.subTest(unit=relative):
                     self.assertEqual(text.count(image), 1)
@@ -119,6 +136,32 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
                     )
                     self.assertIn(new["runtime_version"], description)
                     self.assertNotIn(old["repository_digest"], text)
+            ultimate = (target / ULTIMATE_UNIT).read_text()
+            self.assertEqual(ultimate.count(new_override), 2)
+            self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, ultimate)
+            self.assertNotIn(new["repository_digest"], ultimate)
+            helper = (target / "scripts/gb10_prepare_aeon_ultimate_image.py").read_text()
+            parser = (target / "scripts/gb10_verify_vllm_no_swap_core.py").read_text()
+            no_swap = (target / "scripts/gb10_verify_vllm_no_swap.sh").read_text()
+            storage_text = (target / "scripts/gb10_embedding_activation_storage.py").read_text()
+            self.assertIn(new_override, helper)
+            self.assertIn(new_override, parser)
+            self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, helper)
+            self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, parser)
+            self.assertIn(f'EXPECTED_CORE_SHA256="{_sha256(target / "scripts/gb10_verify_vllm_no_swap_core.py")}"'.replace('"', ""), no_swap)
+            self.assertIn(
+                f'"core": "{_sha256(target / "scripts/gb10_verify_vllm_no_swap_core.py")}"',
+                storage_text,
+            )
+            self.assertIn(
+                f'"wrapper": "{_sha256(target / "scripts/gb10_verify_vllm_no_swap.sh")}"',
+                storage_text,
+            )
+            self.assertIn(
+                "# AEON image release: "
+                f"{new['tag']}; immutable digest: {new_override}",
+                ultimate,
+            )
 
             qwen36 = (target / UNITS[4]).read_text()
             self.assertIn("aeon-qwen36-v0301-aaaaaa", qwen36)
@@ -174,6 +217,54 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
             self.assertIn(old["tag"], markers)
             self.assertIn(old["repository_digest"].removeprefix("sha256:"), markers)
 
+    def test_check_preserves_explicit_ultimate_override_and_central_2421_peers(self) -> None:
+        release = json.loads((ROOT / CONFIG).read_text())
+        self.assertEqual(
+            release["overrides"]["vllm-aeon-ultimate-uncensored-nvfp4.service"],
+            ULTIMATE_OVERRIDE_DIGEST,
+        )
+        self.assertTrue(release["repository_digest"].startswith("sha256:2421bb12"))
+        check = subprocess.run(
+            ["python3", str(ROOT / UPDATER), "--check"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(check.returncode, 0, check.stderr)
+        ultimate = (ROOT / ULTIMATE_UNIT).read_text()
+        self.assertIn(ULTIMATE_OVERRIDE_DIGEST, ultimate)
+        self.assertNotIn(release["repository_digest"], ultimate)
+        embedding = (ROOT / UNITS[2]).read_text()
+        querit = (ROOT / UNITS[1]).read_text()
+        self.assertIn(release["repository_digest"], embedding)
+        self.assertIn(release["repository_digest"], querit)
+        self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, embedding)
+        self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, querit)
+
+    def test_future_generation_rejects_stale_ultimate_override_when_central_digest_moves(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            target = Path(raw_tmp)
+            _copy_fixture(target)
+            old = json.loads((target / CONFIG).read_text())
+            new = {
+                **old,
+                "tag": "2026-10-01-v0.30.1-omni",
+                "repository_digest": "sha256:" + "a" * 64,
+                "arm64_digest": "sha256:" + "b" * 64,
+                "runtime_version": "v0.30.1-omni",
+            }
+            (target / CONFIG).write_text(json.dumps(new, indent=2) + "\n")
+            result = _run_updater(target)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Ultimate derived override is still bound", result.stderr)
+            ultimate = (target / ULTIMATE_UNIT).read_text()
+            self.assertIn(ULTIMATE_OVERRIDE_DIGEST, ultimate)
+            self.assertNotIn(new["repository_digest"], ultimate)
+            embedding = (target / UNITS[2]).read_text()
+            self.assertIn(old["repository_digest"], embedding)
+            self.assertNotIn(new["repository_digest"], embedding)
+
     def test_current_cache_guidance_matches_release_namespace(self) -> None:
         release = json.loads((ROOT / CONFIG).read_text())
         paragraph = _troubleshooting_cache_paragraph((ROOT / "docs/deployment/AGENTS.md").read_text())
@@ -189,7 +280,7 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
     def test_malformed_or_incomplete_consumers_are_rejected_in_both_modes(self) -> None:
         def missing_image(target: Path) -> None:
             release = json.loads((target / CONFIG).read_text())
-            unit = target / UNITS[0]
+            unit = target / UNITS[1]
             unit.write_text(
                 unit.read_text().replace(
                     f"{release['repository']}@{release['repository_digest']}",
@@ -199,7 +290,7 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
 
         def stale_image(target: Path) -> None:
             release = json.loads((target / CONFIG).read_text())
-            unit = target / UNITS[0]
+            unit = target / UNITS[1]
             unit.write_text(
                 unit.read_text().replace(
                     f"{release['repository']}@{release['repository_digest']}",
