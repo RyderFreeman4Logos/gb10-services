@@ -78,6 +78,8 @@ a 7.4 GiB allocation spike. The emergency path releases a touched 64 MiB reserve
 before writing directly to a pre-opened `cgroup.kill` descriptor; it does not
 invoke Docker or systemd under pressure. Embedding and reranker remain outside
 the target set. `sysmon.service` remains the observer-only host monitor.
+Optional loopback dashboard: `sparkdash.service` on `127.0.0.1:20080`
+(`docs/deployment/sparkdash.md`); it does not restart models.
 
 This service repository intentionally ships no standalone memory-guardian
 Cargo workspace, binary, config, or unit. The external `llm-guard-proxy`

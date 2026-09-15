@@ -18,6 +18,7 @@ Goal: an agent with GB10 operator access (`rootless-docker` and `systemctl --use
   * `18002`: `llm-guard-proxy.service` legacy embedding-compatible listener; only embedding upstream profiles are allowed
   * `18003`: `llm-guard-proxy.service` legacy reranker-compatible listener; only reranker upstream profiles are allowed
   * `18005`: `llm-guard-proxy.service` aggregate listener for chat, embedding, and rerank profiles
+  * `20080`: `sparkdash.service` loopback-only MiaAI-Lab/sparkDash dashboard (host Node; see `docs/deployment/sparkdash.md`)
 
 ## Current Reference Runtime
 
@@ -184,6 +185,7 @@ install -m 0644 profile/llm-guard-proxy/llm-guard-proxy.service \
   profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service \
   profile/qwen3-embedding-8b/vllm-embedding.service \
   profile/qwen3-reranker-8b/vllm-qwen3-reranker-8b.service \
+  profile/sparkdash/sparkdash.service \
   /home/obj/.config/systemd/user/
 
 # Install the Ultimate env. Do not point active.env here; that symlink is only
@@ -207,6 +209,8 @@ systemctl --user disable --now vllm-qwen3-reranker-8b.service
 systemctl --user enable --now vllm-querit-4b-reranker.service
 systemctl --user enable --now vllm-aeon-ultimate-uncensored-nvfp4.service
 systemctl --user enable --now llm-guard-proxy.service
+# Optional read-only dashboard (does not start/stop models):
+# bash scripts/sparkdash_install.sh && systemctl --user enable --now sparkdash.service
 ```
 
 ### Model lifecycle audit and investigation lock
