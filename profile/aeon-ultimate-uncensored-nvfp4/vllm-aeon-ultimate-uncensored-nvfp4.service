@@ -1,10 +1,10 @@
 # AEON image release: 2026-09-11-v0.29.0-omni; immutable digest: sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e
-# AEON MIXED NVFP4 + DFlash2 n=7 on one GB10. Same seat as the previous beta unit.
+# AEON MIXED NVFP4 + Dynamic DFlash2 lattice (K=10 peak-16) on one GB10. Same seat as the previous beta unit.
 # Model: /home/obj/models/AEON-7--Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-NVFP4-MIXED--8b185f4e3c97dfba1b015e652deba6be179ef5f0
 # Draft: /home/obj/models/z-lab/Qwen3.8-27B-DFlash2
 # Do not pass --quantization; hf_quant_config.json selects modelopt_mixed.
 [Unit]
-Description=vLLM AEON Ultimate Uncensored NVFP4 + DFlash2 K=7 (AEON v0.29.0-omni)
+Description=vLLM AEON Ultimate Uncensored NVFP4 + Dynamic DFlash2 K=10 (AEON v0.29.0-omni)
 After=network-online.target vllm-embedding.service vllm-querit-4b-reranker.service
 Conflicts=sglang-qwen38-27b.service vllm-aeon-27b.service vllm-aeon-27b-dflash.service vllm-aeon-27b-dflash-hikv.service vllm-aeon-27b-dflash-v2.service vllm-aeon-27b-dflash-v3.service vllm-aeon-27b-nvfp4kv.service vllm-aeon-27b-nvfp4kv-test.service vllm-aeon-27b-nvfp4kv-lowmem.service vllm-aeon-27b-nvfp4kv-plus10g.service vllm-aeon-qwen38-dflash.service
 StartLimitIntervalSec=600
@@ -55,19 +55,19 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
     --served-model-name aeon abliterated-qwen-latest-27b-nvfp4 aeon-ultimate \
     --trust-remote-code \
     --kv-cache-dtype fp8 \
-    --enforce-eager \
+    --compilation-config "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}" \
     --enable-chunked-prefill \
     --no-enable-prefix-caching \
     --attention-backend TRITON_ATTN \
     --max-model-len 262144 \
-    --max-num-batched-tokens 8192 \
-    --max-num-seqs 32 \
+    --max-num-batched-tokens 16384 \
+    --max-num-seqs 16 \
     --gpu-memory-utilization ${AEON_GPU_MEMORY_UTILIZATION} \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \
-    --override-generation-config "{\"temperature\":0.6,\"top_p\":0.95,\"top_k\":20,\"repetition_penalty\":1.05}" \
-    --speculative-config "{\"method\":\"dflash\",\"model\":\"/draft\",\"num_speculative_tokens\":7,\"num_speculative_tokens_per_batch_size\":[[1,3,7],[4,6,3],[7,1000,1]],\"attention_backend\":\"TRITON_ATTN\"}" \
+    --override-generation-config "{\"temperature\":0.6,\"top_p\":0.95,\"top_k\":20,\"repetition_penalty\":1.0}" \
+    --speculative-config "{\"method\":\"dflash\",\"model\":\"/draft\",\"num_speculative_tokens\":10,\"num_speculative_tokens_per_batch_size\":[[1,1,10],[2,2,10],[3,4,8],[5,8,7],[9,10,6],[11,12,5],[13,14,4],[15,16,3]],\"attention_backend\":\"TRITON_ATTN\"}" \
     --no-enable-flashinfer-autotune \
     --kernel-config.enable_jit_warmup=false \
     --kernel-config.enable_cutedsl_warmup=false

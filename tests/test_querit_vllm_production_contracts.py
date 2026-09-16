@@ -203,7 +203,11 @@ class QueritVllmProductionContractTests(unittest.TestCase):
                 "--max-num-batched-tokens": 2,
                 "--max-num-seqs": 2,
             },
-            DEPLOYMENT_AGENTS: {option: 1 for option in scheduler_literals},
+            # Ultimate AEON and Querit both document `--max-num-batched-tokens 16384`.
+            DEPLOYMENT_AGENTS: {
+                "--max-num-batched-tokens": 2,
+                "--max-num-seqs": 1,
+            },
         }
         for path, option_counts in expected_counts.items():
             text = path.read_text()

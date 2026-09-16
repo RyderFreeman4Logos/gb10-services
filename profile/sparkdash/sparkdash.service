@@ -1,0 +1,39 @@
+[Unit]
+Description=sparkDash GB10 local dashboard (loopback :20080, pinned MiaAI-Lab/sparkDash)
+Documentation=https://github.com/MiaAI-Lab/sparkDash
+Documentation=file:%h/project/github/RyderFreeman4Logos/gb10-services/docs/deployment/sparkdash.md
+After=default.target
+# Isolated monitor: never Requires= model units. Read-only HTTP/sysfs only.
+
+[Service]
+Type=simple
+WorkingDirectory=/home/obj/src/sparkDash
+EnvironmentFile=/home/obj/.config/sparkdash/sparkdash.env
+# Runtime boundary wins over missing/legacy/conflicting user env values.
+ExecStart=/usr/bin/env SPARKDASH_READ_ONLY=1 /home/obj/.local/share/mise/installs/node/22.23.2/bin/node server/index.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# Survive SSH disconnect via user lingering (Linger=yes).
+KillMode=mixed
+
+# Bound resource use — do not compete with vLLM
+MemoryMax=512M
+MemoryHigh=384M
+CPUQuota=15%
+Nice=10
+IOSchedulingClass=idle
+
+# No Docker socket, no extra caps
+NoNewPrivileges=yes
+PrivateTmp=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sparkdash
+
+[Install]
+WantedBy=default.target

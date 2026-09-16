@@ -113,12 +113,16 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
         self.assertEqual(_option_value(argv, "--attention-backend"), "TRITON_ATTN")
         self.assertEqual(_option_value(argv, "--kv-cache-dtype"), "fp8")
         self.assertEqual(_option_value(argv, "--max-model-len"), "262144")
-        self.assertEqual(_option_value(argv, "--max-num-batched-tokens"), "8192")
+        self.assertEqual(_option_value(argv, "--max-num-batched-tokens"), "16384")
         self.assertIn("--enable-chunked-prefill", argv)
         self.assertIn("--no-enable-prefix-caching", argv)
-        self.assertEqual(_option_value(argv, "--max-num-seqs"), "32")
+        self.assertEqual(_option_value(argv, "--max-num-seqs"), "16")
         self.assertNotIn("--enable-prefix-caching", argv)
-        self.assertIn("--enforce-eager", argv)
+        self.assertNotIn("--enforce-eager", argv)
+        self.assertEqual(
+            json.loads(_option_value(argv, "--compilation-config")),
+            {"cudagraph_mode": "FULL_AND_PIECEWISE"},
+        )
         self.assertNotIn("--scheduler-reserve-full-isl", argv)
         self.assertNotIn("VLLM_ALLOW_LONG_MAX_MODEL_LEN", unit)
         self.assertNotIn("--hf-overrides", argv)
@@ -134,16 +138,16 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
                 "temperature": 0.6,
                 "top_p": 0.95,
                 "top_k": 20,
-                "repetition_penalty": 1.05,
+                "repetition_penalty": 1.0,
             },
         )
 
-    def test_unit_uses_dflash2_n7_and_production_aliases(self) -> None:
+    def test_unit_uses_dflash2_k10_lattice_and_production_aliases(self) -> None:
         unit = _unit_text()
         argv = _argv()
         self.assertEqual(
             _option_value(argv, "--speculative-config"),
-            '{"method":"dflash","model":"/draft","num_speculative_tokens":7,"num_speculative_tokens_per_batch_size":[[1,3,7],[4,6,3],[7,1000,1]],"attention_backend":"TRITON_ATTN"}',
+            '{"method":"dflash","model":"/draft","num_speculative_tokens":10,"num_speculative_tokens_per_batch_size":[[1,1,10],[2,2,10],[3,4,8],[5,8,7],[9,10,6],[11,12,5],[13,14,4],[15,16,3]],"attention_backend":"TRITON_ATTN"}',
         )
         self.assertEqual(
             set(argv[argv.index("--served-model-name") + 1 : argv.index("--served-model-name") + 4]),
@@ -194,7 +198,7 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
         for required in (
             "vllm-aeon-ultimate-uncensored-nvfp4.service",
             MIXED_MODEL,
-            "DFlash n=7",
+            "Dynamic DFlash2 K=10",
             "max-model-len=262144",
             "72G",
             "hf_quant_config",

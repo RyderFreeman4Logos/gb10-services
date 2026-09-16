@@ -1,0 +1,9 @@
+# Pinned MiaAI-Lab/sparkDash revision for GB10 host-process deploy.
+# Do not curl|sh. Do not use upstream privileged docker-compose.
+repo=https://github.com/MiaAI-Lab/sparkDash
+commit=bbec3bb7886a95498cb495f574d1099a854f8e7f
+version=1.8.6
+checkout=/home/obj/src/sparkDash
+node=mise node@22.23.2
+node_bin=/home/obj/.local/share/mise/installs/node/22.23.2/bin/node
+bind=127.0.0.1:20080
