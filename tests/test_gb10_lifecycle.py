@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import os
+import shlex
 import stat
 import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
+
+from vllm_no_swap_fixtures import VERIFIER, VllmNoSwapFixture
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -779,6 +782,10 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                 systemctl,
                 "#!/bin/sh\n"
                 'printf "%s\\n" "$*" >> "$GB10_HELPER_SYSTEMCTL_LOG"\n'
+                'if [ "${2:-}" = "show" ]; then\n'
+                '    printf "MainPID=0\\nActiveState=inactive\\nSubState=dead\\n"\n'
+                "    exit 0\n"
+                "fi\n"
                 'if [ "${2:-}" = "reset-failed" ]; then\n'
                 '    rm -f "$GB10_HELPER_RATE_LIMIT"\n'
                 "    exit 0\n"
@@ -831,6 +838,8 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             self.assertEqual(
                 commands_log.read_text().splitlines(),
                 [
+                    f"--user show --property=ActiveState --property=SubState "
+                    f"--property=MainPID {ULTIMATE_UNIT}",
                     f"--user stop {ULTIMATE_UNIT}",
                     f"--user start --no-block {ULTIMATE_UNIT}",
                 ],
@@ -849,15 +858,29 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
         self,
         *,
         active_state: str,
+        sub_state: str = "running",
+        main_pid: int = 4242,
         requested_unit: str | None = ULTIMATE_UNIT,
         selected_value: str | None = None,
+        cid: str = "a" * 64,
+        docker_id: str | None = None,
+        verifier_status: int = 0,
     ) -> tuple[subprocess.CompletedProcess[str], list[str], str | None]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             events = root / "events.log"
             lifecycle = root / "lifecycle"
             systemctl = root / "systemctl"
+            docker = root / "docker"
+            verifier = root / "gb10_verify_vllm_no_swap.sh"
             sleep = root / "sleep"
+            cidfile = root / "aeon-text.cid"
+            profile = root / "aeon-ultimate-uncensored-nvfp4.env"
+            cidfile.write_text(cid + "\n")
+            cidfile.chmod(0o600)
+            profile.write_text("AEON_GPU_MEMORY_UTILIZATION=0.515\n")
+            profile.chmod(0o644)
+            resolved_docker_id = docker_id or cid
             selected = root / "selected-text-unit"
             if selected_value is not None:
                 selected.write_text(selected_value)
@@ -871,24 +894,61 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                 "#!/bin/sh\n"
                 'printf "systemctl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
                 'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then\n'
-                '    printf "%s\\n" "$GB10_HELPER_ACTIVE_STATE"\n'
+                '    case " $* " in\n'
+                '        *" --value "*) printf "%s\\n" "$GB10_HELPER_POST_START_STATE" ;;\n'
+                '        *) printf "MainPID=%s\\nActiveState=%s\\nSubState=%s\\n" \\\n'
+                '            "$GB10_HELPER_MAIN_PID" "$GB10_HELPER_ACTIVE_STATE" \\\n'
+                '            "$GB10_HELPER_SUB_STATE" ;;\n'
+                "    esac\n"
                 "    exit 0\n"
                 "fi\n"
                 "exit 1\n",
+            )
+            self.make_executable(
+                docker,
+                "#!/bin/sh\n"
+                + f'printf "docker %s\\n" "$*" >> {str(events)!r}\n'
+                + f"printf '%s /vllm-aeon-ultimate-uncensored-nvfp4 true\\n' "
+                + f"{resolved_docker_id!r}\n",
+            )
+            self.make_executable(
+                verifier,
+                "#!/bin/sh\n"
+                + f'printf "verifier %s\\n" "$*" >> {str(events)!r}\n'
+                + f"exit {verifier_status}\n",
             )
             self.make_executable(sleep, "#!/bin/sh\nexit 0\n")
             helper = root / "aeon_text_stop_start.sh"
             helper.write_text(
                 GUARD_HELPER.read_text()
                 .replace("/usr/bin/systemctl", str(systemctl))
+                .replace("/usr/bin/docker", str(docker))
                 .replace("/usr/bin/sleep", str(sleep))
+                .replace(
+                    "/home/obj/.local/bin/gb10_verify_vllm_no_swap.sh",
+                    str(verifier),
+                )
+                .replace(
+                    "/run/user/1001/gb10-memory-guardian/aeon-text.cid",
+                    str(cidfile),
+                )
+                .replace(
+                    "/home/obj/.config/gb10/aeon-dflash-profiles/"
+                    "aeon-ultimate-uncensored-nvfp4.env",
+                    str(profile),
+                )
             )
             environment = os.environ.copy()
             environment.pop("GB10_TEXT_UNIT", None)
             environment.update(
                 {
                     "GB10_HELPER_ACTIVE_STATE": active_state,
+                    "GB10_HELPER_DOCKER_ID": docker_id or cid,
                     "GB10_HELPER_EVENT_LOG": str(events),
+                    "GB10_HELPER_MAIN_PID": str(main_pid),
+                    "GB10_HELPER_POST_START_STATE": "active",
+                    "GB10_HELPER_SUB_STATE": sub_state,
+                    "GB10_HELPER_VERIFIER_STATUS": str(verifier_status),
                     "GB10_LIFECYCLE_BIN": str(lifecycle),
                     "GB10_SELECTED_TEXT_UNIT_FILE": str(selected),
                 }
@@ -923,6 +983,8 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
+                "systemctl --user show --property=ActiveState --property=SubState "
+                "--property=MainPID " + ULTIMATE_UNIT,
                 "lifecycle stop --unit "
                 + ULTIMATE_UNIT
                 + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
@@ -933,20 +995,81 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             ],
         )
 
-    def test_guard_helper_accepts_activating_canonical_unit_by_default(self) -> None:
+    def test_guard_helper_joins_identity_proven_activating_canonical_unit(self) -> None:
+        cid = "a" * 64
         result, events, selected = self.run_guard_helper(
             active_state="activating",
+            sub_state="start-post",
+            main_pid=4242,
             requested_unit=None,
+            cid=cid,
         )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIsNone(selected)
-        self.assertEqual(
-            events[-1],
-            "systemctl --user show --property=ActiveState --value " + ULTIMATE_UNIT,
+        self.assertFalse(any(event.startswith("lifecycle ") for event in events), events)
+        self.assertEqual(sum(event.startswith("systemctl ") for event in events), 2)
+        self.assertEqual(sum(event.startswith("verifier ") for event in events), 1)
+        self.assertEqual(sum(event.startswith("docker ") for event in events), 1)
+        self.assertIn(
+            "verifier --unit /home/obj/.config/systemd/user/"
+            + ULTIMATE_UNIT
+            + " --container vllm-aeon-ultimate-uncensored-nvfp4",
+            events,
+        )
+        self.assertTrue(
+            any(event.startswith("docker inspect --type container ") and cid in event for event in events),
+            events,
         )
         self.assertNotIn(HIKV_UNIT, "\n".join(events))
         self.assertNotIn(UNIT, "\n".join(events))
+
+    def test_guard_helper_recycles_inactive_canonical_unit(self) -> None:
+        result, events, _selected = self.run_guard_helper(
+            active_state="inactive",
+            sub_state="dead",
+            main_pid=0,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sum(event.startswith("verifier ") for event in events), 0)
+        self.assertEqual(sum(event.startswith("docker ") for event in events), 0)
+        self.assertEqual(
+            [event for event in events if event.startswith("lifecycle ")],
+            [
+                "lifecycle stop --unit "
+                + ULTIMATE_UNIT
+                + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
+                "lifecycle start --unit "
+                + ULTIMATE_UNIT
+                + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
+            ],
+        )
+
+    def test_guard_helper_rejects_mismatched_or_stale_starting_owner(self) -> None:
+        cases = (
+            ("b" * 64, 0, 4242),
+            ("a" * 64, 73, 4242),
+            ("a" * 64, 0, 1),
+        )
+        for docker_id, verifier_status, main_pid in cases:
+            with self.subTest(
+                docker_id=docker_id,
+                verifier_status=verifier_status,
+                main_pid=main_pid,
+            ):
+                result, events, _selected = self.run_guard_helper(
+                    active_state="activating",
+                    sub_state="start-post",
+                    main_pid=main_pid,
+                    docker_id=docker_id,
+                    verifier_status=verifier_status,
+                )
+
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(
+                    any(event.startswith("lifecycle ") for event in events), events
+                )
 
     def test_guard_helper_canonicalizes_hikv_alias_without_is_active(self) -> None:
         result, events, selected = self.run_guard_helper(
@@ -1010,6 +1133,155 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                         for line in lines
                     )
                 )
+
+
+class GuardHelperVerifierContractTests(VllmNoSwapFixture):
+    container = "vllm-aeon-ultimate-uncensored-nvfp4"
+    identifier = "c" * 64
+
+    def make_executable(self, path: Path, content: str) -> None:
+        path.write_text(content)
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.image = (
+            "sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e"
+        )
+        self.identifiers[self.container] = self.identifier
+        self.pids[self.container] = 6262
+        self.started[self.container] = "2026-09-15T01:02:03.123456789Z"
+        self.starttimes[self.container] = 333_333
+        self.scopes[self.container] = (
+            "/user.slice/user-1001.slice/user@1001.service/app.slice/"
+            f"docker-{self.identifier}.scope"
+        )
+        self.cidfile = self.root / "cids/ultimate.cid"
+        self.cidfile.write_text(self.identifier + "\n")
+        self.cidfile.chmod(0o600)
+        self.cidfiles[self.container] = self.cidfile
+        self._write_generation(self.container)
+
+        self.profile = self.profile_dir / "aeon-ultimate-uncensored-nvfp4.env"
+        self.unit = self.root / "vllm-aeon-ultimate-uncensored-nvfp4.service"
+        literal = [
+            "/usr/local/bin/vllm",
+            "serve",
+            "model",
+            "--gpu-memory-utilization",
+            "${AEON_GPU_MEMORY_UTILIZATION}",
+        ]
+        self._write_unit(
+            self.unit,
+            self.container,
+            str(self.cidfile),
+            application=literal,
+            environment_files=(
+                "/home/obj/.config/gb10/aeon-dflash-profiles/"
+                "aeon-ultimate-uncensored-nvfp4.env",
+            ),
+            image=self.image,
+        )
+        rendered = ["0.515" if token == literal[-1] else token for token in literal]
+        self.containers[self.container] = self._inspect(
+            self.container,
+            command=rendered,
+        )
+
+    def run_helper(self, profile_payload: str) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        self.profile.write_text(profile_payload)
+        self.profile.chmod(0o644)
+        self.command_log.unlink(missing_ok=True)
+        self.inspect_state.unlink(missing_ok=True)
+        events = self.root / "helper-events.log"
+        events.unlink(missing_ok=True)
+        lifecycle = self.root / "lifecycle"
+        systemctl = self.root / "helper-systemctl"
+        docker = self.root / "helper-docker"
+        verifier = self.root / "real-verifier"
+        helper = self.root / "aeon_text_stop_start.sh"
+
+        self.make_executable(
+            lifecycle,
+            "#!/bin/sh\n" + f"printf 'lifecycle %s\\n' \"$*\" >> {str(events)!r}\n",
+        )
+        self.make_executable(
+            systemctl,
+            "#!/bin/sh\n"
+            + f"printf 'systemctl %s\\n' \"$*\" >> {str(events)!r}\n"
+            + 'printf "MainPID=6262\\nActiveState=activating\\nSubState=start-post\\n"\n',
+        )
+        self.make_executable(
+            docker,
+            "#!/bin/sh\n"
+            + f"printf 'identity %s\\n' \"$*\" >> {str(events)!r}\n"
+            + f"printf '%s /{self.container} true\\n' {self.identifier!r}\n",
+        )
+        test_environment = self._test_environment(ultimate_profile_path=self.profile)
+        self.make_executable(
+            verifier,
+            "#!/bin/sh\n"
+            + "".join(
+                f"export {key}={shlex.quote(value)}\n"
+                for key, value in test_environment.items()
+            )
+            + f"exec /usr/bin/bash --noprofile --norc {shlex.quote(str(VERIFIER))} "
+            '--test-only "$@"\n',
+        )
+        helper.write_text(
+            GUARD_HELPER.read_text()
+            .replace("/usr/bin/systemctl", str(systemctl))
+            .replace("/usr/bin/docker", str(docker))
+            .replace(
+                "/home/obj/.local/bin/gb10_verify_vllm_no_swap.sh",
+                str(verifier),
+            )
+            .replace("/home/obj/.config/systemd/user/$UNIT", str(self.unit))
+            .replace(
+                "/home/obj/.config/gb10/aeon-dflash-profiles/"
+                "aeon-ultimate-uncensored-nvfp4.env",
+                str(self.profile),
+            )
+            .replace(
+                "/run/user/1001/gb10-memory-guardian/aeon-text.cid",
+                str(self.cidfile),
+            )
+        )
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "AEON_GPU_MEMORY_UTILIZATION": "0.999",
+                "GB10_LIFECYCLE_BIN": str(lifecycle),
+            }
+        )
+        result = subprocess.run(
+            ["/usr/bin/bash", str(helper)],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        return result, events.read_text().splitlines()
+
+    def test_join_uses_canonical_profile_with_real_digest_bound_verifier(self) -> None:
+        healthy, events = self.run_helper("AEON_GPU_MEMORY_UTILIZATION=0.515\n")
+
+        self.assertEqual(healthy.returncode, 0, healthy.stdout + healthy.stderr)
+        self.assertIn("gb10_vllm_no_swap: verified", healthy.stdout)
+        self.assertFalse(any(event.startswith("lifecycle ") for event in events), events)
+        verifier_io = self.command_log.read_text()
+        self.assertIn("docker info --format {{.CgroupVersion}}", verifier_io)
+        self.assertGreaterEqual(
+            verifier_io.count(f"docker inspect --type container {self.container}"),
+            2,
+        )
+
+        invalid, events = self.run_helper("AEON_GPU_MEMORY_UTILIZATION=0.514\n")
+
+        self.assertNotEqual(invalid.returncode, 0, invalid.stdout + invalid.stderr)
+        self.assertFalse(any(event.startswith("lifecycle ") for event in events), events)
 
 
 if __name__ == "__main__":
