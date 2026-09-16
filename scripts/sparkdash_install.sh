@@ -38,8 +38,9 @@ pin_hash() {
 }
 
 preflight_existing_checkout() {
-  local head dirty line index_status path llm_base auth_base llm_overlay auth_overlay
-  local sparks_overlay sparks_legacy llm_backup auth_backup sparks
+  local head dirty line index_status path llm_base auth_base probe_base panel_base types_base store_base
+  local llm_overlay auth_overlay probe_overlay panel_overlay types_overlay store_overlay
+  local sparks_overlay sparks_legacy llm_backup auth_backup probe_backup panel_backup types_backup store_backup sparks
 
   git -C "${CHECKOUT}" cat-file -e "${PINNED_COMMIT}^{commit}" 2>/dev/null ||
     fail "existing checkout lacks pinned commit ${PINNED_COMMIT}; refusing network or source writes"
@@ -49,8 +50,16 @@ preflight_existing_checkout() {
 
   llm_base="$(pin_hash server/collectors/llmHost.js)"
   auth_base="$(pin_hash server/auth.js)"
+  probe_base="$(pin_hash server/collectors/LlmProbe.js)"
+  panel_base="$(pin_hash src/components/SparkPage/LlmPanel.tsx)"
+  types_base="$(pin_hash src/api/types.ts)"
+  store_base="$(pin_hash src/hooks/metricsStore.ts)"
   llm_overlay="$(sha256sum -- "${PROFILE}/llmHost.js" | awk '{print $1}')"
   auth_overlay="$(sha256sum -- "${PROFILE}/auth.js" | awk '{print $1}')"
+  probe_overlay="$(sha256sum -- "${PROFILE}/LlmProbe.js" | awk '{print $1}')"
+  panel_overlay="$(sha256sum -- "${PROFILE}/LlmPanel.tsx" | awk '{print $1}')"
+  types_overlay="$(sha256sum -- "${PROFILE}/types.ts" | awk '{print $1}')"
+  store_overlay="$(sha256sum -- "${PROFILE}/metricsStore.ts" | awk '{print $1}')"
   sparks_overlay="$(sha256sum -- "${PROFILE}/sparks.json" | awk '{print $1}')"
   sparks_legacy="$(sha256sum -- "${PROFILE}/sparks.legacy-bbec3bb.json" | awk '{print $1}')"
 
@@ -63,6 +72,22 @@ preflight_existing_checkout() {
   if ! file_matches "${CHECKOUT}/server/auth.js" "${auth_base}" 644 664 &&
     ! file_matches "${CHECKOUT}/server/auth.js" "${auth_overlay}" 644; then
     fail "refusing unknown bytes or mode at server/auth.js"
+  fi
+  if ! file_matches "${CHECKOUT}/server/collectors/LlmProbe.js" "${probe_base}" 644 664 &&
+    ! file_matches "${CHECKOUT}/server/collectors/LlmProbe.js" "${probe_overlay}" 644; then
+    fail "refusing unknown bytes or mode at server/collectors/LlmProbe.js"
+  fi
+  if ! file_matches "${CHECKOUT}/src/components/SparkPage/LlmPanel.tsx" "${panel_base}" 644 664 &&
+    ! file_matches "${CHECKOUT}/src/components/SparkPage/LlmPanel.tsx" "${panel_overlay}" 644; then
+    fail "refusing unknown bytes or mode at src/components/SparkPage/LlmPanel.tsx"
+  fi
+  if ! file_matches "${CHECKOUT}/src/api/types.ts" "${types_base}" 644 664 &&
+    ! file_matches "${CHECKOUT}/src/api/types.ts" "${types_overlay}" 644; then
+    fail "refusing unknown bytes or mode at src/api/types.ts"
+  fi
+  if ! file_matches "${CHECKOUT}/src/hooks/metricsStore.ts" "${store_base}" 644 664 &&
+    ! file_matches "${CHECKOUT}/src/hooks/metricsStore.ts" "${store_overlay}" 644; then
+    fail "refusing unknown bytes or mode at src/hooks/metricsStore.ts"
   fi
 
   sparks="${CHECKOUT}/config/sparks.json"
@@ -83,6 +108,26 @@ preflight_existing_checkout() {
     file_matches "${auth_backup}" "${auth_base}" 644 664 ||
       fail "refusing unknown bytes or mode at server/auth.js.upstream-bbec3bb"
   fi
+  probe_backup="${CHECKOUT}/server/collectors/LlmProbe.js.upstream-bbec3bb"
+  if [[ -e "${probe_backup}" || -L "${probe_backup}" ]]; then
+    file_matches "${probe_backup}" "${probe_base}" 644 664 ||
+      fail "refusing unknown bytes or mode at server/collectors/LlmProbe.js.upstream-bbec3bb"
+  fi
+  panel_backup="${CHECKOUT}/src/components/SparkPage/LlmPanel.tsx.upstream-bbec3bb"
+  if [[ -e "${panel_backup}" || -L "${panel_backup}" ]]; then
+    file_matches "${panel_backup}" "${panel_base}" 644 664 ||
+      fail "refusing unknown bytes or mode at src/components/SparkPage/LlmPanel.tsx.upstream-bbec3bb"
+  fi
+  types_backup="${CHECKOUT}/src/api/types.ts.upstream-bbec3bb"
+  if [[ -e "${types_backup}" || -L "${types_backup}" ]]; then
+    file_matches "${types_backup}" "${types_base}" 644 664 ||
+      fail "refusing unknown bytes or mode at src/api/types.ts.upstream-bbec3bb"
+  fi
+  store_backup="${CHECKOUT}/src/hooks/metricsStore.ts.upstream-bbec3bb"
+  if [[ -e "${store_backup}" || -L "${store_backup}" ]]; then
+    file_matches "${store_backup}" "${store_base}" 644 664 ||
+      fail "refusing unknown bytes or mode at src/hooks/metricsStore.ts.upstream-bbec3bb"
+  fi
 
   dirty="$(GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C "${CHECKOUT}" status --porcelain=v1 --untracked-files=no)"
   while IFS= read -r line; do
@@ -91,7 +136,7 @@ preflight_existing_checkout() {
     path="${line:3}"
     [[ "${index_status}" == " " ]] || fail "refusing staged source change: ${path}"
     case "${path}" in
-      server/collectors/llmHost.js|server/auth.js) ;;
+      server/collectors/llmHost.js|server/collectors/LlmProbe.js|server/auth.js|src/components/SparkPage/LlmPanel.tsx|src/api/types.ts|src/hooks/metricsStore.ts) ;;
       *) fail "refusing unexpected tracked edit: ${path}" ;;
     esac
   done <<< "${dirty}"
@@ -135,13 +180,29 @@ preflight_existing_checkout
 install -d -m 0755 "${HOME}/.config/sparkdash" "${HOME}/.config/systemd/user"
 llm_tmp="$(mktemp "${TMPDIR}/sparkdash-llm-upstream.XXXXXX")"
 auth_tmp="$(mktemp "${TMPDIR}/sparkdash-auth-upstream.XXXXXX")"
-trap 'rm -f "${llm_tmp}" "${auth_tmp}"' EXIT
+probe_tmp="$(mktemp "${TMPDIR}/sparkdash-probe-upstream.XXXXXX")"
+panel_tmp="$(mktemp "${TMPDIR}/sparkdash-panel-upstream.XXXXXX")"
+types_tmp="$(mktemp "${TMPDIR}/sparkdash-types-upstream.XXXXXX")"
+store_tmp="$(mktemp "${TMPDIR}/sparkdash-store-upstream.XXXXXX")"
+trap 'rm -f "${llm_tmp}" "${auth_tmp}" "${probe_tmp}" "${panel_tmp}" "${types_tmp}" "${store_tmp}"' EXIT
 git -C "${CHECKOUT}" show "${PINNED_COMMIT}:server/collectors/llmHost.js" >"${llm_tmp}"
 git -C "${CHECKOUT}" show "${PINNED_COMMIT}:server/auth.js" >"${auth_tmp}"
+git -C "${CHECKOUT}" show "${PINNED_COMMIT}:server/collectors/LlmProbe.js" >"${probe_tmp}"
+git -C "${CHECKOUT}" show "${PINNED_COMMIT}:src/components/SparkPage/LlmPanel.tsx" >"${panel_tmp}"
+git -C "${CHECKOUT}" show "${PINNED_COMMIT}:src/api/types.ts" >"${types_tmp}"
+git -C "${CHECKOUT}" show "${PINNED_COMMIT}:src/hooks/metricsStore.ts" >"${store_tmp}"
 install -m 0644 "${llm_tmp}" "${CHECKOUT}/server/collectors/llmHost.js.upstream-bbec3bb"
 install -m 0644 "${auth_tmp}" "${CHECKOUT}/server/auth.js.upstream-bbec3bb"
+install -m 0644 "${probe_tmp}" "${CHECKOUT}/server/collectors/LlmProbe.js.upstream-bbec3bb"
+install -m 0644 "${panel_tmp}" "${CHECKOUT}/src/components/SparkPage/LlmPanel.tsx.upstream-bbec3bb"
+install -m 0644 "${types_tmp}" "${CHECKOUT}/src/api/types.ts.upstream-bbec3bb"
+install -m 0644 "${store_tmp}" "${CHECKOUT}/src/hooks/metricsStore.ts.upstream-bbec3bb"
 install -m 0644 "${PROFILE}/llmHost.js" "${CHECKOUT}/server/collectors/llmHost.js"
 install -m 0644 "${PROFILE}/auth.js" "${CHECKOUT}/server/auth.js"
+install -m 0644 "${PROFILE}/LlmProbe.js" "${CHECKOUT}/server/collectors/LlmProbe.js"
+install -m 0644 "${PROFILE}/LlmPanel.tsx" "${CHECKOUT}/src/components/SparkPage/LlmPanel.tsx"
+install -m 0644 "${PROFILE}/types.ts" "${CHECKOUT}/src/api/types.ts"
+install -m 0644 "${PROFILE}/metricsStore.ts" "${CHECKOUT}/src/hooks/metricsStore.ts"
 install -m 0644 "${PROFILE}/sparks.json" "${CHECKOUT}/config/sparks.json"
 if [[ ! -e "${existing_env}" ]]; then
   install -m 0644 "${PROFILE}/sparkdash.env" "${existing_env}"
@@ -154,7 +215,7 @@ file_matches "${HOME}/.config/systemd/user/sparkdash.service" \
   "$(sha256sum -- "${PROFILE}/sparkdash.service" | awk '{print $1}')" 644 ||
   fail "installed unit failed byte/mode verification"
 
-rm -f "${llm_tmp}" "${auth_tmp}"
+rm -f "${llm_tmp}" "${auth_tmp}" "${probe_tmp}" "${panel_tmp}" "${types_tmp}" "${store_tmp}"
 trap - EXIT
 
 echo "sparkdash: installed pin ${PINNED_COMMIT} at ${CHECKOUT}"
