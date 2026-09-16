@@ -15,6 +15,7 @@ readonly LIFECYCLE_ACTOR="llm-guard-proxy.local-recovery"
 readonly LIFECYCLE_REASON="automatic-local-recovery"
 readonly UNIT="vllm-aeon-ultimate-uncensored-nvfp4.service"
 readonly UNIT_PATH="/home/obj/.config/systemd/user/$UNIT"
+readonly ULTIMATE_PROFILE="/home/obj/.config/gb10/aeon-dflash-profiles/aeon-ultimate-uncensored-nvfp4.env"
 readonly CONTAINER="vllm-aeon-ultimate-uncensored-nvfp4"
 readonly CIDFILE="/run/user/1001/gb10-memory-guardian/aeon-text.cid"
 readonly DOCKER_HOST_VALUE="unix:///run/user/1001/docker.sock"
@@ -71,13 +72,18 @@ private_cid() {
 
 join_existing_start() {
     local snapshot_before="$1" active_state sub_state main_pid
-    local cid_before cid_after identity docker_id docker_name running extra snapshot_after
+    local cid_before cid_after identity docker_id docker_name running extra profile_assignment snapshot_after
     read -r active_state sub_state main_pid <<< "$snapshot_before"
     (( main_pid > 1 )) || fail "activating canonical unit has no live MainPID"
     cid_before="$(private_cid)"
+    profile_assignment="$(<"$ULTIMATE_PROFILE")" \
+        || fail "cannot read canonical Ultimate profile"
+    [[ "$profile_assignment" == "AEON_GPU_MEMORY_UTILIZATION=0.515" ]] \
+        || fail "canonical Ultimate profile is invalid"
 
     /usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C \
-        DOCKER_HOST="$DOCKER_HOST_VALUE" /usr/bin/bash --noprofile --norc \
+        "$profile_assignment" DOCKER_HOST="$DOCKER_HOST_VALUE" \
+        /usr/bin/bash --noprofile --norc \
         "$NO_SWAP_VERIFIER" --unit "$UNIT_PATH" --container "$CONTAINER" \
         || fail "activating canonical generation failed strict verification"
     identity="$(/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C \

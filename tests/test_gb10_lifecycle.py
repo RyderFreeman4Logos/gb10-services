@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import os
+import shlex
 import stat
 import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
+
+from vllm_no_swap_fixtures import VERIFIER, VllmNoSwapFixture
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -872,8 +875,11 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             verifier = root / "gb10_verify_vllm_no_swap.sh"
             sleep = root / "sleep"
             cidfile = root / "aeon-text.cid"
+            profile = root / "aeon-ultimate-uncensored-nvfp4.env"
             cidfile.write_text(cid + "\n")
             cidfile.chmod(0o600)
+            profile.write_text("AEON_GPU_MEMORY_UTILIZATION=0.515\n")
+            profile.chmod(0o644)
             resolved_docker_id = docker_id or cid
             selected = root / "selected-text-unit"
             if selected_value is not None:
@@ -925,6 +931,11 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                 .replace(
                     "/run/user/1001/gb10-memory-guardian/aeon-text.cid",
                     str(cidfile),
+                )
+                .replace(
+                    "/home/obj/.config/gb10/aeon-dflash-profiles/"
+                    "aeon-ultimate-uncensored-nvfp4.env",
+                    str(profile),
                 )
             )
             environment = os.environ.copy()
@@ -1122,6 +1133,155 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                         for line in lines
                     )
                 )
+
+
+class GuardHelperVerifierContractTests(VllmNoSwapFixture):
+    container = "vllm-aeon-ultimate-uncensored-nvfp4"
+    identifier = "c" * 64
+
+    def make_executable(self, path: Path, content: str) -> None:
+        path.write_text(content)
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.image = (
+            "sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e"
+        )
+        self.identifiers[self.container] = self.identifier
+        self.pids[self.container] = 6262
+        self.started[self.container] = "2026-09-15T01:02:03.123456789Z"
+        self.starttimes[self.container] = 333_333
+        self.scopes[self.container] = (
+            "/user.slice/user-1001.slice/user@1001.service/app.slice/"
+            f"docker-{self.identifier}.scope"
+        )
+        self.cidfile = self.root / "cids/ultimate.cid"
+        self.cidfile.write_text(self.identifier + "\n")
+        self.cidfile.chmod(0o600)
+        self.cidfiles[self.container] = self.cidfile
+        self._write_generation(self.container)
+
+        self.profile = self.profile_dir / "aeon-ultimate-uncensored-nvfp4.env"
+        self.unit = self.root / "vllm-aeon-ultimate-uncensored-nvfp4.service"
+        literal = [
+            "/usr/local/bin/vllm",
+            "serve",
+            "model",
+            "--gpu-memory-utilization",
+            "${AEON_GPU_MEMORY_UTILIZATION}",
+        ]
+        self._write_unit(
+            self.unit,
+            self.container,
+            str(self.cidfile),
+            application=literal,
+            environment_files=(
+                "/home/obj/.config/gb10/aeon-dflash-profiles/"
+                "aeon-ultimate-uncensored-nvfp4.env",
+            ),
+            image=self.image,
+        )
+        rendered = ["0.515" if token == literal[-1] else token for token in literal]
+        self.containers[self.container] = self._inspect(
+            self.container,
+            command=rendered,
+        )
+
+    def run_helper(self, profile_payload: str) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        self.profile.write_text(profile_payload)
+        self.profile.chmod(0o644)
+        self.command_log.unlink(missing_ok=True)
+        self.inspect_state.unlink(missing_ok=True)
+        events = self.root / "helper-events.log"
+        events.unlink(missing_ok=True)
+        lifecycle = self.root / "lifecycle"
+        systemctl = self.root / "helper-systemctl"
+        docker = self.root / "helper-docker"
+        verifier = self.root / "real-verifier"
+        helper = self.root / "aeon_text_stop_start.sh"
+
+        self.make_executable(
+            lifecycle,
+            "#!/bin/sh\n" + f"printf 'lifecycle %s\\n' \"$*\" >> {str(events)!r}\n",
+        )
+        self.make_executable(
+            systemctl,
+            "#!/bin/sh\n"
+            + f"printf 'systemctl %s\\n' \"$*\" >> {str(events)!r}\n"
+            + 'printf "MainPID=6262\\nActiveState=activating\\nSubState=start-post\\n"\n',
+        )
+        self.make_executable(
+            docker,
+            "#!/bin/sh\n"
+            + f"printf 'identity %s\\n' \"$*\" >> {str(events)!r}\n"
+            + f"printf '%s /{self.container} true\\n' {self.identifier!r}\n",
+        )
+        test_environment = self._test_environment(ultimate_profile_path=self.profile)
+        self.make_executable(
+            verifier,
+            "#!/bin/sh\n"
+            + "".join(
+                f"export {key}={shlex.quote(value)}\n"
+                for key, value in test_environment.items()
+            )
+            + f"exec /usr/bin/bash --noprofile --norc {shlex.quote(str(VERIFIER))} "
+            '--test-only "$@"\n',
+        )
+        helper.write_text(
+            GUARD_HELPER.read_text()
+            .replace("/usr/bin/systemctl", str(systemctl))
+            .replace("/usr/bin/docker", str(docker))
+            .replace(
+                "/home/obj/.local/bin/gb10_verify_vllm_no_swap.sh",
+                str(verifier),
+            )
+            .replace("/home/obj/.config/systemd/user/$UNIT", str(self.unit))
+            .replace(
+                "/home/obj/.config/gb10/aeon-dflash-profiles/"
+                "aeon-ultimate-uncensored-nvfp4.env",
+                str(self.profile),
+            )
+            .replace(
+                "/run/user/1001/gb10-memory-guardian/aeon-text.cid",
+                str(self.cidfile),
+            )
+        )
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "AEON_GPU_MEMORY_UTILIZATION": "0.999",
+                "GB10_LIFECYCLE_BIN": str(lifecycle),
+            }
+        )
+        result = subprocess.run(
+            ["/usr/bin/bash", str(helper)],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        return result, events.read_text().splitlines()
+
+    def test_join_uses_canonical_profile_with_real_digest_bound_verifier(self) -> None:
+        healthy, events = self.run_helper("AEON_GPU_MEMORY_UTILIZATION=0.515\n")
+
+        self.assertEqual(healthy.returncode, 0, healthy.stdout + healthy.stderr)
+        self.assertIn("gb10_vllm_no_swap: verified", healthy.stdout)
+        self.assertFalse(any(event.startswith("lifecycle ") for event in events), events)
+        verifier_io = self.command_log.read_text()
+        self.assertIn("docker info --format {{.CgroupVersion}}", verifier_io)
+        self.assertGreaterEqual(
+            verifier_io.count(f"docker inspect --type container {self.container}"),
+            2,
+        )
+
+        invalid, events = self.run_helper("AEON_GPU_MEMORY_UTILIZATION=0.514\n")
+
+        self.assertNotEqual(invalid.returncode, 0, invalid.stdout + invalid.stderr)
+        self.assertFalse(any(event.startswith("lifecycle ") for event in events), events)
 
 
 if __name__ == "__main__":
