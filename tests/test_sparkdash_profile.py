@@ -80,7 +80,7 @@ class SparkdashProfileTests(unittest.TestCase):
         self.assertNotIn("git clean", script)
         self.assertNotIn("git stash", script)
         self.assertIn("status --porcelain", script)
-        self.assertIn("npm ci --no-audit --no-fund", script)
+        self.assertIn("npm ci --include=dev --no-audit --no-fund", script)
         self.assertIn("npm run build", script)
         self.assertNotIn('! -d "${CHECKOUT}/node_modules"', script)
         self.assertIn("${PROFILE}/auth.js", script)
@@ -172,6 +172,7 @@ def _prepare_installer_fixture(
         "export function llmProbeHost() {}\n"
     )
     (checkout / "server" / "collectors" / "LlmProbe.js").write_text("export class LlmProbe {}\n")
+    (checkout / "server" / "collectors" / "LlmDaily.js").write_text("export class LlmDailyStore {}\n")
     (checkout / "server" / "auth.js").write_text("export function createAuthMiddleware() {}\n")
     (checkout / "src" / "components" / "SparkPage" / "LlmPanel.tsx").write_text("export {};\n")
     (checkout / "src" / "api" / "types.ts").write_text("export interface LlmMetrics {}\n")
@@ -242,6 +243,7 @@ def _prepare_installer_fixture(
     for name in (
         "llmHost.js",
         "LlmProbe.js",
+        "LlmDaily.js",
         "LlmPanel.tsx",
         "types.ts",
         "metricsStore.ts",
@@ -326,12 +328,14 @@ class SparkdashInstallerAttestationTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
             self.assertEqual((checkout / "server" / "index.js").read_text(), "console.log('pin');\n")
             log = npm_log.read_text()
-            self.assertIn("ci --no-audit --no-fund", log)
+            self.assertIn("ci --include=dev --no-audit --no-fund", log)
             self.assertIn("run build", log)
             overlay = (checkout / "server" / "collectors" / "llmHost.js").read_text()
             self.assertIn("if (ip) return ip;", overlay)
             probe = (checkout / "server" / "collectors" / "LlmProbe.js").read_text()
             self.assertIn("VLLM_RATE_STALE_WINDOW_MS", probe)
+            daily = (checkout / "server" / "collectors" / "LlmDaily.js").read_text()
+            self.assertIn("generationTpsState !== \"stale\"", daily)
             self.assertEqual(
                 stat.S_IMODE((checkout / "server" / "collectors" / "LlmProbe.js").stat().st_mode),
                 0o644,
@@ -339,6 +343,16 @@ class SparkdashInstallerAttestationTests(unittest.TestCase):
             self.assertEqual(
                 stat.S_IMODE(
                     (checkout / "server" / "collectors" / "LlmProbe.js.upstream-bbec3bb").stat().st_mode
+                ),
+                0o644,
+            )
+            self.assertEqual(
+                stat.S_IMODE((checkout / "server" / "collectors" / "LlmDaily.js").stat().st_mode),
+                0o644,
+            )
+            self.assertEqual(
+                stat.S_IMODE(
+                    (checkout / "server" / "collectors" / "LlmDaily.js.upstream-bbec3bb").stat().st_mode
                 ),
                 0o644,
             )
@@ -429,6 +443,7 @@ server.listen(0, "127.0.0.1", async () => {
         cases = (
             ("llm-bytes", "server/collectors/llmHost.js", b"arbitrary-overlay\n", None),
             ("probe-bytes", "server/collectors/LlmProbe.js", b"arbitrary-probe\n", None),
+            ("daily-bytes", "server/collectors/LlmDaily.js", b"arbitrary-daily\n", None),
             ("panel-bytes", "src/components/SparkPage/LlmPanel.tsx", b"arbitrary-panel\n", None),
             ("types-bytes", "src/api/types.ts", b"arbitrary-types\n", None),
             ("store-bytes", "src/hooks/metricsStore.ts", b"arbitrary-store\n", None),
@@ -436,12 +451,14 @@ server.listen(0, "127.0.0.1", async () => {
             ("sparks-bytes", "config/sparks.json", b"{}\n", None),
             ("llm-backup-bytes", "server/collectors/llmHost.js.upstream-bbec3bb", b"arbitrary-backup\n", None),
             ("probe-backup-bytes", "server/collectors/LlmProbe.js.upstream-bbec3bb", b"arbitrary-backup\n", None),
+            ("daily-backup-bytes", "server/collectors/LlmDaily.js.upstream-bbec3bb", b"arbitrary-backup\n", None),
             ("panel-backup-bytes", "src/components/SparkPage/LlmPanel.tsx.upstream-bbec3bb", b"arbitrary-backup\n", None),
             ("types-backup-bytes", "src/api/types.ts.upstream-bbec3bb", b"arbitrary-backup\n", None),
             ("store-backup-bytes", "src/hooks/metricsStore.ts.upstream-bbec3bb", b"arbitrary-backup\n", None),
             ("auth-backup-bytes", "server/auth.js.upstream-bbec3bb", b"arbitrary-backup\n", None),
             ("llm-mode", "server/collectors/llmHost.js", None, 0o755),
             ("probe-mode", "server/collectors/LlmProbe.js", None, 0o755),
+            ("daily-mode", "server/collectors/LlmDaily.js", None, 0o755),
             ("panel-mode", "src/components/SparkPage/LlmPanel.tsx", None, 0o755),
             ("types-mode", "src/api/types.ts", None, 0o755),
             ("store-mode", "src/hooks/metricsStore.ts", None, 0o755),
@@ -449,6 +466,7 @@ server.listen(0, "127.0.0.1", async () => {
             ("sparks-mode", "config/sparks.json", None, 0o600),
             ("llm-backup-mode", "server/collectors/llmHost.js.upstream-bbec3bb", None, 0o755),
             ("probe-backup-mode", "server/collectors/LlmProbe.js.upstream-bbec3bb", None, 0o755),
+            ("daily-backup-mode", "server/collectors/LlmDaily.js.upstream-bbec3bb", None, 0o755),
             ("panel-backup-mode", "src/components/SparkPage/LlmPanel.tsx.upstream-bbec3bb", None, 0o755),
             ("types-backup-mode", "src/api/types.ts.upstream-bbec3bb", None, 0o755),
             ("store-backup-mode", "src/hooks/metricsStore.ts.upstream-bbec3bb", None, 0o755),
@@ -479,6 +497,7 @@ server.listen(0, "127.0.0.1", async () => {
                 managed = [
                     checkout / "server" / "collectors" / "llmHost.js",
                     checkout / "server" / "collectors" / "LlmProbe.js",
+                    checkout / "server" / "collectors" / "LlmDaily.js",
                     checkout / "server" / "auth.js",
                     checkout / "src" / "components" / "SparkPage" / "LlmPanel.tsx",
                     checkout / "src" / "api" / "types.ts",
@@ -561,6 +580,24 @@ snap = apply({ prompt: 300, generation: 21, running: 1, iteration: 321 }, 30_001
 if (snap.generationTpsState !== "unavailable" || snap.generationTpsAgeSeconds == null) {
   throw new Error(`expired generation rate was retained: ${JSON.stringify(snap)}`);
 }
+snap = apply({ prompt: 300, generation: 22, running: 0, iteration: 322 });
+if (snap.generationTpsState !== "fresh" || snap.generationTps <= 0) {
+  throw new Error(`final counter advance was overwritten by idle: ${JSON.stringify(snap)}`);
+}
+snap = apply({ prompt: 300, generation: 22, running: 0, iteration: 322 });
+if (snap.generationTpsState !== "idle" || snap.generationTps !== 0) {
+  throw new Error(`verified idle did not replace the prior counter window: ${JSON.stringify(snap)}`);
+}
+probe._fetch = async (url) => {
+  if (url.endsWith("/v1/models")) {
+    return { ok: true, status: 200, json: async () => ({ data: [{ id: "fixture" }] }) };
+  }
+  return { ok: false, status: 503 };
+};
+snap = await probe._probeOpenAICompatible();
+if (snap.generationTpsState !== "unavailable" || snap.requestsRunning !== null) {
+  throw new Error(`metrics failure fabricated idle: ${JSON.stringify(snap)}`);
+}
 snap = apply({ prompt: 1, generation: 1, running: 1, iteration: 2 });
 if (snap.generationTpsState !== "unavailable" || snap.prefillTpsState !== "unavailable") {
   throw new Error(`counter reset was treated as throughput: ${JSON.stringify(snap)}`);
@@ -576,6 +613,51 @@ if (unavailable.available || unavailable.generationTpsState !== "unavailable" ||
 """
             env = os.environ.copy()
             env["SPARKDASH_LLMPROBE_JS"] = (collector / "LlmProbe.js").as_uri()
+            completed = subprocess.run(
+                [node, "--input-type=module", "-e", script],
+                env=env,
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+
+
+class SparkdashDailyFreshnessTests(unittest.TestCase):
+    def test_daily_rollup_excludes_stale_held_vllm_rates(self) -> None:
+        node = _node_bin()
+        daily = PROFILE / "LlmDaily.js"
+        self.assertTrue(daily.is_file(), "profile LlmDaily overlay is required")
+        with tempfile.TemporaryDirectory(prefix="sparkdash-daily-") as raw:
+            tmp = Path(raw)
+            collectors = tmp / "server" / "collectors"
+            collectors.mkdir(parents=True)
+            shutil.copy2(daily, collectors / "LlmDaily.js")
+            (tmp / "server" / "config.js").write_text(
+                f"export const LLM_DAILY_JSON_PATH = {str(tmp / 'daily.json')!r};\n"
+            )
+            util = tmp / "server" / "util"
+            util.mkdir()
+            (util / "atomicWrite.js").write_text(
+                "import fs from 'fs'; export function atomicWrite(path, body) { fs.writeFileSync(path, body); }\n"
+            )
+            (tmp / "package.json").write_text('{"type":"module"}\n')
+            script = r"""
+const { LlmDailyStore } = await import(process.env.SPARKDASH_LLMDAILY_JS);
+const store = new LlmDailyStore(process.env.SPARKDASH_LLMDAILY_OUT);
+const now = new Date("2026-09-16T12:00:00Z");
+store.record("spark-a", 18010, { available: true, generationTps: 12, prefillTps: 30, generationTpsState: "fresh", prefillTpsState: "fresh" }, now);
+store.record("spark-a", 18010, { available: true, generationTps: 12, prefillTps: 30, generationTpsState: "stale", prefillTpsState: "stale" }, now);
+store.record("spark-a", 18010, { available: true, generationTps: 12, prefillTps: 30, generationTpsState: "stale", prefillTpsState: "stale" }, now);
+const day = store.getSeries("spark-a", 18010, { days: 1, now }).days[0];
+if (day.decodeAvg !== 12 || day.prefillAvg !== 30) {
+  throw new Error(`stale samples accumulated into daily rates: ${JSON.stringify(day)}`);
+}
+"""
+            env = os.environ.copy()
+            env["SPARKDASH_LLMDAILY_JS"] = (collectors / "LlmDaily.js").as_uri()
+            env["SPARKDASH_LLMDAILY_OUT"] = str(tmp / "daily.json")
             completed = subprocess.run(
                 [node, "--input-type=module", "-e", script],
                 env=env,

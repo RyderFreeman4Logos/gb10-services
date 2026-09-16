@@ -104,6 +104,8 @@ export class LlmProbe {
       generation: { counter: null, observedAt: null, updatedAt: null, value: 0 },
       prefill: { counter: null, observedAt: null, updatedAt: null, value: 0 },
     };
+    this._vllmMetricsAvailable = false;
+    this._vllmRateAdvanced = { generation: false, prefill: false };
 
     // Cumulative total output tokens (generation) as reported by the LLM server
     this.totalOutputTokens = 0;
@@ -539,6 +541,8 @@ export class LlmProbe {
     }
 
     // Single /metrics fetch: ds4-server or vLLM Prometheus exposition
+    this._vllmMetricsAvailable = false;
+    this._vllmRateAdvanced = { generation: false, prefill: false };
     try {
       const metricsRes = await this._fetch(`${this.baseUrl}/metrics`);
       if (metricsRes.ok) {
@@ -565,6 +569,7 @@ export class LlmProbe {
         this.backendType !== "q27"
       ) {
         this.backendType = "vllm";
+        this.requestsRunning = null;
       }
     } catch {
       if (
@@ -573,6 +578,7 @@ export class LlmProbe {
         this.backendType !== "q27"
       ) {
         this.backendType = "vllm";
+        this.requestsRunning = null;
       }
     }
 
@@ -828,6 +834,8 @@ export class LlmProbe {
    * @param {number} dtSec
    */
   _applyVllmMetrics(txt, dtSec) {
+    this._vllmMetricsAvailable = true;
+    this._vllmRateAdvanced = { generation: false, prefill: false };
     const promptTokens = this._getVllmMetric(txt, "prompt_tokens_total");
     const genTokens = this._getVllmMetric(txt, "generation_tokens_total");
     const running = this._getVllmMetric(txt, "num_requests_running");
@@ -838,8 +846,8 @@ export class LlmProbe {
         (this._vllmRates.prefill.counter != null && promptTokens < this._vllmRates.prefill.counter) ||
         (this._vllmRates.generation.counter != null && genTokens < this._vllmRates.generation.counter);
       if (countersReset) this._resetVllmRates();
-      this._advanceVllmRate("prefill", promptTokens, now);
-      this._advanceVllmRate("generation", genTokens, now);
+      this._vllmRateAdvanced.prefill = this._advanceVllmRate("prefill", promptTokens, now);
+      this._vllmRateAdvanced.generation = this._advanceVllmRate("generation", genTokens, now);
       this.lastTokenCounts.input = promptTokens;
       this.lastTokenCounts.output = genTokens;
       this.totalOutputTokens = genTokens;
@@ -909,6 +917,8 @@ export class LlmProbe {
       generation: { counter: null, observedAt: null, updatedAt: null, value: 0 },
       prefill: { counter: null, observedAt: null, updatedAt: null, value: 0 },
     };
+    this._vllmMetricsAvailable = false;
+    this._vllmRateAdvanced = { generation: false, prefill: false };
   }
 
   /**
@@ -920,31 +930,39 @@ export class LlmProbe {
    */
   _advanceVllmRate(kind, counter, now) {
     const rate = this._vllmRates[kind];
-    if (!Number.isFinite(counter)) return;
+    if (!Number.isFinite(counter)) return false;
     if (rate.counter == null || counter < rate.counter) {
       rate.counter = counter;
       rate.observedAt = now;
       rate.updatedAt = null;
       rate.value = 0;
-      return;
+      return false;
     }
     const delta = counter - rate.counter;
-    if (delta <= 0) return;
+    if (delta <= 0) return false;
     const elapsed = Math.max(0.001, (now - rate.observedAt) / 1000);
     rate.counter = counter;
     rate.observedAt = now;
     rate.updatedAt = now;
     rate.value = Math.max(0, Math.round((delta / elapsed) * 100) / 100);
+    return true;
   }
 
   /** @param {"generation" | "prefill"} kind @param {number} now */
   _vllmRateStatus(kind, now) {
+    if (!this._vllmMetricsAvailable) return { value: 0, state: "unavailable", ageSeconds: null };
     const rate = this._vllmRates[kind];
-    if (this.requestsRunning === 0) return { value: 0, state: "idle", ageSeconds: null };
-    if (rate.updatedAt == null) return { value: 0, state: "unavailable", ageSeconds: null };
+    if (rate.updatedAt == null) {
+      return this.requestsRunning === 0
+        ? { value: 0, state: "idle", ageSeconds: null }
+        : { value: 0, state: "unavailable", ageSeconds: null };
+    }
     const ageSeconds = Math.max(0, Math.round((now - rate.updatedAt) / 100) / 10);
     if (now - rate.updatedAt > VLLM_RATE_STALE_WINDOW_MS) {
       return { value: 0, state: "unavailable", ageSeconds };
+    }
+    if (this.requestsRunning === 0 && !this._vllmRateAdvanced[kind]) {
+      return { value: 0, state: "idle", ageSeconds: null };
     }
     return { value: rate.value, state: ageSeconds === 0 ? "fresh" : "stale", ageSeconds };
   }
