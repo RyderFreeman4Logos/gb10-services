@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import shlex
 import shutil
@@ -247,6 +248,31 @@ class VllmNoSwapVerifierTests(VllmNoSwapFixture):
         self.inspect_state.unlink(missing_ok=True)
         stale = self.assert_rejected(bind_runtime_swap_max=True)
         self.assertIn("cidfile", stale.stderr)
+        self.assertEqual(self.command_log.read_text().splitlines().count(exact_set), 1)
+
+    def test_binder_waits_for_delayed_cidfile_publication(self) -> None:
+        cidfile = self.cidfiles["vllm-test"]
+        cidfile.unlink()
+        self.inspect_state.write_text(
+            json.dumps({self.identifiers["vllm-test"]: 2})
+        )
+
+        bound = self._run(
+            bind_runtime_swap_max=True,
+            second_inspect_actions=[
+                {
+                    "op": "write",
+                    "path": str(cidfile),
+                    "data": self.identifiers["vllm-test"] + "\n",
+                }
+            ],
+        )
+
+        self.assertEqual(bound.returncode, 0, bound.stdout + bound.stderr)
+        exact_set = (
+            f"systemctl set-property --runtime docker-{self.identifiers['vllm-test']}.scope "
+            "MemorySwapMax=0"
+        )
         self.assertEqual(self.command_log.read_text().splitlines().count(exact_set), 1)
 
     def test_binder_compares_complete_generation_evidence_across_set_property(self) -> None:

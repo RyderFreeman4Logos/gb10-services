@@ -1005,8 +1005,8 @@ def verify_generation(contract: UnitContract) -> GenerationEvidence:
 
 
 def bind_runtime_swap_max(contract: UnitContract) -> None:
-    cid_before = private_cidfile(contract)
     before = verify_generation(contract)
+    cid_before = private_cidfile(contract)
     if cid_before[0] != before.snapshot.identifier:
         reject("unit cidfile and exact live Docker generation disagree")
     by_id_payload = inspect_payload(cid_before[0], allow_absent=False)
