@@ -779,6 +779,10 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                 systemctl,
                 "#!/bin/sh\n"
                 'printf "%s\\n" "$*" >> "$GB10_HELPER_SYSTEMCTL_LOG"\n'
+                'if [ "${2:-}" = "show" ]; then\n'
+                '    printf "MainPID=0\\nActiveState=inactive\\nSubState=dead\\n"\n'
+                "    exit 0\n"
+                "fi\n"
                 'if [ "${2:-}" = "reset-failed" ]; then\n'
                 '    rm -f "$GB10_HELPER_RATE_LIMIT"\n'
                 "    exit 0\n"
@@ -831,6 +835,8 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             self.assertEqual(
                 commands_log.read_text().splitlines(),
                 [
+                    f"--user show --property=ActiveState --property=SubState "
+                    f"--property=MainPID {ULTIMATE_UNIT}",
                     f"--user stop {ULTIMATE_UNIT}",
                     f"--user start --no-block {ULTIMATE_UNIT}",
                 ],
@@ -849,15 +855,26 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
         self,
         *,
         active_state: str,
+        sub_state: str = "running",
+        main_pid: int = 4242,
         requested_unit: str | None = ULTIMATE_UNIT,
         selected_value: str | None = None,
+        cid: str = "a" * 64,
+        docker_id: str | None = None,
+        verifier_status: int = 0,
     ) -> tuple[subprocess.CompletedProcess[str], list[str], str | None]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             events = root / "events.log"
             lifecycle = root / "lifecycle"
             systemctl = root / "systemctl"
+            docker = root / "docker"
+            verifier = root / "gb10_verify_vllm_no_swap.sh"
             sleep = root / "sleep"
+            cidfile = root / "aeon-text.cid"
+            cidfile.write_text(cid + "\n")
+            cidfile.chmod(0o600)
+            resolved_docker_id = docker_id or cid
             selected = root / "selected-text-unit"
             if selected_value is not None:
                 selected.write_text(selected_value)
@@ -871,24 +888,56 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                 "#!/bin/sh\n"
                 'printf "systemctl %s\\n" "$*" >> "$GB10_HELPER_EVENT_LOG"\n'
                 'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then\n'
-                '    printf "%s\\n" "$GB10_HELPER_ACTIVE_STATE"\n'
+                '    case " $* " in\n'
+                '        *" --value "*) printf "%s\\n" "$GB10_HELPER_POST_START_STATE" ;;\n'
+                '        *) printf "MainPID=%s\\nActiveState=%s\\nSubState=%s\\n" \\\n'
+                '            "$GB10_HELPER_MAIN_PID" "$GB10_HELPER_ACTIVE_STATE" \\\n'
+                '            "$GB10_HELPER_SUB_STATE" ;;\n'
+                "    esac\n"
                 "    exit 0\n"
                 "fi\n"
                 "exit 1\n",
+            )
+            self.make_executable(
+                docker,
+                "#!/bin/sh\n"
+                + f'printf "docker %s\\n" "$*" >> {str(events)!r}\n'
+                + f"printf '%s /vllm-aeon-ultimate-uncensored-nvfp4 true\\n' "
+                + f"{resolved_docker_id!r}\n",
+            )
+            self.make_executable(
+                verifier,
+                "#!/bin/sh\n"
+                + f'printf "verifier %s\\n" "$*" >> {str(events)!r}\n'
+                + f"exit {verifier_status}\n",
             )
             self.make_executable(sleep, "#!/bin/sh\nexit 0\n")
             helper = root / "aeon_text_stop_start.sh"
             helper.write_text(
                 GUARD_HELPER.read_text()
                 .replace("/usr/bin/systemctl", str(systemctl))
+                .replace("/usr/bin/docker", str(docker))
                 .replace("/usr/bin/sleep", str(sleep))
+                .replace(
+                    "/home/obj/.local/bin/gb10_verify_vllm_no_swap.sh",
+                    str(verifier),
+                )
+                .replace(
+                    "/run/user/1001/gb10-memory-guardian/aeon-text.cid",
+                    str(cidfile),
+                )
             )
             environment = os.environ.copy()
             environment.pop("GB10_TEXT_UNIT", None)
             environment.update(
                 {
                     "GB10_HELPER_ACTIVE_STATE": active_state,
+                    "GB10_HELPER_DOCKER_ID": docker_id or cid,
                     "GB10_HELPER_EVENT_LOG": str(events),
+                    "GB10_HELPER_MAIN_PID": str(main_pid),
+                    "GB10_HELPER_POST_START_STATE": "active",
+                    "GB10_HELPER_SUB_STATE": sub_state,
+                    "GB10_HELPER_VERIFIER_STATUS": str(verifier_status),
                     "GB10_LIFECYCLE_BIN": str(lifecycle),
                     "GB10_SELECTED_TEXT_UNIT_FILE": str(selected),
                 }
@@ -923,6 +972,8 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
+                "systemctl --user show --property=ActiveState --property=SubState "
+                "--property=MainPID " + ULTIMATE_UNIT,
                 "lifecycle stop --unit "
                 + ULTIMATE_UNIT
                 + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
@@ -933,20 +984,81 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             ],
         )
 
-    def test_guard_helper_accepts_activating_canonical_unit_by_default(self) -> None:
+    def test_guard_helper_joins_identity_proven_activating_canonical_unit(self) -> None:
+        cid = "a" * 64
         result, events, selected = self.run_guard_helper(
             active_state="activating",
+            sub_state="start-post",
+            main_pid=4242,
             requested_unit=None,
+            cid=cid,
         )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIsNone(selected)
-        self.assertEqual(
-            events[-1],
-            "systemctl --user show --property=ActiveState --value " + ULTIMATE_UNIT,
+        self.assertFalse(any(event.startswith("lifecycle ") for event in events), events)
+        self.assertEqual(sum(event.startswith("systemctl ") for event in events), 2)
+        self.assertEqual(sum(event.startswith("verifier ") for event in events), 1)
+        self.assertEqual(sum(event.startswith("docker ") for event in events), 1)
+        self.assertIn(
+            "verifier --unit /home/obj/.config/systemd/user/"
+            + ULTIMATE_UNIT
+            + " --container vllm-aeon-ultimate-uncensored-nvfp4",
+            events,
+        )
+        self.assertTrue(
+            any(event.startswith("docker inspect --type container ") and cid in event for event in events),
+            events,
         )
         self.assertNotIn(HIKV_UNIT, "\n".join(events))
         self.assertNotIn(UNIT, "\n".join(events))
+
+    def test_guard_helper_recycles_inactive_canonical_unit(self) -> None:
+        result, events, _selected = self.run_guard_helper(
+            active_state="inactive",
+            sub_state="dead",
+            main_pid=0,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sum(event.startswith("verifier ") for event in events), 0)
+        self.assertEqual(sum(event.startswith("docker ") for event in events), 0)
+        self.assertEqual(
+            [event for event in events if event.startswith("lifecycle ")],
+            [
+                "lifecycle stop --unit "
+                + ULTIMATE_UNIT
+                + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
+                "lifecycle start --unit "
+                + ULTIMATE_UNIT
+                + " --actor llm-guard-proxy.local-recovery --reason automatic-local-recovery",
+            ],
+        )
+
+    def test_guard_helper_rejects_mismatched_or_stale_starting_owner(self) -> None:
+        cases = (
+            ("b" * 64, 0, 4242),
+            ("a" * 64, 73, 4242),
+            ("a" * 64, 0, 1),
+        )
+        for docker_id, verifier_status, main_pid in cases:
+            with self.subTest(
+                docker_id=docker_id,
+                verifier_status=verifier_status,
+                main_pid=main_pid,
+            ):
+                result, events, _selected = self.run_guard_helper(
+                    active_state="activating",
+                    sub_state="start-post",
+                    main_pid=main_pid,
+                    docker_id=docker_id,
+                    verifier_status=verifier_status,
+                )
+
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(
+                    any(event.startswith("lifecycle ") for event in events), events
+                )
 
     def test_guard_helper_canonicalizes_hikv_alias_without_is_active(self) -> None:
         result, events, selected = self.run_guard_helper(
