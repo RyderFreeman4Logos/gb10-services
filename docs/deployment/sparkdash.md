@@ -96,6 +96,7 @@ Does not touch model units or PIDs.
 - `profile/sparkdash/sparks.legacy-bbec3bb.json` — exact admitted pre-upgrade runtime state
 - `profile/sparkdash/llmHost.js` → `/home/obj/src/sparkDash/server/collectors/llmHost.js`
 - `profile/sparkdash/LlmProbe.js` → `/home/obj/src/sparkDash/server/collectors/LlmProbe.js`
+- `profile/sparkdash/LlmDaily.js` → `/home/obj/src/sparkDash/server/collectors/LlmDaily.js`
 - `profile/sparkdash/LlmPanel.tsx` → `/home/obj/src/sparkDash/src/components/SparkPage/LlmPanel.tsx`
 - `profile/sparkdash/types.ts` → `/home/obj/src/sparkDash/src/api/types.ts`
 - `profile/sparkdash/metricsStore.ts` → `/home/obj/src/sparkDash/src/hooks/metricsStore.ts`

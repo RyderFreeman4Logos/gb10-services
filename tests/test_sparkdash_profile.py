@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PROFILE = ROOT / "profile" / "sparkdash"
 INSTALLER = ROOT / "scripts" / "sparkdash_install.sh"
 AGENT_PLAYBOOK = ROOT / "docs" / "deployment" / "AGENTS.md"
+SPARKDASH_DOCS = ROOT / "docs" / "deployment" / "sparkdash.md"
 
 
 class SparkdashProfileTests(unittest.TestCase):
@@ -85,7 +86,17 @@ class SparkdashProfileTests(unittest.TestCase):
         self.assertNotIn('! -d "${CHECKOUT}/node_modules"', script)
         self.assertIn("${PROFILE}/auth.js", script)
         self.assertIn("${PROFILE}/LlmProbe.js", script)
+        self.assertIn("${PROFILE}/LlmDaily.js", script)
         self.assertIn("server/collectors/LlmProbe.js", script)
+        self.assertIn("server/collectors/LlmDaily.js", script)
+        self.assertIn("${CHECKOUT}/dist/index.html", script)
+        self.assertIn("generationTpsState", script)
+        self.assertIn("built dist missing generationTpsState", script)
+
+    def test_tracked_source_docs_list_daily_overlay(self) -> None:
+        docs = SPARKDASH_DOCS.read_text()
+        self.assertIn("profile/sparkdash/LlmDaily.js", docs)
+        self.assertIn("server/collectors/LlmDaily.js", docs)
 
 
 def _node_bin() -> str:
@@ -206,10 +217,18 @@ def _prepare_installer_fixture(
         raise unittest.SkipTest("node is required for sparkDash installer tests")
     (bin_dir / "node").symlink_to(node)
     (bin_dir / "npm").write_text(
-        "#!/bin/sh\n"
-        "printf 'npm:%s\\n' \"$*\" >> \"${ACTION_LOG}\"\n"
-        "printf '%s\\n' \"$*\" >> \"${NPM_LOG}\"\n"
-        "exit 0\n"
+        """#!/bin/sh
+printf 'npm:%s\\n' "$*" >> "${ACTION_LOG}"
+printf '%s\\n' "$*" >> "${NPM_LOG}"
+case " $* " in
+  *" run build "*)
+    mkdir -p "${SPARKDASH_CHECKOUT}/dist/assets"
+    printf '%s\\n' '<!doctype html><script src="/assets/index.js"></script>' > "${SPARKDASH_CHECKOUT}/dist/index.html"
+    printf '%s\\n' 'generationTpsState stale unavailable' > "${SPARKDASH_CHECKOUT}/dist/assets/index.js"
+    ;;
+esac
+exit 0
+"""
     )
     for name in ("mkdir", "install", "cp"):
         real = shutil.which(name)
@@ -309,6 +328,31 @@ class SparkdashInstallerAttestationTests(unittest.TestCase):
             self.assertFalse(action_log.exists())
             self.assertFalse((home / ".config" / "sparkdash" / "sparkdash.env").exists())
 
+    def test_install_rejects_empty_dist_after_build(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sparkdash-install-") as raw:
+            tmp = Path(raw)
+            checkout, home, npm_log, _action_log, env, _pin = _prepare_installer_fixture(tmp)
+            npm = Path(env["PATH"].split(":", 1)[0]) / "npm"
+            npm.write_text(
+                """#!/bin/sh
+printf 'npm:%s\\n' "$*" >> "${ACTION_LOG}"
+printf '%s\\n' "$*" >> "${NPM_LOG}"
+exit 0
+"""
+            )
+            npm.chmod(stat.S_IRWXU)
+            (checkout / "dist" / "index.html").write_text("<!doctype html>\n")
+            completed = subprocess.run(
+                ["bash", str(tmp / "gb10-services" / "scripts" / "sparkdash_install.sh")],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            self.assertIn("built dist missing generationTpsState", completed.stderr)
+            self.assertFalse((home / ".config" / "systemd" / "user" / "sparkdash.service").exists())
+
     def test_old_install_upgrade_forces_readonly_and_serves_metadata(self) -> None:
         with tempfile.TemporaryDirectory(prefix="sparkdash-install-") as raw:
             tmp = Path(raw)
@@ -330,6 +374,10 @@ class SparkdashInstallerAttestationTests(unittest.TestCase):
             log = npm_log.read_text()
             self.assertIn("ci --include=dev --no-audit --no-fund", log)
             self.assertIn("run build", log)
+            dist_html = (checkout / "dist" / "index.html").read_bytes()
+            dist_js = (checkout / "dist" / "assets" / "index.js").read_bytes()
+            self.assertIn(b"generationTpsState", dist_html + dist_js)
+            self.assertIn(b"stale", dist_html + dist_js)
             overlay = (checkout / "server" / "collectors" / "llmHost.js").read_text()
             self.assertIn("if (ip) return ip;", overlay)
             probe = (checkout / "server" / "collectors" / "LlmProbe.js").read_text()

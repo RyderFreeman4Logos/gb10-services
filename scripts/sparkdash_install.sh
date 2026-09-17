@@ -217,6 +217,12 @@ install -m 0644 "${PROFILE}/sparks.json" "${CHECKOUT}/config/sparks.json"
   npm run build
 )
 
+[[ -f "${CHECKOUT}/dist/index.html" && ! -L "${CHECKOUT}/dist/index.html" ]] ||
+  fail "built dist missing ${CHECKOUT}/dist/index.html"
+dist_bytes="$(cat -- "${CHECKOUT}/dist/index.html" "${CHECKOUT}/dist"/assets/*.js 2>/dev/null || true)"
+[[ "${dist_bytes}" == *generationTpsState* && "${dist_bytes}" == *stale* ]] ||
+  fail "built dist missing generationTpsState"
+
 # Build only after overlays, then verify neither source nor modes widened.
 preflight_existing_checkout
 
