@@ -68,6 +68,13 @@ curl -sS http://127.0.0.1:20080/api/sparks/gb10-promax/metrics
 
 Expect `bindHost=127.0.0.1`, three `metrics.llm[]` entries with `available=true` and the model ids above. Idle `requestsRunning=0` is real idle, not fabricated.
 
+For vLLM, each tok/s field includes an explicit state and age: `fresh` is a counter
+advance; `stale` is a last observed window with its age; `unavailable` has no
+recent measured window; and `idle` is a verified zero-running-request sample.
+The overlay retains no rate beyond 30 seconds, does not infer generation from
+prompt-only progress or `requestsRunning`, resets its window on counter reset,
+and returns unavailable on a disconnected probe.
+
 ## Rollback / uninstall
 
 ```bash
@@ -88,6 +95,11 @@ Does not touch model units or PIDs.
 - `profile/sparkdash/sparks.json` → `/home/obj/src/sparkDash/config/sparks.json`
 - `profile/sparkdash/sparks.legacy-bbec3bb.json` — exact admitted pre-upgrade runtime state
 - `profile/sparkdash/llmHost.js` → `/home/obj/src/sparkDash/server/collectors/llmHost.js`
+- `profile/sparkdash/LlmProbe.js` → `/home/obj/src/sparkDash/server/collectors/LlmProbe.js`
+- `profile/sparkdash/LlmDaily.js` → `/home/obj/src/sparkDash/server/collectors/LlmDaily.js`
+- `profile/sparkdash/LlmPanel.tsx` → `/home/obj/src/sparkDash/src/components/SparkPage/LlmPanel.tsx`
+- `profile/sparkdash/types.ts` → `/home/obj/src/sparkDash/src/api/types.ts`
+- `profile/sparkdash/metricsStore.ts` → `/home/obj/src/sparkDash/src/hooks/metricsStore.ts`
 - `profile/sparkdash/auth.js` → `/home/obj/src/sparkDash/server/auth.js`
 - `profile/sparkdash/PIN`
 - `scripts/sparkdash_install.sh`
