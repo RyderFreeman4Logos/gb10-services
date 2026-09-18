@@ -57,7 +57,7 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
     --kv-cache-dtype fp8 \
     --compilation-config "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}" \
     --enable-chunked-prefill \
-    --no-enable-prefix-caching \
+    --enable-prefix-caching \
     --attention-backend TRITON_ATTN \
     --max-model-len 262144 \
     --max-num-batched-tokens 16384 \

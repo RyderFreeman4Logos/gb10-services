@@ -392,8 +392,8 @@ ln -sfn vllm-aeon-27b-dflash.service ~/.config/systemd/user/vllm-aeon-27b-dflash
 # install -m 0644 profile/qwen3.8-27b-nvfp4-vllm/vllm-aeon-qwen38-dflash.service ~/.config/systemd/user/
 
 # Canonical :18010 Ultimate unit. Helper must already be installed above.
-# Live APC is enabled; tracked source currently disables it. Do not
-# daemon-reload this unit until a separate APC-align commit is reviewed.
+# Source now has --enable-prefix-caching. Keep this install commented; first
+# verify every live setting is retained, then copy/reload in a reviewed window.
 # install -m 0644 profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service ~/.config/systemd/user/
 ```
 

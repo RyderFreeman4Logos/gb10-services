@@ -1,10 +1,10 @@
 # Text-unit last-good inspect retention
 
-Tracked Ultimate source currently has `--no-enable-prefix-caching`. Live APC
-is already enabled. Do not write, overlay, or `daemon-reload` the Ultimate
-unit until a separate reviewed APC-align commit changes source and tests to
-`--enable-prefix-caching`. A later reload would load APC-off; the next
-`Restart=always` generation would start APC-off.
+Tracked Ultimate source now has `--enable-prefix-caching`, matching live APC.
+Do not write, overlay, or `daemon-reload` the Ultimate unit until operators
+first verify every live setting is retained. A later reload that drops any
+live flag would start a new `Restart=always` generation with those settings
+lost. This source alignment is not an automatic install.
 
 ## Helper-only stage (this repair)
 
@@ -28,9 +28,10 @@ README Deployment Steps, which call the installer before any text unit.
 
 ## Unit-hook stage (not this repair)
 
-Do not copy this block until a reviewed APC-align commit is in the tree for
-Ultimate, and until the selected fallback unit is independently authorized.
-Reload is not restart. Do not enable, start, stop, or switch text units here.
+Do not copy this block until every live setting is verified against the
+committed Ultimate source, and until the selected fallback unit is
+independently authorized. Reload is not restart. Do not enable, start, stop,
+or switch text units here.
 
 After helper byte/mode read-back, a selected unit can become effective only
 with this order: unit file mode `0644` from the committed source, byte
@@ -43,7 +44,7 @@ proving retain-before-cleanup. Sources:
 - `profile/qwen3.8-27b-nvfp4-vllm/vllm-aeon-qwen38-dflash.service`
   (only after Ultimate is stopped)
 - `profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service`
-  (blocked while source still has `--no-enable-prefix-caching`)
+  (only after operators first verify every live setting is retained)
 
 `ExecStop=-` / `ExecStopPost=-` mean a retain skip or helper error must not
 block `--cleanup`. Units wrap the helper with
