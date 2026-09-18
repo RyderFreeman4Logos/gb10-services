@@ -97,6 +97,10 @@ class SparkdashProfileTests(unittest.TestCase):
         docs = SPARKDASH_DOCS.read_text()
         self.assertIn("profile/sparkdash/LlmDaily.js", docs)
         self.assertIn("server/collectors/LlmDaily.js", docs)
+        self.assertIn("POST /api/sparks/:id/llm/bench", docs)
+        self.assertIn("POST /api/sparks/:id/llm/prefill-bench", docs)
+        self.assertIn("SPARKDASH_READ_ONLY=1", docs)
+        self.assertIn("https://evil.example", docs)
 
 
 def _node_bin() -> str:
@@ -115,8 +119,9 @@ class SparkdashReadOnlyAuthTests(unittest.TestCase):
 import { pathToFileURL } from "node:url";
 const { createAuthMiddleware } = await import(pathToFileURL(process.env.SPARKDASH_AUTH_JS).href);
 const mw = createAuthMiddleware();
-function call(method, origin) {
-  const req = { method, headers: origin ? { origin } : {}, query: {} };
+function call(method, origin, url = "/") {
+  const path = String(url).split("?")[0];
+  const req = { method, url, path, headers: origin ? { origin } : {}, query: {} };
   let status = 200;
   let body = null;
   let nexted = false;
@@ -127,14 +132,37 @@ function call(method, origin) {
   mw(req, res, () => { nexted = true; });
   return { status, body, nexted };
 }
-const post = call("POST", "https://evil.example");
-const get = call("GET", "https://evil.example");
-if (post.nexted || post.status !== 403) {
-  throw new Error(`POST not blocked: ${JSON.stringify(post)}`);
+function mustBlock(label, got) {
+  if (got.nexted || got.status !== 403 || !got.body?.error?.includes("read-only")) {
+    throw new Error(`${label} not blocked: ${JSON.stringify(got)}`);
+  }
 }
-if (!get.nexted || get.status !== 200) {
-  throw new Error(`GET telemetry blocked: ${JSON.stringify(get)}`);
+function mustAllow(label, got) {
+  if (!got.nexted || got.status !== 200) {
+    throw new Error(`${label} blocked: ${JSON.stringify(got)}`);
+  }
 }
+const bench = "/api/sparks/gb10-promax/llm/bench";
+const prefill = "/api/sparks/gb10-promax/llm/prefill-bench";
+const loopback = "http://127.0.0.1:20080";
+const localhost = "http://localhost:20080";
+mustAllow("GET evil origin", call("GET", "https://evil.example", "/api/health"));
+mustAllow("POST bench loopback", call("POST", loopback, bench));
+mustAllow("POST bench localhost", call("POST", localhost, bench));
+mustAllow("POST bench missing origin", call("POST", "", bench));
+mustAllow("DELETE bench cancel loopback", call("DELETE", loopback, `${bench}/job-1`));
+mustAllow("POST prefill loopback", call("POST", loopback, prefill));
+mustAllow("DELETE prefill cancel loopback", call("DELETE", loopback, `${prefill}/job-2`));
+mustBlock("POST bench evil origin", call("POST", "https://evil.example", bench));
+mustBlock("POST shutdown loopback", call("POST", loopback, "/api/sparks/gb10-promax/shutdown"));
+mustBlock("POST showcase loopback", call("POST", loopback, "/api/sparks/gb10-promax/llm/showcase"));
+mustBlock("POST settings loopback", call("POST", loopback, "/api/settings"));
+mustBlock("POST comfy loopback", call("POST", loopback, "/api/sparks/gb10-promax/comfy/run"));
+mustBlock("POST hermes loopback", call("POST", loopback, "/api/sparks/gb10-promax/hermes/update"));
+mustBlock("POST llm-ports loopback", call("POST", loopback, "/api/sparks/gb10-promax/llm-ports"));
+mustBlock("POST sparks CRUD loopback", call("POST", loopback, "/api/sparks"));
+mustBlock("POST wake loopback", call("POST", loopback, "/api/sparks/gb10-promax/wake"));
+mustBlock("POST password loopback", call("POST", loopback, "/api/password"));
 """
         env = os.environ.copy()
         env["SPARKDASH_READ_ONLY"] = "1"
@@ -418,6 +446,10 @@ exit 0
             auth = (checkout / "server" / "auth.js").read_text()
             self.assertIn("createAuthMiddleware", auth)
             self.assertIn("SPARKDASH_READ_ONLY", auth)
+            self.assertIn("allowedReadOnlyMutation", auth)
+            self.assertIn("prefill-bench", auth)
+            self.assertIn("http://127.0.0.1:20080", auth)
+            self.assertIn("http://localhost:20080", auth)
             self.assertIn("rateLabel", (checkout / "src" / "components" / "SparkPage" / "LlmPanel.tsx").read_text())
             self.assertIn("generationTpsState", (checkout / "src" / "api" / "types.ts").read_text())
             self.assertIn(
@@ -447,7 +479,9 @@ const server = http.createServer((req, response) => {
     json(payload) { response.setHeader("content-type", "application/json"); response.end(JSON.stringify(payload)); },
   };
   middleware(req, res, () => {
-    if (req.method === "POST") writeFileSync(process.env.BENCHMARK_WITNESS, "launched");
+    if (req.method === "POST" && String(req.url || "").startsWith("/api/benchmark")) {
+      writeFileSync(process.env.BENCHMARK_WITNESS, "launched");
+    }
     response.setHeader("content-type", "application/json");
     response.end(JSON.stringify({ ok: true, metadata: "fixture" }));
   });
@@ -458,9 +492,15 @@ server.listen(0, "127.0.0.1", async () => {
   const metadata = await get.json();
   const post = await fetch(`http://127.0.0.1:${port}/api/benchmark`, { method: "POST" });
   const rejected = await post.json();
+  const bench = await fetch(`http://127.0.0.1:${port}/api/sparks/gb10-promax/llm/bench`, {
+    method: "POST",
+    headers: { origin: "http://127.0.0.1:20080" },
+  });
+  const benchBody = await bench.json();
   server.close();
   if (get.status !== 200 || metadata.metadata !== "fixture") throw new Error("metadata failed");
   if (post.status !== 403 || !rejected.error?.includes("read-only")) throw new Error("mutation was not read-only rejected");
+  if (bench.status !== 200 || benchBody.ok !== true) throw new Error("loopback llm bench was blocked");
 });
 """
             )
