@@ -117,20 +117,34 @@ class TestGb10ServiceReadyChatProbe(unittest.TestCase):
                 )
 
     def test_vllm_text_units_retain_inspect_evidence_before_cleanup(self) -> None:
+        helper = "/home/obj/.local/bin/gb10_retain_container_inspect.sh"
         for unit in RETAINED_TEXT_UNITS:
             with self.subTest(unit=unit.name):
                 text = unit.read_text()
                 self.assertNotIn("docker run --rm", text)
-                post = [
-                    line for line in text.splitlines() if line.startswith("ExecStopPost=")
+                self.assertNotIn("docker inspect ", text)
+                stop = [
+                    line
+                    for line in text.splitlines()
+                    if line.startswith("ExecStop=") or line.startswith("ExecStopPost=")
                 ]
-                inspect_at = next(
-                    index for index, line in enumerate(post) if "docker inspect" in line
-                )
-                cleanup_at = next(
-                    index for index, line in enumerate(post) if "--cleanup" in line
-                )
-                self.assertLess(inspect_at, cleanup_at)
+                inspect_at = [
+                    index for index, line in enumerate(stop) if helper in line
+                ]
+                cleanup_at = [
+                    index for index, line in enumerate(stop) if "--cleanup" in line
+                ]
+                self.assertEqual(len(inspect_at), 2)
+                self.assertEqual(len(cleanup_at), 2)
+                self.assertLess(inspect_at[0], cleanup_at[0])
+                self.assertLess(inspect_at[1], cleanup_at[1])
+                for line in stop:
+                    if helper in line:
+                        self.assertTrue(
+                            line.startswith("ExecStop=-")
+                            or line.startswith("ExecStopPost=-"),
+                            line,
+                        )
 
 
 if __name__ == "__main__":
