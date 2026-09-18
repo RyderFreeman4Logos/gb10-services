@@ -138,7 +138,7 @@ cp profile/aeon-ultimate-uncensored-nvfp4/llm-guard-proxy/config.toml /home/obj/
 ### 3. Build llm-guard-proxy
 ```bash
 # Build/update the reviewed main branch with mise's cargo-Git backend.
-mise use -g 'cargo:https://github.com/RyderFreeman4Logos/llm-guard-proxy@branch:main[crate=llm-guard-proxy,features=guard]'
+mise use -g 'cargo:https://github.com/RyderFreeman4Logos/llm-guard-proxy[crate=llm-guard-proxy,features=guard]@branch:main'
 install -Dm755 "$(mise which llm-guard-proxy)" /home/obj/.local/bin/llm-guard-proxy
 ```
 

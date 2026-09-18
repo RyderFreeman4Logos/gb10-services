@@ -316,7 +316,7 @@ Pre-download the required model weights into `~/.cache/huggingface/` or prepare 
 ### 3. Build llm-guard-proxy
 Install/update the proxy on the host through mise's cargo-Git backend:
 ```bash
-mise use -g 'cargo:https://github.com/RyderFreeman4Logos/llm-guard-proxy@branch:main[crate=llm-guard-proxy,features=guard]'
+mise use -g 'cargo:https://github.com/RyderFreeman4Logos/llm-guard-proxy[crate=llm-guard-proxy,features=guard]@branch:main'
 install -Dm755 "$(mise which llm-guard-proxy)" ~/.local/bin/llm-guard-proxy
 ```
 
