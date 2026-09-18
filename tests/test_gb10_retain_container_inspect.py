@@ -493,28 +493,32 @@ class RetainContainerInspectTests(unittest.TestCase):
             self.assertNotIn("daemon-reload", block)
             self.assertNotIn("systemctl", block)
         self.assertIn("unit_hooks_effective=false", text)
-        self.assertIn("--no-enable-prefix-caching", text)
+        self.assertIn("--enable-prefix-caching", text)
+        self.assertNotIn("--no-enable-prefix-caching", text)
         self.assertLess(
-            text.find("--no-enable-prefix-caching"),
+            text.find("first verify every live setting is retained"),
             text.find(ULTIMATE_UNIT_SOURCE),
         )
         self.assertNotIn("Then install the unit that will own", text)
 
     def test_runbook_unit_hook_stage_requires_reload_readback_and_apc_gate(self) -> None:
         text = RUNBOOK.read_text()
-        apc_at = text.find("--no-enable-prefix-caching")
-        self.assertNotEqual(apc_at, -1)
+        live_gate_at = text.find("first verify every live setting is retained")
+        self.assertNotEqual(live_gate_at, -1)
         for name, source in UNIT_SOURCES.items():
             with self.subTest(unit=name):
                 source_at = text.find(source)
                 self.assertNotEqual(source_at, -1, source)
-                self.assertGreater(source_at, apc_at, source)
+                self.assertGreater(source_at, live_gate_at, source)
                 self.assertNotIn(f"install -m 0644 {source}", text)
         self.assertIn("daemon-reload", text)
         self.assertIn("systemctl --user show", text)
         self.assertIn("ExecStop", text)
         self.assertIn("ExecStopPost", text)
-        self.assertIn("Do not copy this block until a reviewed APC-align commit", text)
+        self.assertIn(
+            "Do not copy this block until every live setting is verified",
+            text,
+        )
 
 
 if __name__ == "__main__":

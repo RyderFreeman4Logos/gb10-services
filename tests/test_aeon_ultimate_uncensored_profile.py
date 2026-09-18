@@ -115,9 +115,9 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
         self.assertEqual(_option_value(argv, "--max-model-len"), "262144")
         self.assertEqual(_option_value(argv, "--max-num-batched-tokens"), "16384")
         self.assertIn("--enable-chunked-prefill", argv)
-        self.assertIn("--no-enable-prefix-caching", argv)
+        self.assertIn("--enable-prefix-caching", argv)
         self.assertEqual(_option_value(argv, "--max-num-seqs"), "16")
-        self.assertNotIn("--enable-prefix-caching", argv)
+        self.assertNotIn("--no-enable-prefix-caching", argv)
         self.assertNotIn("--enforce-eager", argv)
         self.assertEqual(
             json.loads(_option_value(argv, "--compilation-config")),
