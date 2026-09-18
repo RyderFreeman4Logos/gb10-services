@@ -350,6 +350,7 @@ install -m 0644 scripts/gb10_bounded_process.py ~/.local/bin/
 cp scripts/llm_guard_proxy_publish_cgroup_registration.sh ~/.local/bin/
 install -m 0644 scripts/gb10_verify_vllm_no_swap_core.py ~/.local/bin/gb10_verify_vllm_no_swap_core.py
 install -m 0755 scripts/gb10_verify_vllm_no_swap.sh ~/.local/bin/gb10_verify_vllm_no_swap.sh
+bash scripts/gb10_install_retain_container_inspect.sh
 install -m 0755 scripts/gb10_lifecycle.sh ~/.local/bin/gb10_lifecycle.sh
 install -m 0755 scripts/gb10_restart_text_safe.sh ~/.local/bin/gb10_restart_text_safe.sh
 cp scripts/sysmon.sh ~/.local/bin/
@@ -385,6 +386,15 @@ install -m 0644 config/aeon-dflash-profiles/baseline.env config/aeon-dflash-prof
 ln -sfn hikv.env ~/.config/gb10/aeon-dflash-profiles/active.env.new
 mv -Tf ~/.config/gb10/aeon-dflash-profiles/active.env.new ~/.config/gb10/aeon-dflash-profiles/active.env
 ln -sfn vllm-aeon-27b-dflash.service ~/.config/systemd/user/vllm-aeon-27b-dflash-hikv.service
+
+# Optional Qwen38 text unit. Helper must already be installed above.
+# Do not enable this together with 27B or Ultimate.
+# install -m 0644 profile/qwen3.8-27b-nvfp4-vllm/vllm-aeon-qwen38-dflash.service ~/.config/systemd/user/
+
+# Canonical :18010 Ultimate unit. Helper must already be installed above.
+# Live APC is enabled; tracked source currently disables it. Do not
+# daemon-reload this unit until a separate APC-align commit is reviewed.
+# install -m 0644 profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service ~/.config/systemd/user/
 ```
 
 ### Step 3: Enable and Start the Stack

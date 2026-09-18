@@ -138,6 +138,13 @@ class TestGb10ServiceReadyChatProbe(unittest.TestCase):
                 self.assertEqual(len(cleanup_at), 2)
                 self.assertLess(inspect_at[0], cleanup_at[0])
                 self.assertLess(inspect_at[1], cleanup_at[1])
+                for line in stop:
+                    if helper in line:
+                        self.assertTrue(
+                            line.startswith("ExecStop=-")
+                            or line.startswith("ExecStopPost=-"),
+                            line,
+                        )
 
 
 if __name__ == "__main__":

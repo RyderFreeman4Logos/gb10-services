@@ -112,12 +112,15 @@ def _logical_argv(unit: str, directive: str) -> list[list[str]]:
     commands: list[list[str]] = []
     pending: list[str] = []
     prefix = f"{directive}="
+    ignore_prefix = f"{directive}=-"
     for raw in unit.splitlines():
         line = raw.strip()
         if not line or line.startswith(("#", ";")):
             continue
         if pending:
             value = line
+        elif line.startswith(ignore_prefix):
+            value = line[len(ignore_prefix) :]
         elif line.startswith(prefix):
             value = line[len(prefix) :]
         else:
