@@ -28,6 +28,9 @@ CENTRAL_UNITS = UNITS[1:]
 ULTIMATE_OVERRIDE_DIGEST = (
     "sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e"
 )
+ULTIMATE_DOCKERFILE = Path(
+    "profile/aeon-ultimate-uncensored-nvfp4/image/Dockerfile.aeon-v029-modelopt-54367"
+)
 ALIASES = {
     Path("profile/abliterated-qwen-latest-27b"): Path("aeon-ultimate-uncensored-nvfp4"),
     Path("profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash-hikv.service"): Path(
@@ -43,6 +46,7 @@ DERIVED = UNITS + (
     Path("scripts/gb10_embedding_activation_storage.py"),
     Path("scripts/gb10_embedding_profile_contract.py"),
     Path("scripts/gb10_prepare_aeon_ultimate_image.py"),
+    ULTIMATE_DOCKERFILE,
     Path("scripts/gb10_verify_vllm_no_swap_core.py"),
     Path("scripts/gb10_verify_vllm_no_swap.sh"),
     Path("scripts/querit_replay_trust.py"),
@@ -104,6 +108,12 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
                 "repository_digest": "sha256:" + "a" * 64,
                 "arm64_digest": "sha256:" + "b" * 64,
                 "runtime_version": "v0.30.1-omni",
+                "ultimate_base_repository_digest": old.get(
+                    "ultimate_base_repository_digest", old["repository_digest"]
+                ),
+                "ultimate_base_arm64_digest": old.get(
+                    "ultimate_base_arm64_digest", old["arm64_digest"]
+                ),
                 "overrides": {
                     "vllm-aeon-ultimate-uncensored-nvfp4.service": new_override
                 },
@@ -217,13 +227,79 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
             self.assertIn(old["tag"], markers)
             self.assertIn(old["repository_digest"].removeprefix("sha256:"), markers)
 
-    def test_check_preserves_explicit_ultimate_override_and_central_2421_peers(self) -> None:
+    def test_release_schema_keeps_ultimate_base_fields_optional(self) -> None:
         release = json.loads((ROOT / CONFIG).read_text())
         self.assertEqual(
-            release["overrides"]["vllm-aeon-ultimate-uncensored-nvfp4.service"],
-            ULTIMATE_OVERRIDE_DIGEST,
+            set(release),
+            {
+                "repository",
+                "tag",
+                "repository_digest",
+                "arm64_digest",
+                "runtime_version",
+                "overrides",
+            },
         )
+        dockerfile = (ROOT / ULTIMATE_DOCKERFILE).read_text()
+        self.assertIn(
+            f"FROM {release['repository']}@{release['repository_digest']}",
+            dockerfile,
+        )
+        self.assertIn(f'aeon.base="{release["repository_digest"]}"', dockerfile)
+
+    def test_check_accepts_config_missing_named_ultimate_base_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            target = Path(raw_tmp)
+            _copy_fixture(target)
+            release = json.loads((target / CONFIG).read_text())
+            release.pop("ultimate_base_repository_digest", None)
+            release.pop("ultimate_base_arm64_digest", None)
+            (target / CONFIG).write_text(json.dumps(release, indent=2) + "\n")
+            result = _run_updater(target, check=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            dockerfile = (target / ULTIMATE_DOCKERFILE).read_text()
+            self.assertIn(release["repository_digest"], dockerfile)
+
+    def test_partial_ultimate_base_fields_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            target = Path(raw_tmp)
+            _copy_fixture(target)
+            release = json.loads((target / CONFIG).read_text())
+            release["ultimate_base_repository_digest"] = "sha256:" + "a" * 64
+            (target / CONFIG).write_text(json.dumps(release, indent=2) + "\n")
+            result = _run_updater(target, check=True)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("must be set together", result.stderr)
+
+    def test_check_rejects_dockerfile_from_that_does_not_match_ultimate_base(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            target = Path(raw_tmp)
+            _copy_fixture(target)
+            release = json.loads((target / CONFIG).read_text())
+            release["overrides"][ULTIMATE_UNIT.name] = "sha256:" + "c" * 64
+            release["ultimate_base_repository_digest"] = release["repository_digest"]
+            release["ultimate_base_arm64_digest"] = release["arm64_digest"]
+            (target / CONFIG).write_text(json.dumps(release, indent=2) + "\n")
+            dockerfile = target / ULTIMATE_DOCKERFILE
+            dockerfile.write_text(
+                dockerfile.read_text().replace(
+                    release["ultimate_base_repository_digest"],
+                    "sha256:" + "e" * 64,
+                )
+            )
+            result = _run_updater(target, check=True)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            combined = result.stdout + result.stderr
+            self.assertTrue(
+                "declared base" in combined or ULTIMATE_DOCKERFILE.name in combined,
+                combined,
+            )
+
+    def test_check_preserves_explicit_ultimate_override_and_central_2421_peers(self) -> None:
+        release = json.loads((ROOT / CONFIG).read_text())
+        override = release["overrides"]["vllm-aeon-ultimate-uncensored-nvfp4.service"]
         self.assertTrue(release["repository_digest"].startswith("sha256:2421bb12"))
+        self.assertNotIn("ultimate_base_repository_digest", release)
         check = subprocess.run(
             ["python3", str(ROOT / UPDATER), "--check"],
             cwd=ROOT,
@@ -232,17 +308,20 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(check.returncode, 0, check.stderr)
+        self.assertEqual(override, ULTIMATE_OVERRIDE_DIGEST)
         ultimate = (ROOT / ULTIMATE_UNIT).read_text()
-        self.assertIn(ULTIMATE_OVERRIDE_DIGEST, ultimate)
+        self.assertIn(override, ultimate)
         self.assertNotIn(release["repository_digest"], ultimate)
         embedding = (ROOT / UNITS[2]).read_text()
         querit = (ROOT / UNITS[1]).read_text()
         self.assertIn(release["repository_digest"], embedding)
         self.assertIn(release["repository_digest"], querit)
-        self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, embedding)
-        self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, querit)
+        self.assertNotIn(override, embedding)
+        self.assertNotIn(override, querit)
 
-    def test_future_generation_rejects_stale_ultimate_override_when_central_digest_moves(self) -> None:
+    def test_future_generation_rejects_stale_ultimate_override_when_central_digest_moves(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             target = Path(raw_tmp)
             _copy_fixture(target)
@@ -264,6 +343,56 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
             embedding = (target / UNITS[2]).read_text()
             self.assertIn(old["repository_digest"], embedding)
             self.assertNotIn(new["repository_digest"], embedding)
+
+    def test_fleet_digest_can_move_while_ultimate_keeps_its_own_declared_base(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            target = Path(raw_tmp)
+            _copy_fixture(target)
+            old = json.loads((target / CONFIG).read_text())
+            new_override = "sha256:" + "c" * 64
+            new = {
+                **old,
+                "tag": "2026-10-01-v0.30.1-omni",
+                "repository_digest": "sha256:" + "a" * 64,
+                "arm64_digest": "sha256:" + "b" * 64,
+                "runtime_version": "v0.30.1-omni",
+                "ultimate_base_repository_digest": old["repository_digest"],
+                "ultimate_base_arm64_digest": old["arm64_digest"],
+                "overrides": {
+                    "vllm-aeon-ultimate-uncensored-nvfp4.service": new_override
+                },
+            }
+            (target / CONFIG).write_text(json.dumps(new, indent=2) + "\n")
+            result = _run_updater(target)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            embedding = (target / UNITS[2]).read_text()
+            self.assertIn(new["repository_digest"], embedding)
+            self.assertNotIn(old["repository_digest"], embedding)
+            ultimate = (target / ULTIMATE_UNIT).read_text()
+            self.assertIn(new_override, ultimate)
+            self.assertNotIn(new["repository_digest"], ultimate)
+            dockerfile = (target / ULTIMATE_DOCKERFILE).read_text()
+            self.assertIn(new["ultimate_base_repository_digest"], dockerfile)
+            self.assertNotIn(new["repository_digest"], dockerfile)
+
+    def test_check_rejects_configured_base_without_matching_derived_iid(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            target = Path(raw_tmp)
+            _copy_fixture(target)
+            old = json.loads((target / CONFIG).read_text())
+            new = {
+                **old,
+                "ultimate_base_repository_digest": "sha256:" + "a" * 64,
+                "ultimate_base_arm64_digest": "sha256:" + "b" * 64,
+            }
+            (target / CONFIG).write_text(json.dumps(new, indent=2) + "\n")
+            result = _run_updater(target, check=True)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("still bound", result.stderr)
+            ultimate = (target / ULTIMATE_UNIT).read_text()
+            self.assertIn(ULTIMATE_OVERRIDE_DIGEST, ultimate)
+            embedding = (target / UNITS[2]).read_text()
+            self.assertIn(old["repository_digest"], embedding)
 
     def test_current_cache_guidance_matches_release_namespace(self) -> None:
         release = json.loads((ROOT / CONFIG).read_text())
