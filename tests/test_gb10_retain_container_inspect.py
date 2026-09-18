@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -67,15 +69,18 @@ INSTALLER = ROOT / "scripts" / "gb10_install_retain_container_inspect.sh"
 INSTALL_COMMAND = "bash scripts/gb10_install_retain_container_inspect.sh"
 HELPER_DEST = "/home/obj/.local/bin/gb10_retain_container_inspect.sh"
 CONTAINER = "vllm-aeon-ultimate-uncensored-nvfp4"
-DEPLOY_GUIDES = (
-    ROOT / "README.md",
-    ROOT / "docs" / "deployment" / "text-inspect-retention.md",
+RETAIN_DEADLINE_SEC = 10
+RETAIN_KILL_AFTER_SEC = 2
+MAX_INSPECT_BYTES = 262144
+RUNBOOK = ROOT / "docs" / "deployment" / "text-inspect-retention.md"
+README = ROOT / "README.md"
+NESTED_AGENTS = ROOT / "docs" / "deployment" / "AGENTS.md"
+ULTIMATE_UNIT_SOURCE = (
+    "profile/aeon-ultimate-uncensored-nvfp4/"
+    "vllm-aeon-ultimate-uncensored-nvfp4.service"
 )
 UNIT_SOURCES = {
-    "vllm-aeon-ultimate-uncensored-nvfp4.service": (
-        "profile/aeon-ultimate-uncensored-nvfp4/"
-        "vllm-aeon-ultimate-uncensored-nvfp4.service"
-    ),
+    "vllm-aeon-ultimate-uncensored-nvfp4.service": ULTIMATE_UNIT_SOURCE,
     "vllm-aeon-27b-dflash.service": (
         "profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service"
     ),
@@ -83,6 +88,7 @@ UNIT_SOURCES = {
         "profile/qwen3.8-27b-nvfp4-vllm/vllm-aeon-qwen38-dflash.service"
     ),
 }
+FENCED_BASH = re.compile(r"```(?:bash)?\n(.*?)```", re.S)
 
 
 def _exited_payload(**overrides: object) -> str:
@@ -99,6 +105,23 @@ def _exited_payload(**overrides: object) -> str:
     }
     body.update(overrides)
     return json.dumps([body])
+
+
+def _padded_exited_payload(size: int) -> str:
+    body = json.loads(_exited_payload())[0]
+    body["Config"] = {"Labels": {"pad": ""}}
+    pad = size - len(json.dumps([body]))
+    if pad < 0:
+        raise ValueError(f"payload already larger than {size}")
+    body["Config"]["Labels"]["pad"] = "x" * pad
+    raw = json.dumps([body])
+    if len(raw) != size:
+        raise AssertionError(f"padded payload is {len(raw)} bytes, not {size}")
+    return raw
+
+
+def _fenced_bash(text: str) -> list[str]:
+    return FENCED_BASH.findall(text)
 
 
 def _run(
@@ -235,6 +258,11 @@ class RetainContainerInspectTests(unittest.TestCase):
                     self.assertIn(f"--container {container}", line)
                     self.assertIn(f"--cidfile {cidfile}", line)
                     self.assertIn(f"--output {output}", line)
+                    self.assertIn(
+                        f"/usr/bin/timeout --signal=TERM --kill-after={RETAIN_KILL_AFTER_SEC} {RETAIN_DEADLINE_SEC} ",
+                        line,
+                    )
+                    self.assertLess(RETAIN_DEADLINE_SEC + RETAIN_KILL_AFTER_SEC, 60)
                 retain_at = [index for index, line in enumerate(stop) if helper in line]
                 cleanup_at = [index for index, line in enumerate(stop) if "--cleanup" in line]
                 self.assertLess(retain_at[0], cleanup_at[0])
@@ -283,7 +311,7 @@ class RetainContainerInspectTests(unittest.TestCase):
         docker.write_text("#!/bin/sh\nexec /bin/sleep 30\n")
         docker.chmod(docker.stat().st_mode | stat.S_IXUSR)
         try:
-            result = _run(self.env, self.cidfile, self.output, timeout=12)
+            result = _run(self.env, self.cidfile, self.output, timeout=14)
         except subprocess.TimeoutExpired:
             self.fail("inspect hung past the helper deadline")
         _assert_kept_last_good(self, result, self.output)
@@ -297,25 +325,157 @@ class RetainContainerInspectTests(unittest.TestCase):
         result = _run(self.env, self.cidfile, self.output)
         _assert_kept_last_good(self, result, self.output)
 
+    def test_nul_cidfile_does_not_overwrite_last_good_inspect(self) -> None:
+        self.cidfile.write_bytes(f"{CID}\0\n".encode())
+        _fake_docker(self.bin_dir, _exited_payload() + "\n", 0)
+        result = _run(self.env, self.cidfile, self.output)
+        _assert_kept_last_good(self, result, self.output)
+
+    def test_cidfile_without_newline_does_not_overwrite_last_good_inspect(self) -> None:
+        self.cidfile.write_bytes(CID.encode())
+        _fake_docker(self.bin_dir, _exited_payload() + "\n", 0)
+        result = _run(self.env, self.cidfile, self.output)
+        _assert_kept_last_good(self, result, self.output)
+
+    def test_cidfile_extra_byte_and_second_line_do_not_overwrite_last_good_inspect(
+        self,
+    ) -> None:
+        cases = (f"{CID}x\n".encode(), f"{CID}\nextra\n".encode(), (b"a" * 4096))
+        for raw in cases:
+            with self.subTest(raw=raw[:16]):
+                self.cidfile.write_bytes(raw)
+                _fake_docker(self.bin_dir, _exited_payload() + "\n", 0)
+                result = _run(self.env, self.cidfile, self.output)
+                _assert_kept_last_good(self, result, self.output)
+
+    def test_cidfile_fifo_does_not_hang_or_overwrite_last_good_inspect(self) -> None:
+        self.cidfile.unlink()
+        os.mkfifo(self.cidfile, 0o600)
+        _fake_docker(self.bin_dir, _exited_payload() + "\n", 0)
+        started = time.monotonic()
+        result = _run(self.env, self.cidfile, self.output, timeout=14)
+        elapsed = time.monotonic() - started
+        _assert_kept_last_good(self, result, self.output)
+        self.assertLess(elapsed, RETAIN_DEADLINE_SEC + RETAIN_KILL_AFTER_SEC + 2)
+
+    def test_created_and_dead_status_do_not_overwrite_last_good_inspect(self) -> None:
+        for status in ("created", "dead", "restarting"):
+            with self.subTest(status=status):
+                payload = json.loads(_exited_payload())
+                payload[0]["State"]["Status"] = status
+                payload[0]["State"]["Running"] = False
+                _fake_docker(self.bin_dir, json.dumps(payload) + "\n", 0)
+                result = _run(self.env, self.cidfile, self.output)
+                _assert_kept_last_good(self, result, self.output)
+
+    def test_non_string_status_does_not_overwrite_last_good_inspect(self) -> None:
+        payload = json.loads(_exited_payload())
+        payload[0]["State"]["Status"] = None
+        _fake_docker(self.bin_dir, json.dumps(payload) + "\n", 0)
+        result = _run(self.env, self.cidfile, self.output)
+        _assert_kept_last_good(self, result, self.output)
+
+    def test_inspect_json_at_cap_is_published(self) -> None:
+        raw = _padded_exited_payload(MAX_INSPECT_BYTES)
+        _fake_docker(self.bin_dir, raw, 0)
+        result = _run(self.env, self.cidfile, self.output, timeout=14)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.output.read_text(), raw)
+        self.assertIn("retained", result.stdout.lower())
+
+    def test_inspect_json_over_cap_keeps_last_good_within_deadline(self) -> None:
+        raw = _padded_exited_payload(MAX_INSPECT_BYTES + 1)
+        _fake_docker(self.bin_dir, raw, 0)
+        started = time.monotonic()
+        result = _run(self.env, self.cidfile, self.output, timeout=14)
+        elapsed = time.monotonic() - started
+        _assert_kept_last_good(self, result, self.output)
+        self.assertLess(elapsed, RETAIN_DEADLINE_SEC + RETAIN_KILL_AFTER_SEC + 2)
+
+    def test_endless_inspect_producer_keeps_last_good_within_deadline(self) -> None:
+        docker = self.bin_dir / "docker"
+        docker.write_text("#!/bin/sh\nwhile true; do printf 'x'; done\n")
+        docker.chmod(docker.stat().st_mode | stat.S_IXUSR)
+        started = time.monotonic()
+        result = _run(self.env, self.cidfile, self.output, timeout=14)
+        elapsed = time.monotonic() - started
+        _assert_kept_last_good(self, result, self.output)
+        leftover = list(self.identity.glob(f"{self.output.name}.tmp.*"))
+        self.assertEqual(leftover, [])
+        self.assertLess(elapsed, RETAIN_DEADLINE_SEC + RETAIN_KILL_AFTER_SEC + 2)
+
+    def test_post_inspect_fifo_keeps_last_good_within_deadline(self) -> None:
+        docker = self.bin_dir / "docker"
+        pattern = str(self.identity / f"{self.output.name}.tmp.*")
+        docker.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s' {json.dumps(_exited_payload())}\n"
+            f"for f in {pattern}; do\n"
+            "  [ -e \"$f\" ] || continue\n"
+            "  /bin/rm -f -- \"$f\"\n"
+            "  /usr/bin/mkfifo -- \"$f\"\n"
+            "done\n"
+            "exit 0\n"
+        )
+        docker.chmod(docker.stat().st_mode | stat.S_IXUSR)
+        started = time.monotonic()
+        result = _run(self.env, self.cidfile, self.output, timeout=14)
+        elapsed = time.monotonic() - started
+        _assert_kept_last_good(self, result, self.output)
+        leftover = list(self.identity.glob(f"{self.output.name}.tmp.*"))
+        self.assertEqual(leftover, [])
+        self.assertLess(elapsed, RETAIN_DEADLINE_SEC + RETAIN_KILL_AFTER_SEC + 2)
+
     def test_deploy_guides_install_helper_before_every_text_unit(self) -> None:
         self.assertTrue(INSTALLER.is_file())
         installer = INSTALLER.read_text()
         self.assertIn("install -m 0755", installer)
         self.assertIn("scripts/gb10_retain_container_inspect.sh", installer)
         self.assertIn(HELPER_DEST, installer)
-        agents = (ROOT / "docs" / "deployment" / "AGENTS.md").read_text()
+        agents = NESTED_AGENTS.read_text()
         self.assertNotIn("gb10_retain_container_inspect.sh", agents)
-        for guide in DEPLOY_GUIDES:
-            with self.subTest(guide=guide.name):
-                text = guide.read_text()
-                helper_at = text.find(INSTALL_COMMAND)
-                self.assertNotEqual(helper_at, -1, guide)
-                for source in UNIT_SOURCES.values():
-                    unit_at = text.find(f"install -m 0644 {source}")
-                    if unit_at == -1:
-                        unit_at = text.find(source)
-                    self.assertNotEqual(unit_at, -1, f"{guide} missing {source}")
-                    self.assertLess(helper_at, unit_at, source)
+        readme = README.read_text()
+        self.assertIn(INSTALL_COMMAND, readme)
+        for source in UNIT_SOURCES.values():
+            self.assertIn(source, readme, f"README missing {source}")
+        helper_at = readme.find(INSTALL_COMMAND)
+        for source in UNIT_SOURCES.values():
+            self.assertLess(helper_at, readme.find(source), source)
+
+    def test_runbook_helper_only_stage_has_no_executable_unit_write(self) -> None:
+        text = RUNBOOK.read_text()
+        blocks = _fenced_bash(text)
+        self.assertGreaterEqual(len(blocks), 1)
+        helper_blocks = [block for block in blocks if INSTALL_COMMAND in block]
+        self.assertEqual(len(helper_blocks), 1)
+        self.assertEqual(helper_blocks[0].strip(), INSTALL_COMMAND)
+        for block in blocks:
+            self.assertNotIn("install -m 0644", block)
+            self.assertNotIn("daemon-reload", block)
+            self.assertNotIn("systemctl", block)
+        self.assertIn("unit_hooks_effective=false", text)
+        self.assertIn("--no-enable-prefix-caching", text)
+        self.assertLess(
+            text.find("--no-enable-prefix-caching"),
+            text.find(ULTIMATE_UNIT_SOURCE),
+        )
+        self.assertNotIn("Then install the unit that will own", text)
+
+    def test_runbook_unit_hook_stage_requires_reload_readback_and_apc_gate(self) -> None:
+        text = RUNBOOK.read_text()
+        apc_at = text.find("--no-enable-prefix-caching")
+        self.assertNotEqual(apc_at, -1)
+        for name, source in UNIT_SOURCES.items():
+            with self.subTest(unit=name):
+                source_at = text.find(source)
+                self.assertNotEqual(source_at, -1, source)
+                self.assertGreater(source_at, apc_at, source)
+                self.assertNotIn(f"install -m 0644 {source}", text)
+        self.assertIn("daemon-reload", text)
+        self.assertIn("systemctl --user show", text)
+        self.assertIn("ExecStop", text)
+        self.assertIn("ExecStopPost", text)
+        self.assertIn("Do not copy this block until a reviewed APC-align commit", text)
 
 
 if __name__ == "__main__":

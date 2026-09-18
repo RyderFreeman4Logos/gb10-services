@@ -1,49 +1,56 @@
 # Text-unit last-good inspect retention
 
-Install the helper **before** any text unit that calls it on stop. The units
-use the fixed path `/home/obj/.local/bin/gb10_retain_container_inspect.sh`.
-A missing helper makes the first `ExecStop` fail; the `-` prefix still lets
-generation-safe cleanup run, but the inspect file is not updated.
+Tracked Ultimate source currently has `--no-enable-prefix-caching`. Live APC
+is already enabled. Do not write, overlay, or `daemon-reload` the Ultimate
+unit until a separate reviewed APC-align commit changes source and tests to
+`--enable-prefix-caching`. A later reload would load APC-off; the next
+`Restart=always` generation would start APC-off.
+
+## Helper-only stage (this repair)
+
+This is the only executable install path in this runbook.
+
+`unit_hooks_effective=false`. Helper install does not write a unit, does not
+reload or restart, and does not change the current PID or container
+generation. Stop hooks stay at the already-loaded definition.
 
 ```bash
 bash scripts/gb10_install_retain_container_inspect.sh
 ```
 
-Then install the unit that will own `:18010`. Do not enable more than one of
-these text units at once.
+The installer publishes `/home/obj/.local/bin/gb10_retain_container_inspect.sh`
+mode `0755`. Read back owner, mode, and bytes against
+`scripts/gb10_retain_container_inspect.sh` before claiming helper staging.
 
-```bash
-install -m 0644 profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service \
-  /home/obj/.config/systemd/user/
-```
+`docs/deployment/AGENTS.md` script provisioning does not install this helper
+and is not a complete rebuild of text retain hooks. Use this runbook or
+README Deployment Steps, which call the installer before any text unit.
 
-27B DFlash fallback (only after Ultimate is stopped):
+## Unit-hook stage (not this repair)
 
-```bash
-bash scripts/gb10_install_retain_container_inspect.sh
-install -m 0644 profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service \
-  /home/obj/.config/systemd/user/
-```
+Do not copy this block until a reviewed APC-align commit is in the tree for
+Ultimate, and until the selected fallback unit is independently authorized.
+Reload is not restart. Do not enable, start, stop, or switch text units here.
 
-Qwen38 / SuperQwen3.8 fallback (only after Ultimate is stopped):
+After helper byte/mode read-back, a selected unit can become effective only
+with this order: unit file mode `0644` from the committed source, byte
+identity of that leaf, `systemctl --user daemon-reload`, then
+`systemctl --user show` of the loaded `ExecStop` / `ExecStopPost` argv
+proving retain-before-cleanup. Sources:
 
-```bash
-bash scripts/gb10_install_retain_container_inspect.sh
-install -m 0644 profile/qwen3.8-27b-nvfp4-vllm/vllm-aeon-qwen38-dflash.service \
-  /home/obj/.config/systemd/user/
-```
+- `profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service`
+  (only after Ultimate is stopped)
+- `profile/qwen3.8-27b-nvfp4-vllm/vllm-aeon-qwen38-dflash.service`
+  (only after Ultimate is stopped)
+- `profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service`
+  (blocked while source still has `--no-enable-prefix-caching`)
 
 `ExecStop=-` / `ExecStopPost=-` mean a retain skip or helper error must not
-block `--cleanup`. The helper itself bounds `docker inspect` to 8 seconds,
-keeps the previous JSON on timeout/failure, and replaces the output leaf only
-when it is absent or an owner-owned regular file. That replace is a same-
-directory `mv -Tf`; it is not a crash-durable fsync transaction.
-
-## Live APC is a separate deploy gate
-
-Tracked Ultimate source currently has `--no-enable-prefix-caching`. Live APC
-is already enabled. Installing the helper alone does not change the running
-generation. Installing the Ultimate unit and `daemon-reload` updates the next
-stop/start definition; the next natural `Restart=always` would start APC-off.
-Do not treat whole-unit install as this inspect fix. Align source APC in a
-separate reviewed commit before an authorized unit+reload.
+block `--cleanup`. Units wrap the helper with
+`/usr/bin/timeout --signal=TERM --kill-after=2 10`, well under
+`TimeoutStopSec=60`, so a blocked cid/JSON/FIFO path cannot consume the
+stop budget. The helper also self-wraps that same deadline, rejects cid
+bytes other than 64 lowercase hex plus newline, caps inspect JSON at
+262144 bytes, and requires `State.Status` to be the string `exited`.
+Publish is a same-directory `mv -Tf`; it is not a crash-durable fsync
+transaction.
