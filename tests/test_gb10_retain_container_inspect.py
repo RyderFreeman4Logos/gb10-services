@@ -317,6 +317,45 @@ class RetainContainerInspectTests(unittest.TestCase):
         _assert_kept_last_good(self, result, self.output)
         self.assertIn("skip", result.stderr.lower())
 
+    def test_outer_publication_stall_maps_term_timeout_to_skip(self) -> None:
+        _fake_docker(self.bin_dir, _exited_payload() + "\n", 0)
+        mv = self.bin_dir / "mv"
+        mv.write_text("#!/bin/sh\nexec /bin/sleep 30\n")
+        mv.chmod(mv.stat().st_mode | stat.S_IXUSR)
+        started = time.monotonic()
+        try:
+            result = _run(self.env, self.cidfile, self.output, timeout=16)
+        except subprocess.TimeoutExpired:
+            self.fail("outer retain deadline did not terminate")
+        elapsed = time.monotonic() - started
+        _assert_kept_last_good(self, result, self.output)
+        self.assertIn("timed out", result.stderr.lower())
+        self.assertGreaterEqual(elapsed, RETAIN_DEADLINE_SEC - 1)
+        self.assertLess(elapsed, RETAIN_DEADLINE_SEC + RETAIN_KILL_AFTER_SEC + 2)
+
+    def test_outer_timeout_kill_escalation_maps_to_skip(self) -> None:
+        _fake_docker(self.bin_dir, _exited_payload() + "\n", 0)
+        mv = self.bin_dir / "mv"
+        mv.write_text("#!/bin/sh\ntrap '' TERM\nexec /bin/sleep 30\n")
+        mv.chmod(mv.stat().st_mode | stat.S_IXUSR)
+        bash_env = Path(self.temporary.name) / "ignore-term.bash"
+        bash_env.write_text("trap '' TERM\n")
+        self.env["BASH_ENV"] = str(bash_env)
+        started = time.monotonic()
+        try:
+            result = _run(self.env, self.cidfile, self.output, timeout=18)
+        except subprocess.TimeoutExpired:
+            self.fail("outer retain kill-after did not terminate")
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.output.read_text(), LAST_GOOD + "\n")
+        self.assertNotIn("retained", result.stdout.lower())
+        self.assertIn("timed out", result.stderr.lower())
+        leftover = list(self.identity.glob(f"{self.output.name}.tmp.*"))
+        self.assertEqual(len(leftover), 1)
+        self.assertGreaterEqual(elapsed, RETAIN_DEADLINE_SEC + RETAIN_KILL_AFTER_SEC - 1)
+        self.assertLess(elapsed, RETAIN_DEADLINE_SEC + RETAIN_KILL_AFTER_SEC + 3)
+
     def test_chmod_failure_keeps_last_good_and_exits_zero(self) -> None:
         chmod = self.bin_dir / "chmod"
         chmod.write_text("#!/bin/sh\nexit 1\n")

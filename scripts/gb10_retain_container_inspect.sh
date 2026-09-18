@@ -10,14 +10,17 @@ MAX_INSPECT_BYTES=262144
 
 if [[ "${GB10_RETAIN_UNDER_TIMEOUT:-}" != "1" ]]; then
   export GB10_RETAIN_UNDER_TIMEOUT=1
-  /usr/bin/timeout --signal=TERM --kill-after="$RETAIN_KILL_AFTER_SEC" \
-    "$RETAIN_DEADLINE_SEC" /usr/bin/bash --noprofile --norc "$0" "$@"
-  rc=$?
-  if [[ $rc -eq 124 || $rc -eq 137 ]]; then
-    echo "gb10_retain_container_inspect: skip: retain timed out; keeping last inspect" >&2
+  if /usr/bin/timeout --signal=TERM --kill-after="$RETAIN_KILL_AFTER_SEC" \
+    "$RETAIN_DEADLINE_SEC" /usr/bin/bash --noprofile --norc "$0" "$@"; then
     exit 0
+  else
+    rc=$?
+    if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+      echo "gb10_retain_container_inspect: skip: retain timed out; keeping last inspect" >&2
+      exit 0
+    fi
+    exit "$rc"
   fi
-  exit "$rc"
 fi
 
 usage() {
