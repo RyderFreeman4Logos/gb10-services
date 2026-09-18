@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import os
 import py_compile
 import subprocess
@@ -40,6 +41,16 @@ class AeonUltimateDerivedImageProvenanceTests(unittest.TestCase):
             with self.subTest(path=path.relative_to(ROOT)):
                 self.assertTrue(path.is_file(), f"missing {path}")
                 self.assertEqual(_sha256(path), digest)
+
+    def test_absent_ultimate_base_fields_fall_back_to_fleet_pin(self) -> None:
+        release = json.loads((ROOT / "config/aeon-vllm-release.json").read_text())
+        text = DOCKERFILE.read_text()
+        self.assertNotIn("ultimate_base_repository_digest", release)
+        self.assertNotIn("ultimate_base_arm64_digest", release)
+        self.assertEqual(release["repository_digest"], BASE)
+        self.assertEqual(release["overrides"]["vllm-aeon-ultimate-uncensored-nvfp4.service"], EXPECTED_IMAGE)
+        self.assertIn(f"FROM ghcr.io/aeon-7/aeon-vllm-ultimate@{BASE}", text)
+        self.assertIn(f'aeon.base="{BASE}"', text)
 
     def test_dockerfile_derives_from_central_2421_base_and_names_the_patch(self) -> None:
         text = DOCKERFILE.read_text()
@@ -248,6 +259,39 @@ class AeonUltimateDerivedImageProvenanceTests(unittest.TestCase):
             self.assertNotIn("BUILDX_CONFIG", env or {})
             self.assertNotIn("DOCKER_BUILDKIT", env or {})
             self.assertNotEqual((env or {}).get("DOCKER_HOST"), hostile["DOCKER_HOST"])
+
+    def test_discover_records_iidfile_without_comparing_to_configured_override(self) -> None:
+        helper = ROOT / "scripts" / "gb10_prepare_aeon_ultimate_image.py"
+        spec = importlib.util.spec_from_file_location(
+            "gb10_prepare_aeon_ultimate_image_discover", helper
+        )
+        if spec is None or spec.loader is None:
+            self.fail("could not load Ultimate image admission helper")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        discovered = "sha256:" + "d" * 64
+
+        def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            args = list(argv)
+            if len(args) >= 2 and args[0] == "/usr/bin/docker" and args[1] == "build":
+                Path(args[args.index("--iidfile") + 1]).write_text(discovered + "\n")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            iidfile = Path(raw_tmp) / "discover.iid"
+            argv = [
+                "gb10_prepare_aeon_ultimate_image.py",
+                "--root",
+                str(ROOT),
+                "--iidfile",
+                str(iidfile),
+                "--build",
+                "--discover",
+            ]
+            with mock.patch.object(sys, "argv", argv):
+                with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                    self.assertEqual(module.main(), 0)
+            self.assertEqual(iidfile.read_text().strip(), discovered)
 
 
 if __name__ == "__main__":

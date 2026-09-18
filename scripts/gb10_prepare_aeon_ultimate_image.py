@@ -25,10 +25,10 @@ DOCKERFILE = IMAGE_DIR / "Dockerfile.aeon-v029-modelopt-54367"
 CONFIG = Path("config/aeon-vllm-release.json")
 
 
-def configured_override(root: Path) -> str:
+def configured_override(root: Path, *, require_expected: bool = True) -> str:
     release = json.loads((root / CONFIG).read_text())
     digest = release["overrides"][UNIT_NAME]
-    if digest != EXPECTED_IMAGE_ID:
+    if require_expected and digest != EXPECTED_IMAGE_ID:
         raise ValueError(
             f"configured Ultimate override {digest} is not {EXPECTED_IMAGE_ID}"
         )
@@ -83,11 +83,21 @@ def main() -> int:
     parser.add_argument("--load", type=Path)
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--compare-only", action="store_true")
+    parser.add_argument(
+        "--discover",
+        action="store_true",
+        help="record iidfile from --build without comparing to the configured override",
+    )
     args = parser.parse_args()
     root = args.root.resolve()
     try:
-        expected = configured_override(root)
+        expected = configured_override(root, require_expected=not args.discover)
         iidfile = args.iidfile if args.iidfile.is_absolute() else root / args.iidfile
+        if args.discover:
+            if not args.build:
+                raise ValueError("--discover requires --build")
+            if args.compare_only or args.load is not None:
+                raise ValueError("--discover cannot combine with --load or --compare-only")
         if args.compare_only:
             if args.load is not None or args.build:
                 raise ValueError("compare-only cannot combine with --load or --build")
@@ -134,7 +144,10 @@ def main() -> int:
                     f"{IMAGE_DIR}"
                 )
             iidfile.write_text(normalize_iid(inspect.stdout) + "\n")
-        observed = compare_iidfile(iidfile, expected)
+        if args.discover:
+            observed = normalize_iid(iidfile.read_text())
+        else:
+            observed = compare_iidfile(iidfile, expected)
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         print(f"gb10_prepare_aeon_ultimate_image: {error}", file=sys.stderr)
         return 1

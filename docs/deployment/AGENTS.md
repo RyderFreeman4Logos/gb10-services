@@ -168,10 +168,15 @@ python3 scripts/gb10_prepare_aeon_ultimate_image.py --build --iidfile /tmp/aeon-
 The helper uses `profile/aeon-ultimate-uncensored-nvfp4/image` as the
 build context, `--network=none --pull=false`, writes `--iidfile`, and
 fail-closed compares that ID to the configured override. Rebuild image IDs
-are not assumed deterministic: if the iidfile does not match
-`sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e`,
-`docker load` a previously verified artifact (`--load`) instead of starting
-the unit.
+are not assumed deterministic: if the iidfile does not match the configured
+override, `docker load` a previously verified artifact (`--load`) instead of
+starting the unit. A non-activating identity discovery build may pass
+`--build --discover` to record a new iidfile without comparing it to the
+current override; that does not admit or start the unit. Optional
+`ultimate_base_repository_digest` / `ultimate_base_arm64_digest` in
+`config/aeon-vllm-release.json` name an Ultimate-only Dockerfile base; when
+absent, the generator falls back to the fleet pin. A declared base that does
+not match the live derived image ID is rejected.
 
 ### 5. Systemd User Services Installation
 ```bash

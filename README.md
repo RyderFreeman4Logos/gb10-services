@@ -105,6 +105,9 @@ runtime version: v0.29.0-omni
 The official package tag above resolves to the immutable OCI index digest shown
 above and selects the Linux ARM64 manifest
 `sha256:1cc0e0921ebf535db40f42e9d0cdf5ac0f94e5e01ac359216b8a51b79811a336`.
+Optional `ultimate_base_repository_digest` / `ultimate_base_arm64_digest` may
+name an Ultimate-only build base later; when omitted, derived builds keep the
+fleet pin and do not move embedding/reranker images.
 The release name declares vLLM v0.29.0-omni; source pinning does not establish
 model readiness or feature compatibility. Historical prior-generation claims
 and deployment evidence remain in their dated research records.

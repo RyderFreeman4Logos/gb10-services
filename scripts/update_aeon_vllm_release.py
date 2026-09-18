@@ -21,6 +21,9 @@ EMBEDDING_UNIT = Path("profile/qwen3-embedding-8b/vllm-embedding.service")
 ULTIMATE_UNIT = Path(
     "profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service"
 )
+ULTIMATE_DOCKERFILE = Path(
+    "profile/aeon-ultimate-uncensored-nvfp4/image/Dockerfile.aeon-v029-modelopt-54367"
+)
 UNIT_PATHS = (
     ULTIMATE_UNIT,
     Path("profile/querit-4b-reranker/vllm-querit-4b-reranker.service"),
@@ -61,6 +64,7 @@ ULTIMATE_OVERRIDE_SURFACES = (
     Path("tests/test_aeon_ultimate_derived_image.py"),
     Path("tests/test_update_aeon_vllm_release.py"),
     Path("tests/test_vllm_no_swap_verifier.py"),
+    ULTIMATE_DOCKERFILE,
 )
 ANNOTATION = re.compile(
     r"^# AEON image release: (?P<tag>\d{4}-\d{2}-\d{2}-(?P<version>v[^;]+)); "
@@ -98,21 +102,40 @@ def _cache_key(version: str) -> str:
     return f"v{major}{minor:02d}{patch}"
 
 
+REQUIRED_RELEASE_KEYS = {
+    "repository",
+    "tag",
+    "repository_digest",
+    "arm64_digest",
+    "runtime_version",
+    "overrides",
+}
+OPTIONAL_ULTIMATE_BASE_KEYS = (
+    "ultimate_base_repository_digest",
+    "ultimate_base_arm64_digest",
+)
+KNOWN_DERIVED_BASES = {
+    "sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e": (
+        "sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7"
+    ),
+}
+
+
 def _load_release(root: Path) -> dict:
     release = json.loads((root / CONFIG).read_text())
-    expected = {
-        "repository",
-        "tag",
-        "repository_digest",
-        "arm64_digest",
-        "runtime_version",
-        "overrides",
-    }
-    if set(release) != expected:
-        raise ValueError(f"{CONFIG}: expected exactly {sorted(expected)}")
+    if not isinstance(release, dict):
+        raise ValueError(f"{CONFIG}: expected an object")
+    extra = set(release) - REQUIRED_RELEASE_KEYS - set(OPTIONAL_ULTIMATE_BASE_KEYS)
+    missing = REQUIRED_RELEASE_KEYS - set(release)
+    if extra or missing:
+        raise ValueError(
+            f"{CONFIG}: expected keys {sorted(REQUIRED_RELEASE_KEYS)} "
+            f"plus optional {list(OPTIONAL_ULTIMATE_BASE_KEYS)}; "
+            f"missing={sorted(missing)} extra={sorted(extra)}"
+        )
     for key in ("repository", "tag", "repository_digest", "arm64_digest", "runtime_version"):
         if not isinstance(release[key], str) or not release[key]:
-            raise ValueError(f"{CONFIG}: expected exactly {sorted(expected)}")
+            raise ValueError(f"{CONFIG}: {key} must be a non-empty string")
     overrides = release["overrides"]
     if not isinstance(overrides, dict) or set(overrides) != {ULTIMATE_UNIT.name}:
         raise ValueError("overrides must pin only the Ultimate unit")
@@ -123,25 +146,68 @@ def _load_release(root: Path) -> dict:
     for key in ("repository_digest", "arm64_digest"):
         if DIGEST.fullmatch(release[key]) is None:
             raise ValueError(f"{key} must be a full sha256 digest")
+    present_base = [key for key in OPTIONAL_ULTIMATE_BASE_KEYS if key in release]
+    if present_base and set(present_base) != set(OPTIONAL_ULTIMATE_BASE_KEYS):
+        raise ValueError(
+            "ultimate_base_repository_digest and ultimate_base_arm64_digest "
+            "must be set together"
+        )
+    if present_base:
+        for key in OPTIONAL_ULTIMATE_BASE_KEYS:
+            if not isinstance(release[key], str) or DIGEST.fullmatch(release[key]) is None:
+                raise ValueError(f"{key} must be a full sha256 digest")
+    else:
+        release["ultimate_base_repository_digest"] = release["repository_digest"]
+        release["ultimate_base_arm64_digest"] = release["arm64_digest"]
     override_digest = overrides[ULTIMATE_UNIT.name]
     if DIGEST.fullmatch(override_digest) is None:
         raise ValueError("Ultimate override must be a full sha256 digest")
     if override_digest == release["repository_digest"]:
         raise ValueError("Ultimate override must differ from the central digest")
-    derived_image = (
-        "sha256:0652d5b5641f673c43455523ceb981e8ddd4df04ad862ad86edb0d59a517672e"
-    )
-    derived_base = (
-        "sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7"
-    )
-    if override_digest == derived_image and release["repository_digest"] != derived_base:
+    if override_digest == release["ultimate_base_repository_digest"]:
+        raise ValueError("Ultimate override must differ from its declared base")
+    bound_base = KNOWN_DERIVED_BASES.get(override_digest)
+    if bound_base is None:
+        raise ValueError(
+            "Ultimate derived override is unknown; discover and bind the "
+            "actual image ID to its declared base before generation"
+        )
+    if bound_base != release["ultimate_base_repository_digest"]:
         raise ValueError(
             "Ultimate derived override is still bound to "
-            f"{derived_base}; rebuild or retarget the override before moving "
-            "the central release"
+            f"{bound_base}; rebuild or retarget the override before moving "
+            "its declared base"
         )
+    if (
+        release["ultimate_base_repository_digest"] == release["repository_digest"]
+        and release["ultimate_base_arm64_digest"] != release["arm64_digest"]
+    ):
+        raise ValueError("Ultimate base arm64 digest does not match the fleet pin")
     _cache_key(release["runtime_version"])
     return release
+
+
+def _assert_ultimate_declared_base(release: dict, dockerfile: str) -> None:
+    expected_from = (
+        f"FROM {release['repository']}@{release['ultimate_base_repository_digest']}"
+    )
+    if expected_from not in dockerfile:
+        raise ValueError(
+            f"{ULTIMATE_DOCKERFILE}: FROM does not match declared base "
+            f"{release['ultimate_base_repository_digest']}"
+        )
+    expected_label = f'aeon.base="{release["ultimate_base_repository_digest"]}"'
+    if expected_label not in dockerfile:
+        raise ValueError(
+            f"{ULTIMATE_DOCKERFILE}: aeon.base label does not match declared base"
+        )
+    if (
+        release["repository_digest"] != release["ultimate_base_repository_digest"]
+        and release["repository_digest"] in dockerfile
+    ):
+        raise ValueError(
+            f"{ULTIMATE_DOCKERFILE}: fleet digest leaked into Ultimate Dockerfile"
+        )
 
 
 def _append_rollback(readme: str, guide: str, identity_test: str, old: dict[str, str]) -> tuple[str, str, str]:
@@ -211,6 +277,26 @@ def _render(root: Path) -> dict[Path, str]:
         )
     )
     texts = {path: (root / path).read_text() for path in paths}
+    dockerfile = texts[ULTIMATE_DOCKERFILE]
+    from_match = re.search(
+        r"^FROM (?P<repository>[^\s]+)@(?P<digest>sha256:[0-9a-f]{64})$",
+        dockerfile,
+        re.MULTILINE,
+    )
+    if from_match is None:
+        raise ValueError(f"{ULTIMATE_DOCKERFILE}: FROM digest pin is missing")
+    dockerfile = dockerfile.replace(
+        from_match.group(0),
+        f"FROM {release['repository']}@{release['ultimate_base_repository_digest']}",
+        1,
+    )
+    dockerfile = dockerfile.replace(
+        f'aeon.base="{from_match.group("digest")}"',
+        f'aeon.base="{release["ultimate_base_repository_digest"]}"',
+        1,
+    )
+    _assert_ultimate_declared_base(release, dockerfile)
+    texts[ULTIMATE_DOCKERFILE] = dockerfile
     canonical = texts[QWEN36_UNIT]
     match = ANNOTATION.search(canonical)
     if match is None:
@@ -326,6 +412,20 @@ def _render(root: Path) -> dict[Path, str]:
     old_arm = arm_match.group("digest")
     texts[README] = readme.replace(old_arm, release["arm64_digest"])
     texts[GUIDE] = texts[GUIDE].replace(old_arm, release["arm64_digest"])
+    readme = texts[README]
+    if re.search(r"^ultimate base index: sha256:[0-9a-f]{64}$", readme, re.MULTILINE):
+        texts[README] = _replace_regex(
+            readme,
+            r"^ultimate base index: sha256:[0-9a-f]{64}$",
+            f"ultimate base index: {release['ultimate_base_repository_digest']}",
+            str(README),
+        )
+        texts[README] = _replace_regex(
+            texts[README],
+            r"^ultimate base arm64: sha256:[0-9a-f]{64}$",
+            f"ultimate base arm64: {release['ultimate_base_arm64_digest']}",
+            str(README),
+        )
 
     guide_lines = texts[GUIDE].splitlines(keepends=True)
     for index, line in enumerate(guide_lines):
