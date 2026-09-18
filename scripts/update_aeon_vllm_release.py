@@ -167,7 +167,12 @@ def _load_release(root: Path) -> dict:
     if override_digest == release["ultimate_base_repository_digest"]:
         raise ValueError("Ultimate override must differ from its declared base")
     bound_base = KNOWN_DERIVED_BASES.get(override_digest)
-    if bound_base is not None and bound_base != release["ultimate_base_repository_digest"]:
+    if bound_base is None:
+        raise ValueError(
+            "Ultimate derived override is unknown; discover and bind the "
+            "actual image ID to its declared base before generation"
+        )
+    if bound_base != release["ultimate_base_repository_digest"]:
         raise ValueError(
             "Ultimate derived override is still bound to "
             f"{bound_base}; rebuild or retarget the override before moving "

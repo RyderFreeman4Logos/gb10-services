@@ -101,21 +101,16 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
             _copy_fixture(target)
 
             old = json.loads((target / CONFIG).read_text())
-            new_override = "sha256:" + "c" * 64
             new = {
                 **old,
                 "tag": "2026-10-01-v0.30.1-omni",
                 "repository_digest": "sha256:" + "a" * 64,
                 "arm64_digest": "sha256:" + "b" * 64,
                 "runtime_version": "v0.30.1-omni",
-                "ultimate_base_repository_digest": old.get(
-                    "ultimate_base_repository_digest", old["repository_digest"]
-                ),
-                "ultimate_base_arm64_digest": old.get(
-                    "ultimate_base_arm64_digest", old["arm64_digest"]
-                ),
+                "ultimate_base_repository_digest": old["repository_digest"],
+                "ultimate_base_arm64_digest": old["arm64_digest"],
                 "overrides": {
-                    "vllm-aeon-ultimate-uncensored-nvfp4.service": new_override
+                    "vllm-aeon-ultimate-uncensored-nvfp4.service": ULTIMATE_OVERRIDE_DIGEST
                 },
             }
             (target / CONFIG).write_text(json.dumps(new, indent=2) + "\n")
@@ -147,17 +142,14 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
                     self.assertIn(new["runtime_version"], description)
                     self.assertNotIn(old["repository_digest"], text)
             ultimate = (target / ULTIMATE_UNIT).read_text()
-            self.assertEqual(ultimate.count(new_override), 2)
-            self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, ultimate)
+            self.assertEqual(ultimate.count(ULTIMATE_OVERRIDE_DIGEST), 2)
             self.assertNotIn(new["repository_digest"], ultimate)
             helper = (target / "scripts/gb10_prepare_aeon_ultimate_image.py").read_text()
             parser = (target / "scripts/gb10_verify_vllm_no_swap_core.py").read_text()
             no_swap = (target / "scripts/gb10_verify_vllm_no_swap.sh").read_text()
             storage_text = (target / "scripts/gb10_embedding_activation_storage.py").read_text()
-            self.assertIn(new_override, helper)
-            self.assertIn(new_override, parser)
-            self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, helper)
-            self.assertNotIn(ULTIMATE_OVERRIDE_DIGEST, parser)
+            self.assertIn(ULTIMATE_OVERRIDE_DIGEST, helper)
+            self.assertIn(ULTIMATE_OVERRIDE_DIGEST, parser)
             self.assertIn(f'EXPECTED_CORE_SHA256="{_sha256(target / "scripts/gb10_verify_vllm_no_swap_core.py")}"'.replace('"', ""), no_swap)
             self.assertIn(
                 f'"core": "{_sha256(target / "scripts/gb10_verify_vllm_no_swap_core.py")}"',
@@ -169,7 +161,7 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
             )
             self.assertIn(
                 "# AEON image release: "
-                f"{new['tag']}; immutable digest: {new_override}",
+                f"{new['tag']}; immutable digest: {ULTIMATE_OVERRIDE_DIGEST}",
                 ultimate,
             )
 
@@ -276,7 +268,6 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
             target = Path(raw_tmp)
             _copy_fixture(target)
             release = json.loads((target / CONFIG).read_text())
-            release["overrides"][ULTIMATE_UNIT.name] = "sha256:" + "c" * 64
             release["ultimate_base_repository_digest"] = release["repository_digest"]
             release["ultimate_base_arm64_digest"] = release["arm64_digest"]
             (target / CONFIG).write_text(json.dumps(release, indent=2) + "\n")
@@ -349,7 +340,6 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
             target = Path(raw_tmp)
             _copy_fixture(target)
             old = json.loads((target / CONFIG).read_text())
-            new_override = "sha256:" + "c" * 64
             new = {
                 **old,
                 "tag": "2026-10-01-v0.30.1-omni",
@@ -359,7 +349,7 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
                 "ultimate_base_repository_digest": old["repository_digest"],
                 "ultimate_base_arm64_digest": old["arm64_digest"],
                 "overrides": {
-                    "vllm-aeon-ultimate-uncensored-nvfp4.service": new_override
+                    "vllm-aeon-ultimate-uncensored-nvfp4.service": ULTIMATE_OVERRIDE_DIGEST
                 },
             }
             (target / CONFIG).write_text(json.dumps(new, indent=2) + "\n")
@@ -369,11 +359,29 @@ class UpdateAeonVllmReleaseTests(unittest.TestCase):
             self.assertIn(new["repository_digest"], embedding)
             self.assertNotIn(old["repository_digest"], embedding)
             ultimate = (target / ULTIMATE_UNIT).read_text()
-            self.assertIn(new_override, ultimate)
+            self.assertIn(ULTIMATE_OVERRIDE_DIGEST, ultimate)
             self.assertNotIn(new["repository_digest"], ultimate)
             dockerfile = (target / ULTIMATE_DOCKERFILE).read_text()
             self.assertIn(new["ultimate_base_repository_digest"], dockerfile)
             self.assertNotIn(new["repository_digest"], dockerfile)
+
+    def test_unknown_derived_override_is_rejected_even_with_declared_base(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            target = Path(raw_tmp)
+            _copy_fixture(target)
+            old = json.loads((target / CONFIG).read_text())
+            new = {
+                **old,
+                "ultimate_base_repository_digest": old["repository_digest"],
+                "ultimate_base_arm64_digest": old["arm64_digest"],
+                "overrides": {
+                    "vllm-aeon-ultimate-uncensored-nvfp4.service": "sha256:" + "c" * 64
+                },
+            }
+            (target / CONFIG).write_text(json.dumps(new, indent=2) + "\n")
+            result = _run_updater(target, check=True)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("unknown", result.stderr)
 
     def test_check_rejects_configured_base_without_matching_derived_iid(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
