@@ -20,9 +20,32 @@ export function allowOpenRemote() {
   return v === "1";
 }
 
-/** GB10 overlay: SPARKDASH_READ_ONLY=1 rejects every mutating HTTP method. */
+/** GB10 overlay: SPARKDASH_READ_ONLY=1 rejects mutating HTTP except loopback LLM benches. */
 export function readOnlyMode() {
   return process.env.SPARKDASH_READ_ONLY === "1";
+}
+
+const LOOPBACK_ORIGINS = new Set(["http://127.0.0.1:20080", "http://localhost:20080"]);
+
+function requestPath(req) {
+  return String(req.path || req.url || "").split("?")[0];
+}
+
+function loopbackOriginOk(req) {
+  const origin = req.headers?.origin;
+  if (origin == null || origin === "") return true;
+  return LOOPBACK_ORIGINS.has(origin);
+}
+
+/** Decode/prefill start + cancel only. Shutdown/settings/showcase stay blocked. */
+export function allowedReadOnlyMutation(req) {
+  const method = (req.method || "GET").toUpperCase();
+  const path = requestPath(req);
+  if (method === "POST" && /^\/api\/sparks\/[^/]+\/llm\/bench$/.test(path)) return true;
+  if (method === "DELETE" && /^\/api\/sparks\/[^/]+\/llm\/bench\/[^/]+$/.test(path)) return true;
+  if (method === "POST" && /^\/api\/sparks\/[^/]+\/llm\/prefill-bench$/.test(path)) return true;
+  if (method === "DELETE" && /^\/api\/sparks\/[^/]+\/llm\/prefill-bench\/[^/]+$/.test(path)) return true;
+  return false;
 }
 
 function tokensEqual(left, right) {
@@ -55,6 +78,7 @@ export function createAuthMiddleware() {
     const method = (req.method || "GET").toUpperCase();
     const mutating = method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
     if (mutating && readOnlyMode()) {
+      if (allowedReadOnlyMutation(req) && loopbackOriginOk(req)) return next();
       return res.status(403).json({ error: "sparkDash is read-only; mutating routes are disabled" });
     }
     const remote = requireRemoteAuth(process.env.BIND_HOST || "127.0.0.1");

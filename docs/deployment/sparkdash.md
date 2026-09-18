@@ -1,11 +1,14 @@
 # sparkDash (loopback :20080)
 
 Read-only MiaAI-Lab/sparkDash dashboard for this GB10 host. Not a model unit.
-Mutating HTTP (bench, shutdown, config, Hermes/Comfy actions) is rejected in
-`createAuthMiddleware()`. The unit's `ExecStart` forces
-`SPARKDASH_READ_ONLY=1`, so a preserved legacy/user env cannot reopen writes.
-Loopback bind is not enough: tokenless loopback POSTs from a hostile Origin would otherwise start
-real model work. Do not set a `SPARKDASH_TOKEN` in the tracked env.
+`createAuthMiddleware()` still rejects mutating HTTP except loopback decode/prefill
+bench start/cancel. Shutdown, settings, showcase, sparks CRUD, Comfy, Hermes,
+llm-ports, wake, and password stay 403. Allowed POSTs/DELETEs still require Origin
+missing or exactly `http://127.0.0.1:20080` / `http://localhost:20080`;
+`https://evil.example` is 403. The unit's `ExecStart` forces
+`SPARKDASH_READ_ONLY=1`, so a preserved legacy/user env cannot reopen other writes.
+Loopback bind is not enough: a hostile Origin must not start model work.
+Do not set a `SPARKDASH_TOKEN` in the tracked env.
 
 ## Pin
 
@@ -33,7 +36,12 @@ Guard `:18009` is **not** an `llmPorts` target (not a generation engine). Its `/
 
 Overlay `profile/sparkdash/llmHost.js`: if `lanIp` is set, probe that host even when `isLocal` is true. Upstream probes `127.0.0.1` for local Sparks and would miss Tailnet-bound vLLM.
 
-Disabled: Comfy cancel, Hermes update, decode/prefill/showcase benches, shutdown/WoL (`hermesMonitoring=false`, `comfyMonitoring=false`). The overlay still rejects those mutating routes server-side; hiding UI buttons is not the control. GET `/api/health` and metrics remain available.
+Loopback-only allowlist (Origin missing or `http://127.0.0.1:20080` / `http://localhost:20080`):
+`POST /api/sparks/:id/llm/bench`, `DELETE /api/sparks/:id/llm/bench/:benchId`,
+`POST /api/sparks/:id/llm/prefill-bench`, `DELETE /api/sparks/:id/llm/prefill-bench/:benchId`.
+Still disabled server-side: showcase, shutdown/WoL, settings, sparks CRUD, Comfy, Hermes,
+llm-ports, password (`hermesMonitoring=false`, `comfyMonitoring=false`). Hiding UI buttons
+is not the control. GET `/api/health` and metrics remain available.
 
 `gpuMemoryUtilization=1` in sparkDash means engine-active/sleep flag, **not** AEON `--gpu-memory-utilization 0.515`.
 
