@@ -283,7 +283,18 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                     if "--cleanup" in argv
                 ]
                 self.assertEqual(start_pre_cleanups, [cleanup])
-                self.assertEqual(_logical_argv(unit, "ExecStop"), [cleanup])
+                stop_commands = _logical_argv(unit, "ExecStop")
+                if name in AEON_UNITS:
+                    retain = stop_commands[0]
+                    self.assertTrue(
+                        any(
+                            token.endswith("/gb10_retain_container_inspect.sh")
+                            for token in retain
+                        )
+                    )
+                    self.assertEqual(stop_commands[1:], [cleanup])
+                else:
+                    self.assertEqual(stop_commands, [cleanup])
                 stop_post_cleanups = [
                     argv
                     for argv in _logical_argv(unit, "ExecStopPost")
