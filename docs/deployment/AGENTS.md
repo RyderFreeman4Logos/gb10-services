@@ -226,7 +226,7 @@ stop/start. It accepts only the tracked AEON, embedding, and reranker units,
 requires a content-free `--actor` and `--reason` token, serializes operations,
 and writes owner-only records to the fixed production path
 `/home/obj/.local/state/gb10-lifecycle/lifecycle-audit.log`. Every record
-contains UTC and monotonic timestamps, UID, PID, event, actor, reason, and
+contains UTC and monotonic timestamps, UID, PID, a bounded caller chain, event, actor, reason, and
 outcome. Lifecycle request/result records also contain action and unit; failed
 results and failed investigation closes include `exit_status`, and blocked
 requests identify the active investigation. The accepted request is written

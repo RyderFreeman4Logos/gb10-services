@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import stat
 import subprocess
@@ -163,6 +164,75 @@ class LifecycleAuditScriptTests(unittest.TestCase):
         self.assertFalse((self.root / "ignored-state").exists())
         self.assertFalse((self.root / "ignored-xdg-state").exists())
         self.assertFalse((self.root / "ignored-home").exists())
+
+    def test_audit_records_shell_ancestor_and_missing_parent(self) -> None:
+        secret = "SECRET_REQUEST_BODY_DO_NOT_RECORD"
+        environment = self.environment.copy()
+        environment[secret] = "1"
+        result = subprocess.run(
+            [
+                "/bin/dash",
+                "-c",
+                '/usr/bin/bash "$1" investigation-begin --actor test-operator --reason approved-maintenance',
+                "dash",
+                str(self.script),
+            ],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.systemctl_log.exists())
+        audit = (self.state / "lifecycle-audit.log").read_text()
+        self.assertNotIn(secret, audit)
+        self.assertNotIn("cmdline", audit)
+        line = next(
+            row
+            for row in audit.splitlines()
+            if "event=investigation-begin" in row and "outcome=created" in row
+        )
+        match = re.search(r"caller_chain=([^ ]+)", line)
+        self.assertIsNotNone(match, line)
+        assert match is not None
+        hops = match.group(1).split(",")
+        self.assertGreaterEqual(len(hops), 2)
+        self.assertLessEqual(len(hops), 6)
+        self.assertTrue(any(hop.endswith(":dash") for hop in hops), hops)
+        self.assertTrue(all(re.fullmatch(r"[0-9]+:[0-9]+:[A-Za-z0-9._+-]+", hop) for hop in hops), hops)
+        (self.state / "investigation.lock").unlink()
+
+        missing = subprocess.run(
+            [
+                "/usr/bin/bash",
+                "-c",
+                "gone=$(/bin/dash -c 'echo $$'); "
+                "export GB10_LIFECYCLE_ANCESTOR_PID=$gone; "
+                'exec /usr/bin/bash "$0" "$@"',
+                str(self.script),
+                "investigation-end",
+                "--actor",
+                "test-operator",
+                "--reason",
+                "approved-maintenance",
+            ],
+            cwd=ROOT,
+            env=self.environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertNotEqual(missing.returncode, 0, missing.stdout + missing.stderr)
+        missing_line = next(
+            row
+            for row in (self.state / "lifecycle-audit.log").read_text().splitlines()
+            if "outcome=missing" in row
+        )
+        self.assertRegex(missing_line, r"caller_chain=[0-9]+:unavailable:unavailable")
+        self.assertNotIn(secret, missing_line)
 
     def test_investigation_lock_blocks_model_lifecycle_until_it_is_closed(self) -> None:
         begin = self.execute(
@@ -607,7 +677,7 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
         )
         self.assertIn(
             "Every record contains UTC and monotonic timestamps, UID, PID, "
-            "event, actor, reason, and outcome",
+            "a bounded caller chain, event, actor, reason, and outcome",
             runbook,
         )
         self.assertIn(
