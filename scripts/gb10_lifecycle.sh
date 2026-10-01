@@ -64,14 +64,43 @@ monotonic_seconds() {
     fi
 }
 
+# pid:starttime:exe-basename, at most 6 ancestors. Missing identity is explicit.
+# ponytail: basename only; full exe path if two basenames collide.
+caller_chain() {
+    local pid="$PPID" hops=0 chain="" start exe base next
+    # Test-only start for one already-exited process. Production leaves this unset.
+    if [[ "${GB10_LIFECYCLE_ANCESTOR_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+        pid="$GB10_LIFECYCLE_ANCESTOR_PID"
+    fi
+    while [[ "$hops" -lt 6 && "$pid" =~ ^[1-9][0-9]*$ ]]; do
+        if [[ ! -r "/proc/$pid/stat" ]]; then
+            chain+="${chain:+,}${pid}:unavailable:unavailable"
+            break
+        fi
+        start="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)"
+        exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+        base="${exe##*/}"
+        [[ "$start" =~ ^[0-9]+$ ]] || start="unavailable"
+        [[ "$base" =~ ^[A-Za-z0-9._+-]+$ ]] || base="unavailable"
+        chain+="${chain:+,}${pid}:${start}:${base}"
+        next="$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || true)"
+        [[ "$next" =~ ^[0-9]+$ && "$next" != "$pid" ]] || break
+        pid="$next"
+        hops=$((hops + 1))
+    done
+    [[ -n "$chain" ]] || chain="unavailable:unavailable:unavailable"
+    printf '%s' "$chain"
+}
+
 audit() {
     local event="$1"
     shift
-    printf '%s monotonic_seconds=%s uid=%s pid=%s event=%s %s\n' \
+    printf '%s monotonic_seconds=%s uid=%s pid=%s caller_chain=%s event=%s %s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         "$(monotonic_seconds)" \
         "$EUID" \
         "$$" \
+        "$(caller_chain)" \
         "$event" \
         "$*" >> "$AUDIT_LOG"
 }
