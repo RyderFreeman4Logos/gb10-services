@@ -67,7 +67,7 @@ monotonic_seconds() {
 # pid:starttime:exe-basename, at most 6 ancestors. Missing identity is explicit.
 # ponytail: basename only; full exe path if two basenames collide.
 caller_chain() {
-    local pid="$PPID" hops=0 chain="" start exe base next
+    local pid="$PPID" hops=0 chain="" start exe base next tail
     # Test-only start for one already-exited process. Production leaves this unset.
     if [[ "${GB10_LIFECYCLE_ANCESTOR_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
         pid="$GB10_LIFECYCLE_ANCESTOR_PID"
@@ -77,14 +77,15 @@ caller_chain() {
             chain+="${chain:+,}${pid}:unavailable:unavailable"
             break
         fi
-        start="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)"
+        tail="$(sed -n 's/.*) //p' "/proc/$pid/stat" 2>/dev/null || true)"
+        start="$(awk '{print $20}' <<< "$tail")"
+        next="$(awk '{print $2}' <<< "$tail")"
         exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
         base="${exe##*/}"
         [[ "$start" =~ ^[0-9]+$ ]] || start="unavailable"
         [[ "$base" =~ ^[A-Za-z0-9._+-]+$ ]] || base="unavailable"
         chain+="${chain:+,}${pid}:${start}:${base}"
-        next="$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || true)"
-        [[ "$next" =~ ^[0-9]+$ && "$next" != "$pid" ]] || break
+        [[ "$next" =~ ^[0-9]+$ && "$next" != "$pid" && "$next" != 0 ]] || break
         pid="$next"
         hops=$((hops + 1))
     done
