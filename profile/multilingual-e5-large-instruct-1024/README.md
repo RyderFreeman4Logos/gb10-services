@@ -38,14 +38,14 @@ interpret a cap as measured residency.
 ```bash
 # Run on GB10, replacing SOURCE with the verified private script path.
 DOCKER_HOST=unix:///run/user/1001/docker.sock docker run --rm \
-  --name gb10-native1024-canary --network host \
+  --name gb10-native1024-canary --network bridge -p 127.0.0.1:18016:18016 \
   --memory 5g --memory-swap 5g --cpus 2 --pids-limit 128 --oom-score-adj 1000 \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
   -e TOKENIZERS_PARALLELISM=false -e OMP_NUM_THREADS=2 \
   -v /home/obj/.cache/huggingface/hub:/cache:ro \
   -v SOURCE:/native1024_canary.py:ro --entrypoint python3 \
   ghcr.io/aeon-7/aeon-vllm-ultimate@sha256:2421bb1228a85370c1c50adb31f605c4361acf4d48d65282fcb919e74f34fae7 \
-  /native1024_canary.py --model-path \
+  /native1024_canary.py --container-publish-loopback --model-path \
   /cache/models--intfloat--multilingual-e5-large-instruct/snapshots/274baa43b0e13e37fafa6428dbc7938e62e5c439
 ```
 

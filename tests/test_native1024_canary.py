@@ -8,6 +8,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 
 class Native1024CanaryTests(unittest.TestCase):
+    def test_rootless_loopback_publish_is_explicit(self):
+        import subprocess
+        result = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / "scripts/native1024_canary.py"), "--help"], capture_output=True, text=True, check=True)
+        self.assertIn("--container-publish-loopback", result.stdout)
+
     def test_request_contract(self):
         try:
             canary = importlib.import_module("native1024_canary")
