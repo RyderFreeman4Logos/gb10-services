@@ -53,7 +53,7 @@ SERVICE_CONTRACTS = {
     ),
     "vllm-aeon-ultimate-uncensored-nvfp4.service": (
         "vllm-aeon-ultimate-uncensored-nvfp4",
-        "%t/gb10-memory-guardian/aeon-text.cid",
+        "/home/obj/.local/state/gb10-vllm-cids/vllm-aeon-ultimate-uncensored-nvfp4.cid",
     ),
     "vllm-embedding.service": (
         "vllm-embedding",
@@ -136,6 +136,37 @@ def _logical_argv(unit: str, directive: str) -> list[list[str]]:
 
 
 class VllmNoSwapUnitContractTests(unittest.TestCase):
+    def test_boot_order_waits_for_rootless_docker_and_preserves_model_priority(self) -> None:
+        expected_after = {
+            "vllm-embedding.service": {"docker.service"},
+            "vllm-querit-4b-reranker.service": {
+                "docker.service",
+                "vllm-embedding.service",
+            },
+            "vllm-aeon-ultimate-uncensored-nvfp4.service": {
+                "docker.service",
+                "vllm-embedding.service",
+                "vllm-querit-4b-reranker.service",
+            },
+        }
+        for name, dependencies in expected_after.items():
+            with self.subTest(unit=name):
+                unit = UNIT_PATHS[name].read_text()
+                unit_section = unit.split("[Service]", 1)[0]
+                after = {
+                    dependency
+                    for line in unit_section.splitlines()
+                    if line.startswith("After=")
+                    for dependency in line.removeprefix("After=").split()
+                }
+                requires = [
+                    line.removeprefix("Requires=")
+                    for line in unit_section.splitlines()
+                    if line.startswith("Requires=")
+                ]
+                self.assertTrue(dependencies <= after)
+                self.assertEqual(requires, ["docker.service"])
+
     def test_wrapper_has_one_fixed_digest_bound_non_executable_core(self) -> None:
         core = VERIFIER_CORE.read_bytes()
         source = VERIFIER.read_text()
@@ -170,6 +201,15 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
         for name, (container, cidfile) in SERVICE_CONTRACTS.items():
             with self.subTest(unit=name):
                 unit = UNIT_PATHS[name].read_text()
+                if name == "vllm-aeon-ultimate-uncensored-nvfp4.service":
+                    cid_directory = cidfile.rsplit("/", 1)[0]
+                    self.assertIn(
+                        f"Environment=GB10_CONTAINER_CIDFILE={cidfile}", unit
+                    )
+                    self.assertIn(
+                        f"ExecStartPre=/usr/bin/install -d -m 0700 {cid_directory} %t/gb10-memory-guardian",
+                        unit,
+                    )
                 start = _logical_argv(unit, "ExecStart")
                 self.assertEqual(len(start), 1)
                 argv = start[0]

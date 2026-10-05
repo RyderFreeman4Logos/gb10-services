@@ -77,6 +77,35 @@ class VllmNoSwapCleanupTests(VllmNoSwapFixture):
         second = self._run_cleanup(cidfile)
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
 
+    def test_reboot_retains_cid_authority_for_a_retained_text_container(self) -> None:
+        from vllm_no_swap_fixtures import ROOT
+        from test_vllm_no_swap_unit_contracts import _logical_argv
+
+        unit = (ROOT / "profile/aeon-ultimate-uncensored-nvfp4"
+                / "vllm-aeon-ultimate-uncensored-nvfp4.service").read_text()
+        start = _logical_argv(unit, "ExecStart")[0]
+        configured = next(arg.split("=", 1)[1] for arg in start if arg.startswith("--cidfile="))
+        self.assertNotIn("--rm", start)
+        self.assertTrue(configured.startswith("/home/obj/.local/state/"))
+        identifier = self.identifiers["vllm-test"]
+        volatile = self._seed_cleanup(cid=identifier)
+        durable = self.root / configured.removeprefix("/home/obj/")
+        durable.parent.mkdir(parents=True, mode=0o700)
+        volatile.rename(durable)
+        volatile.parent.rmdir()  # Reboot discards runtime state, not Docker metadata.
+        state = json.loads(self.cleanup_state.read_text())
+        state["objects"][identifier]["State"].update(Running=False, Status="exited", Pid=0)
+        self.cleanup_state.write_text(json.dumps(state))
+        volatile.parent.mkdir(mode=0o700)
+        lost_authority = self._run_cleanup(volatile)
+        self.assertNotEqual(lost_authority.returncode, 0)
+        self.assertIn("without its private cidfile authority", lost_authority.stderr)
+        self.assertEqual(json.loads(self.cleanup_state.read_text())["removed"], [])
+        result = self._run_cleanup(durable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(self.cleanup_state.read_text())["removed"], [identifier])
+        self.assertFalse(durable.exists())
+
     def test_cleanup_accepts_each_approved_dflash_generation_from_one_allowlist(self) -> None:
         identifier = self.identifiers["vllm-test"]
         for name in DFLASH_CONTAINERS:

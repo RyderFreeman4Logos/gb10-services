@@ -37,7 +37,7 @@ done
   exit 2
 }
 case "$container_cidfile" in
-  "$identity_dir/aeon-text.cid"|"$identity_dir/aeon-qwen38-text.cid") ;;
+  "$identity_dir/aeon-text.cid"|"$identity_dir/aeon-qwen38-text.cid"|"$HOME/.local/state/gb10-vllm-cids/vllm-aeon-ultimate-uncensored-nvfp4.cid") ;;
   *)
     echo "container CID file must use the reviewed AEON runtime path" >&2
     exit 2
