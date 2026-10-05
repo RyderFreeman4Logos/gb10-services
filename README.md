@@ -67,7 +67,17 @@ graph TD
    Production rejects inherited `SYSMON_*` fixture selectors and uses real
    `/proc`, the real clock, and `~/log`. Only hermetic tests invoke `--test-only`;
    boot-ID and PSI inputs are byte-bounded regular files, with hostile input
-   recorded as `N/A`.
+   recorded as `N/A`. Install `sysmon_csv_writer.py` beside `sysmon.sh`.
+   CSV writes use a finite kernel pipe and atomic nonblocking rows (at most
+   4096 bytes). A full pipe, dead writer, or invalid sink fails the observer
+   with a content-free error; systemd retains its existing restart policy.
+   The writer syncs the first new-file row, then every 60 monotonic seconds,
+   on daily rotation and graceful exit. Shutdown drains for at most 2 seconds,
+   then uses a generation-checked pidfd kill and a 1-second exit confirmation.
+   A failed drain explicitly means queued samples may be lost. Successful
+   enqueue is not proof of persistence; a forced reboot may lose the unsynced
+   tail. This is observer hardening, not proof of a historical freeze cause,
+   Mode-1 recovery, or a guarantee against stalled kernel I/O.
 
 ### Integrated Guardian
 `llm-guard-proxy` owns the only automatic low-memory recovery path. The GB10
@@ -356,6 +366,7 @@ install -m 0755 scripts/gb10_verify_vllm_no_swap.sh ~/.local/bin/gb10_verify_vll
 bash scripts/gb10_install_retain_container_inspect.sh
 install -m 0755 scripts/gb10_lifecycle.sh ~/.local/bin/gb10_lifecycle.sh
 install -m 0755 scripts/gb10_restart_text_safe.sh ~/.local/bin/gb10_restart_text_safe.sh
+install -m 0644 scripts/sysmon_csv_writer.py ~/.local/bin/
 cp scripts/sysmon.sh ~/.local/bin/
 
 
