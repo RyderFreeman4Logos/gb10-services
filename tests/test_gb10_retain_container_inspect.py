@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import re
 import stat
@@ -100,6 +101,7 @@ def _exited_payload(**overrides: object) -> str:
             "Running": False,
             "ExitCode": 137,
             "OOMKilled": False,
+            "StartedAt": "2026-09-17T17:00:00.000Z",
             "FinishedAt": "2026-09-17T18:59:23.000Z",
         },
     }
@@ -214,6 +216,125 @@ class RetainContainerInspectTests(unittest.TestCase):
         self.assertEqual(self.output.read_text(), updated + "\n")
         leftover = list(self.identity.glob(f"{self.output.name}.tmp.*"))
         self.assertEqual(leftover, [])
+
+    def test_durable_generation_receipt_survives_runtime_directory_loss(self) -> None:
+        payload = json.loads(_exited_payload())
+        payload[0]["Config"] = {"Env": ["SECRET=must-not-be-archived"]}
+        _fake_docker(self.bin_dir, json.dumps(payload), 0)
+        result = _run(self.env, self.cidfile, self.output)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        archive = next((Path(self.env["HOME"]) / ".local/state/gb10-vllm-cids").glob(f"{CID}.*.exited.json"), None)
+        self.assertIsNotNone(archive, result.stdout + result.stderr)
+        assert archive is not None
+        receipt = json.loads(archive.read_text())
+        self.assertEqual(receipt["container_id"], CID)
+        self.assertEqual(receipt["state"]["ExitCode"], 137)
+        self.assertIs(receipt["state"]["OOMKilled"], False)
+        self.assertEqual(receipt["memory_events"]["status"], "unavailable")
+        self.assertGreater(receipt["caller"]["pid"], 0)
+        self.assertGreater(receipt["caller"]["start_ticks"], 0)
+        self.assertRegex(receipt["boot_id"], r"^[0-9a-f-]{36}$")
+        self.assertNotIn("must-not-be-archived", archive.read_text())
+        self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o600)
+        self.cidfile.unlink()
+        self.output.unlink()
+        self.identity.rmdir()
+        self.assertEqual(json.loads(archive.read_text()), receipt)
+
+    def test_durable_archive_keeps_first_episode_and_rejects_unsafe_store(self) -> None:
+        _fake_docker(self.bin_dir, _exited_payload(), 0)
+        first = _run(self.env, self.cidfile, self.output)
+        self.assertIn("retained", first.stdout)
+        store = Path(self.env["HOME"]) / ".local/state/gb10-vllm-cids"
+        archive = next(store.glob(f"{CID}.*.exited.json"))
+        initial = archive.read_bytes()
+        second = _run(self.env, self.cidfile, self.output)
+        self.assertIn("retained", second.stdout)
+        self.assertEqual(archive.read_bytes(), initial)
+        store.chmod(0o777)
+        self.output.write_text(LAST_GOOD + "\n")
+        refused = _run(self.env, self.cidfile, self.output)
+        _assert_kept_last_good(self, refused, self.output)
+        self.assertEqual(archive.read_bytes(), initial)
+
+    def test_archive_distinguishes_started_at_and_preserves_capacity(self) -> None:
+        _fake_docker(self.bin_dir, _exited_payload(), 0)
+        self.assertIn("retained", _run(self.env, self.cidfile, self.output).stdout)
+        store = Path(self.env["HOME"]) / ".local/state/gb10-vllm-cids"
+        payload = json.loads(_exited_payload())
+        payload[0]["State"]["StartedAt"] = "2026-09-18T17:00:00.000Z"
+        _fake_docker(self.bin_dir, json.dumps(payload), 0)
+        self.assertIn("retained", _run(self.env, self.cidfile, self.output).stdout)
+        self.assertEqual(len(list(store.glob("*.exited.json"))), 2)
+        for index in range(62):
+            (store / f"retained-{index}.exited.json").write_text("{}")
+        payload[0]["State"]["StartedAt"] = "2026-09-19T17:00:00.000Z"
+        _fake_docker(self.bin_dir, json.dumps(payload), 0)
+        self.output.write_text(LAST_GOOD + "\n")
+        refused = _run(self.env, self.cidfile, self.output)
+        _assert_kept_last_good(self, refused, self.output)
+        self.assertEqual(len(list(store.glob("*.exited.json"))), 64)
+
+    def test_concurrent_archive_admission_preserves_capacity(self) -> None:
+        # Execute the unchanged archive block in owned processes, pausing only
+        # the first count snapshot while the second writer attempts admission.
+        source = HELPER.read_text()
+        block = source.split('<<\'PY\' || skip "inspect validation or durable archive failed; keeping last inspect"\n', 1)[1].split('\nPY\n', 1)[0]
+        context = multiprocessing.get_context("fork")
+        snapshot, release = context.Event(), context.Event()
+        results = context.Queue()
+        store = Path(self.env["HOME"]) / ".local/state/gb10-vllm-cids"
+        store.mkdir(parents=True, mode=0o700)
+        for index in range(63):
+            (store / f"retained-{index}.exited.json").write_text("{}")
+
+        def worker(cid: str, pause: bool) -> None:
+            import sys
+            os.environ["HOME"] = self.env["HOME"]
+            payload = Path(self.temporary.name) / f"{cid}.inspect"
+            body = json.loads(_exited_payload())
+            body[0]["Id"] = cid
+            payload.write_text(json.dumps(body))
+            sys.argv = ["archive", cid, CONTAINER, str(payload), str(MAX_INSPECT_BYTES)]
+            original = os.listdir
+            def count(directory: int) -> list[str]:
+                entries = original(directory)
+                if pause:
+                    snapshot.set()
+                    if not release.wait(6):
+                        raise TimeoutError("admission fixture release")
+                return entries
+            os.listdir = count
+            try:
+                exec(compile(block, str(HELPER), "exec"), {"__name__": "__main__"})
+                results.put("success")
+            except (OSError, SystemExit) as error:
+                results.put(type(error).__name__)
+
+        first = context.Process(target=worker, args=("a" * 64, True))
+        second = context.Process(target=worker, args=("b" * 64, False))
+        try:
+            first.start()
+            self.assertTrue(snapshot.wait(3))
+            second.start()
+            second.join(3)
+            self.assertFalse(second.is_alive())
+            release.set()
+            first.join(3)
+            self.assertFalse(first.is_alive())
+            self.assertEqual(first.exitcode, 0)
+            self.assertEqual(second.exitcode, 0)
+            self.assertLessEqual(len(list(store.glob("*.exited.json"))), 64)
+            self.assertEqual(sorted(results.get(timeout=1) for _ in range(2)), ["BlockingIOError", "success"])
+        finally:
+            release.set()
+            for process in (first, second):
+                if process.pid is not None:
+                    if process.is_alive():
+                        process.kill()
+                    process.join(3)
+            results.close()
+            results.join_thread()
 
     def test_inspects_full_cid_not_container_name(self) -> None:
         seen = self.bin_dir / "seen.args"

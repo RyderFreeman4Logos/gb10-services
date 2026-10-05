@@ -51,7 +51,24 @@ block `--cleanup`. Units wrap the helper with
 `/usr/bin/timeout --signal=TERM --kill-after=2 10`, well under
 `TimeoutStopSec=60`, so a blocked cid/JSON/FIFO path cannot consume the
 stop budget. The helper also self-wraps that same deadline, rejects cid
-bytes other than 64 lowercase hex plus newline, caps inspect JSON at
-262144 bytes, and requires `State.Status` to be the string `exited`.
-Publish is a same-directory `mv -Tf`; it is not a crash-durable fsync
-transaction.
+bytes other than exactly 64 lowercase hex with an optional single newline,
+caps inspect JSON at 262144 bytes, and requires `State.Status` to be `exited`.
+Before runtime publication, the same helper synchronizes a content-free receipt
+in the existing owner-only `~/.local/state/gb10-vllm-cids/` store. Receipts are
+keyed by full CID and Docker `StartedAt`, with file and directory fsync; repeated
+stop hooks preserve the first receipt. Capacity is 64 receipts: at capacity the
+helper skips without deleting older evidence. A nonblocking directory lock
+serializes count and publication; contention skips rather than delaying cleanup.
+Runtime last-good inspect still
+uses same-directory `mv -Tf` and is not itself a crash-durable transaction.
+
+The durable receipt excludes Docker environment, labels, mounts and raw argv.
+It records boot ID, timestamps, exited state/OOMKilled, the actual retainer PID
+and starttime, and canonical CID-scope memory.events if still readable. These
+counters have an observed scope inode but no independent same-StartedAt Docker
+re-inspection fence; they are not sufficient alone for natural-event attribution.
+A vanished scope is explicitly `unavailable`, not zero OOM events. Caller identity
+names the retainer, **not the SIGKILL initiator**. This stop-time capture cannot
+reconstruct events already removed by Docker on process exit; a future natural
+137 still needs actor attribution and same-generation event evidence. A
+simulated loss of the runtime directory is not an actual forced-reboot test.
