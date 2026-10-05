@@ -58,3 +58,39 @@ matched local-incumbent quality/latency, and a fresh isolated LanceDB
 vectors into existing Qwen-prefix or other-model collections: same size does
 not mean same vector space. EverOS adoption and any persistent routing change
 require separate explicit approval and corpus-level acceptance.
+
+## Executed acceptance evidence (2026-10-05)
+
+The pinned cached model was exercised on GB10 CPU through the loopback-published
+API, not just imported. Explicit `dimensions=1024` and omitted dimensions both
+returned finite, unit-normalized **1024** outputs with repeat cosine **1.0**.
+Wrong dimensions and over-512-token inputs returned HTTP 400. Eight bilingual /
+cross-language synthetic retrieval queries achieved top-1 and MRR **1.0**, as did
+the unchanged Qwen 4096 baseline. In a fresh isolated LanceDB 0.34.0 store,
+eight native vectors were committed as `fixed_size_list[1024]`, fsynced, then
+read and searched in a fresh process (version 2, eight rows, dimension 1024).
+No canonical EverOS store/config/service was accessed or changed.
+
+| Measured control (batch 2, serial, shared-host observation) | Candidate CPU | Qwen incumbent GPU |
+|---|---:|---:|
+| STS17 English Spearman, first 24 committed pairs | 0.810106 | 0.906360 |
+| HTTP latency p50 | 0.345355 s | 0.996097 s |
+| Maximum observed HTTP latency | 0.662545 s | 17.948027 s |
+| Observed serial texts/s | 5.675909 | 1.285950 |
+| Request/text count | 34 / 66 | 32 / 64 |
+
+These sequential samples include shared-route contention; they are **not** an
+isolated throughput benchmark or evidence that CPU is generally faster. Candidate
+cgroup peak was **3,468,701,696 bytes** under a 5 GiB cap; `memory.swap.max/current`
+and every `oom`/`oom_kill` counter were zero. Incumbent cgroup current was
+4,121,583,616 bytes after the trial; its 16,961,908,736-byte lifetime peak is not a
+trial delta and cgroup accounting is not complete GPU/UMA residency. The canary
+was stopped/removed by its exact recorded CID; all three production container
+IDs/PIDs/start times and Guard/model unit generations remained unchanged.
+
+**Issue #117 remains open:** this delivers real opt-in 1024 API/storage capability,
+not incumbent-quality equivalence or EverOS adoption. English STS regressed by
+0.096255 Spearman; the attempted long Chinese STS22 pair was rejected at the
+native 512-token boundary. Do not truncate those documents to manufacture parity.
+A corpus-appropriate quality decision and separately approved consumer adoption
+are still required before a persistent replacement route can be recommended.
