@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import re
 import stat
@@ -273,6 +274,67 @@ class RetainContainerInspectTests(unittest.TestCase):
         refused = _run(self.env, self.cidfile, self.output)
         _assert_kept_last_good(self, refused, self.output)
         self.assertEqual(len(list(store.glob("*.exited.json"))), 64)
+
+    def test_concurrent_archive_admission_preserves_capacity(self) -> None:
+        # Execute the unchanged archive block in owned processes, pausing only
+        # the first count snapshot while the second writer attempts admission.
+        source = HELPER.read_text()
+        block = source.split('<<\'PY\' || skip "inspect validation or durable archive failed; keeping last inspect"\n', 1)[1].split('\nPY\n', 1)[0]
+        context = multiprocessing.get_context("fork")
+        snapshot, release = context.Event(), context.Event()
+        results = context.Queue()
+        store = Path(self.env["HOME"]) / ".local/state/gb10-vllm-cids"
+        store.mkdir(parents=True, mode=0o700)
+        for index in range(63):
+            (store / f"retained-{index}.exited.json").write_text("{}")
+
+        def worker(cid: str, pause: bool) -> None:
+            import sys
+            os.environ["HOME"] = self.env["HOME"]
+            payload = Path(self.temporary.name) / f"{cid}.inspect"
+            body = json.loads(_exited_payload())
+            body[0]["Id"] = cid
+            payload.write_text(json.dumps(body))
+            sys.argv = ["archive", cid, CONTAINER, str(payload), str(MAX_INSPECT_BYTES)]
+            original = os.listdir
+            def count(directory: int) -> list[str]:
+                entries = original(directory)
+                if pause:
+                    snapshot.set()
+                    if not release.wait(6):
+                        raise TimeoutError("admission fixture release")
+                return entries
+            os.listdir = count
+            try:
+                exec(compile(block, str(HELPER), "exec"), {"__name__": "__main__"})
+                results.put("success")
+            except (OSError, SystemExit) as error:
+                results.put(type(error).__name__)
+
+        first = context.Process(target=worker, args=("a" * 64, True))
+        second = context.Process(target=worker, args=("b" * 64, False))
+        try:
+            first.start()
+            self.assertTrue(snapshot.wait(3))
+            second.start()
+            second.join(3)
+            self.assertFalse(second.is_alive())
+            release.set()
+            first.join(3)
+            self.assertFalse(first.is_alive())
+            self.assertEqual(first.exitcode, 0)
+            self.assertEqual(second.exitcode, 0)
+            self.assertLessEqual(len(list(store.glob("*.exited.json"))), 64)
+            self.assertEqual(sorted(results.get(timeout=1) for _ in range(2)), ["BlockingIOError", "success"])
+        finally:
+            release.set()
+            for process in (first, second):
+                if process.pid is not None:
+                    if process.is_alive():
+                        process.kill()
+                    process.join(3)
+            results.close()
+            results.join_thread()
 
     def test_inspects_full_cid_not_container_name(self) -> None:
         seen = self.bin_dir / "seen.args"

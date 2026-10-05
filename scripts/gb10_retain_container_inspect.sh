@@ -120,6 +120,7 @@ fi
 [[ -f "$tmp" && ! -L "$tmp" ]] || skip "inspect tempfile is not a regular file; keeping last inspect"
 
 /usr/bin/python3 -IS - "$cid" "$container" "$tmp" "$MAX_INSPECT_BYTES" <<'PY' || skip "inspect validation or durable archive failed; keeping last inspect"
+import fcntl
 import hashlib
 import json
 import os
@@ -191,6 +192,8 @@ try:
     info = os.fstat(directory)
     if info.st_uid != uid or info.st_mode & 0o077:
         raise SystemExit(1)
+    # Count and publish share a nonblocking lock; contention never delays cleanup.
+    fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
     boot = open("/proc/sys/kernel/random/boot_id", encoding="ascii").read(64).strip()
     if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot):
         raise SystemExit(1)
