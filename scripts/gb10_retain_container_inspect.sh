@@ -119,11 +119,14 @@ if [[ "$inspect_status" -ne 0 || "$head_status" -ne 0 ]]; then
 fi
 [[ -f "$tmp" && ! -L "$tmp" ]] || skip "inspect tempfile is not a regular file; keeping last inspect"
 
-/usr/bin/python3 - "$cid" "$container" "$tmp" "$MAX_INSPECT_BYTES" <<'PY' || skip "inspect payload is empty, failed, oversized, or a different generation"
+/usr/bin/python3 -IS - "$cid" "$container" "$tmp" "$MAX_INSPECT_BYTES" <<'PY' || skip "inspect validation or durable archive failed; keeping last inspect"
+import hashlib
 import json
 import os
+import re
 import stat
 import sys
+import time
 
 cid, name, path, max_text = sys.argv[1:]
 max_bytes = int(max_text)
@@ -162,6 +165,110 @@ if type(state.get("ExitCode")) is not int:
     raise SystemExit(1)
 if type(state.get("OOMKilled")) is not bool:
     raise SystemExit(1)
+for key in ("StartedAt", "FinishedAt"):
+    value = state.get(key)
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z", value):
+        raise SystemExit(1)
+
+# Content-free receipt in the existing durable CID store, before cleanup.
+# This caller is the retainer, NOT evidence identifying a SIGKILL initiator.
+uid = os.getuid()
+store = os.path.join(os.environ["HOME"], ".local", "state", "gb10-vllm-cids")
+directory = os.open(os.environ["HOME"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    for component in (".local", "state", "gb10-vllm-cids"):
+        parent_info = os.fstat(directory)
+        if parent_info.st_uid != uid or parent_info.st_mode & 0o022:
+            raise SystemExit(1)
+        try:
+            os.mkdir(component, mode=0o700, dir_fd=directory)
+        except FileExistsError:
+            pass
+        next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+        os.fsync(directory)
+        os.close(directory)
+        directory = next_fd
+    info = os.fstat(directory)
+    if info.st_uid != uid or info.st_mode & 0o077:
+        raise SystemExit(1)
+    boot = open("/proc/sys/kernel/random/boot_id", encoding="ascii").read(64).strip()
+    if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot):
+        raise SystemExit(1)
+    pid = os.getpid()
+    proc = open(f"/proc/{pid}/stat", encoding="ascii").read(4096)
+    fields = proc[proc.rfind(")") + 2:].split()
+    caller = {"pid": pid, "start_ticks": int(fields[19]), "ppid": os.getppid(), "uid": uid}
+    scope = f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/docker-{cid}.scope"
+    events = {"status": "unavailable"}
+    try:
+        scope_fd = os.open(scope, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            scope_stat = os.fstat(scope_fd)
+            event_fd = os.open("memory.events", flags, dir_fd=scope_fd)
+            try:
+                event_stat = os.fstat(event_fd)
+                data = os.read(event_fd, 4097).decode("ascii")
+                if not stat.S_ISREG(event_stat.st_mode) or len(data) > 4096:
+                    raise ValueError("invalid events")
+                counts = {}
+                for line in data.splitlines():
+                    key, value = line.split()
+                    if key in counts or not re.fullmatch(r"[a-z_]+", key) or not value.isdecimal():
+                        raise ValueError("invalid events")
+                    counts[key] = int(value)
+                if not {"oom", "oom_kill"} <= counts.keys():
+                    raise ValueError("missing events")
+                events = {"status": "captured", "path": scope, "device": scope_stat.st_dev,
+                          "inode": scope_stat.st_ino, "counts": counts}
+            finally:
+                os.close(event_fd)
+        finally:
+            os.close(scope_fd)
+    except (OSError, ValueError, UnicodeError):
+        pass  # A vanished exited scope is unknown, never an inferred zero.
+    safe_state = {key: state.get(key) for key in
+                  ("Status", "Running", "ExitCode", "OOMKilled", "StartedAt", "FinishedAt")}
+    receipt = {"schema": 1, "boot_id": boot, "container_id": cid, "container_name": name,
+               "state": safe_state, "caller": caller, "memory_events": events,
+               "realtime_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
+               "inspect_sha256": hashlib.sha256(raw).hexdigest(), "kill_initiator": "UNKNOWN"}
+    generation = hashlib.sha256(str(state.get("StartedAt")).encode()).hexdigest()[:16]
+    leaf = f"{cid}.{generation}.exited.json"
+    # ponytail: 64 receipts maximum; preserve old evidence and fail closed at capacity.
+    entries = os.listdir(directory)
+    if len([entry for entry in entries if entry.endswith(".exited.json")]) >= 64 and leaf not in entries:
+        raise SystemExit(1)
+    archive_tmp = ".inspect-" + os.urandom(16).hex()
+    archive_fd = os.open(archive_tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+    try:
+        with os.fdopen(archive_fd, "w", encoding="ascii") as stream:
+            json.dump(receipt, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Immutable per Docker StartedAt generation; duplicate stop hooks keep first evidence.
+        try:
+            os.link(archive_tmp, leaf, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+        except FileExistsError:
+            existing = os.open(leaf, flags, dir_fd=directory)
+            try:
+                existing_stat = os.fstat(existing)
+                previous = json.loads(os.read(existing, 16385))
+                if (not stat.S_ISREG(existing_stat.st_mode) or existing_stat.st_uid != uid
+                        or existing_stat.st_mode & 0o077 or previous.get("container_id") != cid
+                        or previous.get("state", {}).get("StartedAt") != state.get("StartedAt")):
+                    raise SystemExit(1)
+            finally:
+                os.close(existing)
+        os.fsync(directory)
+    finally:
+        os.unlink(archive_tmp, dir_fd=directory)
+    os.fsync(directory)
+    current = os.stat(store, follow_symlinks=False)
+    if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+        raise SystemExit(1)
+finally:
+    os.close(directory)
 PY
 
 chmod 0600 "$tmp" || skip "chmod failed; keeping last inspect"

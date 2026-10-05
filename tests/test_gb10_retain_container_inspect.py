@@ -100,6 +100,7 @@ def _exited_payload(**overrides: object) -> str:
             "Running": False,
             "ExitCode": 137,
             "OOMKilled": False,
+            "StartedAt": "2026-09-17T17:00:00.000Z",
             "FinishedAt": "2026-09-17T18:59:23.000Z",
         },
     }
@@ -214,6 +215,64 @@ class RetainContainerInspectTests(unittest.TestCase):
         self.assertEqual(self.output.read_text(), updated + "\n")
         leftover = list(self.identity.glob(f"{self.output.name}.tmp.*"))
         self.assertEqual(leftover, [])
+
+    def test_durable_generation_receipt_survives_runtime_directory_loss(self) -> None:
+        payload = json.loads(_exited_payload())
+        payload[0]["Config"] = {"Env": ["SECRET=must-not-be-archived"]}
+        _fake_docker(self.bin_dir, json.dumps(payload), 0)
+        result = _run(self.env, self.cidfile, self.output)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        archive = next((Path(self.env["HOME"]) / ".local/state/gb10-vllm-cids").glob(f"{CID}.*.exited.json"), None)
+        self.assertIsNotNone(archive, result.stdout + result.stderr)
+        assert archive is not None
+        receipt = json.loads(archive.read_text())
+        self.assertEqual(receipt["container_id"], CID)
+        self.assertEqual(receipt["state"]["ExitCode"], 137)
+        self.assertIs(receipt["state"]["OOMKilled"], False)
+        self.assertEqual(receipt["memory_events"]["status"], "unavailable")
+        self.assertGreater(receipt["caller"]["pid"], 0)
+        self.assertGreater(receipt["caller"]["start_ticks"], 0)
+        self.assertRegex(receipt["boot_id"], r"^[0-9a-f-]{36}$")
+        self.assertNotIn("must-not-be-archived", archive.read_text())
+        self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o600)
+        self.cidfile.unlink()
+        self.output.unlink()
+        self.identity.rmdir()
+        self.assertEqual(json.loads(archive.read_text()), receipt)
+
+    def test_durable_archive_keeps_first_episode_and_rejects_unsafe_store(self) -> None:
+        _fake_docker(self.bin_dir, _exited_payload(), 0)
+        first = _run(self.env, self.cidfile, self.output)
+        self.assertIn("retained", first.stdout)
+        store = Path(self.env["HOME"]) / ".local/state/gb10-vllm-cids"
+        archive = next(store.glob(f"{CID}.*.exited.json"))
+        initial = archive.read_bytes()
+        second = _run(self.env, self.cidfile, self.output)
+        self.assertIn("retained", second.stdout)
+        self.assertEqual(archive.read_bytes(), initial)
+        store.chmod(0o777)
+        self.output.write_text(LAST_GOOD + "\n")
+        refused = _run(self.env, self.cidfile, self.output)
+        _assert_kept_last_good(self, refused, self.output)
+        self.assertEqual(archive.read_bytes(), initial)
+
+    def test_archive_distinguishes_started_at_and_preserves_capacity(self) -> None:
+        _fake_docker(self.bin_dir, _exited_payload(), 0)
+        self.assertIn("retained", _run(self.env, self.cidfile, self.output).stdout)
+        store = Path(self.env["HOME"]) / ".local/state/gb10-vllm-cids"
+        payload = json.loads(_exited_payload())
+        payload[0]["State"]["StartedAt"] = "2026-09-18T17:00:00.000Z"
+        _fake_docker(self.bin_dir, json.dumps(payload), 0)
+        self.assertIn("retained", _run(self.env, self.cidfile, self.output).stdout)
+        self.assertEqual(len(list(store.glob("*.exited.json"))), 2)
+        for index in range(62):
+            (store / f"retained-{index}.exited.json").write_text("{}")
+        payload[0]["State"]["StartedAt"] = "2026-09-19T17:00:00.000Z"
+        _fake_docker(self.bin_dir, json.dumps(payload), 0)
+        self.output.write_text(LAST_GOOD + "\n")
+        refused = _run(self.env, self.cidfile, self.output)
+        _assert_kept_last_good(self, refused, self.output)
+        self.assertEqual(len(list(store.glob("*.exited.json"))), 64)
 
     def test_inspects_full_cid_not_container_name(self) -> None:
         seen = self.bin_dir / "seen.args"
