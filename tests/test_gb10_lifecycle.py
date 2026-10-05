@@ -944,7 +944,10 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             docker = root / "docker"
             verifier = root / "gb10_verify_vllm_no_swap.sh"
             sleep = root / "sleep"
-            cidfile = root / "aeon-text.cid"
+            unit_source = (ROOT / "profile/aeon-ultimate-uncensored-nvfp4" / ULTIMATE_UNIT).read_text()
+            production_cid, = re.findall(r"^Environment=GB10_CONTAINER_CIDFILE=(.+)$", unit_source, re.M)
+            self.assertIn(f'readonly CIDFILE="{production_cid}"', GUARD_HELPER.read_text())
+            cidfile = root / Path(production_cid).name
             profile = root / "aeon-ultimate-uncensored-nvfp4.env"
             cidfile.write_text(cid + "\n")
             cidfile.chmod(0o600)
@@ -999,7 +1002,7 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                     str(verifier),
                 )
                 .replace(
-                    "/run/user/1001/gb10-memory-guardian/aeon-text.cid",
+                    production_cid,
                     str(cidfile),
                 )
                 .replace(

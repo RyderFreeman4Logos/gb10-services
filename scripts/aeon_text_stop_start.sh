@@ -17,7 +17,7 @@ readonly UNIT="vllm-aeon-ultimate-uncensored-nvfp4.service"
 readonly UNIT_PATH="/home/obj/.config/systemd/user/$UNIT"
 readonly ULTIMATE_PROFILE="/home/obj/.config/gb10/aeon-dflash-profiles/aeon-ultimate-uncensored-nvfp4.env"
 readonly CONTAINER="vllm-aeon-ultimate-uncensored-nvfp4"
-readonly CIDFILE="/run/user/1001/gb10-memory-guardian/aeon-text.cid"
+readonly CIDFILE="/home/obj/.local/state/gb10-vllm-cids/vllm-aeon-ultimate-uncensored-nvfp4.cid"
 readonly DOCKER_HOST_VALUE="unix:///run/user/1001/docker.sock"
 
 fail() {
