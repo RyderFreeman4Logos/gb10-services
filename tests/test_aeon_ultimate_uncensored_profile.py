@@ -173,8 +173,11 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
         self.assertIn("--deadline 2800", unit)
         self.assertIn("TimeoutStartSec=3000", unit)
         self.assertIn("OOMScoreAdjust=800", unit)
-        self.assertIn("After=network-online.target vllm-embedding.service vllm-querit-4b-reranker.service", unit)
-        self.assertNotIn("Requires=", unit)
+        self.assertIn("After=docker.service network-online.target vllm-embedding.service vllm-querit-4b-reranker.service", unit)
+        self.assertEqual(
+            [line for line in unit.splitlines() if line.startswith("Requires=")],
+            ["Requires=docker.service"],
+        )
         self.assertIn("Conflicts=", unit)
         self.assertIn("vllm-aeon-qwen38-dflash.service", unit)
         self.assertIn("vllm-aeon-27b-dflash.service", unit)

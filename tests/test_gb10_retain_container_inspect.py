@@ -35,7 +35,7 @@ UNITS = (
         ROOT
         / "profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service",
         "vllm-aeon-ultimate-uncensored-nvfp4",
-        "%t/gb10-memory-guardian/aeon-text.cid",
+        "/home/obj/.local/state/gb10-vllm-cids/vllm-aeon-ultimate-uncensored-nvfp4.cid",
         "%t/gb10-memory-guardian/last-aeon-ultimate-uncensored-nvfp4-inspect.json",
     ),
     (
