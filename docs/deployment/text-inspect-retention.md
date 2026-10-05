@@ -63,12 +63,25 @@ Runtime last-good inspect still
 uses same-directory `mv -Tf` and is not itself a crash-durable transaction.
 
 The durable receipt excludes Docker environment, labels, mounts and raw argv.
-It records boot ID, timestamps, exited state/OOMKilled, the actual retainer PID
-and starttime, and canonical CID-scope memory.events if still readable. These
-counters have an observed scope inode but no independent same-StartedAt Docker
-re-inspection fence; they are not sufficient alone for natural-event attribution.
-A vanished scope is explicitly `unavailable`, not zero OOM events. Caller identity
-names the retainer, **not the SIGKILL initiator**. This stop-time capture cannot
-reconstruct events already removed by Docker on process exit; a future natural
-137 still needs actor attribution and same-generation event evidence. A
-simulated loss of the runtime directory is not an actual forced-reboot test.
+It records boot ID, timestamps, exited state/OOMKilled and the retainer PID/starttime;
+the retainer is **not the SIGKILL initiator**. Three text units now call the same
+helper once with `--snapshot-live` before readiness. This owner-alive baseline
+binds full CID, Docker StartedAt, PID/starttime, canonical proc cgroup and scope
+inode, rechecks Docker and owner identity, and durably publishes raw memory.events
+in an immutable `<CID>.<StartedAt-hash>.memory.json` beside the exited archive.
+There is no daemon, additional poller, high-frequency fsync, eviction or cap change;
+capacity is 64 live snapshots plus 64 exited receipts under the same nonblocking lock.
+Repeated hooks preserve the first baseline. A helper-only install does not execute
+this new start hook on an already-running generation; no current coverage is implied.
+
+A readable stop-time scope with that same baseline inode and unchanged exited
+CID/StartedAt is marked `generation_fenced=true`, `terminal_status=captured`.
+Otherwise the baseline is only `status=last-known`, `terminal_status=unavailable`:
+its raw counters survive scope deletion, but events between the baseline and death
+are **unknown**, even if the baseline already contains a nonzero oom_kill count.
+Missing, malformed, unsafe or different-generation snapshots are never substituted;
+legacy unfenced stop counters explicitly say `terminal_status=unfenced`.
+Literal terminal-counter retention and next-natural-137 attribution remain PARTIAL
+until a real same-generation death provides final counters and independent actor
+or kernel evidence. One baseline does not reconstruct historical lost counters,
+and simulated runtime-directory/cgroup loss is not an actual death or reboot test.

@@ -24,7 +24,7 @@ if [[ "${GB10_RETAIN_UNDER_TIMEOUT:-}" != "1" ]]; then
 fi
 
 usage() {
-  echo "usage: gb10_retain_container_inspect.sh --container NAME --cidfile PATH --output PATH" >&2
+  echo "usage: gb10_retain_container_inspect.sh [--snapshot-live] --container NAME --cidfile PATH --output PATH" >&2
   exit 2
 }
 
@@ -36,8 +36,13 @@ skip() {
 container=""
 cidfile=""
 output=""
+export GB10_RETAIN_SNAPSHOT_LIVE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --snapshot-live)
+      export GB10_RETAIN_SNAPSHOT_LIVE=1
+      shift
+      ;;
     --container)
       [[ $# -ge 2 ]] || usage
       container="$2"
@@ -128,8 +133,11 @@ import re
 import stat
 import sys
 import time
+import subprocess
+import tempfile
 
 cid, name, path, max_text = sys.argv[1:]
+live = os.environ.get("GB10_RETAIN_SNAPSHOT_LIVE") == "1"
 max_bytes = int(max_text)
 flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 try:
@@ -158,9 +166,9 @@ if payload[0].get("Name") != "/" + name:
 state = payload[0].get("State")
 if not isinstance(state, dict):
     raise SystemExit(1)
-if state.get("Status") != "exited":
+if state.get("Status") != ("running" if live else "exited"):
     raise SystemExit(1)
-if state.get("Running") is not False:
+if state.get("Running") is not live:
     raise SystemExit(1)
 if type(state.get("ExitCode")) is not int:
     raise SystemExit(1)
@@ -204,6 +212,54 @@ try:
     fields = proc[proc.rfind(")") + 2:].split()
     caller = {"pid": pid, "start_ticks": int(fields[19]), "ppid": os.getppid(), "uid": uid}
     scope = f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/docker-{cid}.scope"
+    generation = hashlib.sha256(str(state.get("StartedAt")).encode()).hexdigest()[:16]
+    memory_leaf = f"{cid}.{generation}.memory.json"
+    def read_file(file, limit):
+        fd = os.open(file, flags)
+        try:
+            meta = os.fstat(fd)
+            data = os.read(fd, limit + 1)
+            if not stat.S_ISREG(meta.st_mode) or len(data) > limit:
+                raise ValueError("invalid file")
+            return data.decode("ascii")
+        finally:
+            os.close(fd)
+    def owner_identity():
+        owner_pid = state.get("Pid")
+        if type(owner_pid) is not int or owner_pid <= 1:
+            raise ValueError("invalid owner PID")
+        proc = read_file(f"/proc/{owner_pid}/stat", 4096)
+        fields = proc[proc.rfind(")") + 2:].split()
+        if not proc.startswith(f"{owner_pid} (") or len(fields) < 20 or not fields[19].isdecimal() or int(fields[19]) <= 0:
+            raise ValueError("invalid owner stat")
+        if read_file(f"/proc/{owner_pid}/cgroup", 4096) != "0::" + scope.removeprefix("/sys/fs/cgroup") + "\n":
+            raise ValueError("owner scope mismatch")
+        return {"pid": owner_pid, "start_ticks": int(fields[19])}
+    def parse_events(data):
+        if not data.endswith("\n") or "\r" in data:
+            raise ValueError("unterminated events")
+        counts = {}
+        for line in data.splitlines():
+            key, value = line.split()
+            if key in counts or not re.fullmatch(r"[a-z_]+", key) or not re.fullmatch(r"[0-9]{1,20}", value):
+                raise ValueError("invalid events")
+            counts[key] = int(value)
+        if not {"oom", "oom_kill"} <= counts.keys():
+            raise ValueError("missing events")
+        return counts
+    def inspect_fence():
+        # Fixed projection excludes Docker environment/argv; disk-backed output
+        # is bounded on read and covered by the helper's existing outer deadline.
+        with tempfile.TemporaryFile() as stream:
+            result = subprocess.run(["/usr/bin/timeout", "--signal=TERM", "--kill-after=1", "2",
+                                     "docker", "inspect", "--type", "container", "--format",
+                                     "{{.Id}} {{.Name}} {{.State.Running}} {{.State.Pid}} {{.State.StartedAt}}", cid],
+                                    stdout=stream, stderr=subprocess.DEVNULL, check=False)
+            stream.seek(0)
+            expected = f"{cid} /{name} {'true' if live else 'false'} {state.get('Pid', 0)} {state.get('StartedAt')}\n"
+            return result.returncode == 0 and stream.read(1025) == expected.encode("ascii")
+    owner = owner_identity() if live else None
+    sampled_ns = time.time_ns()
     events = {"status": "unavailable"}
     try:
         scope_fd = os.open(scope, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -215,33 +271,99 @@ try:
                 data = os.read(event_fd, 4097).decode("ascii")
                 if not stat.S_ISREG(event_stat.st_mode) or len(data) > 4096:
                     raise ValueError("invalid events")
-                counts = {}
-                for line in data.splitlines():
-                    key, value = line.split()
-                    if key in counts or not re.fullmatch(r"[a-z_]+", key) or not value.isdecimal():
-                        raise ValueError("invalid events")
-                    counts[key] = int(value)
-                if not {"oom", "oom_kill"} <= counts.keys():
-                    raise ValueError("missing events")
+                counts = parse_events(data)
                 events = {"status": "captured", "path": scope, "device": scope_stat.st_dev,
-                          "inode": scope_stat.st_ino, "counts": counts}
+                          "inode": scope_stat.st_ino, "counts": counts, "raw": data,
+                          "sampled_realtime_ns": sampled_ns, "generation_fenced": False,
+                          "terminal_status": "unfenced"}
             finally:
                 os.close(event_fd)
         finally:
             os.close(scope_fd)
     except (OSError, ValueError, UnicodeError):
         pass  # A vanished exited scope is unknown, never an inferred zero.
+    saved = None
+    try:
+        fd = os.open(memory_leaf, flags, dir_fd=directory)
+        try:
+            meta = os.fstat(fd)
+            data = os.read(fd, 16385)
+            if (not stat.S_ISREG(meta.st_mode) or meta.st_uid != uid or meta.st_mode & 0o077
+                    or meta.st_nlink != 1 or len(data) > 16384):
+                raise ValueError("unsafe snapshot")
+            candidate = json.loads(data)
+            prior = candidate.get("memory_events", {})
+            prior_owner = candidate.get("owner", {})
+            if (candidate.get("schema") != 1 or candidate.get("container_id") != cid
+                    or candidate.get("started_at") != state.get("StartedAt")
+                    or candidate.get("container_name") != name or candidate.get("boot_id") != boot
+                    or prior.get("path") != scope or prior.get("status") != "captured"
+                    or prior.get("generation_fenced") is not True or prior.get("terminal_status") != "not-observed"
+                    or type(prior.get("device")) is not int or type(prior.get("inode")) is not int
+                    or prior["device"] < 0 or prior["inode"] <= 0
+                    or type(prior_owner.get("pid")) is not int or prior_owner["pid"] <= 1
+                    or type(prior_owner.get("start_ticks")) is not int or prior_owner["start_ticks"] <= 0
+                    or type(prior.get("sampled_realtime_ns")) is not int
+                    or not 0 < prior["sampled_realtime_ns"] <= sampled_ns
+                    or not isinstance(prior.get("raw"), str) or len(prior["raw"]) > 4096
+                    or not isinstance(prior.get("counts"), dict)
+                    or any(type(value) is not int for value in prior["counts"].values())
+                    or parse_events(prior["raw"]) != prior.get("counts")):
+                raise ValueError("snapshot generation mismatch")
+            saved = candidate
+        finally:
+            os.close(fd)
+    except (OSError, ValueError, UnicodeError, AttributeError, TypeError):
+        pass
+    if live:
+        if events["status"] != "captured" or owner_identity() != owner or not inspect_fence() or owner_identity() != owner:
+            raise SystemExit(1)
+        current_fd = os.open(scope, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            current = os.fstat(current_fd)
+        finally:
+            os.close(current_fd)
+        if (current.st_dev, current.st_ino) != (events["device"], events["inode"]):
+            raise SystemExit(1)
+        events["generation_fenced"] = True
+        events["terminal_status"] = "not-observed"
+        if saved is not None and (saved["owner"] != owner or
+                (saved["memory_events"]["device"], saved["memory_events"]["inode"]) != (current.st_dev, current.st_ino)):
+            raise SystemExit(1)
+    elif saved is not None:
+        if events["status"] == "captured":
+            prior = saved["memory_events"]
+            current_identity = None
+            try:
+                current_fd = os.open(scope, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    current = os.fstat(current_fd)
+                    current_identity = (current.st_dev, current.st_ino)
+                finally:
+                    os.close(current_fd)
+            except OSError:
+                pass
+            if (events["device"], events["inode"]) == (prior["device"], prior["inode"]) == current_identity and inspect_fence():
+                events["generation_fenced"] = True
+                events["terminal_status"] = "captured"
+            else:
+                events = {"status": "unavailable"}
+        if events["status"] == "unavailable":
+            events = dict(saved["memory_events"], status="last-known", terminal_status="unavailable")
     safe_state = {key: state.get(key) for key in
                   ("Status", "Running", "ExitCode", "OOMKilled", "StartedAt", "FinishedAt")}
     receipt = {"schema": 1, "boot_id": boot, "container_id": cid, "container_name": name,
                "state": safe_state, "caller": caller, "memory_events": events,
                "realtime_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
                "inspect_sha256": hashlib.sha256(raw).hexdigest(), "kill_initiator": "UNKNOWN"}
-    generation = hashlib.sha256(str(state.get("StartedAt")).encode()).hexdigest()[:16]
-    leaf = f"{cid}.{generation}.exited.json"
-    # ponytail: 64 receipts maximum; preserve old evidence and fail closed at capacity.
+    if live:
+        receipt = {"schema": 1, "boot_id": boot, "container_id": cid, "container_name": name,
+                   "started_at": state.get("StartedAt"), "owner": owner, "memory_events": events}
+    leaf = memory_leaf if live else f"{cid}.{generation}.exited.json"
+    # ponytail: 64 receipts of each kind maximum; no eviction or second poller.
     entries = os.listdir(directory)
-    if len([entry for entry in entries if entry.endswith(".exited.json")]) >= 64 and leaf not in entries:
+    suffix = ".memory.json" if live else ".exited.json"
+    if len([entry for entry in entries if entry.endswith(suffix)]) >= 64 and leaf not in entries:
         raise SystemExit(1)
     archive_tmp = ".inspect-" + os.urandom(16).hex()
     archive_fd = os.open(archive_tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
@@ -261,7 +383,8 @@ try:
                 previous = json.loads(os.read(existing, 16385))
                 if (not stat.S_ISREG(existing_stat.st_mode) or existing_stat.st_uid != uid
                         or existing_stat.st_mode & 0o077 or previous.get("container_id") != cid
-                        or previous.get("state", {}).get("StartedAt") != state.get("StartedAt")):
+                        or (previous.get("started_at") if live else previous.get("state", {}).get("StartedAt")) != state.get("StartedAt")
+                        or (live and saved is None)):
                     raise SystemExit(1)
             finally:
                 os.close(existing)
@@ -276,6 +399,10 @@ finally:
     os.close(directory)
 PY
 
+if [[ "$GB10_RETAIN_SNAPSHOT_LIVE" == 1 ]]; then
+  echo "gb10_retain_container_inspect: captured live cid=$cid container=$container"
+  exit 0
+fi
 chmod 0600 "$tmp" || skip "chmod failed; keeping last inspect"
 if [[ -L "$output" || -e "$output" ]]; then
   [[ -f "$output" && ! -L "$output" ]] || skip "output leaf is not a replaceable regular file"
