@@ -161,6 +161,25 @@ class IntegratedGuardianRegistrationTests(unittest.TestCase):
             ),
         )
 
+    def test_publishes_ultimate_durable_cid_after_runtime_recreation(self) -> None:
+        temporary, env, registration, _systemctl = self.fixture()
+        self.addCleanup(temporary.cleanup)
+        home = Path(temporary.name) / "home"
+        durable = home / ".local/state/gb10-vllm-cids/vllm-aeon-ultimate-uncensored-nvfp4.cid"
+        durable.parent.mkdir(parents=True, mode=0o700)
+        Path(env["GB10_CONTAINER_CIDFILE"]).rename(durable)
+        registration.parent.rmdir()
+        registration.parent.parent.rmdir()
+        registration.parent.mkdir(parents=True, mode=0o700)
+        env["HOME"] = str(home)
+        env["GB10_CONTAINER_CIDFILE"] = str(durable)
+        result = subprocess.run(
+            [str(PUBLISHER)], env=env, text=True, capture_output=True, timeout=10
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("container_id=" + "a" * 64, registration.read_text())
+        self.assertTrue(durable.is_file())
+
     def test_rejects_unreviewed_cidfile_without_registration(self) -> None:
         temporary, env, registration, _systemctl = self.fixture("hostile.cid")
         self.addCleanup(temporary.cleanup)

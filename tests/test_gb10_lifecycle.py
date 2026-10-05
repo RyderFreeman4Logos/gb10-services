@@ -25,6 +25,10 @@ UNIT = "vllm-aeon-27b-dflash.service"
 HIKV_UNIT = "vllm-aeon-27b-dflash-hikv.service"
 QWEN38_UNIT = "vllm-aeon-qwen38-dflash.service"
 ULTIMATE_UNIT = "vllm-aeon-ultimate-uncensored-nvfp4.service"
+ULTIMATE_CID, = re.findall(
+    r"^Environment=GB10_CONTAINER_CIDFILE=(.+)$",
+    (ROOT / "profile/aeon-ultimate-uncensored-nvfp4" / ULTIMATE_UNIT).read_text(), re.M,
+)
 
 
 class LifecycleAuditScriptTests(unittest.TestCase):
@@ -944,7 +948,8 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             docker = root / "docker"
             verifier = root / "gb10_verify_vllm_no_swap.sh"
             sleep = root / "sleep"
-            cidfile = root / "aeon-text.cid"
+            self.assertIn(f'readonly CIDFILE="{ULTIMATE_CID}"', GUARD_HELPER.read_text())
+            cidfile = root / Path(ULTIMATE_CID).name
             profile = root / "aeon-ultimate-uncensored-nvfp4.env"
             cidfile.write_text(cid + "\n")
             cidfile.chmod(0o600)
@@ -999,7 +1004,7 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
                     str(verifier),
                 )
                 .replace(
-                    "/run/user/1001/gb10-memory-guardian/aeon-text.cid",
+                    ULTIMATE_CID,
                     str(cidfile),
                 )
                 .replace(
@@ -1313,7 +1318,7 @@ class GuardHelperVerifierContractTests(VllmNoSwapFixture):
                 str(self.profile),
             )
             .replace(
-                "/run/user/1001/gb10-memory-guardian/aeon-text.cid",
+                ULTIMATE_CID,
                 str(self.cidfile),
             )
         )
