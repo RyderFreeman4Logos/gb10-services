@@ -194,11 +194,13 @@ try:
         raise SystemExit(1)
     # Count and publish share a nonblocking lock; contention never delays cleanup.
     fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    boot = open("/proc/sys/kernel/random/boot_id", encoding="ascii").read(64).strip()
+    with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as stream:
+        boot = stream.read(64).strip()
     if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot):
         raise SystemExit(1)
     pid = os.getpid()
-    proc = open(f"/proc/{pid}/stat", encoding="ascii").read(4096)
+    with open(f"/proc/{pid}/stat", encoding="ascii") as stream:
+        proc = stream.read(4096)
     fields = proc[proc.rfind(")") + 2:].split()
     caller = {"pid": pid, "start_ticks": int(fields[19]), "ppid": os.getppid(), "uid": uid}
     scope = f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/docker-{cid}.scope"
