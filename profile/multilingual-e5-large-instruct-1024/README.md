@@ -38,7 +38,7 @@ interpret a cap as measured residency.
 
 ```bash
 # Run on GB10, replacing SOURCE with the verified private script path.
-DOCKER_HOST=unix:///run/user/1001/docker.sock docker run --rm \
+DOCKER_HOST=unix:///run/user/1001/docker.sock docker run \
   --name gb10-native1024-canary --network bridge -p 127.0.0.1:18016:18016 \
   --memory 5g --memory-swap 5g --cpus 2 --pids-limit 128 --oom-score-adj 1000 \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
@@ -51,7 +51,9 @@ DOCKER_HOST=unix:///run/user/1001/docker.sock docker run --rm \
 ```
 
 The whole Hub root is read-only to preserve existing snapshot→blob symlinks;
-a snapshot-only mount breaks those links. No CUDA devices are granted.
+a snapshot-only mount breaks those links. No CUDA devices are granted. Preserve logs and terminal Docker state before
+removing only the recorded, verified owned CID; omit `--rm` so failed startup
+cannot erase its evidence.
 Only synthetic data is authorized for this canary. Verify API model identity,
 1024 finite/unit-normalized outputs, repeat stability, semantic controls,
 matched local-incumbent quality/latency, and a fresh isolated LanceDB
