@@ -8,6 +8,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 
 class Native1024CanaryTests(unittest.TestCase):
+    def test_startup_consumes_the_same_lifetime_budget(self):
+        import subprocess
+        code = '''import sys,types,tempfile,pathlib,json,hashlib,time
+import native1024_canary as c
+with tempfile.TemporaryDirectory() as root:
+ p=pathlib.Path(root)/c.REVISION;p.mkdir();(p/"config.json").write_text(json.dumps({"hidden_size":1024,"architectures":["XLMRobertaModel"]}));(p/"model.safetensors").write_bytes(b"")
+ c.WEIGHTS_SHA256=hashlib.sha256(b"").hexdigest();c._available=lambda:12*1024**3
+ def late(*args,**kwargs):raise AssertionError("startup escaped the one-second lifetime")
+ sys.modules["torch"]=types.SimpleNamespace(set_num_threads=lambda n:time.sleep(3),float32=None)
+ sys.modules["transformers"]=types.SimpleNamespace(AutoModel=types.SimpleNamespace(from_pretrained=late),AutoTokenizer=types.SimpleNamespace(from_pretrained=late))
+ sys.argv=["canary","--model-path",str(p),"--seconds","1"]
+ try:c.main()
+ except TimeoutError:print("STARTUP_DEADLINE_ENFORCED")
+ else:raise AssertionError("startup never expired")
+'''
+        result = subprocess.run([sys.executable, "-c", "import sys;sys.path.insert(0," + repr(str(Path(__file__).resolve().parents[1] / "scripts")) + ");" + code], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("STARTUP_DEADLINE_ENFORCED", result.stdout)
+
     def test_accepted_request_cannot_outlive_canary_deadline(self):
         import signal
         import socket

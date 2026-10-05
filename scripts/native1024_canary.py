@@ -75,6 +75,9 @@ def main() -> None:
     args = parser.parse_args()
     if not 1024 <= args.port <= 65535 or not 1 <= args.seconds <= 900:
         parser.error("invalid port or lifetime")
+    deadline = time.monotonic() + args.seconds
+    signal.signal(signal.SIGALRM, _request_timeout)
+    signal.setitimer(signal.ITIMER_REAL, args.seconds)
     path = args.model_path
     if path.name != REVISION or _available() < 11 * 1024**3:
         raise RuntimeError("immutable model pin or 11 GiB startup admission failed")
@@ -141,10 +144,10 @@ def main() -> None:
                 self.reply(400, {"error": "invalid request or native vector contract"})
 
     # ponytail: single synchronous canary worker; use a production engine after corpus acceptance.
-    signal.signal(signal.SIGALRM, _request_timeout)
     with _BoundedHTTPServer(("0.0.0.0" if args.container_publish_loopback else "127.0.0.1", args.port), Handler) as server:
         server.timeout = 1
-        deadline = server.deadline = time.monotonic() + args.seconds
+        server.deadline = deadline
+        signal.setitimer(signal.ITIMER_REAL, 0)
         print(json.dumps({"ready": True, "model": MODEL, "revision": REVISION, "weights_sha256": digest}), flush=True)
         while time.monotonic() < deadline and _available() >= 6 * 1024**3:
             server.handle_request()
