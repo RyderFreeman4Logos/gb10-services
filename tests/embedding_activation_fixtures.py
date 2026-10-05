@@ -34,7 +34,7 @@ CONTAINER_ID = "a" * 64
 
 
 def _tool_source() -> str:
-    return r'''#!/usr/bin/env python3
+    return r'''#!/usr/bin/python3 -IS
 import json
 import os
 import subprocess
@@ -201,7 +201,7 @@ raise SystemExit(95)
 
 
 def _verifier_source() -> str:
-    return r'''#!/usr/bin/env python3
+    return r'''#!/usr/bin/python3 -IS
 import json
 import os
 import sys
@@ -277,7 +277,7 @@ def _no_swap_helper_source(core: bytes) -> str:
 set -euo pipefail
 CORE_BASENAME=gb10_verify_vllm_no_swap_core.py
 EXPECTED_CORE_SHA256={digest}
-/usr/bin/python3 -I - "${{BASH_SOURCE[0]}}" "$EXPECTED_CORE_SHA256" "$@" <<'PY'
+/usr/bin/python3 -I -S - "${{BASH_SOURCE[0]}}" "$EXPECTED_CORE_SHA256" "$@" <<'PY'
 import hashlib
 import os
 import stat
