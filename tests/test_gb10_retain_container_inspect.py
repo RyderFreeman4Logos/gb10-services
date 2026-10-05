@@ -222,8 +222,28 @@ class RetainContainerInspectTests(unittest.TestCase):
                 except SystemExit as error:
                     self.assertEqual(error.code, 1)
 
-        execute(True)
         store = root / ".local/state/gb10-vllm-cids"
+        original_fsync = os.fsync
+        def execute_interrupted(live):
+            def crash_after_durable_publish(fd):
+                original_fsync(fd)
+                suffix = "*.memory.json" if live else "*.exited.json"
+                if stat.S_ISDIR(os.fstat(fd).st_mode) and list(store.glob(suffix)):
+                    os._exit(77)  # Real child interruption before publication cleanup.
+            def capture():
+                with patch.object(os, "fsync", crash_after_durable_publish):
+                    execute(live)
+            child = multiprocessing.get_context("fork").Process(target=capture)
+            try:
+                child.start()
+                child.join(8)
+                self.assertFalse(child.is_alive(), "publication fault barrier timed out")
+                self.assertEqual(child.exitcode, 77)
+            finally:
+                if child.is_alive():
+                    child.kill()
+                child.join(3)
+        execute_interrupted(True)
         snapshot = next(store.glob("*.memory.json"), None)
         self.assertIsNotNone(snapshot, "live same-generation counters were not durably captured")
         assert snapshot is not None
@@ -236,14 +256,16 @@ class RetainContainerInspectTests(unittest.TestCase):
         _fake_docker(self.bin_dir, f"{CID} /{CONTAINER} false 0 {body['State']['StartedAt']}\n", 0)
         # A surviving scope is terminal evidence only with the saved inode and
         # a second same-StartedAt exited inspection around the counter read.
-        execute(False)
+        execute_interrupted(False)
         archive = next(store.glob("*.exited.json"))
+        self.assertEqual(snapshot.stat().st_nlink, 1)
+        self.assertEqual(archive.stat().st_nlink, 1)
         terminal = json.loads(archive.read_text())["memory_events"]
         self.assertTrue(terminal["generation_fenced"])
         self.assertEqual(terminal["terminal_status"], "captured")
         archive.unlink()
         shutil.rmtree(owned_scope)
-        execute(False)
+        execute_interrupted(False)
         archive = next(store.glob("*.exited.json"))
         receipt = json.loads(archive.read_text())
         self.assertEqual(receipt["memory_events"]["status"], "last-known")
@@ -254,6 +276,20 @@ class RetainContainerInspectTests(unittest.TestCase):
         self.assertEqual(receipt["state"]["StartedAt"], saved["started_at"])
         archive.unlink()
         original = snapshot.read_bytes()
+        # Neither a foreign alias nor a symlink is our publication protocol.
+        foreign = root / "foreign-alias"
+        os.link(snapshot, foreign)
+        execute(False)
+        self.assertEqual(json.loads(archive.read_text())["memory_events"]["status"], "unavailable")
+        archive.unlink()
+        foreign.unlink()
+        snapshot.rename(foreign)
+        snapshot.symlink_to(foreign)
+        execute(False)
+        self.assertEqual(json.loads(archive.read_text())["memory_events"]["status"], "unavailable")
+        archive.unlink()
+        snapshot.unlink()
+        foreign.rename(snapshot)
         for field, value in (("container_id", "a" * 64),
                              ("started_at", "2026-09-18T17:00:00.000Z"),
                              ("boot_id", "0" * 36), ("owner", {"pid": 1234, "start_ticks": 0}),
@@ -384,6 +420,18 @@ class RetainContainerInspectTests(unittest.TestCase):
         second = _run(self.env, self.cidfile, self.output)
         self.assertIn("retained", second.stdout)
         self.assertEqual(archive.read_bytes(), initial)
+        # Simultaneous duplicate hooks with different evidence cannot replace
+        # the first generation receipt, even after lock contention settles.
+        from concurrent.futures import ThreadPoolExecutor
+        changed = json.loads(_exited_payload())
+        changed[0]["State"]["ExitCode"] = 0
+        _fake_docker(self.bin_dir, json.dumps(changed), 0)
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            results = list(workers.map(lambda _: _run(self.env, self.cidfile, self.output), range(4)))
+        self.assertTrue(all(result.returncode == 0 for result in results))
+        self.assertEqual(archive.read_bytes(), initial)
+        self.assertEqual(archive.stat().st_nlink, 1)
+        self.assertEqual(list(store.glob(".inspect-*")), [])
         store.chmod(0o777)
         self.output.write_text(LAST_GOOD + "\n")
         refused = _run(self.env, self.cidfile, self.output)

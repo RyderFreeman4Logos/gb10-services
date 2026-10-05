@@ -125,6 +125,7 @@ fi
 [[ -f "$tmp" && ! -L "$tmp" ]] || skip "inspect tempfile is not a regular file; keeping last inspect"
 
 /usr/bin/python3 -IS - "$cid" "$container" "$tmp" "$MAX_INSPECT_BYTES" <<'PY' || skip "inspect validation or durable archive failed; keeping last inspect"
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -373,9 +374,16 @@ try:
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        # Immutable per Docker StartedAt generation; duplicate stop hooks keep first evidence.
+        # Linux RENAME_NOREPLACE atomically moves the single link: a crash after
+        # directory fsync cannot strand our own alias and poison reader admission.
+        rename = ctypes.CDLL(None, use_errno=True).renameat2
+        rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+        rename.restype = ctypes.c_int
         try:
-            os.link(archive_tmp, leaf, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+            if rename(directory, os.fsencode(archive_tmp), directory, os.fsencode(leaf), 1) != 0:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error), leaf)
+            archive_tmp = None
         except FileExistsError:
             existing = os.open(leaf, flags, dir_fd=directory)
             try:
@@ -390,7 +398,8 @@ try:
                 os.close(existing)
         os.fsync(directory)
     finally:
-        os.unlink(archive_tmp, dir_fd=directory)
+        if archive_tmp is not None:
+            os.unlink(archive_tmp, dir_fd=directory)
     os.fsync(directory)
     current = os.stat(store, follow_symlinks=False)
     if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
