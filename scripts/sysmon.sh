@@ -68,25 +68,6 @@ PROC_MAP="$LOG_DIR/sysmon_process_names.csv"
 
 HEADER="timestamp,load_1m,load_5m,load_15m,mem_used_mb,mem_total_mb,swap_used_mb,swap_total_mb,tz0,tz1,tz2,tz3,tz4,tz5,tz6,nvme_c,nvme_s1,nvme_s2,gpu_temp_c,gpu_power_w,gpu_util_pct,gpu_clock_mhz,top1_proc_id,top1_rss_mb,top2_proc_id,top2_rss_mb,top3_proc_id,top3_rss_mb,top4_proc_id,top4_rss_mb,top5_proc_id,top5_rss_mb,disk_read_mb_s,disk_write_mb_s,disk_io_ms_s,swap_in_mb_s,swap_out_mb_s,top1_swap_pid,top1_swap_proc_id,top1_swap_mb,top2_swap_pid,top2_swap_proc_id,top2_swap_mb,top3_swap_pid,top3_swap_proc_id,top3_swap_mb,top4_swap_pid,top4_swap_proc_id,top4_swap_mb,top5_swap_pid,top5_swap_proc_id,top5_swap_mb,mem_available_mb,sample_cadence_ms,sample_elapsed_ms,sample_lag_ms,boot_id,memory_some_avg10,memory_full_avg10,io_full_avg10,cpu_some_avg10"
 
-rotate_log() {
-    local epoch_seconds="$1"
-    local today hhmmss existing_header
-    printf -v today '%(%Y-%m-%d)T' "$epoch_seconds"
-    printf -v hhmmss '%(%H%M%S)T' "$epoch_seconds"
-    local logfile="$LOG_DIR/sysmon_${today}.csv"
-    existing_header=""
-    if [[ -f "$logfile" ]]; then
-        IFS= read -r existing_header < "$logfile" || true
-    fi
-    if [[ -f "$logfile" && "$existing_header" != "$HEADER" ]]; then
-        mv "$logfile" "${logfile%.csv}.pre-v6.${hhmmss}.csv"
-    fi
-    if [[ ! -f "$logfile" ]]; then
-        printf '%s\n' "$HEADER" > "$logfile"
-    fi
-    printf '%s\n' "$logfile"
-}
-
 if [[ -n "$CLOCK_FILE" ]]; then
     exec 8< "$CLOCK_FILE"
 fi
@@ -281,7 +262,60 @@ counter_rate() {
         'BEGIN {delta=current-previous; if (delta < 0) delta=0; printf "%.2f", delta/seconds}'
 }
 
-mkdir -p "$LOG_DIR"
+# The pipe is a bounded queue, not a durability acknowledgement. On overload
+# fail the observer explicitly; never block sampling behind storage latency.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+csv_writer_pid=""
+csv_writer_fd=""
+shutdown_status=0
+
+cleanup() {
+    local status=$? stopped=0
+    trap - EXIT
+    trap '' INT TERM
+    if [[ -n "$csv_writer_fd" ]]; then
+        exec {csv_writer_fd}>&-
+    fi
+    if [[ -n "$csv_writer_pid" ]]; then
+        /usr/bin/python3 -I "$SCRIPT_DIR/sysmon_csv_writer.py" \
+            --stop "$csv_writer_pid" "$csv_writer_starttime" || stopped=$?
+        # Only wait after pidfd confirms exit; wait on a live writer is unbounded.
+        if (( stopped < 2 )); then
+            wait "$csv_writer_pid" || status=1
+        fi
+        if (( stopped != 0 )); then
+            echo "sysmon CSV drain failed; queued samples may be unsaved" >&2
+            status=1
+        fi
+    fi
+    if [[ -n "${NVS_PID:-}" ]]; then
+        kill -TERM "$NVS_PID" 2>/dev/null || true
+    fi
+    exit "$status"
+}
+trap cleanup EXIT
+# Defer termination during launch so the writer cannot escape ownership.
+trap 'shutdown_status=130' INT
+trap 'shutdown_status=143' TERM
+mkdir -p "$LOG_DIR" || exit 1
+coproc CSV_WRITER {
+    exec /usr/bin/python3 -I "$SCRIPT_DIR/sysmon_csv_writer.py" "$LOG_DIR" "$HEADER"
+}
+csv_writer_pid="$CSV_WRITER_PID"
+csv_writer_starttime="$(/usr/bin/python3 -I "$SCRIPT_DIR/sysmon_csv_writer.py" --identity "$csv_writer_pid")" || exit 1
+# Duplicate the write end: Bash may unset the coproc array when the writer dies.
+exec {csv_writer_fd}>&"${CSV_WRITER[1]}"
+exec {CSV_WRITER[1]}>&-
+if ! IFS= read -r -t 2 -u "${CSV_WRITER[0]}" csv_writer_ready || [[ "$csv_writer_ready" != READY ]]; then
+    echo "sysmon CSV writer did not become ready" >&2
+    exit 1
+fi
+exec {CSV_WRITER[0]}<&-
+if (( shutdown_status != 0 )); then
+    exit "$shutdown_status"
+fi
+trap 'exit 130' INT
+trap 'exit 143' TERM
 init_proc_map
 
 # Find NVMe hwmon path once at startup
@@ -300,20 +334,12 @@ fi
 # stdin (${NVS[1]}) is unused; we only consume stdout (${NVS[0]}).
 if [[ "$TEST_MODE" != "1" ]]; then
     coproc NVS {
-        nvidia-smi \
+        exec nvidia-smi \
             --query-gpu=temperature.gpu,power.draw,utilization.gpu,clocks.gr \
             --format=csv,noheader,nounits \
             --loop-ms="$GPU_LOOP_MS" 2>/dev/null
     }
 fi
-# Ensure the child nvidia-smi is killed if this script exits.
-cleanup() {
-    if [[ -n "${NVS_PID:-}" ]] && kill -0 "$NVS_PID" 2>/dev/null; then
-        kill -TERM "$NVS_PID" 2>/dev/null
-    fi
-}
-trap cleanup EXIT INT TERM
-
 prev_vm_counters=$(read_vm_counters)
 IFS=, read -r prev_swap_in prev_swap_out <<< "$prev_vm_counters"
 prev_disk_counters=$(read_disk_counters)
@@ -327,7 +353,6 @@ while true; do
     now_microseconds
     sample_start_us="$NOW_US"
     sample_epoch_seconds=$((sample_start_us / 1000000))
-    logfile=$(rotate_log "$sample_epoch_seconds")
     format_timestamp "$sample_epoch_seconds"
     ts="$SAMPLE_TIMESTAMP"
     if (( previous_sample_start_us == 0 )); then
@@ -474,7 +499,11 @@ while true; do
         sample_lag_ms=0
     fi
 
-    echo "${ts},${load1},${load5},${load15},${mem_used},${mem_total},${swap_used},${swap_total},${tz[0]},${tz[1]},${tz[2]},${tz[3]},${tz[4]},${tz[5]},${tz[6]},${nvme_c},${nvme_s1},${nvme_s2},${gpu_temp:-N/A},${gpu_power:-N/A},${gpu_util:-N/A},${gpu_clock:-N/A},${top_fields[0]},${top_fields[1]},${top_fields[2]},${top_fields[3]},${top_fields[4]},${top_fields[5]},${top_fields[6]},${top_fields[7]},${top_fields[8]},${top_fields[9]},${disk_read_mb_s},${disk_write_mb_s},${disk_io_ms_s},${swap_in_mb_s},${swap_out_mb_s},${top_swap_fields[0]},${top_swap_fields[1]},${top_swap_fields[2]},${top_swap_fields[3]},${top_swap_fields[4]},${top_swap_fields[5]},${top_swap_fields[6]},${top_swap_fields[7]},${top_swap_fields[8]},${top_swap_fields[9]},${top_swap_fields[10]},${top_swap_fields[11]},${top_swap_fields[12]},${top_swap_fields[13]},${top_swap_fields[14]},${mem_available_mb},${sample_cadence_ms},${sample_elapsed_ms},${sample_lag_ms},${boot_id},${memory_some_avg10},${memory_full_avg10},${io_full_avg10},${cpu_some_avg10}" >> "$logfile"
+    csv_row="${ts},${load1},${load5},${load15},${mem_used},${mem_total},${swap_used},${swap_total},${tz[0]},${tz[1]},${tz[2]},${tz[3]},${tz[4]},${tz[5]},${tz[6]},${nvme_c},${nvme_s1},${nvme_s2},${gpu_temp:-N/A},${gpu_power:-N/A},${gpu_util:-N/A},${gpu_clock:-N/A},${top_fields[0]},${top_fields[1]},${top_fields[2]},${top_fields[3]},${top_fields[4]},${top_fields[5]},${top_fields[6]},${top_fields[7]},${top_fields[8]},${top_fields[9]},${disk_read_mb_s},${disk_write_mb_s},${disk_io_ms_s},${swap_in_mb_s},${swap_out_mb_s},${top_swap_fields[0]},${top_swap_fields[1]},${top_swap_fields[2]},${top_swap_fields[3]},${top_swap_fields[4]},${top_swap_fields[5]},${top_swap_fields[6]},${top_swap_fields[7]},${top_swap_fields[8]},${top_swap_fields[9]},${top_swap_fields[10]},${top_swap_fields[11]},${top_swap_fields[12]},${top_swap_fields[13]},${top_swap_fields[14]},${mem_available_mb},${sample_cadence_ms},${sample_elapsed_ms},${sample_lag_ms},${boot_id},${memory_some_avg10},${memory_full_avg10},${io_full_avg10},${cpu_some_avg10}"
+    if ! /usr/bin/python3 -I "$SCRIPT_DIR/sysmon_csv_writer.py" --send "$csv_row" >&"$csv_writer_fd"; then
+        echo "sysmon CSV enqueue failed; sample not accepted" >&2
+        exit 1
+    fi
 
     previous_sample_start_us="$sample_start_us"
     sample_count=$((sample_count + 1))
