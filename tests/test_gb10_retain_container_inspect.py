@@ -370,11 +370,17 @@ class RetainContainerInspectTests(unittest.TestCase):
         result = _run(self.env, self.cidfile, self.output)
         _assert_kept_last_good(self, result, self.output)
 
-    def test_cidfile_without_newline_does_not_overwrite_last_good_inspect(self) -> None:
+    def test_docker_cidfile_without_newline_retains_exited_generation(self) -> None:
+        # Docker writes exactly 64 hex bytes, without a trailing newline.
         self.cidfile.write_bytes(CID.encode())
-        _fake_docker(self.bin_dir, _exited_payload() + "\n", 0)
+        updated = _exited_payload()
+        _fake_docker(self.bin_dir, updated + "\n", 0)
         result = _run(self.env, self.cidfile, self.output)
-        _assert_kept_last_good(self, result, self.output)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.output.read_text(), updated + "\n")
+        self.assertIn(f"retained cid={CID}", result.stdout)
+        self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o600)
+        self.assertEqual(list(self.identity.glob(f"{self.output.name}.tmp.*")), [])
 
     def test_cidfile_extra_byte_and_second_line_do_not_overwrite_last_good_inspect(
         self,

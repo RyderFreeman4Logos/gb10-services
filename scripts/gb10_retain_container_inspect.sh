@@ -85,9 +85,10 @@ try:
     raw = os.read(fd, 66)
 finally:
     os.close(fd)
-if len(raw) != 65 or raw[-1:] != b"\n" or b"\0" in raw:
-    raise SystemExit(1)
-cid = raw[:-1]
+# Docker's --cidfile is 64 hex bytes; legacy publishers append one newline.
+if len(raw) == 65 and raw[-1:] == b"\n":
+    raw = raw[:-1]
+cid = raw
 if len(cid) != 64 or any(byte not in b"0123456789abcdef" for byte in cid):
     raise SystemExit(1)
 sys.stdout.buffer.write(cid)
