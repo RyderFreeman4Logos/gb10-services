@@ -6,7 +6,10 @@ import argparse
 import hashlib
 import json
 import math
+import signal
+import socket
 import time
+from types import FrameType
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -42,6 +45,24 @@ def validate_vectors(vectors: list[list[float]], count: int) -> None:
 
 def _available() -> int:
     return int(next(line.split()[1] for line in Path("/proc/meminfo").read_text().splitlines() if line.startswith("MemAvailable:"))) * 1024
+
+
+def _request_timeout(signum: int, frame: FrameType | None) -> None:
+    raise TimeoutError("absolute canary request deadline")
+
+
+class _BoundedHTTPServer(HTTPServer):
+    deadline: float
+
+    def finish_request(self, request: object, client_address: tuple[str, int]) -> None:
+        if not isinstance(request, socket.socket):
+            raise TypeError("canary requires a TCP socket")
+        request.settimeout(5)
+        signal.setitimer(signal.ITIMER_REAL, max(0.001, min(30, self.deadline - time.monotonic())))
+        try:
+            super().finish_request(request, client_address)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
 
 
 def main() -> None:
@@ -120,9 +141,10 @@ def main() -> None:
                 self.reply(400, {"error": "invalid request or native vector contract"})
 
     # ponytail: single synchronous canary worker; use a production engine after corpus acceptance.
-    with HTTPServer(("0.0.0.0" if args.container_publish_loopback else "127.0.0.1", args.port), Handler) as server:
+    signal.signal(signal.SIGALRM, _request_timeout)
+    with _BoundedHTTPServer(("0.0.0.0" if args.container_publish_loopback else "127.0.0.1", args.port), Handler) as server:
         server.timeout = 1
-        deadline = time.monotonic() + args.seconds
+        deadline = server.deadline = time.monotonic() + args.seconds
         print(json.dumps({"ready": True, "model": MODEL, "revision": REVISION, "weights_sha256": digest}), flush=True)
         while time.monotonic() < deadline and _available() >= 6 * 1024**3:
             server.handle_request()

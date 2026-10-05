@@ -15,7 +15,8 @@ for local clients. No cloud fallback or GPU is used.
   image below. Missing dependencies are a blocker, never dummy embeddings.
 - **512-token** native limit, versus incumbent 32K. Oversize requests are rejected,
   never silently truncated. One synchronous worker, at most two texts/request,
-  32 KiB request body, bounded 600s lifetime (maximum 900s).
+  32 KiB request body, 5s socket idle timeout and absolute 30s request deadline
+  (also capped by the 600s lifetime; maximum lifetime 900s).
 - As trained, retrieval **queries** need `Instruct: <task>\nQuery: <query>`;
   documents need no prefix. The API does not guess which inputs are queries.
   Existing consumers are not drop-in compatible solely because dimensions match.
