@@ -14,7 +14,6 @@ __all__ = ["main"]
 
 ROOT = Path(__file__).resolve().parents[1]
 UNIT_SOURCE = ROOT / "profile"
-TARGET_ROOT = ROOT / "target"
 EXEC_DIRECTIVES = (
     "ExecCondition=",
     "ExecStart=",
@@ -44,8 +43,7 @@ def main() -> int:
     if not units:
         raise SystemExit("no tracked systemd user services found")
 
-    TARGET_ROOT.mkdir(exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="systemd-user-verify-", dir=TARGET_ROOT) as temp:
+    with tempfile.TemporaryDirectory(prefix="systemd-user-verify-") as temp:
         fixture_root = Path(temp)
         unit_dir = fixture_root / "user"
         bin_dir = fixture_root / "bin"
@@ -74,6 +72,12 @@ def main() -> int:
 
         for target in targets:
             (unit_dir / target).write_text("[Unit]\n")
+
+        # Rootless Docker is installed on GB10, not part of this source tree.
+        # Keep other missing service dependencies fatal; never stub them by name.
+        (unit_dir / "docker.service").write_text(
+            "[Service]\nType=notify\nExecStart=/usr/bin/true\n"
+        )
 
         environment = os.environ.copy()
         environment["SYSTEMD_UNIT_PATH"] = str(unit_dir)
