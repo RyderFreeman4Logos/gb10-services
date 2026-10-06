@@ -40,6 +40,18 @@ class ReceiptStoreTests(unittest.TestCase):
             capture_output=True, text=True, timeout=5, check=False,
         )
 
+    def assert_unchanged_entry(self, before: os.stat_result, original: bytes) -> None:
+        # Immutable publication protects payload and all metadata except atime:
+        # ordinary reads (including this oracle's read_bytes) may update it.
+        names = [name for name in dir(before)
+                 if name.startswith("st_") and name not in {"st_atime", "st_atime_ns"}]
+        after = self.leaf.lstat()
+        self.assertEqual(
+            {name: getattr(after, name) for name in names},
+            {name: getattr(before, name) for name in names},
+        )
+        self.assertEqual(self.leaf.read_bytes(), original)
+
     def test_interrupted_actual_publication_remains_single_link_and_retryable(self) -> None:
         # Both barriers perform the real syscall before exiting without cleanup.
         # The link barrier witnesses the old defect; rename witnesses the repair.
@@ -105,14 +117,61 @@ m.run("publish", Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4])
                 else:
                     self.leaf.write_bytes(b"tampered\n" if kind == "tamper" else self.candidate.read_bytes())
                     self.leaf.chmod(0o644 if kind == "mode" else 0o600)
+                # Force relatime to expose read-induced atime changes without sleeps.
+                os.utime(self.leaf, ns=(1, 2), follow_symlinks=False)
                 before = self.leaf.lstat()
                 original = self.leaf.read_bytes()
                 for command in ("verify", "publish"):
                     result = self.command(command)
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertEqual(self.leaf.lstat(), before)
-                    self.assertEqual(self.leaf.read_bytes(), original)
+                    self.assert_unchanged_entry(before, original)
                     self.assertEqual(target.read_bytes(), b"untouched foreign bytes\n")
+
+    def test_read_induced_atime_is_not_an_overwrite(self) -> None:
+        self.directory.mkdir(mode=0o700)
+        original = b"tampered\n"
+        self.leaf.write_bytes(original)
+        self.leaf.chmod(0o600)
+        # First isolate the oracle's own read, then the real store's reads.
+        for reader in ("oracle", "verify", "publish"):
+            with self.subTest(reader=reader):
+                os.utime(self.leaf, ns=(1, 2))
+                before = self.leaf.lstat()
+                if reader == "oracle":
+                    self.assertEqual(self.leaf.read_bytes(), original)
+                else:
+                    result = self.command(reader)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("stale or tampered", result.stderr)
+                self.assertNotEqual(self.leaf.lstat().st_atime_ns, before.st_atime_ns)
+                self.assert_unchanged_entry(before, original)
+
+    def test_unchanged_oracle_rejects_real_mutations(self) -> None:
+        self.directory.mkdir(mode=0o700)
+        original = b"tampered\n"
+        for mutation in ("write", "replace", "mode", "link", "mtime"):
+            with self.subTest(mutation=mutation):
+                self.leaf.write_bytes(original)
+                self.leaf.chmod(0o600)
+                before = self.leaf.lstat()
+                if mutation == "write":
+                    self.leaf.write_bytes(b"modified\n")  # Same length still fails.
+                elif mutation == "replace":
+                    replacement = self.root / "replacement"
+                    replacement.write_bytes(original)
+                    replacement.chmod(0o600)
+                    replacement.replace(self.leaf)  # Same bytes still fails.
+                elif mutation == "mode":
+                    self.leaf.chmod(0o644)
+                elif mutation == "link":
+                    os.link(self.leaf, self.root / "alias")
+                else:
+                    os.utime(self.leaf, ns=(before.st_atime_ns, before.st_mtime_ns + 1))
+                with self.assertRaises(AssertionError):
+                    self.assert_unchanged_entry(before, original)
+                self.leaf.unlink()
+                if mutation == "link":
+                    (self.root / "alias").unlink()
 
     def test_wrong_digest_refused_before_publication(self) -> None:
         for command in ("verify", "publish"):
@@ -126,12 +185,12 @@ m.run("publish", Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4])
             results = list(executor.map(lambda _: self.command("publish"), range(6)))
         for result in results:
             self.assertEqual(result.returncode, 0, result.stderr)
+        os.utime(self.leaf, ns=(1, 2))
         before = self.leaf.stat()
         self.assertEqual(before.st_nlink, 1)
         again = self.command("publish")
         self.assertEqual(again.returncode, 0, again.stderr)
-        self.assertEqual(self.leaf.stat(), before)
-        self.assertEqual(self.leaf.read_bytes(), self.candidate.read_bytes())
+        self.assert_unchanged_entry(before, self.candidate.read_bytes())
 
     def test_unavailable_no_replace_fails_closed_without_link_fallback(self) -> None:
         for failure in ("missing-symbol", errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
