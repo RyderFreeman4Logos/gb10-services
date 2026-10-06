@@ -339,6 +339,23 @@ existing installation, follow the Guard admission contract below **before**
 stop, install, start, or any canonical database mutation. The general stack
 installation commands are not an upgrade/rollback transaction.
 
+**FIRST INSTALL only:** on an authorized fresh host with no existing Guard
+entrypoint or canonical Guard database, publish the built binary before unit
+installation/start. Under exclusive installation ownership, this prerequisite
+refuses an existing file or symlink (including a dangling link); it is **not**
+an upgrade command. Existing installations must use the schema-gated procedure
+below instead.
+```bash
+(
+  set -eu
+  if [ -e "$HOME/.local/bin/llm-guard-proxy" ] || [ -L "$HOME/.local/bin/llm-guard-proxy" ]; then
+    printf '%s\n' 'HOLD: existing Guard installation requires schema admission' >&2
+    exit 1
+  fi
+  install -Dm755 "$(mise which llm-guard-proxy)" "$HOME/.local/bin/llm-guard-proxy"
+)
+```
+
 #### Guard binary/schema admission and readiness (#128)
 
 `python3 scripts/gb10_guard_deployment.py` is a read-only executable check, not

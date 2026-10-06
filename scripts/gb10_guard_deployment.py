@@ -6,6 +6,7 @@ No lifecycle, executable publication, or database writes are performed here.
 import argparse
 import hashlib
 import json
+import os
 import re
 import stat
 import time
@@ -131,6 +132,17 @@ def strict_object(pairs):
     return dict(pairs)
 
 
+def read_metadata(path: Path) -> dict:
+    """Nonblocking open, then validate the held file before parsing its bytes.
+
+    Directory symlinks remain supported; no storage path is rewritten.
+    """
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "r") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise Hold("metadata must be a regular file")
+        return json.load(stream, object_pairs_hook=strict_object)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
@@ -145,7 +157,7 @@ def main():
     args = parser.parse_args()
     try:
         if args.action == "admit":
-            evidence = json.loads(args.evidence.read_text(), object_pairs_hook=strict_object)
+            evidence = read_metadata(args.evidence)
             admit(evidence, digest(args.old_binary), digest(args.candidate_binary), args.current_schema)
             for role in ("old", "candidate"):
                 row = evidence[role]
@@ -157,7 +169,7 @@ def main():
                               "candidate_sha256": evidence["candidate"]["sha256"],
                               "migration_target": evidence["candidate"]["migration_target"]}, sort_keys=True))
         else:
-            before = json.loads(args.before.read_text(), object_pairs_hook=strict_object)
+            before = read_metadata(args.before)
             generation = wait_ready(before, args.expected_sha256)
             print(json.dumps({"status": "READY", "generation": generation,
                               "held_sha256": args.expected_sha256}, sort_keys=True))

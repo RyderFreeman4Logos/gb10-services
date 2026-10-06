@@ -3,6 +3,9 @@ import contextlib
 import copy
 import io
 import json
+import os
+import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -164,6 +167,91 @@ class GuardDeploymentTests(unittest.TestCase):
             self.assertEqual(run(), (1, "HOLD"))
             evidence["old"].pop("supported_schemas")
             self.assertEqual(run(), (1, "HOLD"))
+
+    def test_real_cli_metadata_refuses_fifo_and_invalid_regular_inputs(self):
+        with tempfile.TemporaryDirectory(dir=Path.home() / "tmp") as folder:
+            root = Path(folder)
+            fifo = root / "metadata.fifo"
+            os.mkfifo(fifo, 0o600)
+            malformed = root / "malformed.json"
+            malformed.write_text("{")
+            duplicate = root / "duplicate.json"
+            duplicate.write_text('{"old": {}, "old": {}}')
+            unknown = root / "unknown.json"
+            unknown.write_text("{}")
+            for action in ("admit", "ready"):
+                for metadata in (fifo, malformed, duplicate, unknown, root):
+                    with self.subTest(action=action, metadata=metadata.name):
+                        argv = [sys.executable, "-B", str(SCRIPTS / "gb10_guard_deployment.py"), action]
+                        if action == "admit":
+                            argv += ["--old-binary", str(malformed), "--candidate-binary", str(malformed),
+                                     "--evidence", str(metadata), "--current-schema", "4"]
+                        else:
+                            # Only the unknown regular object uses an invalid digest.
+                            argv += ["--before", str(metadata), "--expected-sha256",
+                                     "unknown" if metadata == unknown else NEW]
+                        try:
+                            result = subprocess.run(argv, capture_output=True, text=True, timeout=2)
+                        except subprocess.TimeoutExpired:
+                            self.fail("real CLI metadata open blocked before HOLD")
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertEqual(json.loads(result.stdout)["status"], "HOLD")
+
+    def test_metadata_reader_checks_held_descriptor_and_preserves_directory_symlink(self):
+        with tempfile.TemporaryDirectory(dir=Path.home() / "tmp") as folder:
+            root = Path(folder)
+            metadata = root / "metadata.json"
+            metadata.write_text('{"offline": true}')
+            alias = root / "alias"
+            alias.symlink_to(root, target_is_directory=True)
+            self.assertEqual(contract.read_metadata(alias / metadata.name), {"offline": True})
+            self.assertTrue(alias.is_symlink())
+            fifo = root / "metadata.fifo"
+            os.mkfifo(fifo, 0o600)
+            fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+            with patch.object(contract.os, "open", return_value=fd), \
+                 patch.object(contract.json, "load", side_effect=AssertionError("read before fstat")):
+                with self.assertRaises(contract.Hold):
+                    contract.read_metadata(metadata)  # Path is regular; opened descriptor is not.
+            with self.assertRaises(OSError):
+                os.fstat(fd)  # Refusal closes the owned descriptor.
+
+    def test_readme_first_install_is_guarded_and_matches_unit_entrypoint(self):
+        readme = (SCRIPTS.parent / "README.md").read_text()
+        first_install = readme.split("#### Guard binary/schema admission", 1)[0]
+        blocks = re.findall(r"```bash\n(.*?)```", first_install, re.S)
+        blocks = [block for block in blocks if "install -Dm755" in block and "llm-guard-proxy" in block]
+        self.assertEqual(len(blocks), 1, "missing guarded FIRST INSTALL binary publication")
+        unit = (SCRIPTS.parent / "profile/llm-guard-proxy/llm-guard-proxy.service").read_text()
+        self.assertIn("ExecStart=/home/obj/.local/bin/llm-guard-proxy", unit)
+        with tempfile.TemporaryDirectory(dir=Path.home() / "tmp") as folder:
+            root = Path(folder)
+            candidate = root / "candidate"
+            candidate.write_bytes(b"offline candidate")
+            tools = root / "tools"
+            tools.mkdir()
+            mise = tools / "mise"
+            mise.write_text('#!/bin/sh\nif [ "$1" = which ]; then printf "%s\\n" "$CANDIDATE"; fi\n')
+            mise.chmod(0o755)
+            env = dict(os.environ, HOME=str(root), CANDIDATE=str(candidate),
+                       PATH=str(tools) + os.pathsep + os.environ["PATH"])
+            destination = root / ".local/bin/llm-guard-proxy"
+            result = subprocess.run(["bash", "-eu", "-c", blocks[0]], env=env,
+                                    capture_output=True, text=True, timeout=2)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(destination.read_bytes(), candidate.read_bytes())
+            destination.write_bytes(b"retained existing installation")
+            result = subprocess.run(["bash", "-eu", "-c", blocks[0]], env=env,
+                                    capture_output=True, text=True, timeout=2)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(destination.read_bytes(), b"retained existing installation")
+            destination.unlink()
+            destination.symlink_to(root / "missing")
+            result = subprocess.run(["bash", "-eu", "-c", blocks[0]], env=env,
+                                    capture_output=True, text=True, timeout=2)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(destination.is_symlink())
+            self.assertFalse((root / "missing").exists())
 
     def test_nonregular_evidence_is_rejected_before_open(self):
         with patch.object(Path, "stat", return_value=type("Stat", (), {"st_mode": 0o010600})()), \
