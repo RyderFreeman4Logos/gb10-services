@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import fcntl
 import hashlib
 import os
@@ -279,13 +280,28 @@ def publish(directory_fd: int, receipt_name: str, candidate: bytes) -> None:
         finally:
             os.close(temporary_fd)
         try:
-            os.link(
-                temporary_name,
-                receipt_name,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
-                follow_symlinks=False,
+            # Move the single link atomically; interruption must not leave an
+            # alias that poisons immutable receipt admission. No unsafe fallback.
+            try:
+                rename = ctypes.CDLL(None, use_errno=True).renameat2
+            except AttributeError as error:
+                raise StoreError(
+                    "atomic no-replace receipt publication is unavailable"
+                ) from error
+            rename.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
             )
+            rename.restype = ctypes.c_int
+            if rename(
+                directory_fd, os.fsencode(temporary_name),
+                directory_fd, os.fsencode(receipt_name), 1,  # RENAME_NOREPLACE
+            ) != 0:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error), receipt_name)
         except FileExistsError:
             verify_existing(directory_fd, receipt_name, candidate)
         unlink_created_entry(directory_fd, temporary_name, temporary_identity)
