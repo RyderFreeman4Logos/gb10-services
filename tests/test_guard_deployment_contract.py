@@ -99,6 +99,13 @@ class GuardDeploymentTests(unittest.TestCase):
         self.assertTrue(all(0 < value <= 5 for value in timeouts))
         self.assertEqual(operations, [])
 
+    def test_process_tree_containment_error_is_terminal(self):
+        failure = contract.ProcessTreeContainmentError("controlled containment failure")
+        result, _, timeouts, _ = self.wait([failure, 200])
+        self.assertEqual(result, "HOLD")
+        self.assertEqual(len(timeouts), 1)
+        self.assertEqual(self.wait([RuntimeError("ordinary command failure"), 200])[0], AFTER)
+
     def test_expiry_and_permanent_schema_failure_are_bounded(self):
         result, elapsed, _, operations = self.wait([ConnectionRefusedError()])
         self.assertEqual(result, "HOLD")
@@ -136,6 +143,52 @@ class GuardDeploymentTests(unittest.TestCase):
             with self.assertRaises(contract.Hold):
                 contract.wait_ready(BEFORE, NEW)
 
+    def run_ready_cli(self, generations, health, digests):
+        with tempfile.TemporaryDirectory(dir=Path.home() / "tmp") as folder:
+            before = Path(folder) / "before.json"
+            before.write_text(json.dumps(BEFORE))
+            argv = ["guard-check", "ready", "--before", str(before), "--expected-sha256", NEW]
+            calls = []
+            generation_rows, health_rows, hashes = iter(generations), iter(health), iter(digests)
+            def command(args, **kwargs):
+                if args[0] == "/usr/bin/systemctl":
+                    calls.append("query")
+                    row = next(generation_rows)
+                    return "\n".join(f"{field}={row[field]}" for field in contract.FIELDS)
+                calls.append("health")
+                result = next(health_rows)
+                if isinstance(result, Exception):
+                    raise result
+                return str(result)
+            output = io.StringIO()
+            with patch.object(sys, "argv", argv), patch.object(contract, "command", side_effect=command), \
+                 patch.object(contract, "digest", side_effect=lambda _: next(hashes)), \
+                 patch.object(contract.time, "monotonic", return_value=0), \
+                 patch.object(contract.time, "sleep"), contextlib.redirect_stdout(output):
+                rc = contract.main()
+        return rc, json.loads(output.getvalue()), calls
+
+    def test_cli_readiness_holds_terminal_final_observations_without_retry(self):
+        failed = dict(AFTER, ActiveState="failed", SubState="failed", MainPID="0")
+        cases = [([AFTER, failed, AFTER, AFTER], [200, 200], [NEW, NEW, NEW]),
+                 ([AFTER, AFTER, AFTER, AFTER], [200, 200], [NEW, OLD, NEW, NEW])]
+        for generations, health, digests in cases:
+            with self.subTest(generations=generations[1], digests=digests):
+                rc, receipt, calls = self.run_ready_cli(generations, health, digests)
+                self.assertEqual((rc, receipt["status"]), (1, "HOLD"))
+                self.assertEqual(calls, ["query", "health", "query"])
+
+    def test_cli_readiness_retries_refusal_and_generation_change(self):
+        changed = dict(AFTER, MainPID="14", InvocationID="c" * 32,
+                       ExecMainStartTimestampMonotonic="300")
+        cases = [([AFTER, changed, changed, changed], [200, 200], [NEW] * 4),
+                 ([AFTER, AFTER, AFTER], [ConnectionRefusedError(), 200], [NEW] * 3)]
+        for generations, health, digests in cases:
+            with self.subTest(generations=generations, health=health):
+                rc, receipt, calls = self.run_ready_cli(generations, health, digests)
+                self.assertEqual((rc, receipt["status"]), (0, "READY"))
+                self.assertGreater(calls.count("query"), 2)
+
     def test_cli_rechecks_real_offline_binary_and_report_bytes(self):
         with tempfile.TemporaryDirectory(dir=Path.home() / "tmp") as folder:
             root = Path(folder)
@@ -160,6 +213,33 @@ class GuardDeploymentTests(unittest.TestCase):
             self.assertEqual(run(), (1, "HOLD"))  # real 4→5 admission call
             evidence["old"]["supported_schemas"] = [4, 5]
             self.assertEqual(run(), (0, "ADMIT"))
+            parsed_manifest = root / "manifest.parsed"
+            parsed_manifest.write_bytes((root / "evidence.json").read_bytes())
+            parsed_sha256 = contract.digest(parsed_manifest)
+            read_metadata = contract.read_metadata
+            def rewrite_after_parse(path):
+                snapshot = read_metadata(path)
+                if path == root / "evidence.json":
+                    path.write_bytes(path.read_bytes() + bytes([10]))
+                return snapshot
+            output = io.StringIO()
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(contract, "read_metadata", side_effect=rewrite_after_parse),
+                patch.object(contract, "command") as commands,
+                contextlib.redirect_stdout(output),
+            ):
+                rc = contract.main()
+            receipt = json.loads(output.getvalue())
+            self.assertEqual(commands.call_args_list, [])
+            self.assertEqual(rc, 0)
+            self.assertEqual(receipt["evidence_sha256"], parsed_sha256)
+            self.assertNotEqual(receipt["evidence_sha256"], contract.digest(root / "evidence.json"))
+            for role in ("old", "candidate"):
+                evidence[role]["evidence_file"] = str(root / "report")
+            self.assertEqual(run(), (1, "HOLD"))
+            for role in ("old", "candidate"):
+                evidence[role]["evidence_file"] = "report"
             (root / "candidate").write_text("changed offline candidate")
             self.assertEqual(run(), (1, "HOLD"))
             evidence["candidate"]["sha256"] = contract.digest(root / "candidate")
@@ -179,8 +259,10 @@ class GuardDeploymentTests(unittest.TestCase):
             duplicate.write_text('{"old": {}, "old": {}}')
             unknown = root / "unknown.json"
             unknown.write_text("{}")
+            oversized = root / "oversized.json"
+            oversized.write_bytes(b" " * (contract.MAX_METADATA_BYTES + 1))
             for action in ("admit", "ready"):
-                for metadata in (fifo, malformed, duplicate, unknown, root):
+                for metadata in (fifo, malformed, duplicate, unknown, oversized, root):
                     with self.subTest(action=action, metadata=metadata.name):
                         argv = [sys.executable, "-B", str(SCRIPTS / "gb10_guard_deployment.py"), action]
                         if action == "admit":
@@ -197,6 +279,13 @@ class GuardDeploymentTests(unittest.TestCase):
                         self.assertEqual(result.returncode, 1, result.stderr)
                         self.assertEqual(json.loads(result.stdout)["status"], "HOLD")
 
+    def test_metadata_reader_rejects_bom_encoded_metadata(self):
+        with tempfile.TemporaryDirectory(dir=Path.home() / "tmp") as folder:
+            metadata = Path(folder) / "metadata.json"
+            metadata.write_bytes(bytes.fromhex("efbbbf7b7d"))
+            with self.assertRaises(json.JSONDecodeError):
+                contract.read_metadata(metadata)
+
     def test_metadata_reader_checks_held_descriptor_and_preserves_directory_symlink(self):
         with tempfile.TemporaryDirectory(dir=Path.home() / "tmp") as folder:
             root = Path(folder)
@@ -204,13 +293,13 @@ class GuardDeploymentTests(unittest.TestCase):
             metadata.write_text('{"offline": true}')
             alias = root / "alias"
             alias.symlink_to(root, target_is_directory=True)
-            self.assertEqual(contract.read_metadata(alias / metadata.name), {"offline": True})
+            self.assertEqual(contract.read_metadata(alias / metadata.name)[0], {"offline": True})
             self.assertTrue(alias.is_symlink())
             fifo = root / "metadata.fifo"
             os.mkfifo(fifo, 0o600)
             fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
             with patch.object(contract.os, "open", return_value=fd), \
-                 patch.object(contract.json, "load", side_effect=AssertionError("read before fstat")):
+                 patch.object(contract.json, "loads", side_effect=AssertionError("read before fstat")):
                 with self.assertRaises(contract.Hold):
                     contract.read_metadata(metadata)  # Path is regular; opened descriptor is not.
             with self.assertRaises(OSError):

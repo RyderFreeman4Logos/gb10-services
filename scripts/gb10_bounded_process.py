@@ -40,6 +40,10 @@ class BoundedProcessError(RuntimeError):
         self.errno = error_number
 
 
+class ProcessTreeContainmentError(BoundedProcessError):
+    """Cleanup expired while one or more command-process descendants remained."""
+
+
 def remaining(deadline: float, cap: float | None = None) -> float:
     value = deadline - time.monotonic()
     if cap is not None:
@@ -465,7 +469,7 @@ def _bounded_reap(
         survivors.sort()
     if survivors:
         diagnostic = "" if first_error is None else f"; cleanup={_bounded_error_summary(first_error)}"
-        raise BoundedProcessError(
+        raise ProcessTreeContainmentError(
             f"subprocess cleanup deadline exhausted; survivor_count={len(survivors)}"
             + diagnostic
         )

@@ -12,9 +12,10 @@ import stat
 import time
 from pathlib import Path
 
-from gb10_bounded_process import command, remaining
+from gb10_bounded_process import ProcessTreeContainmentError, command, remaining
 
 UNIT = "llm-guard-proxy.service"
+MAX_METADATA_BYTES = 1 << 20
 FIELDS = ("ActiveState", "SubState", "MainPID", "InvocationID",
           "ExecMainStartTimestampMonotonic")
 
@@ -37,7 +38,8 @@ def admit(evidence, old_sha256, candidate_sha256, current_schema):
             raise ValueError
         for role, expected in (("old", old_sha256), ("candidate", candidate_sha256)):
             row = evidence[role]
-            if (not re.fullmatch(r"[0-9a-f]{64}", expected)
+            if (("evidence_file" in row and Path(row["evidence_file"]).is_absolute())
+                    or not re.fullmatch(r"[0-9a-f]{64}", expected)
                     or row["sha256"] != expected
                     or not re.fullmatch(r"[0-9a-f]{40}", row["source_commit"])
                     or not re.fullmatch(r"[0-9a-f]{64}", row["evidence_sha256"])):
@@ -102,21 +104,27 @@ def wait_ready(before, expected_sha256):
     if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
         raise Hold("unknown expected executable digest")
     deadline = time.monotonic() + 60
+
+    def validate_observation(generation):
+        if generation["ActiveState"] == "failed":
+            raise Hold("Guard startup failed; preserve data and failure evidence")
+        is_fresh = fresh(before, generation)
+        if is_fresh and held_digest(generation) != expected_sha256:
+            raise Hold("held Guard executable digest mismatch")
+        return is_fresh
+
     while time.monotonic() < deadline:
         try:
             current = query_generation(deadline)
-            if current["ActiveState"] == "failed":
-                raise Hold("Guard startup failed; preserve data and failure evidence")
-            if fresh(before, current):
-                if held_digest(current) != expected_sha256:
-                    raise Hold("held Guard executable digest mismatch")
-                if health_status(deadline) == 200:
-                    after = query_generation(deadline)
-                    if (after == current and held_digest(after) == expected_sha256
-                            and time.monotonic() < deadline):
-                        return after
+            if validate_observation(current) and health_status(deadline) == 200:
+                after = query_generation(deadline)
+                after_is_fresh = validate_observation(after)
+                if after == current and after_is_fresh and time.monotonic() < deadline:
+                    return after
         except Hold:
             raise
+        except ProcessTreeContainmentError:
+            raise Hold("Guard readiness command containment failed") from None
         except (OSError, RuntimeError, ValueError, KeyError):
             # Type=simple submission can precede bind(); refusal is not rollback.
             pass
@@ -132,15 +140,15 @@ def strict_object(pairs):
     return dict(pairs)
 
 
-def read_metadata(path: Path) -> dict:
-    """Nonblocking open, then validate the held file before parsing its bytes.
-
-    Directory symlinks remain supported; no storage path is rewritten.
-    """
-    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "r") as stream:
+def read_metadata(path: Path) -> tuple[dict, str]:
+    """Parse and hash one bounded byte snapshot from a validated held descriptor."""
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise Hold("metadata must be a regular file")
-        return json.load(stream, object_pairs_hook=strict_object)
+        data = stream.read(MAX_METADATA_BYTES + 1)
+        if len(data) > MAX_METADATA_BYTES:
+            raise Hold("metadata exceeds byte limit")
+        return json.loads(data.decode("utf-8"), object_pairs_hook=strict_object), hashlib.sha256(data).hexdigest()
 
 
 def main():
@@ -157,19 +165,19 @@ def main():
     args = parser.parse_args()
     try:
         if args.action == "admit":
-            evidence = read_metadata(args.evidence)
+            evidence, evidence_sha256 = read_metadata(args.evidence)
             admit(evidence, digest(args.old_binary), digest(args.candidate_binary), args.current_schema)
             for role in ("old", "candidate"):
                 row = evidence[role]
                 if digest(args.evidence.parent / row["evidence_file"]) != row["evidence_sha256"]:
                     raise Hold("source/isolated evidence artifact digest mismatch")
             print(json.dumps({"status": "ADMIT", "current_schema": args.current_schema,
-                              "evidence_sha256": digest(args.evidence),
+                              "evidence_sha256": evidence_sha256,
                               "old_sha256": evidence["old"]["sha256"],
                               "candidate_sha256": evidence["candidate"]["sha256"],
                               "migration_target": evidence["candidate"]["migration_target"]}, sort_keys=True))
         else:
-            before = read_metadata(args.before)
+            before, _ = read_metadata(args.before)
             generation = wait_ready(before, args.expected_sha256)
             print(json.dumps({"status": "READY", "generation": generation,
                               "held_sha256": args.expected_sha256}, sort_keys=True))
