@@ -1732,6 +1732,7 @@ def command(
     streams: dict[int, tuple[str, object]] = {}
     captures = {"stdout": _Capture(bytearray()), "stderr": _Capture(bytearray())}
     failure: str | None = None
+    containment_error: ProcessTreeContainmentError | None = None
     input_offset = 0
     try:
         assert process.stdout is not None and process.stderr is not None
@@ -1796,9 +1797,11 @@ def command(
         elif process.returncode is None:
             process.wait(timeout=max(0.001, hard_deadline - time.monotonic()))
     except BaseException as error:
-        if process.stdin is not None and not process.stdin.closed:
-            process.stdin.close()
+        if isinstance(error, ProcessTreeContainmentError):
+            containment_error = error
         try:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
             _bounded_reap(
                 process,
                 tree,
@@ -1808,15 +1811,25 @@ def command(
                 hard_deadline,
             )
         except BaseException as cleanup_error:
+            if isinstance(cleanup_error, ProcessTreeContainmentError):
+                containment_error = containment_error or cleanup_error
+            if containment_error is not None and cleanup_error is not containment_error:
+                raise containment_error from cleanup_error
             raise cleanup_error from error
         raise
     finally:
-        if process.stdin is not None and not process.stdin.closed:
-            process.stdin.close()
-        for descriptor in list(streams):
-            _close_stream(selector, streams, descriptor)
-        selector.close()
-        tree.close()
+        try:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            for descriptor in list(streams):
+                _close_stream(selector, streams, descriptor)
+            selector.close()
+            tree.close()
+        except BaseException as cleanup_error:
+            # A terminal census cannot become retryable through later cleanup.
+            if containment_error is not None:
+                raise containment_error from cleanup_error
+            raise
 
     stdout = _render(captures["stdout"])
     stderr = _render(captures["stderr"])

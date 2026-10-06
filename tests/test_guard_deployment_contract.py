@@ -15,6 +15,7 @@ from unittest.mock import patch
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import gb10_guard_deployment as contract
+import gb10_bounded_process as bounded
 
 OLD = "a" * 64
 NEW = "b" * 64
@@ -105,6 +106,77 @@ class GuardDeploymentTests(unittest.TestCase):
         self.assertEqual(result, "HOLD")
         self.assertEqual(len(timeouts), 1)
         self.assertEqual(self.wait([RuntimeError("ordinary command failure"), 200])[0], AFTER)
+
+    def test_real_command_containment_remains_terminal_through_cleanup(self):
+        # Actual child cleanup precedes the synthetic census: no live survivor claim.
+        real_reap, real_capture = bounded._bounded_reap, bounded._Capture
+        real_close = bounded._ProcessTree.close
+        for fault in (None, "reap", "finalize"):
+            with self.subTest(fault=fault):
+                primaries, observed, children, cleanups, queries = [], [], [], [], []
+                secondary = OSError("controlled secondary cleanup fault")
+
+                def reap(process, tree, selector, streams, captures, deadline):
+                    real_reap(process, tree, selector, streams, captures, deadline)
+                    children.append(process)
+                    cleanups.append("reap")
+                    if len(cleanups) == 1:
+                        with patch.object(tree, "survivors", return_value=[999999999]):
+                            try:
+                                real_reap(process, tree, selector, streams, captures,
+                                          bounded.time.monotonic() - 1)
+                            except bounded.ProcessTreeContainmentError as error:
+                                primaries.append(error)
+                                raise
+                    elif fault == "reap":
+                        raise secondary
+
+                def close(tree):
+                    real_close(tree)
+                    if fault == "finalize":
+                        raise secondary
+
+                def query(deadline):
+                    queries.append("query")
+                    if len(queries) == 1:
+                        try:
+                            with patch.object(bounded, "_bounded_reap", side_effect=reap), \
+                                 patch.object(bounded, "_Capture", side_effect=lambda data: real_capture(data, limit=0)), \
+                                 patch.object(bounded._ProcessTree, "close", close):
+                                bounded.command([sys.executable, "-B", "-c", 'print("offline")'], timeout=2)
+                        except BaseException as error:
+                            observed.append(error)
+                            raise
+                    return AFTER
+
+                with patch.object(contract, "query_generation", side_effect=query), \
+                     patch.object(contract, "health_status", return_value=200) as health, \
+                     patch.object(contract, "held_digest", return_value=NEW), \
+                     patch.object(contract.time, "sleep") as sleep:
+                    try:
+                        contract.wait_ready(BEFORE, NEW)
+                        result = "READY"
+                    except contract.Hold:
+                        result = "HOLD"
+                self.assertEqual(result, "HOLD")
+                self.assertEqual(queries, ["query"])
+                health.assert_not_called()
+                sleep.assert_not_called()
+                self.assertEqual(len(cleanups), 2)
+                self.assertIs(observed[0], primaries[0])
+                self.assertIsInstance(observed[0], bounded.ProcessTreeContainmentError)
+                if fault is not None:
+                    self.assertIs(observed[0].__cause__, secondary)
+                    self.assertIn("controlled secondary cleanup fault", str(observed[0].__cause__))
+                for child in children:
+                    self.assertIsNotNone(child.returncode)
+                    self.assertFalse(Path(f"/proc/{child.pid}").exists())
+                    self.assertTrue(child.stdout.closed and child.stderr.closed)
+
+    def test_ordinary_runtime_and_refusal_still_retry(self):
+        for error in (RuntimeError("ordinary command failure"), ConnectionRefusedError()):
+            with self.subTest(error=error):
+                self.assertEqual(self.wait([error, 200])[0], AFTER)
 
     def test_expiry_and_permanent_schema_failure_are_bounded(self):
         result, elapsed, _, operations = self.wait([ConnectionRefusedError()])
