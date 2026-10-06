@@ -40,6 +40,10 @@ class BoundedProcessError(RuntimeError):
         self.errno = error_number
 
 
+class ProcessTreeContainmentError(BoundedProcessError):
+    """Cleanup expired while one or more command-process descendants remained."""
+
+
 def remaining(deadline: float, cap: float | None = None) -> float:
     value = deadline - time.monotonic()
     if cap is not None:
@@ -465,7 +469,7 @@ def _bounded_reap(
         survivors.sort()
     if survivors:
         diagnostic = "" if first_error is None else f"; cleanup={_bounded_error_summary(first_error)}"
-        raise BoundedProcessError(
+        raise ProcessTreeContainmentError(
             f"subprocess cleanup deadline exhausted; survivor_count={len(survivors)}"
             + diagnostic
         )
@@ -1728,6 +1732,7 @@ def command(
     streams: dict[int, tuple[str, object]] = {}
     captures = {"stdout": _Capture(bytearray()), "stderr": _Capture(bytearray())}
     failure: str | None = None
+    containment_error: ProcessTreeContainmentError | None = None
     input_offset = 0
     try:
         assert process.stdout is not None and process.stderr is not None
@@ -1792,9 +1797,11 @@ def command(
         elif process.returncode is None:
             process.wait(timeout=max(0.001, hard_deadline - time.monotonic()))
     except BaseException as error:
-        if process.stdin is not None and not process.stdin.closed:
-            process.stdin.close()
+        if isinstance(error, ProcessTreeContainmentError):
+            containment_error = error
         try:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
             _bounded_reap(
                 process,
                 tree,
@@ -1804,15 +1811,25 @@ def command(
                 hard_deadline,
             )
         except BaseException as cleanup_error:
+            if isinstance(cleanup_error, ProcessTreeContainmentError):
+                containment_error = containment_error or cleanup_error
+            if containment_error is not None and cleanup_error is not containment_error:
+                raise containment_error from cleanup_error
             raise cleanup_error from error
         raise
     finally:
-        if process.stdin is not None and not process.stdin.closed:
-            process.stdin.close()
-        for descriptor in list(streams):
-            _close_stream(selector, streams, descriptor)
-        selector.close()
-        tree.close()
+        try:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            for descriptor in list(streams):
+                _close_stream(selector, streams, descriptor)
+            selector.close()
+            tree.close()
+        except BaseException as cleanup_error:
+            # A terminal census cannot become retryable through later cleanup.
+            if containment_error is not None:
+                raise containment_error from cleanup_error
+            raise
 
     stdout = _render(captures["stdout"])
     stderr = _render(captures["stderr"])

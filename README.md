@@ -327,14 +327,106 @@ Pre-download the required model weights into `~/.cache/huggingface/` or prepare 
 * **Reranker Model**: `Querit/Querit-4B`, snapshot `7b796de30ad8dc772d6c46c75659c1341283a665`
 
 ### 3. Build llm-guard-proxy
-Install/update the proxy on the host through mise's cargo-Git backend:
+Build the candidate through mise's cargo-Git backend; building is **not**
+permission to replace the running executable:
 ```bash
 mise use -g 'cargo:https://github.com/RyderFreeman4Logos/llm-guard-proxy[crate=llm-guard-proxy,features=guard]@branch:main'
-install -Dm755 "$(mise which llm-guard-proxy)" ~/.local/bin/llm-guard-proxy
 ```
 
 The explicit crate and `guard` feature select the production binary. The user
-unit keeps its stable `/home/obj/.local/bin/llm-guard-proxy` entrypoint.
+unit keeps its stable `/home/obj/.local/bin/llm-guard-proxy` entrypoint. On an
+existing installation, follow the Guard admission contract below **before**
+stop, install, start, or any canonical database mutation. The general stack
+installation commands are not an upgrade/rollback transaction.
+
+**FIRST INSTALL only:** on an authorized fresh host with no existing Guard
+entrypoint or canonical Guard database, publish the built binary before unit
+installation/start. Under exclusive installation ownership, this prerequisite
+refuses an existing file or symlink (including a dangling link); it is **not**
+an upgrade command. Existing installations must use the schema-gated procedure
+below instead.
+```bash
+(
+  set -eu
+  if [ -e "$HOME/.local/bin/llm-guard-proxy" ] || [ -L "$HOME/.local/bin/llm-guard-proxy" ]; then
+    printf '%s\n' 'HOLD: existing Guard installation requires schema admission' >&2
+    exit 1
+  fi
+  install -Dm755 "$(mise which llm-guard-proxy)" "$HOME/.local/bin/llm-guard-proxy"
+)
+```
+
+#### Guard binary/schema admission and readiness (#128)
+
+`python3 scripts/gb10_guard_deployment.py` is a read-only executable check, not
+an installer or deployment authorization. It reuses the bounded-process helper;
+no database restore, downgrade, deletion, rerouting, or lifecycle write exists
+in it. A cutover caller must fail closed on its nonzero exit **before its first
+write**, not run admission after installing the candidate.
+
+Before a separately authorized Guard-only cutover, retain the old executable,
+freeze both executable SHA-256 hashes and config/Tier2 plus model/sysmon
+identities, and obtain reviewed source/isolated exact-binary evidence for both
+schema support sets and the candidate's startup migration target. Do not infer
+schema support from a version string, a byte backup, or this incident's values.
+Unknown support means HOLD. The private evidence JSON has `old` and `candidate`
+objects, each with `sha256`, `source_commit` (40 lowercase hex),
+`supported_schemas` (explicit integer list), `evidence_file` (relative to that
+JSON), and `evidence_sha256` (the supporting report's actual hash). `candidate`
+also has integer `migration_target`. The reports must bind those exact binaries
+and source commits to verified schema/reopen behavior; reviewing that evidence
+is an operator prerequisite, not something hashing an arbitrary report proves.
+No fabricated sample metadata or production schema default is supplied.
+
+Under exclusive cutover ownership, record the canonical database path/identity
+and a read-only `PRAGMA user_version` observation without opening it through the
+candidate (startup may migrate it). Recheck that identity/schema and the binary
+hashes immediately before the first mutation; a changed or unobserved binding
+means HOLD. Pass the observed schema and retained/staged binary paths explicitly:
+
+```bash
+python3 scripts/gb10_guard_deployment.py admit \
+  --old-binary "$retained_old" --candidate-binary "$staged_candidate" \
+  --evidence "$reviewed_evidence_json" --current-schema "$observed_schema"
+# Only exit 0 + ADMIT permits proceeding with separately authorized cutover.
+# Any error/nonzero/missing receipt: HOLD; ZERO stop/install/start/DB writes.
+```
+
+Both binaries must support the current schema, and both must support the
+candidate migration target. In particular, old support `[4]`, target `5` is
+HOLD even if the candidate itself supports `[4,5]`. Snapshot migration is not
+admitted by this check. It requires a separate explicit data-loss policy and
+reviewed SQLite-consistent snapshot after writer quiescence (including WAL),
+canonical ownership/path binding, old-binary reopen on a disposable copy,
+restored-generation readiness, and handling of post-snapshot writes/audit loss.
+Without that authorization/proof, HOLD; never relabel schema 5 as 4 or restore
+production data automatically.
+
+Capture the pre-cutover Guard `systemctl --user show` fields `ActiveState`,
+`SubState`, `MainPID`, `InvocationID`, and `ExecMainStartTimestampMonotonic`
+as a JSON object of strings. After an admitted and separately authorized start:
+
+```bash
+python3 scripts/gb10_guard_deployment.py ready \
+  --before "$before_generation_json" --expected-sha256 "$admitted_candidate_sha256"
+```
+
+Readiness has one monotonic 60-second deadline; every systemd/HTTP subprocess
+is capped at 5 seconds and the remaining budget, including cleanup. It requires
+HTTP 200, active/running, a fresh PID/InvocationID/start timestamp, unchanged
+generation across health, and the digest of `/proc/<MainPID>/exe` (not merely
+the installed path). Transient refusal is retried within the bound, never an
+old-byte restore trigger. Deadline expiry, failed startup, or digest mismatch
+returns HOLD and preserves canonical data; this helper does not claim rollback
+success. Any separately authorized rollback must rerun `admit` against the
+**actual post-start schema**, then prove a fresh restored generation with
+`ready` and the old digest. Never restore old bytes solely because start or
+health failed. Preserve failed receipts and protected-service fences; real
+proxy/raw/SSE acceptance and unchanged config/Tier2/neighbors remain required.
+
+Offline regression check (no live endpoints, services, or databases):
+`python3 -m unittest discover -s tests -p 'test_guard_deployment_contract.py' -v`.
+The same tests run under `just quick-check`; final gates are `just pre-push`.
 
 ### 4. Verify the integrated guardian
 
