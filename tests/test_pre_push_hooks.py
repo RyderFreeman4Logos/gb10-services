@@ -78,7 +78,8 @@ class HookFixture:
             review.read_text().replace(
                 'CSA_EXECUTABLE="/home/obj/.local/bin/csa"',
                 f'CSA_EXECUTABLE="{self.trusted_csa}"',
-            )
+            ).replace("/tmp/gb10-pre-push-review.",
+                      f"{tempfile.gettempdir()}/gb10-pre-push-review.")
         )
 
         self.bin = root / "bin"
