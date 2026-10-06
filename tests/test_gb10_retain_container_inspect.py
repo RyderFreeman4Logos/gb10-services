@@ -180,6 +180,175 @@ class RetainContainerInspectTests(unittest.TestCase):
         self.env["HOME"] = str(root)
         self.env["DOCKER_HOST"] = "unix:///run/user/1001/docker.sock"
 
+    def test_live_snapshot_survives_destroyed_scope_as_last_known_not_terminal(self) -> None:
+        # Execute the source archive boundary; remap only kernel paths into an
+        # owned filesystem fixture, never remove or populate a real cgroup.
+        import shutil
+        import sys
+        from unittest.mock import patch
+
+        source = HELPER.read_text()
+        block = source.split('<<\'PY\' || skip "inspect validation or durable archive failed; keeping last inspect"\n', 1)[1].split('\nPY\n', 1)[0]
+        root = Path(self.temporary.name)
+        scope = f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice/docker-{CID}.scope"
+        owned_scope = root / "kernel" / scope.lstrip("/")
+        owned_scope.mkdir(parents=True)
+        raw = "low 0\nhigh 0\nmax 0\noom 2\noom_kill 1\noom_group_kill 0\n"
+        (owned_scope / "memory.events").write_text(raw)
+        proc = root / "kernel/proc/1234"
+        proc.mkdir(parents=True)
+        (proc / "stat").write_text("1234 (fixture) S " + "0 " * 18 + "42\n")
+        (proc / "cgroup").write_text("0::" + scope.removeprefix("/sys/fs/cgroup") + "\n")
+        body = json.loads(_exited_payload())[0]
+        body["State"].update(Status="running", Running=True, Pid=1234)
+        payload = root / "live.inspect"
+        payload.write_text(json.dumps([body]))
+        _fake_docker(self.bin_dir, f"{CID} /{CONTAINER} true 1234 {body['State']['StartedAt']}\n", 0)
+        original_open = os.open
+        denied = False
+        def kernel_open(path, *args, **kwargs):
+            text = os.fspath(path)
+            if denied and text == "memory.events":
+                raise PermissionError("fixture access denied")
+            if isinstance(text, str) and (text.startswith(scope) or text.startswith("/proc/1234/")):
+                path = root / "kernel" / text.lstrip("/")
+            return original_open(path, *args, **kwargs)
+        def execute(live):
+            argv = ["archive", CID, CONTAINER, str(payload), str(MAX_INSPECT_BYTES)]
+            environment = dict(self.env, GB10_RETAIN_SNAPSHOT_LIVE=str(int(live)))
+            with patch.dict(os.environ, environment), patch.object(sys, "argv", argv), patch.object(os, "open", kernel_open):
+                try:
+                    exec(compile(block, str(HELPER), "exec"), {"__name__": "__main__"})
+                except SystemExit as error:
+                    self.assertEqual(error.code, 1)
+
+        store = root / ".local/state/gb10-vllm-cids"
+        original_fsync = os.fsync
+        def execute_interrupted(live):
+            def crash_after_durable_publish(fd):
+                original_fsync(fd)
+                suffix = "*.memory.json" if live else "*.exited.json"
+                if stat.S_ISDIR(os.fstat(fd).st_mode) and list(store.glob(suffix)):
+                    os._exit(77)  # Real child interruption before publication cleanup.
+            def capture():
+                with patch.object(os, "fsync", crash_after_durable_publish):
+                    execute(live)
+            child = multiprocessing.get_context("fork").Process(target=capture)
+            try:
+                child.start()
+                child.join(8)
+                self.assertFalse(child.is_alive(), "publication fault barrier timed out")
+                self.assertEqual(child.exitcode, 77)
+            finally:
+                if child.is_alive():
+                    child.kill()
+                child.join(3)
+        execute_interrupted(True)
+        snapshot = next(store.glob("*.memory.json"), None)
+        self.assertIsNotNone(snapshot, "live same-generation counters were not durably captured")
+        assert snapshot is not None
+        saved = json.loads(snapshot.read_text())
+        self.assertEqual(saved["memory_events"]["raw"], raw)
+        self.assertEqual(saved["owner"]["start_ticks"], 42)
+        self.assertEqual(stat.S_IMODE(snapshot.stat().st_mode), 0o600)
+        body = json.loads(_exited_payload())[0]
+        payload.write_text(json.dumps([body]))
+        _fake_docker(self.bin_dir, f"{CID} /{CONTAINER} false 0 {body['State']['StartedAt']}\n", 0)
+        # A surviving scope is terminal evidence only with the saved inode and
+        # a second same-StartedAt exited inspection around the counter read.
+        execute_interrupted(False)
+        archive = next(store.glob("*.exited.json"))
+        self.assertEqual(snapshot.stat().st_nlink, 1)
+        self.assertEqual(archive.stat().st_nlink, 1)
+        terminal = json.loads(archive.read_text())["memory_events"]
+        self.assertTrue(terminal["generation_fenced"])
+        self.assertEqual(terminal["terminal_status"], "captured")
+        archive.unlink()
+        shutil.rmtree(owned_scope)
+        execute_interrupted(False)
+        archive = next(store.glob("*.exited.json"))
+        receipt = json.loads(archive.read_text())
+        self.assertEqual(receipt["memory_events"]["status"], "last-known")
+        self.assertEqual(receipt["memory_events"]["raw"], raw)
+        self.assertEqual(receipt["memory_events"]["counts"]["oom_kill"], 1)
+        self.assertEqual(receipt["memory_events"]["terminal_status"], "unavailable")
+        self.assertEqual(receipt["kill_initiator"], "UNKNOWN")
+        self.assertEqual(receipt["state"]["StartedAt"], saved["started_at"])
+        archive.unlink()
+        original = snapshot.read_bytes()
+        # Neither a foreign alias nor a symlink is our publication protocol.
+        foreign = root / "foreign-alias"
+        os.link(snapshot, foreign)
+        execute(False)
+        self.assertEqual(json.loads(archive.read_text())["memory_events"]["status"], "unavailable")
+        archive.unlink()
+        foreign.unlink()
+        snapshot.rename(foreign)
+        snapshot.symlink_to(foreign)
+        execute(False)
+        self.assertEqual(json.loads(archive.read_text())["memory_events"]["status"], "unavailable")
+        archive.unlink()
+        snapshot.unlink()
+        foreign.rename(snapshot)
+        for field, value in (("container_id", "a" * 64),
+                             ("started_at", "2026-09-18T17:00:00.000Z"),
+                             ("boot_id", "0" * 36), ("owner", {"pid": 1234, "start_ticks": 0}),
+                             ("memory_events", {"status": "captured", "raw": "oom bad\n"})):
+            with self.subTest(stale=field):
+                candidate = dict(saved, **{field: value})
+                snapshot.write_text(json.dumps(candidate))
+                execute(False)
+                self.assertEqual(json.loads(archive.read_text())["memory_events"]["status"], "unavailable")
+                archive.unlink()
+        for invalid in (b"[]", b"{", b"x" * 16385):
+            snapshot.write_bytes(invalid)
+            execute(False)
+            self.assertEqual(json.loads(archive.read_text())["memory_events"]["status"], "unavailable")
+            archive.unlink()
+        snapshot.write_bytes(original)
+        snapshot.chmod(0o644)
+        execute(False)
+        self.assertEqual(json.loads(archive.read_text())["memory_events"]["status"], "unavailable")
+        archive.unlink()
+        snapshot.chmod(0o600)
+        # PID reuse and malformed/unreadable kernel counters must never publish
+        # a replacement snapshot. Everything here is fixture-owned.
+        owned_scope.mkdir()
+        event = owned_scope / "memory.events"
+        body["State"].update(Status="running", Running=True, Pid=1234)
+        payload.write_text(json.dumps([body]))
+        _fake_docker(self.bin_dir, f"{CID} /{CONTAINER} true 1234 {body['State']['StartedAt']}\n", 0)
+        (proc / "stat").write_text("1234 (fixture) S " + "0 " * 18 + "43\n")
+        event.write_text(raw)
+        execute(True)
+        self.assertEqual(snapshot.read_bytes(), original)
+        snapshot.unlink()
+        (proc / "stat").write_text("1234 (fixture) S " + "0 " * 18 + "42\n")
+        denied = True
+        execute(True)
+        self.assertFalse(snapshot.exists())
+        denied = False
+        for invalid in ("oom 1\noom_kill bad\n", "oom 1\noom 2\noom_kill 0\n", "oom 1\noom_kill 0"):
+            event.write_text(invalid)
+            execute(True)
+            self.assertFalse(snapshot.exists())
+        event.unlink()
+        event.symlink_to(root / "missing")
+        execute(True)
+        self.assertFalse(snapshot.exists())
+
+    def test_text_start_hooks_capture_once_before_readiness(self) -> None:
+        for unit, container, cidfile, output in UNITS:
+            text = unit.read_text()
+            hooks = [line for line in text.splitlines() if line.startswith("ExecStartPost=")]
+            live = [line for line in hooks if "--snapshot-live" in line]
+            self.assertEqual(len(live), 1, unit.name)
+            self.assertIn(HELPER_DEST, live[0])
+            self.assertIn(f"--container {container}", live[0])
+            self.assertIn(f"--cidfile {cidfile}", live[0])
+            self.assertIn(f"--output {output}", live[0])
+            self.assertLess(hooks.index(live[0]), next(i for i, line in enumerate(hooks) if "gb10_service_ready.sh" in line))
+
     def test_empty_array_does_not_overwrite_last_good_inspect(self) -> None:
         _fake_docker(self.bin_dir, "[]\n", 1)
         result = _run(self.env, self.cidfile, self.output)
@@ -251,6 +420,18 @@ class RetainContainerInspectTests(unittest.TestCase):
         second = _run(self.env, self.cidfile, self.output)
         self.assertIn("retained", second.stdout)
         self.assertEqual(archive.read_bytes(), initial)
+        # Simultaneous duplicate hooks with different evidence cannot replace
+        # the first generation receipt, even after lock contention settles.
+        from concurrent.futures import ThreadPoolExecutor
+        changed = json.loads(_exited_payload())
+        changed[0]["State"]["ExitCode"] = 0
+        _fake_docker(self.bin_dir, json.dumps(changed), 0)
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            results = list(workers.map(lambda _: _run(self.env, self.cidfile, self.output), range(4)))
+        self.assertTrue(all(result.returncode == 0 for result in results))
+        self.assertEqual(archive.read_bytes(), initial)
+        self.assertEqual(archive.stat().st_nlink, 1)
+        self.assertEqual(list(store.glob(".inspect-*")), [])
         store.chmod(0o777)
         self.output.write_text(LAST_GOOD + "\n")
         refused = _run(self.env, self.cidfile, self.output)
