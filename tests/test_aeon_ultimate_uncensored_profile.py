@@ -36,6 +36,10 @@ MIXED_MODEL = (
     "AEON-7--Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-NVFP4-MIXED--"
     "8b185f4e3c97dfba1b015e652deba6be179ef5f0"
 )
+DRAFT_MODEL = (
+    "/home/obj/models/"
+    "AEON-7--AEON-DFlash2-Qwen3.8-27B--dc657db980dc25426171cf15898428bcc2f6ba89"
+)
 
 
 def reserved_ingress_errors(config: dict) -> list[str]:
@@ -85,7 +89,7 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
         self.assertIn(f"-v {MIXED_MODEL}:/model:ro", unit)
         self.assertNotIn("AEON-ULTIMATE-UNCENSORED-NVFP4-beta-version", unit)
         self.assertIn(
-            "-v /home/obj/models/z-lab/Qwen3.8-27B-DFlash2:/draft:ro",
+            f"-v {DRAFT_MODEL}:/draft:ro",
             unit,
         )
         self.assertEqual(_option_value(argv, "--model"), "/model")
@@ -142,12 +146,12 @@ class AeonUltimateUncensoredProfileTests(unittest.TestCase):
             },
         )
 
-    def test_unit_uses_dflash2_k10_lattice_and_production_aliases(self) -> None:
+    def test_unit_uses_author_dflash2_k9_lattice_and_probabilistic_sampling(self) -> None:
         unit = _unit_text()
         argv = _argv()
         self.assertEqual(
             _option_value(argv, "--speculative-config"),
-            '{"method":"dflash","model":"/draft","num_speculative_tokens":10,"num_speculative_tokens_per_batch_size":[[1,1,10],[2,2,10],[3,4,8],[5,8,7],[9,10,6],[11,12,5],[13,14,4],[15,16,3]],"attention_backend":"TRITON_ATTN"}',
+            '{"method":"dflash","model":"/draft","num_speculative_tokens":9,"num_speculative_tokens_per_batch_size":[[1,2,9],[3,8,7],[9,12,6],[13,16,4]],"attention_backend":"TRITON_ATTN","draft_sample_method":"probabilistic"}',
         )
         self.assertEqual(
             set(argv[argv.index("--served-model-name") + 1 : argv.index("--served-model-name") + 4]),
