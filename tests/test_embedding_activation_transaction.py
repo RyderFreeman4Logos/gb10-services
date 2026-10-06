@@ -1628,12 +1628,24 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             ACTIVATION_ENGINE.parent / "gb10_embedding_verifier_runtime.py",
             ACTIVATION_ENGINE.parent / "gb10_verify_embedding_profile.py",
         )
+        for dependency_name in (
+            "gb10_embedding_verifier_runtime.py",
+            "gb10_bounded_process.py",
+        ):
+            with self.subTest(dependency=dependency_name):
+                self._assert_dependency_substitution_rejected(
+                    production_files, dependency_name
+                )
+
+    def _assert_dependency_substitution_rejected(
+        self, production_files: tuple[Path, ...], dependency_name: str
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             copied = Path(temporary)
             for source in production_files:
                 (copied / source.name).write_bytes(source.read_bytes())
             marker = copied / "substituted-dependency-imported"
-            runtime = copied / "gb10_embedding_verifier_runtime.py"
+            runtime = copied / dependency_name
             runtime.write_text(
                 runtime.read_text().replace(
                     "import json\n",
@@ -1656,6 +1668,9 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 timeout=5,
             )
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(
+                f"activation import authority differs: {dependency_name}", result.stderr
+            )
             self.assertFalse(marker.exists())
 
     def test_dependencies_load_from_verified_bytes_after_path_replacement(self) -> None:
