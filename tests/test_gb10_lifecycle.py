@@ -32,6 +32,17 @@ ULTIMATE_CID, = re.findall(
 
 
 class LifecycleAuditScriptTests(unittest.TestCase):
+    def test_pending_stack_recovery_blocks_manual_operations(self) -> None:
+        self.state.mkdir(mode=0o700)
+        (self.state / "recovery-owner.json").write_text("owned-or-stale")
+        for action in ("stop", "start", "investigation-begin", "investigation-end"):
+            arguments = self.arguments(action) if action in {"stop", "start"} else (
+                action, "--actor", "test-operator", "--reason", "maintenance")
+            result = self.execute(*arguments)
+            self.assertNotEqual(result.returncode, 0, action)
+            self.assertIn("recovery", result.stderr)
+        self.assertFalse(self.systemctl_log.exists())
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -939,10 +950,15 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
         cid: str = "a" * 64,
         docker_id: str | None = None,
         verifier_status: int = 0,
+        recovery_pending: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], list[str], str | None]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             events = root / "events.log"
+            recovery_marker = root / "recovery-owner.json"
+            if recovery_pending:
+                recovery_marker.write_text("pending")
+                events.touch()
             lifecycle = root / "lifecycle"
             systemctl = root / "systemctl"
             docker = root / "docker"
@@ -996,6 +1012,7 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
             helper = root / "aeon_text_stop_start.sh"
             helper.write_text(
                 GUARD_HELPER.read_text()
+                .replace("/home/obj/.local/state/gb10-lifecycle/recovery-owner.json", str(recovery_marker))
                 .replace("/usr/bin/systemctl", str(systemctl))
                 .replace("/usr/bin/docker", str(docker))
                 .replace("/usr/bin/sleep", str(sleep))
@@ -1098,6 +1115,13 @@ class LifecycleIntegrationContractTests(unittest.TestCase):
         )
         self.assertNotIn(HIKV_UNIT, "\n".join(events))
         self.assertNotIn(UNIT, "\n".join(events))
+
+    def test_guard_helper_does_not_join_owned_stack_start(self) -> None:
+        result, events, _ = self.run_guard_helper(
+            active_state="activating", sub_state="start-post", recovery_pending=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stack recovery", result.stderr)
+        self.assertFalse(any(event.startswith("verifier ") for event in events))
 
     def test_guard_helper_recycles_inactive_canonical_unit(self) -> None:
         result, events, _selected = self.run_guard_helper(

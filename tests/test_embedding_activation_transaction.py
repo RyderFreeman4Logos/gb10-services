@@ -377,7 +377,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             fixture.state["verify_status"] = 9
             result = fixture.run()
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assert_restored(fixture)
+            self.assert_restored(fixture, result=result)
             state = json.loads(fixture.state_path.read_text())
             snapshots = state["daemon_reload_units"]
             self.assertEqual(len(snapshots), 2)
@@ -409,7 +409,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 fixture.save()
                 result = self.terminate_at_pause(fixture, signum)
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assert_restored(fixture)
+                self.assert_restored(fixture, result=result)
 
     def test_signal_after_receipt_is_precommit_and_rolls_back(self) -> None:
         with ActivationFixture() as fixture:
@@ -417,7 +417,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             fixture.save()
             result = self.terminate_at_pause(fixture, signal.SIGTERM)
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assert_restored(fixture)
+            self.assert_restored(fixture, result=result)
             self.assertFalse((fixture.state_root / "activation.receipt.json").exists())
 
     def test_committed_phase_is_authoritative_during_cleanup_interruption(self) -> None:
@@ -473,7 +473,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             recovered = fixture.run()
             self.assertNotEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
             self.assertIn("rerun activation", recovered.stderr)
-            self.assert_restored(fixture)
+            self.assert_restored(fixture, result=recovered)
             fixture.source_unit.write_bytes(CANONICAL_UNIT.read_bytes())
             fixture.source_unit.chmod(0o644)
             activated = fixture.run()
@@ -498,7 +498,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             fixture.hooks["pause_at"] = ""
             recovered = fixture.run()
             self.assertNotEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
-            self.assert_restored(fixture)
+            self.assert_restored(fixture, result=recovered)
             self.assertFalse((fixture.state_root / "activation.receipt.json").exists())
 
     def test_sigkill_during_rollback_resumes_rolling_back_phase(self) -> None:
@@ -520,7 +520,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             fixture.state["verify_status"] = 0
             recovered = fixture.run()
             self.assertNotEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
-            self.assert_restored(fixture)
+            self.assert_restored(fixture, result=recovered)
 
     def test_term_during_rollback_is_deferred_until_rollback_finishes(self) -> None:
         with ActivationFixture() as fixture:
@@ -538,7 +538,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 fixture.release.write_text("release\n")
                 stdout, stderr = process.communicate(timeout=15)
                 self.assertNotEqual(process.returncode, 0, stdout + stderr)
-                self.assert_restored(fixture)
+                self.assert_restored(fixture, stdout=stdout, stderr=stderr)
             finally:
                 if process.poll() is None:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -558,14 +558,14 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 fixture.state.update({"verify_status": 0, failure: False})
                 recovered = fixture.run()
                 self.assertNotEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
-                self.assert_restored(fixture)
+                self.assert_restored(fixture, result=recovered)
 
     def test_explicit_prior_absence_is_restored_on_failure(self) -> None:
         with ActivationFixture(prior_present=False) as fixture:
             fixture.state["verify_status"] = 9
             result = fixture.run()
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assert_restored(fixture, present=False)
+            self.assert_restored(fixture, result=result, present=False)
             receipt = json.loads((fixture.state_root / "rollback.receipt.json").read_text())
             self.assertFalse(receipt["restored_presence"])
 
@@ -580,7 +580,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 fixture.release.write_text("release\n")
                 stdout, stderr = process.communicate(timeout=15)
                 self.assertNotEqual(process.returncode, 0, stdout + stderr)
-                self.assert_restored(fixture)
+                self.assert_restored(fixture, stdout=stdout, stderr=stderr)
             finally:
                 if process.poll() is None:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -595,7 +595,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 fixture.release.write_text("release\n")
                 stdout, stderr = process.communicate(timeout=15)
                 self.assertNotEqual(process.returncode, 0, stdout + stderr)
-                self.assert_restored(fixture)
+                self.assert_restored(fixture, stdout=stdout, stderr=stderr)
             finally:
                 if process.poll() is None:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -613,7 +613,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 stdout, stderr = process.communicate(timeout=15)
                 self.assertNotEqual(process.returncode, 0, stdout + stderr)
                 self.assertNotIn("embedding rollback failed", stderr)
-                self.assert_restored(fixture)
+                self.assert_restored(fixture, stdout=stdout, stderr=stderr)
                 state = json.loads(fixture.state_path.read_text())
                 self.assertEqual(state["daemon_reload_unbound"], [[], []])
             finally:
@@ -644,7 +644,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             )
             self.assertIn("rerun activation", recovered.stderr)
             self.assertNotIn("embedding rollback failed", recovered.stderr)
-            self.assert_restored(fixture)
+            self.assert_restored(fixture, result=recovered)
             state = json.loads(fixture.state_path.read_text())
             self.assertEqual(state["daemon_reload_unbound"], [[], []])
 
@@ -796,7 +796,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                     fixture.release.write_text("release\n")
                     stdout, stderr = process.communicate(timeout=15)
                     self.assertNotEqual(process.returncode, 0, stdout + stderr)
-                    self.assert_restored(fixture)
+                    self.assert_restored(fixture, stdout=stdout, stderr=stderr)
                 finally:
                     if process.poll() is None:
                         os.killpg(process.pid, signal.SIGKILL)
@@ -807,7 +807,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             fixture.hooks["fail_at"] = "after_core_install"
             result = fixture.run()
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assert_restored(fixture)
+            self.assert_restored(fixture, result=result)
 
     def test_partial_prior_core_restore_is_durable_and_recoverable(self) -> None:
         with ActivationFixture() as fixture:
@@ -828,7 +828,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             self.assertNotEqual(
                 recovered.returncode, 0, recovered.stdout + recovered.stderr
             )
-            self.assert_restored(fixture)
+            self.assert_restored(fixture, result=recovered)
 
     def test_no_swap_helper_source_drift_after_prepare_rolls_back_exact_prior(self) -> None:
         with ActivationFixture() as fixture:
@@ -843,7 +843,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 fixture.release.write_text("release\n")
                 stdout, stderr = process.communicate(timeout=15)
                 self.assertNotEqual(process.returncode, 0, stdout + stderr)
-                self.assert_restored(fixture)
+                self.assert_restored(fixture, stdout=stdout, stderr=stderr)
             finally:
                 if process.poll() is None:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -894,7 +894,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             fixture.state["fail_no_swap_at"] = 5
             result = fixture.run()
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assert_restored(fixture, helper_present=False)
+            self.assert_restored(fixture, result=result, helper_present=False)
             receipt = json.loads(
                 (fixture.state_root / "rollback.receipt.json").read_text()
             )
@@ -925,7 +925,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
                 fixture.release.write_text("release\n")
                 stdout, stderr = process.communicate(timeout=15)
                 self.assertNotEqual(process.returncode, 0, stdout + stderr)
-                self.assert_restored(fixture)
+                self.assert_restored(fixture, stdout=stdout, stderr=stderr)
             finally:
                 if process.poll() is None:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -936,7 +936,7 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
             fixture.state["hang_once"] = "daemon-reload"
             result = fixture.run(timeout=20)
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assert_restored(fixture)
+            self.assert_restored(fixture, result=result)
             self.assertTrue(fixture.child_pid_path.exists())
             child_pid = int(fixture.child_pid_path.read_text())
             deadline = time.monotonic() + 3

@@ -320,6 +320,10 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                 for cleanup_container in cleanup_containers:
                     cleanup.extend(["--container", cleanup_container])
                 cleanup.extend(["--cidfile", cidfile])
+                retention_lines = [line for line in unit.splitlines()
+                                   if line.startswith("ExecStartPost=") and "--snapshot-live" in line]
+                if retention_lines:
+                    cleanup.extend(["--retain-inspect-output", retention_lines[0].split("--output ", 1)[1]])
                 start_pre_cleanups = [
                     argv
                     for argv in _logical_argv(unit, "ExecStartPre")
@@ -327,17 +331,7 @@ class VllmNoSwapUnitContractTests(unittest.TestCase):
                 ]
                 self.assertEqual(start_pre_cleanups, [cleanup])
                 stop_commands = _logical_argv(unit, "ExecStop")
-                if name in AEON_UNITS:
-                    retain = stop_commands[0]
-                    self.assertTrue(
-                        any(
-                            token.endswith("/gb10_retain_container_inspect.sh")
-                            for token in retain
-                        )
-                    )
-                    self.assertEqual(stop_commands[1:], [cleanup])
-                else:
-                    self.assertEqual(stop_commands, [cleanup])
+                self.assertEqual(stop_commands, [cleanup])
                 stop_post_cleanups = [
                     argv
                     for argv in _logical_argv(unit, "ExecStopPost")

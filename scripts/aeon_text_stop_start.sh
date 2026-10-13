@@ -19,6 +19,7 @@ readonly ULTIMATE_PROFILE="/home/obj/.config/gb10/aeon-dflash-profiles/aeon-ulti
 readonly CONTAINER="vllm-aeon-ultimate-uncensored-nvfp4"
 readonly CIDFILE="/home/obj/.local/state/gb10-vllm-cids/vllm-aeon-ultimate-uncensored-nvfp4.cid"
 readonly DOCKER_HOST_VALUE="unix:///run/user/1001/docker.sock"
+readonly RECOVERY_OWNER="/home/obj/.local/state/gb10-lifecycle/recovery-owner.json"
 
 fail() {
     printf 'aeon_text_stop_start: %s\n' "$*" >&2
@@ -118,10 +119,12 @@ case "${GB10_TEXT_UNIT:-$UNIT}" in
         ;;
 esac
 
+[[ ! -e "$RECOVERY_OWNER" && ! -L "$RECOVERY_OWNER" ]] || fail "stack recovery owns the current startup"
 snapshot="$(unit_snapshot)"
 read -r active_state sub_state _main_pid <<< "$snapshot"
 if [[ "$active_state" == activating && "$sub_state" == start-post ]]; then
     join_existing_start "$snapshot"
+    [[ ! -e "$RECOVERY_OWNER" && ! -L "$RECOVERY_OWNER" ]] || fail "stack recovery acquired the current startup"
     exit 0
 fi
 

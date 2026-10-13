@@ -197,6 +197,12 @@ if ! "$FLOCK_BIN" -n 9; then
     fail "another lifecycle operation holds the mutex"
 fi
 
+# A killed coordinator releases flock before its manager-owned cleanup runs.
+if [[ -e "$STATE_DIR/recovery-owner.json" || -L "$STATE_DIR/recovery-owner.json" ]]; then
+    audit lock actor="$ACTOR" reason="$REASON" outcome=recovery-pending
+    fail "pending stack recovery owns lifecycle operations; do not remove its marker"
+fi
+
 case "$ACTION" in
     investigation-begin)
         if [[ -e "$INVESTIGATION_LOCK" || -L "$INVESTIGATION_LOCK" ]]; then

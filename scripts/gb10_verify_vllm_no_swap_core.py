@@ -132,11 +132,18 @@ class GenerationEvidence:
 def run_command(
     arguments: Sequence[str],
     *,
-    timeout: int | None = None,
+    timeout: float | None = None,
+    deadline: float | None = None,
     allow_failure: bool = False,
 ) -> CommandResult:
     if not arguments or any(not isinstance(value, str) or "\x00" in value for value in arguments):
         reject("internal command argv is invalid")
+    command_timeout = COMMAND_TIMEOUT_SECONDS if timeout is None else timeout
+    if deadline is not None:
+        # Leave four seconds for the existing TERM/KILL/reap sequence.
+        command_timeout = min(command_timeout, deadline - time.monotonic() - 4)
+        if command_timeout <= 0:
+            reject("cleanup deadline exhausted before command dispatch")
     try:
         process = subprocess.Popen(
             list(arguments),
@@ -149,7 +156,7 @@ def run_command(
     except OSError as error:
         reject(f"cannot execute required command: {arguments[0]}: {error}")
     try:
-        stdout, stderr = process.communicate(timeout=COMMAND_TIMEOUT_SECONDS if timeout is None else timeout)
+        stdout, stderr = process.communicate(timeout=command_timeout)
     except subprocess.TimeoutExpired:
         for selected_signal, grace in ((signal.SIGTERM, 2), (signal.SIGKILL, 1)):
             try:
@@ -706,10 +713,10 @@ def known_absence(result: CommandResult) -> bool:
     )
 
 
-def inspect_payload(reference: str, *, allow_absent: bool) -> dict[str, object] | None:
+def inspect_payload(reference: str, *, allow_absent: bool, deadline: float | None = None) -> dict[str, object] | None:
     result = run_command(
         [DOCKER_BIN, "inspect", "--type", "container", reference],
-        allow_failure=True,
+        allow_failure=True, deadline=deadline,
     )
     if result.returncode != 0:
         if allow_absent and known_absence(result):
@@ -1065,7 +1072,10 @@ def minimal_identity(payload: dict[str, object], reference: str) -> tuple[str, s
     return identifier, name.removeprefix("/")
 
 
-def cleanup(containers: Sequence[str], cidfile_raw: str) -> None:
+def cleanup(containers: Sequence[str], cidfile_raw: str, retain_output: str | None = None) -> None:
+    deadline = time.monotonic() + 50
+    if retain_output is not None:
+        canonical_absolute(retain_output, "retained inspect output")
     for container in containers:
         if NAME.fullmatch(container) is None:
             reject("cleanup container name is unsafe")
@@ -1079,7 +1089,7 @@ def cleanup(containers: Sequence[str], cidfile_raw: str) -> None:
         reject(f"cannot inspect cleanup cidfile: {error}")
     if lexical is None:
         if any(
-            inspect_payload(container, allow_absent=True) is not None
+            inspect_payload(container, allow_absent=True, deadline=deadline) is not None
             for container in containers
         ):
             reject("container exists without its private cidfile authority")
@@ -1097,10 +1107,10 @@ def cleanup(containers: Sequence[str], cidfile_raw: str) -> None:
     identifier = text.rstrip("\n")
     by_names: list[tuple[str, dict[str, object]]] = []
     for container in containers:
-        by_name = inspect_payload(container, allow_absent=True)
+        by_name = inspect_payload(container, allow_absent=True, deadline=deadline)
         if by_name is not None:
             by_names.append((container, by_name))
-    by_identifier = inspect_payload(identifier, allow_absent=True)
+    by_identifier = inspect_payload(identifier, allow_absent=True, deadline=deadline)
     if not by_names and by_identifier is None:
         current = os.lstat(cidfile)
         if (current.st_dev, current.st_ino) != (lexical.st_dev, lexical.st_ino):
@@ -1122,24 +1132,55 @@ def cleanup(containers: Sequence[str], cidfile_raw: str) -> None:
 
     stopped = run_command(
         [DOCKER_BIN, "stop", "--time", "20", identifier],
-        timeout=35,
+        timeout=35, deadline=deadline,
         allow_failure=True,
     )
     if stopped.returncode != 0:
         reject("generation-bound Docker stop failed")
+    # Preserve the authority while the exited container still exists. A changed
+    # CID must not cause the retainer to archive a replacement generation.
+    current_payload, current = read_regular(cidfile, 128, "cleanup cidfile")
+    if metadata_identity(current) != metadata_identity(opened) or current_payload != payload:
+        reject("cleanup cidfile changed before retention/removal")
+    if retain_output is not None:
+        # Leave twenty seconds for removal and absence checks. Retention is
+        # best-effort; stop/remove and generation failures remain fatal.
+        retain_timeout = min(10.0, deadline - time.monotonic() - 24)
+        if retain_timeout <= 0:
+            print("gb10_vllm_no_swap: retention skipped: cleanup budget", file=sys.stderr)
+        else:
+            try:
+                retained = run_command([
+                    "/usr/bin/bash", "--noprofile", "--norc",
+                    "/home/obj/.local/bin/gb10_retain_container_inspect.sh",
+                    "--container", container, "--cidfile", str(cidfile),
+                    "--expected-cid", identifier, "--output", retain_output,
+                ], timeout=retain_timeout, deadline=deadline, allow_failure=True)
+                if retained.returncode != 0:
+                    print("gb10_vllm_no_swap: retention failed: helper exit", file=sys.stderr)
+                elif f"retained cid={identifier} ".encode("ascii") in retained.stdout:
+                    print(f"gb10_vllm_no_swap: retained exited inspect cid={identifier}")
+                else:
+                    print("gb10_vllm_no_swap: retention skipped: helper validation/archive", file=sys.stderr)
+            except ContractError:
+                print("gb10_vllm_no_swap: retention failed: helper execution/deadline", file=sys.stderr)
+    # Recheck after the helper as well; do not consume replacement authority.
+    current_payload, current = read_regular(cidfile, 128, "cleanup cidfile")
+    if metadata_identity(current) != metadata_identity(opened) or current_payload != payload:
+        reject("cleanup cidfile changed before removal")
     removed = run_command(
         [DOCKER_BIN, "rm", "-f", identifier],
-        timeout=15,
+        timeout=15, deadline=deadline,
         allow_failure=True,
     )
     if removed.returncode != 0 and not known_absence(removed):
         reject("generation-bound Docker remove failed")
     if any(
-        inspect_payload(container, allow_absent=True) is not None
+        inspect_payload(container, allow_absent=True, deadline=deadline) is not None
         for container in containers
     ):
         reject("container name still resolves after cleanup")
-    if inspect_payload(identifier, allow_absent=True) is not None:
+    if inspect_payload(identifier, allow_absent=True, deadline=deadline) is not None:
         reject("full container ID still resolves after cleanup")
     current = os.lstat(cidfile)
     if (current.st_dev, current.st_ino) != (lexical.st_dev, lexical.st_ino):
@@ -1166,12 +1207,13 @@ def profile_authority_mode(arguments: Sequence[str]) -> bool:
 
 def parse_cli(
     arguments: Sequence[str],
-) -> tuple[bool, bool, list[str], list[str], str | None]:
+) -> tuple[bool, bool, list[str], list[str], str | None, str | None]:
     cleanup_mode = False
     bind_mode = False
     units: list[str] = []
     containers: list[str] = []
     cidfile: str | None = None
+    retain_output: str | None = None
     index = 0
     while index < len(arguments):
         token = arguments[index]
@@ -1187,7 +1229,7 @@ def parse_cli(
             bind_mode = True
             index += 1
             continue
-        if token in {"--unit", "--container", "--cidfile"}:
+        if token in {"--unit", "--container", "--cidfile", "--retain-inspect-output"}:
             if index + 1 >= len(arguments):
                 reject(f"{token} requires one direct value")
             value = arguments[index + 1]
@@ -1195,6 +1237,10 @@ def parse_cli(
                 units.append(value)
             elif token == "--container":
                 containers.append(value)
+            elif token == "--retain-inspect-output":
+                if retain_output is not None:
+                    reject("--retain-inspect-output may appear only once")
+                retain_output = value
             else:
                 if cidfile is not None:
                     reject("--cidfile may appear only once")
@@ -1205,7 +1251,7 @@ def parse_cli(
             reject(
                 "usage: [--bind-runtime-swap-max] --unit ABSOLUTE_PATH "
                 "[--container NAME] or --cleanup [--container NAME]... "
-                "--cidfile ABSOLUTE_PATH"
+                "--cidfile ABSOLUTE_PATH [--retain-inspect-output ABSOLUTE_PATH]"
             )
         reject(f"unknown CLI argument: {token}")
     if cleanup_mode and bind_mode:
@@ -1216,13 +1262,13 @@ def parse_cli(
         if len(set(containers)) != len(containers):
             reject("cleanup arguments contain duplicates")
     else:
-        if cidfile is not None or not units:
+        if cidfile is not None or retain_output is not None or not units:
             reject("verification requires at least one --unit")
         if len(set(units)) != len(units) or len(set(containers)) != len(containers):
             reject("verification arguments contain duplicates")
         if bind_mode and (len(units) != 1 or len(containers) != 1):
             reject("runtime swap binding requires one unit and its one container")
-    return cleanup_mode, bind_mode, units, containers, cidfile
+    return cleanup_mode, bind_mode, units, containers, cidfile, retain_output
 
 
 def main() -> None:
@@ -1231,10 +1277,10 @@ def main() -> None:
 
     if profile_authority_mode(ARGUMENTS):
         return
-    cleanup_mode, bind_mode, unit_paths, containers, cidfile = parse_cli(ARGUMENTS)
+    cleanup_mode, bind_mode, unit_paths, containers, cidfile, retain_output = parse_cli(ARGUMENTS)
     if cleanup_mode:
         assert cidfile is not None
-        cleanup(containers, cidfile)
+        cleanup(containers, cidfile, retain_output)
         print("gb10_vllm_no_swap: cleanup verified")
         return
 
