@@ -56,8 +56,9 @@ owner_alive() {
   [ -z "$UNIT" ] && return 0
 
   local main_pid inspect main_pid_ok=true inspect_ok=true
-  main_pid=$(systemctl --user show --property=MainPID --value "$UNIT" 2>&1) || main_pid_ok=false
-  inspect=$(docker inspect --format 'running={{.State.Running}} pid={{.State.Pid}} oom_killed={{.State.OOMKilled}} exit_code={{.State.ExitCode}} error={{json .State.Error}} started_at={{.State.StartedAt}} finished_at={{.State.FinishedAt}}' "$CONTAINER" 2>&1) || inspect_ok=false
+  # Owner checks must stay bounded even when systemd or Docker is unresponsive.
+  main_pid=$(/usr/bin/timeout --signal=TERM --kill-after=1 5 systemctl --user show --property=MainPID --value "$UNIT" 2>&1) || main_pid_ok=false
+  inspect=$(/usr/bin/timeout --signal=TERM --kill-after=1 5 docker inspect --format 'running={{.State.Running}} pid={{.State.Pid}} oom_killed={{.State.OOMKilled}} exit_code={{.State.ExitCode}} error={{json .State.Error}} started_at={{.State.StartedAt}} finished_at={{.State.FinishedAt}}' "$CONTAINER" 2>&1) || inspect_ok=false
 
   if [ "$main_pid_ok" = false ] || ! [[ "$main_pid" =~ ^[0-9]+$ ]] ||
      [ "$main_pid" -le 1 ]; then

@@ -893,7 +893,11 @@ class ActivationFixture:
         self._remember_group(process)
         return process
 
-    def wait_for_marker(self, timeout: float = 5) -> None:
+    def wait_for_marker(self, timeout: float | None = None) -> None:
+        if timeout is None:
+            config = json.loads(self.config.read_text())
+            # Rendezvous must not expire before the operation it is observing.
+            timeout = config["deadline_seconds"] + config["rollback_seconds"]
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and not self.marker.exists():
             time.sleep(0.02)
