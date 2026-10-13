@@ -179,9 +179,37 @@ class Host:
     def stop(self, unit):
         self.call(["/usr/bin/systemctl", "--user", "stop", "--no-block", unit])
 
+    def startable(self, unit):
+        props = self.properties(unit)
+        check(props["ActiveState"] in {"inactive", "failed"} and props["Job"] in {"", "0"},
+              "start requires an inactive unit without a pending job")
+
     def start(self, unit):
+        self.startable(unit)
         self.call(["/usr/bin/systemctl", "--user", "reset-failed", unit])
-        self.call(["/usr/bin/systemctl", "--user", "start", "--no-block", unit])
+        self.startable(unit)
+        raw = self.call(["/usr/bin/busctl", "--user", "call", "org.freedesktop.systemd1",
+                         "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
+                         "StartUnit", "ss", unit, "fail"])
+        match = re.fullmatch(r'o "(/org/freedesktop/systemd1/job/([1-9][0-9]{0,9}))"\n?', raw)
+        check(match is not None and int(match[2]) < 2**32, "invalid submitted manager job")
+        return match[1]
+
+    def acquire(self, unit, job):
+        """First ownership requires the submitted job to bracket one invocation."""
+        match = re.fullmatch(r"/org/freedesktop/systemd1/job/([1-9][0-9]{0,9})", job)
+        check(match is not None and int(match[1]) < 2**32, "invalid acquisition job")
+        before = self.properties(unit)
+        check(before["Job"] == match[1], "submitted job is no longer attached to unit")
+        invocation = before["InvocationID"]
+        if not invocation:
+            return None  # The owned job is queued but has not created an invocation.
+        check(re.fullmatch(r"[0-9a-f]{32}", invocation) is not None, "invalid acquired invocation")
+        generation = self.snapshot(unit)
+        after = self.properties(unit)
+        check(after["Job"] == match[1] and after["InvocationID"] == invocation
+              and generation["invocation"] == invocation, "submitted job invocation changed during acquisition")
+        return generation
 
     def gone(self, generation):
         cid = generation["cid"]
@@ -316,9 +344,12 @@ class Recovery:
             for unit in START_ORDER:
                 self.journal["intent"] = ["start", unit]
                 self.save()
-                self.host.start(unit)
+                job = self.host.start(unit)
                 def capture():
-                    generation = self.host.snapshot(unit)
+                    generation = (self.host.snapshot(unit) if unit in self.journal["new"]
+                                  else self.host.acquire(unit, job))
+                    if generation is None:
+                        return False
                     if generation["invocation"] and generation["invocation"] != self.journal["old"][unit]["invocation"]:
                         check(generation["restarts"] == 0, "automatic restart cannot become owned startup")
                         if unit not in self.journal["new"]:

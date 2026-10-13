@@ -111,8 +111,9 @@ class StackRecoveryTests(unittest.TestCase):
     def test_automatic_restart_is_not_adopted_as_owned_start(self):
         original = self.host.start
         def restarted(unit):
-            original(unit)
+            job = original(unit)
             self.host.generations[unit]["restarts"] = 1
+            return job
         self.host.start = restarted
         with self.assertRaises(RuntimeError): self.execute()
         self.assertFalse((self.run / "result.json").exists())
@@ -271,8 +272,9 @@ class StackRecoveryTests(unittest.TestCase):
     def test_cleanup_rejects_same_container_restarted_at_new_time(self):
         start = self.host.start
         def started(unit):
-            start(unit)
+            job = start(unit)
             self.host.generations[unit]["started"] = "first"
+            return job
         self.host.start = started
         self.host.fail_probe = self.c.EMBED
         with self.assertRaises(RuntimeError): self.execute()
@@ -282,6 +284,118 @@ class StackRecoveryTests(unittest.TestCase):
         self.assertEqual(self.host.actions, before)
         self.assertTrue(self.recovery.marker.exists())
         self.assertFalse((self.run / "result.json").exists())
+
+    def test_foreign_job_before_first_capture_is_never_adopted(self):
+        start = self.host.start
+        def foreign(unit):
+            job = start(unit)
+            self.host.jobs[unit] = "/org/freedesktop/systemd1/job/999"
+            self.host.generations[unit].update(invocation="foreign", cid="foreign", restarts=0)
+            return job
+        self.host.start = foreign
+        with self.assertRaises(RuntimeError): self.execute()
+        self.assertEqual(self.recovery.journal["new"], {})
+        before = list(self.host.actions)
+        with self.assertRaises(RuntimeError): self.recovery.cleanup()
+        self.assertEqual(self.host.actions, before)
+        self.assertTrue(self.recovery.marker.exists())
+        self.assertFalse((self.run / "result.json").exists())
+
+    def test_completed_job_before_first_capture_holds_without_guessing(self):
+        start = self.host.start
+        def completed(unit):
+            job = start(unit)
+            self.host.jobs[unit] = None
+            return job
+        self.host.start = completed
+        with self.assertRaises(RuntimeError): self.execute()
+        self.assertEqual(self.recovery.journal["new"], {})
+        self.assertTrue(self.recovery.marker.exists())
+        self.assertFalse((self.run / "result.json").exists())
+
+    def test_same_job_invocation_change_during_first_capture_is_rejected(self):
+        snapshot = self.host.snapshot
+        def replaced(unit):
+            if ("start", unit) in self.host.actions:
+                self.host.generations[unit]["invocation"] = "foreign"
+            return snapshot(unit)
+        self.host.snapshot = replaced
+        with self.assertRaises(RuntimeError): self.execute()
+        self.assertEqual(self.recovery.journal["new"], {})
+        self.assertTrue(self.recovery.marker.exists())
+        self.assertFalse((self.run / "result.json").exists())
+
+    def test_proven_slow_start_retains_ownership_after_job_completes(self):
+        acquire = self.host.acquire
+        snapshot = self.host.snapshot
+        waiting = set()
+        def captured(unit, job):
+            generation = acquire(unit, job)
+            generation["running"] = False
+            waiting.add(unit)
+            self.host.jobs[unit] = None
+            return generation
+        def completed(unit):
+            generation = snapshot(unit)
+            if unit in waiting:
+                waiting.remove(unit)
+                generation["running"] = False
+            return generation
+        self.host.acquire = captured
+        self.host.snapshot = completed
+        self.execute()
+        self.assertEqual(json.loads((self.run / "result.json").read_text())["status"], "succeeded")
+        self.assertFalse(self.recovery.marker.exists())
+
+    def test_host_start_returns_exact_manager_job_and_rejects_bad_output(self):
+        host = self.c.Host()
+        properties = dict(ActiveState="inactive", SubState="dead", Job="", InvocationID="", MainPID="0", NRestarts="0")
+        for output in ('o "/org/freedesktop/systemd1/job/42"\n', '', 'o "/org/freedesktop/systemd1/job/0"', 'o "/wrong/42"', 's "/org/freedesktop/systemd1/job/42"', 'o "/org/freedesktop/systemd1/job/42" trailing'):
+            with self.subTest(output=output), patch.object(host, "properties", return_value=properties), patch.object(host, "call", side_effect=["", output]) as call:
+                if output.endswith("\n"):
+                    self.assertEqual(host.start(self.c.EMBED), "/org/freedesktop/systemd1/job/42")
+                    self.assertEqual(call.call_args.args[0], ["/usr/bin/busctl", "--user", "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "StartUnit", "ss", self.c.EMBED, "fail"])
+                else:
+                    with self.assertRaises(RuntimeError): host.start(self.c.EMBED)
+
+    def test_host_start_refuses_existing_active_or_pending_generation(self):
+        host = self.c.Host()
+        for active, job in (("active", ""), ("activating", "42"), ("inactive", "42")):
+            with self.subTest(active=active, job=job), patch.object(host, "properties", return_value={"ActiveState": active, "Job": job}), patch.object(host, "call", return_value="") as call:
+                with self.assertRaises(RuntimeError): host.start(self.c.EMBED)
+                self.assertFalse(any("StartUnit" in args.args[0] for args in call.call_args_list))
+
+    def test_host_acquisition_brackets_exact_job_and_invocation(self):
+        host = self.c.Host()
+        self.assertTrue(callable(getattr(host, "acquire", None)), "first acquisition needs manager-job proof")
+        props = dict(ActiveState="activating", SubState="start-post", Job="42", InvocationID="a" * 32, MainPID="123", NRestarts="0")
+        generation = dict(invocation="a" * 32, cid=None, running=False)
+        for change in ({}, {"Job": "43"}, {"Job": ""}, {"InvocationID": "b" * 32}):
+            with self.subTest(change=change), patch.object(host, "properties", side_effect=[props, {**props, **change}]), patch.object(host, "snapshot", return_value=generation):
+                if change:
+                    with self.assertRaises(RuntimeError): host.acquire(self.c.EMBED, "/org/freedesktop/systemd1/job/42")
+                else:
+                    self.assertEqual(host.acquire(self.c.EMBED, "/org/freedesktop/systemd1/job/42"), generation)
+
+    def test_host_job_operations_obey_existing_command_deadline(self):
+        host = self.c.Host()
+        host.deadline = 0
+        with patch.object(self.c, "command") as command:
+            with self.assertRaisesRegex(RuntimeError, "deadline exhausted"):
+                host.start(self.c.EMBED)
+            with self.assertRaisesRegex(RuntimeError, "deadline exhausted"):
+                host.acquire(self.c.EMBED, "/org/freedesktop/systemd1/job/42")
+            command.assert_not_called()
+
+    def test_host_first_acquisition_waits_only_for_owned_queued_job(self):
+        host = self.c.Host()
+        for job, invocation in (("42", ""), ("", "a" * 32), ("43", "a" * 32), ("42", "invalid")):
+            with self.subTest(job=job, invocation=invocation), patch.object(host, "properties", return_value={"Job": job, "InvocationID": invocation}), patch.object(host, "snapshot") as snapshot:
+                if job == "42" and not invocation:
+                    self.assertIsNone(host.acquire(self.c.EMBED, "/org/freedesktop/systemd1/job/42"))
+                else:
+                    with self.assertRaises(RuntimeError): host.acquire(self.c.EMBED, "/org/freedesktop/systemd1/job/42")
+                snapshot.assert_not_called()
 
     def test_template_is_disabled_and_cleanup_is_owned_by_manager(self):
         unit = Path(__file__).resolve().parents[1] / "profile/llm-guard-proxy/gb10-stack-recovery@.service"
@@ -425,6 +539,7 @@ class FakeHost:
         self.memory = 1000
         self.release_memory = True
         self.actions = []
+        self.jobs = {}
         self.probes = []
         self.target_matches = True
         self.fail_probe = None
@@ -448,6 +563,16 @@ class FakeHost:
         self.actions.append(("start", unit))
         self.generations[unit] = dict(invocation="new-" + unit, cid="new-" + unit,
             running=True, cgroup="/new/" + unit, device=3, inode=4, restarts=0)
+        self.jobs[unit] = "/org/freedesktop/systemd1/job/" + str(len(self.actions))
+        return self.jobs[unit]
+
+    def acquire(self, unit, job):
+        before = (self.jobs[unit], self.generations[unit]["invocation"])
+        self.module.check(job and before[0] == job, "submitted job is not attached")
+        generation = self.snapshot(unit)
+        self.module.check((self.jobs[unit], self.generations[unit]["invocation"]) == before
+                          and generation["invocation"] == before[1], "owned job invocation changed")
+        return generation
     def gone(self, generation):
         return not any(x["running"] and x["cid"] == generation["cid"] for x in self.generations.values())
     def available(self): return self.memory
