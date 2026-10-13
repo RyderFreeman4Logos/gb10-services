@@ -143,35 +143,31 @@ class TestGb10ServiceReadyChatProbe(unittest.TestCase):
                     [argv[index : index + 4] for index in range(helper_at + 1, len(argv))],
                 )
 
-    def test_vllm_text_units_retain_inspect_evidence_before_cleanup(self) -> None:
+    def test_vllm_text_units_retain_inside_generation_bound_cleanup(self) -> None:
         helper = "/home/obj/.local/bin/gb10_retain_container_inspect.sh"
         for unit in RETAINED_TEXT_UNITS:
             with self.subTest(unit=unit.name):
                 text = unit.read_text()
                 self.assertNotIn("docker run --rm", text)
                 self.assertNotIn("docker inspect ", text)
-                stop = [
-                    line
-                    for line in text.splitlines()
-                    if line.startswith("ExecStop=") or line.startswith("ExecStopPost=")
-                ]
-                inspect_at = [
-                    index for index, line in enumerate(stop) if helper in line
-                ]
-                cleanup_at = [
-                    index for index, line in enumerate(stop) if "--cleanup" in line
-                ]
-                self.assertEqual(len(inspect_at), 2)
-                self.assertEqual(len(cleanup_at), 2)
-                self.assertLess(inspect_at[0], cleanup_at[0])
-                self.assertLess(inspect_at[1], cleanup_at[1])
-                for line in stop:
-                    if helper in line:
-                        self.assertTrue(
-                            line.startswith("ExecStop=-")
-                            or line.startswith("ExecStopPost=-"),
-                            line,
-                        )
+                lines = text.splitlines()
+                live = [shlex.split(line.split("=", 1)[1]) for line in lines
+                        if line.startswith("ExecStartPost=") and helper in line]
+                self.assertEqual(len(live), 1)
+                self.assertIn("--snapshot-live", live[0])
+                output = live[0][live[0].index("--output") + 1]
+                cidfile = live[0][live[0].index("--cidfile") + 1]
+                for directive in ("ExecStartPre=", "ExecStop=", "ExecStopPost="):
+                    commands = [shlex.split(line.split("=", 1)[1]) for line in lines
+                                if line.startswith(directive)]
+                    self.assertFalse(any(helper in argv for argv in commands))
+                    cleanup = [argv for argv in commands if "--cleanup" in argv]
+                    self.assertEqual(len(cleanup), 1)
+                    argv = cleanup[0]
+                    self.assertEqual(argv.count("--retain-inspect-output"), 1)
+                    self.assertEqual(argv[argv.index("--retain-inspect-output") + 1], output)
+                    self.assertEqual(argv[argv.index("--cidfile") + 1], cidfile)
+                    self.assertIn("/home/obj/.local/bin/gb10_verify_vllm_no_swap.sh", argv)
 
 
 if __name__ == "__main__":
