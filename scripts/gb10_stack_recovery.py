@@ -174,6 +174,7 @@ class Host:
               and snapshot["cgroup"] == manifest["control_group"]
               and snapshot["device"] == manifest["target_device"]
               and snapshot["inode"] == manifest["target_inode"], "old Guardian target changed")
+        return snapshot
 
     def stop(self, unit):
         self.call(["/usr/bin/systemctl", "--user", "stop", "--no-block", unit])
@@ -293,8 +294,9 @@ class Recovery:
             write_private(self.directory / "ready.json", self.identity, create=True)
             self.wait(lambda: os.path.lexists(self.directory / "permit.json"), limit)
             self.permit()
-            self.host.target(self.manifest)
-            self.journal = {"identity": self.identity, "old": {unit: self.host.snapshot(unit) for unit in STOP_ORDER},
+            target = self.host.target(self.manifest)
+            old = {unit: target if unit == TEXT else self.host.snapshot(unit) for unit in STOP_ORDER}
+            self.journal = {"identity": self.identity, "old": old,
                             "new": {}, "intent": None, "successful": False,
                             "startup_min_available_bytes": self.startup_min,
                             "available_before": self.host.available()}
@@ -321,15 +323,16 @@ class Recovery:
                         check(generation["restarts"] == 0, "automatic restart cannot become owned startup")
                         if unit not in self.journal["new"]:
                             self.journal["new"][unit] = generation
-                            self.save()
                         check(generation["invocation"] == self.journal["new"][unit]["invocation"], "new unit replaced during startup")
-                        for field in ("cid", "cgroup", "device", "inode"):
+                        for field in ("cid", "cgroup", "device", "inode", "started"):
                             expected = self.journal["new"][unit].get(field)
                             check(expected is None or generation.get(field) == expected,
                                   "new container replaced during startup")
+                        # Retain each validated observation, including the first CID
+                        # materialized while the service is still activating.
+                        self.journal["new"][unit] = generation
+                        self.save()
                         if generation["running"]:
-                            self.journal["new"][unit] = generation
-                            self.save()
                             return True
                     return False
                 self.wait(capture, limit)
@@ -357,24 +360,25 @@ class Recovery:
                     check(self.host.snapshot(unit) == self.journal["new"][unit], "successful generation changed")
                     self.host.ready(unit, self.host.deadline)
                     check(self.host.snapshot(unit) == self.journal["new"][unit], "successful generation changed during probe")
+                check(all(self.host.snapshot(unit) == self.journal["new"][unit] for unit in START_ORDER),
+                      "successful stack changed before result")
                 self.result("succeeded")
                 self.release_marker()
                 return
-            # Check every owner before any stop: external systemctl drift is HOLD.
+            # Retain every validated observation: a fresh snapshot is not authority.
+            owned = {}
             for unit in STOP_ORDER:
                 current = self.host.snapshot(unit)
                 expected = self.journal["new"].get(unit, self.journal["old"][unit])
-                pending = self.journal["intent"] == ["start", unit] and unit not in self.journal["new"]
-                if pending and current["invocation"] != expected["invocation"]:
-                    check(current["restarts"] == 0, "cleanup cannot adopt automatic replacement")
+                # An intent cannot prove submission or ownership of a new invocation.
                 absent = current.get("settled", False) and current["cid"] is None and self.host.gone(expected)
-                check(current["invocation"] == expected["invocation"] or pending or absent,
+                check(current["invocation"] == expected["invocation"] or absent,
                       "outside-protocol unit generation replacement")
-                if not absent and not pending:
-                    for field in ("cid", "cgroup", "device", "inode"):
+                if not absent:
+                    for field in ("cid", "cgroup", "device", "inode", "started"):
                         check(expected.get(field) is None or current.get(field) == expected[field],
                               "outside-protocol container generation replacement")
-            owned = {unit: self.host.snapshot(unit) for unit in STOP_ORDER}
+                owned[unit] = current
             for unit in STOP_ORDER:
                 check(self.host.snapshot(unit) == owned[unit], "cleanup generation changed before stop")
                 self.host.stop(unit)

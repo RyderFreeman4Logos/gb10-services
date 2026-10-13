@@ -36,6 +36,8 @@ class StackRecoveryTests(unittest.TestCase):
             deadline_boottime_ms=1000000)
         self.write("manifest.json", self.manifest)
         self.host = FakeHost(self.c)
+        self.host.generations[self.c.TEXT].update(cid=self.manifest["container_id"],
+            cgroup=self.manifest["control_group"])
         self.recovery = self.c.Recovery(self.run, self.host, self.state, self.invocation)
         self.recovery.startup_min = 101
 
@@ -142,6 +144,144 @@ class StackRecoveryTests(unittest.TestCase):
         with patch.object(self.recovery, "save", side_effect=replace):
             with self.assertRaises(RuntimeError): self.execute()
         self.assertEqual(self.host.actions, [])
+
+    def test_validated_target_replaced_before_journal_is_not_adopted(self):
+        target = self.host.target
+        calls = 0
+        def replaced(manifest):
+            nonlocal calls
+            validated = target(manifest)
+            calls += 1
+            if calls == 2:
+                self.host.generations[self.c.TEXT].update(invocation="foreign", cid="foreign")
+            return validated
+        self.host.target = replaced
+        with self.assertRaises(RuntimeError): self.execute()
+        self.assertEqual(self.host.actions, [])
+        with self.assertRaises(RuntimeError): self.recovery.cleanup()
+        self.assertEqual(self.host.actions, [])
+        self.assertTrue(self.recovery.marker.exists())
+        self.assertFalse((self.run / "result.json").exists())
+
+    def test_cleanup_retains_validated_snapshot_instead_of_recapturing_owner(self):
+        self.host.fail_probe = self.c.EMBED
+        with self.assertRaises(RuntimeError): self.execute()
+        snapshot = self.host.snapshot
+        observations = 0
+        def replaced(unit):
+            nonlocal observations
+            if unit == self.c.TEXT:
+                observations += 1
+                if observations == 2:
+                    self.host.generations[unit].update(invocation="foreign", cid="foreign", running=True)
+            return snapshot(unit)
+        self.host.snapshot = replaced
+        before = list(self.host.actions)
+        with self.assertRaises(RuntimeError): self.recovery.cleanup()
+        self.assertEqual(self.host.actions, before)
+        self.assertTrue(self.recovery.marker.exists())
+        self.assertFalse((self.run / "result.json").exists())
+
+    def test_unsubmitted_start_intent_cannot_authorize_foreign_generation(self):
+        save = self.recovery.save
+        def crash():
+            save()
+            if self.recovery.journal["intent"] == ["start", self.c.EMBED]:
+                raise RuntimeError("crash before start submission")
+        with patch.object(self.recovery, "save", side_effect=crash):
+            with self.assertRaisesRegex(RuntimeError, "crash before start submission"):
+                self.execute()
+        self.assertFalse(any(action == "start" for action, _ in self.host.actions))
+        self.host.generations[self.c.EMBED].update(invocation="foreign", cid="foreign", running=True, restarts=0)
+        before = list(self.host.actions)
+        with self.assertRaises(RuntimeError): self.recovery.cleanup()
+        self.assertEqual(self.host.actions, before)
+        self.assertTrue(self.recovery.marker.exists())
+        self.assertFalse((self.run / "result.json").exists())
+
+    def test_submitted_but_uncaptured_start_holds_without_generation_proof(self):
+        start = self.host.start
+        def crash(unit):
+            start(unit)
+            raise RuntimeError("crash after submit before capture")
+        self.host.start = crash
+        with self.assertRaisesRegex(RuntimeError, "crash after submit before capture"):
+            self.execute()
+        before = list(self.host.actions)
+        with self.assertRaises(RuntimeError): self.recovery.cleanup()
+        self.assertEqual(self.host.actions, before)
+        self.assertTrue(self.recovery.marker.exists())
+        self.assertFalse((self.run / "result.json").exists())
+
+    def test_startup_binds_container_when_first_observed_before_running(self):
+        snapshot = self.host.snapshot
+        observations = 0
+        def changing(unit):
+            nonlocal observations
+            result = snapshot(unit)
+            if unit == self.c.EMBED and ("start", unit) in self.host.actions:
+                observations += 1
+                if observations == 1:
+                    result.update(cid=None, cgroup=None, device=None, inode=None, running=False)
+                elif observations == 2:
+                    result["running"] = False
+                else:
+                    self.host.generations[unit]["cid"] = "foreign"
+                    result = snapshot(unit)
+            return result
+        self.host.snapshot = changing
+        with self.assertRaises(RuntimeError): self.execute()
+        before = list(self.host.actions)
+        with self.assertRaises(RuntimeError): self.recovery.cleanup()
+        self.assertEqual(self.host.actions, before)
+        self.assertTrue(self.recovery.marker.exists())
+        self.assertFalse((self.run / "result.json").exists())
+
+    def test_success_cleanup_rechecks_whole_stack_after_last_probe(self):
+        with patch.object(self.recovery, "release_marker", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError): self.execute()
+        (self.run / "result.json").unlink()
+        ready = self.host.ready
+        def replaced(unit, deadline):
+            ready(unit, deadline)
+            if unit == self.c.TEXT:
+                self.host.generations[self.c.EMBED].update(invocation="foreign", cid="foreign")
+        self.host.ready = replaced
+        before = list(self.host.actions)
+        with self.assertRaises(RuntimeError): self.recovery.cleanup()
+        self.assertEqual(self.host.actions, before)
+        self.assertTrue(self.recovery.marker.exists())
+        self.assertFalse((self.run / "result.json").exists())
+
+    def test_startup_rejects_same_container_restarted_at_new_time(self):
+        snapshot = self.host.snapshot
+        observations = 0
+        def restarted(unit):
+            nonlocal observations
+            result = snapshot(unit)
+            if unit == self.c.EMBED and ("start", unit) in self.host.actions:
+                observations += 1
+                result["started"] = "first" if observations == 1 else "replacement"
+                if observations == 1: result["running"] = False
+            return result
+        self.host.snapshot = restarted
+        with self.assertRaises(RuntimeError): self.execute()
+        self.assertFalse((self.run / "result.json").exists())
+
+    def test_cleanup_rejects_same_container_restarted_at_new_time(self):
+        start = self.host.start
+        def started(unit):
+            start(unit)
+            self.host.generations[unit]["started"] = "first"
+        self.host.start = started
+        self.host.fail_probe = self.c.EMBED
+        with self.assertRaises(RuntimeError): self.execute()
+        self.host.generations[self.c.EMBED]["started"] = "replacement"
+        before = list(self.host.actions)
+        with self.assertRaises(RuntimeError): self.recovery.cleanup()
+        self.assertEqual(self.host.actions, before)
+        self.assertTrue(self.recovery.marker.exists())
+        self.assertFalse((self.run / "result.json").exists())
 
     def test_template_is_disabled_and_cleanup_is_owned_by_manager(self):
         unit = Path(__file__).resolve().parents[1] / "profile/llm-guard-proxy/gb10-stack-recovery@.service"
@@ -298,6 +438,7 @@ class FakeHost:
     def sleep(self): self.now += 1; self.on_wait()
     def target(self, manifest):
         if not self.target_matches: raise RuntimeError("target replaced")
+        return self.module.Host.target(self, manifest)
     def snapshot(self, unit): return dict(self.generations[unit])
     def stop(self, unit):
         self.actions.append(("stop", unit))
