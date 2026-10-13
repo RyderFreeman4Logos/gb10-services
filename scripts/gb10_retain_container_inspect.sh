@@ -24,7 +24,7 @@ if [[ "${GB10_RETAIN_UNDER_TIMEOUT:-}" != "1" ]]; then
 fi
 
 usage() {
-  echo "usage: gb10_retain_container_inspect.sh [--snapshot-live] --container NAME --cidfile PATH --output PATH" >&2
+  echo "usage: gb10_retain_container_inspect.sh [--snapshot-live] --container NAME --cidfile PATH --output PATH [--expected-cid CID]" >&2
   exit 2
 }
 
@@ -34,6 +34,7 @@ skip() {
 }
 
 container=""
+expected_cid=""
 cidfile=""
 output=""
 export GB10_RETAIN_SNAPSHOT_LIVE=0
@@ -42,6 +43,11 @@ while [[ $# -gt 0 ]]; do
     --snapshot-live)
       export GB10_RETAIN_SNAPSHOT_LIVE=1
       shift
+      ;;
+    --expected-cid)
+      [[ $# -ge 2 && "$2" =~ ^[0-9a-f]{64}$ ]] || usage
+      expected_cid="$2"
+      shift 2
       ;;
     --container)
       [[ $# -ge 2 ]] || usage
@@ -101,6 +107,8 @@ PY
 )"; then
   skip "cidfile is missing or malformed; keeping last inspect"
 fi
+
+[[ -z "$expected_cid" || "$cid" == "$expected_cid" ]] || skip "cidfile generation changed"
 
 tmp="$(mktemp "${output}.tmp.XXXXXX")" || skip "mktemp failed; keeping last inspect"
 cleanup() { rm -f -- "$tmp"; }

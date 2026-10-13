@@ -132,6 +132,7 @@ def _run(
     output: Path,
     container: str = CONTAINER,
     timeout: int = 5,
+    expected_cid: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -143,6 +144,7 @@ def _run(
             str(cidfile),
             "--output",
             str(output),
+            *(["--expected-cid", expected_cid] if expected_cid is not None else []),
         ],
         env=env,
         text=True,
@@ -534,7 +536,7 @@ class RetainContainerInspectTests(unittest.TestCase):
         self.assertNotIn("vllm-aeon-ultimate-uncensored-nvfp4", args)
         self.assertIn("--type container", args)
 
-    def test_text_units_ignore_retain_failures_before_cleanup(self) -> None:
+    def test_text_units_retain_inside_generation_bound_cleanup(self) -> None:
         helper = HELPER_DEST
         for unit, container, cidfile, output in UNITS:
             with self.subTest(unit=unit.name):
@@ -550,25 +552,26 @@ class RetainContainerInspectTests(unittest.TestCase):
                 ]
                 retain = [line for line in stop if helper in line]
                 cleanup = [line for line in stop if "--cleanup" in line]
-                self.assertEqual(len(retain), 2)
+                self.assertEqual(retain, [])
                 self.assertEqual(len(cleanup), 2)
-                for line in retain:
-                    self.assertTrue(
-                        line.startswith("ExecStop=-") or line.startswith("ExecStopPost=-"),
-                        line,
-                    )
-                    self.assertIn(f"--container {container}", line)
+                for line in cleanup:
+                    self.assertIn(f"--retain-inspect-output {output}", line)
                     self.assertIn(f"--cidfile {cidfile}", line)
-                    self.assertIn(f"--output {output}", line)
-                    self.assertIn(
-                        f"/usr/bin/timeout --signal=TERM --kill-after={RETAIN_KILL_AFTER_SEC} {RETAIN_DEADLINE_SEC} ",
-                        line,
-                    )
-                    self.assertLess(RETAIN_DEADLINE_SEC + RETAIN_KILL_AFTER_SEC, 60)
-                retain_at = [index for index, line in enumerate(stop) if helper in line]
-                cleanup_at = [index for index, line in enumerate(stop) if "--cleanup" in line]
-                self.assertLess(retain_at[0], cleanup_at[0])
-                self.assertLess(retain_at[1], cleanup_at[1])
+
+    def test_expected_cid_rejects_replacement_before_inspect(self) -> None:
+        _fake_docker(self.bin_dir, _exited_payload(), 0)
+        result = _run(self.env, self.cidfile, self.output, expected_cid="b" * 64)
+        _assert_kept_last_good(self, result, self.output)
+        self.assertIn("cidfile generation changed", result.stderr)
+
+    def test_expected_cid_archives_matching_exited_generation(self) -> None:
+        _fake_docker(self.bin_dir, _exited_payload(), 0)
+        result = _run(self.env, self.cidfile, self.output, expected_cid=CID)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("retained cid=" + CID, result.stdout)
+        receipts = list((Path(self.env["HOME"]) / ".local/state/gb10-vllm-cids").glob("*.exited.json"))
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(json.loads(receipts[0].read_text())["container_id"], CID)
 
     def test_running_inspect_does_not_overwrite_last_good_inspect(self) -> None:
         payload = json.loads(_exited_payload())
