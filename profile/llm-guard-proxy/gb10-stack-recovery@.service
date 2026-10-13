@@ -1,0 +1,20 @@
+# Opt-in only: install explicitly after the matching Guard protocol is reviewed.
+[Unit]
+Description=Owned GB10 stack recovery %i
+BindsTo=llm-guard-proxy.service
+After=llm-guard-proxy.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+UMask=0077
+Environment=PYTHONPATH=/home/obj/.local/bin
+# No default: admission requires an operator-reviewed cold-stack measurement.
+EnvironmentFile=-/home/obj/.config/gb10/stack-recovery.env
+ExecStart=/usr/bin/python3 /home/obj/.local/bin/gb10_stack_recovery.py run --run-directory %t/gb10-memory-guardian/recovery/%i --startup-min-available-bytes ${GB10_STACK_STARTUP_MIN_AVAILABLE_BYTES}
+ExecStopPost=/usr/bin/python3 /home/obj/.local/bin/gb10_stack_recovery.py cleanup --run-directory %t/gb10-memory-guardian/recovery/%i
+TimeoutStartSec=3360
+TimeoutStopSec=240
+KillMode=control-group
+SendSIGKILL=yes
+Restart=no
