@@ -1,6 +1,7 @@
 """Contracts for the unified GB10 systemd readiness probe."""
 
 import os
+import signal
 from pathlib import Path
 import shlex
 import subprocess
@@ -22,7 +23,9 @@ RETAINED_TEXT_UNITS = (
 )
 
 
-def _run_probe(main_pid: int, container_state: str) -> subprocess.CompletedProcess[str]:
+def _run_probe(
+    main_pid: int, container_state: str, blocked_command: str | None = None
+) -> subprocess.CompletedProcess[str]:
     with tempfile.TemporaryDirectory() as raw_tmp:
         fake_bin = Path(raw_tmp)
         commands = {
@@ -37,8 +40,10 @@ def _run_probe(main_pid: int, container_state: str) -> subprocess.CompletedProce
                 "oom_killed=false exit_code=137 error=none started_at=earlier "
                 "finished_at=now\"\n"
             ),
-            "curl": "#!/bin/sh\nexit 1\n",
+            "curl": "#!/bin/sh\nprintf '%s\\n' '{\"choices\":[{\"message\":{\"content\":\"OK\"}}]}'\n",
         }
+        if blocked_command:
+            commands[blocked_command] = "#!/bin/sh\nexec /usr/bin/sleep 60\n"
         for name, source in commands.items():
             path = fake_bin / name
             path.write_text(source)
@@ -48,28 +53,37 @@ def _run_probe(main_pid: int, container_state: str) -> subprocess.CompletedProce
             "FAKE_MAINPID": str(main_pid),
             "FAKE_CONTAINER_STATE": container_state,
         }
+        process = subprocess.Popen(
+            [
+                "bash",
+                str(READY),
+                "chat",
+                "http://127.0.0.1:9",
+                "test-model",
+                "--deadline",
+                "60",
+                "--unit",
+                "test.service",
+                "--container",
+                "test-container",
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
         try:
-            return subprocess.run(
-                [
-                    "bash",
-                    str(READY),
-                    "chat",
-                    "http://127.0.0.1:9",
-                    "test-model",
-                    "--deadline",
-                    "60",
-                    "--unit",
-                    "test.service",
-                    "--container",
-                    "test-container",
-                ],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=1,
-            )
+            stdout, stderr = process.communicate(timeout=8 if blocked_command else 1)
+            return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
         except subprocess.TimeoutExpired as error:
-            raise AssertionError("readiness waited after its MainPID disappeared") from error
+            raise AssertionError("readiness blocked on owner inspection or waited after owner exit") from error
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
 
 
 class TestGb10ServiceReadyChatProbe(unittest.TestCase):
@@ -94,6 +108,19 @@ class TestGb10ServiceReadyChatProbe(unittest.TestCase):
                 result = _run_probe(os.getpid(), state)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn(evidence, result.stdout)
+
+    def test_hung_owner_commands_fail_fast(self) -> None:
+        for command in ("systemctl", "docker"):
+            with self.subTest(command=command):
+                result = _run_probe(os.getpid(), "true", blocked_command=command)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("OWNER EXITED", result.stdout)
+                self.assertNotIn("SERVICE_READY", result.stdout)
+
+    def test_live_owner_and_successful_probe_are_ready(self) -> None:
+        result = _run_probe(os.getpid(), "true")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("SERVICE_READY", result.stdout)
 
     def test_every_readiness_caller_identifies_its_systemd_and_container_owner(self) -> None:
         for unit, container in READINESS_UNITS.items():
