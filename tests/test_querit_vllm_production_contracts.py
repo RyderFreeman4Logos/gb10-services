@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shlex
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -119,6 +120,13 @@ def _docker_host_and_vllm_options(unit: str) -> tuple[list[str], dict[str, list[
 
 
 class QueritVllmProductionContractTests(unittest.TestCase):
+    def test_guard_routes_canonical_querit_and_legacy_aliases_to_real_model(self) -> None:
+        config = tomllib.loads((ROOT / "profile/aeon-ultimate-uncensored-nvfp4/llm-guard-proxy/config.toml").read_text())
+        route = next(u for u in config["upstreams"] if u["name"] == "qwen3-reranker-8b")
+        self.assertEqual(route["match_models"], ["Querit/Querit-4B", "qwen3-reranker-8b", "Qwen/Qwen3-Reranker-8B"])
+        self.assertEqual(route.get("upstream_model"), "Querit/Querit-4B")
+        self.assertEqual(route["base_url"], "http://100.105.4.92:18013/v1")
+
     def test_production_unit_preserves_the_proven_vllm_profile(self) -> None:
         unit = PRODUCTION_UNIT.read_text()
         host, options = _docker_host_and_vllm_options(unit)

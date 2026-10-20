@@ -51,7 +51,7 @@ def rewrite_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "num_labels": 1,
             "head_dtype": "model",
             "sbert_ce_default_activation_function": (
-                "torch.nn.modules.activation.Tanh"
+                "torch.nn.modules.activation.Sigmoid"
             ),
         }
     )
@@ -98,7 +98,7 @@ def rewrite_weight_index(
 def rewrite_head_state(
     state: Mapping[str, Any], *, bfloat16_dtype: object
 ) -> dict[str, Any]:
-    """Return a copy with Querit's two-class head rewritten as a scalar Tanh head."""
+    """Return a copy with Querit's two-class head rewritten as a scalar sigmoid head for p1."""
 
     if "score.weight" in state or "score.bias" in state:
         raise ValueError("pre-existing score tensor found")
@@ -116,8 +116,9 @@ def rewrite_head_state(
     if head_bias.dtype != bfloat16_dtype:
         raise ValueError(f"bias dtype must be BF16, got {head_bias.dtype}")
 
-    score_weight = ((head_weight[1:2] - head_weight[0:1]) / 2).contiguous()
-    score_bias = ((head_bias[1:2] - head_bias[0:1]) / 2).contiguous()
+    # sigmoid(z1 - z0) == softmax([z0, z1])[1]; no batch normalization.
+    score_weight = (head_weight[1:2] - head_weight[0:1]).contiguous()
+    score_bias = (head_bias[1:2] - head_bias[0:1]).contiguous()
     if tuple(score_weight.shape) != (1, 2560) or tuple(score_bias.shape) != (1,):
         raise ValueError("score shape changed unexpectedly during conversion")
     if score_weight.dtype != bfloat16_dtype or score_bias.dtype != bfloat16_dtype:
@@ -225,6 +226,11 @@ def convert_snapshot(
     source_tree_sha256 = querit_vllm_artifact.attest_source_snapshot(snapshot)
     index = rewrite_weight_index(_load_json_object(index_path))
     config = rewrite_config(_load_json_object(config_path))
+    tokenizer_path = snapshot / "tokenizer.json"
+    tokenizer = _load_json_object(tokenizer_path)
+    # Official Querit uses add_special_tokens=False and appends CLS itself.
+    # vLLM scoring forces True: remove the source tokenizer's trailing EOS step.
+    tokenizer["post_processor"] = None
 
     loader = load_shard or _load_safetensors
     saver = save_shard or _save_safetensors
@@ -250,6 +256,7 @@ def convert_snapshot(
             [
                 (index_path, _stage_bytes(index_path, _json_bytes(index))),
                 (config_path, _stage_bytes(config_path, _json_bytes(config))),
+                (tokenizer_path, _stage_bytes(tokenizer_path, _json_bytes(tokenizer))),
                 (
                     snapshot / TEMPLATE_NAME,
                     _stage_bytes(snapshot / TEMPLATE_NAME, template_bytes),

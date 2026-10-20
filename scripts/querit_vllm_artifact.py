@@ -22,7 +22,7 @@ from querit_replay_trust import (
 
 MANIFEST_NAME = "querit-vllm-artifact-manifest.json"
 SOURCE_REVISION = "7b796de30ad8dc772d6c46c75659c1341283a665"
-TRANSFORM = "querit-tanh-scalar-head-v1"
+TRANSFORM = "querit-sigmoid-p1-head-v2"
 MANIFEST_SCHEMA = "querit-vllm-artifact-manifest-v2"
 MAX_FILES = 4096
 MAX_FILE_BYTES = 32 * 1024 * 1024 * 1024
@@ -38,7 +38,10 @@ SCALAR_HEAD_KEYS = {
 }
 OBSOLETE_HEAD_KEYS = frozenset({"head.bias", "head.weight"})
 EXPECTED_TEMPLATE_SHA256 = (
-    "048e14c0ed521d08717dd31b89990e4bf7ac12366c9ae338f2a2cc5d5d7b301d"
+    "1a506f1c77f79eef844e2c2f54239612c0c420eb46a8a8cbb89125a18bf9b15e"
+)
+EXPECTED_TOKENIZER_SHA256 = (
+    "00254297c436a8be97fcbd0cab8b68bf75146a0aca85c34983f1ab44987d531b"
 )
 SOURCE_LEDGER = tuple(dict(row) for row in TRUSTED_MODEL_FILES)
 SOURCE_LEDGER_SHA256 = TRUSTED_MODEL_LEDGER_SHA256
@@ -344,7 +347,7 @@ def _verify_semantics(root: Path) -> None:
         "head_dtype": "model",
         "hidden_size": 2560,
         "num_labels": 1,
-        "sbert_ce_default_activation_function": ("torch.nn.modules.activation.Tanh"),
+        "sbert_ce_default_activation_function": ("torch.nn.modules.activation.Sigmoid"),
     }
     for key, value in expected.items():
         if config.get(key) != value:
@@ -357,6 +360,9 @@ def _verify_semantics(root: Path) -> None:
             "converted config must not override the scoring problem type"
         )
     _verify_index_and_tensors(root)
+    _size, tokenizer_sha256 = _hash_regular(root / "tokenizer.json")
+    if tokenizer_sha256 != EXPECTED_TOKENIZER_SHA256:
+        raise ArtifactError("converted tokenizer is not the pinned no-extra-EOS tokenizer")
     _size, template_sha256 = _hash_regular(root / "querit-rerank.jinja")
     if template_sha256 != EXPECTED_TEMPLATE_SHA256:
         raise ArtifactError(
