@@ -427,7 +427,7 @@ class QueritServiceContractTests(unittest.TestCase):
         )
         self.assertEqual(
             profiles["qwen3-reranker-8b"]["match_models"],
-            ["qwen3-reranker-8b", "Qwen/Qwen3-Reranker-8B"],
+            ["Querit/Querit-4B", "qwen3-reranker-8b", "Qwen/Qwen3-Reranker-8B"],
         )
         self.assertEqual(default_chat["upstream_model"], "aeon-ultimate")
         self.assertEqual(default_chat["thinking"]["mode"], "force_disable")

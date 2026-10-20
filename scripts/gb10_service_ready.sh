@@ -136,12 +136,18 @@ assert len(d['data'][0]['embedding']) > 0, 'empty embedding'
     rerank)
       resp=$(curl -fsS --max-time "$PROBE_TIMEOUT" \
         -H 'Content-Type: application/json' \
-        -d "{\"model\":\"$MODEL\",\"query\":\"health\",\"documents\":[\"ok\",\"not ok\"]}" \
+        -d "{\"model\":\"$MODEL\",\"query\":\"What is the capital of France?\",\"documents\":[\"Paris is the capital of France.\",\"Quantum chromodynamics describes quarks and gluons.\"]}" \
         "$BASE_URL/v1/rerank" 2>/dev/null || true)
       if echo "$resp" | python3 -c "
-import sys, json
+import sys, json, math
 d = json.load(sys.stdin)
-assert len(d['results']) >= 2, 'missing results'
+r = d['results']
+assert len(r) == 2 and {x['index'] for x in r} == {0, 1}, 'missing results'
+assert all(isinstance(x['relevance_score'], (int, float))
+           and not isinstance(x['relevance_score'], bool)
+           and math.isfinite(x['relevance_score'])
+           and 0 <= x['relevance_score'] <= 1 for x in r), 'invalid probability'
+assert r[0]['index'] == 0 and r[0]['relevance_score'] > r[1]['relevance_score'], 'wrong ranking'
 " 2>/dev/null; then
         PROBE_OK=true
         break

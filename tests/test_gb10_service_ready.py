@@ -1,6 +1,7 @@
 """Contracts for the unified GB10 systemd readiness probe."""
 
 import os
+import json
 from pathlib import Path
 import shlex
 import subprocess
@@ -73,6 +74,18 @@ def _run_probe(main_pid: int, container_state: str) -> subprocess.CompletedProce
 
 
 class TestGb10ServiceReadyChatProbe(unittest.TestCase):
+    def test_rerank_probe_requires_probability_domain_and_relevant_first(self) -> None:
+        code = READY.read_text().split("    rerank)\n", 1)[1].split('python3 -c "', 1)[1].split('" 2>/dev/null', 1)[0]
+        cases = [(0.6, 0.3, True), (-0.1, -0.2, False), (1.1, 0.2, False),
+                 (float("nan"), 0.2, False), (float("inf"), 0.2, False),
+                 (0.3, 0.6, False), (0.5, 0.5, False)]
+        for relevant, irrelevant, valid in cases:
+            response = {"results": [{"index": 0, "relevance_score": relevant},
+                                    {"index": 1, "relevance_score": irrelevant}]}
+            result = subprocess.run(["python3", "-c", code], input=json.dumps(response),
+                                    text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode == 0, valid, response)
+
     def test_chat_probe_accepts_reasoning_without_thinking(self) -> None:
         text = READY.read_text(encoding="utf-8")
         self.assertIn("enable_thinking", text)

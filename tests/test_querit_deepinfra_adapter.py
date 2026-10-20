@@ -118,7 +118,7 @@ class QueritDeepinfraAdapterTests(unittest.TestCase):
             self.assertTrue(release.wait(timeout=2))
             with lock:
                 active -= 1
-            return _backend_response([-1.0, 0.0, 1.0])
+            return _backend_response([0.0, 0.5, 1.0])
 
         def request() -> None:
             connection = http.client.HTTPConnection(
@@ -176,7 +176,7 @@ class QueritDeepinfraAdapterTests(unittest.TestCase):
             with patch.object(
                 adapter,
                 "_call_backend",
-                return_value=_backend_response([-1.0, 0.0, 1.0]),
+                return_value=_backend_response([0.0, 0.5, 1.0]),
             ):
                 connection.request(
                     "POST",
@@ -299,7 +299,7 @@ class QueritDeepinfraAdapterTests(unittest.TestCase):
         )
         response = json.loads(
             adapter.public_response_bytes(
-                adapter.parse_backend_response(_backend_response([-1.0, 0.0, 1.0]), 3)
+                adapter.parse_backend_response(_backend_response([0.0, 0.5, 1.0]), 3)
             )
         )
         self.assertEqual(response["scores"], [0.0, 0.5, 1.0])
@@ -322,7 +322,8 @@ class QueritDeepinfraAdapterTests(unittest.TestCase):
         self.assertEqual(custom_backend["instruction"], "rank faithfully")
 
         template = (ROOT / "config" / "querit" / "querit-rerank.jinja").read_text()
-        self.assertIn('~ "<Instruct>: " ~ instruction ~ "\\n"', template)
+        self.assertIn("instruction if instruction is defined and instruction is not none", template)
+        self.assertIn('~ " Query: " ~ q ~ "; Content: " ~ d ~ "[CLS]"', template)
         self.assertNotIn(
             "<Instruct>: Given a web search query, retrieve relevant passages that answer the query\\n",
             template,
@@ -331,12 +332,12 @@ class QueritDeepinfraAdapterTests(unittest.TestCase):
     def test_real_vllm_025_score_response_usage_shape_is_accepted(self) -> None:
         response = adapter.parse_backend_response(_backend_response([0.25]), 1)
         self.assertEqual(response.input_tokens, 123)
-        self.assertEqual(response.scores, (0.625,))
+        self.assertEqual(response.scores, (0.25,))
 
-    def test_internal_tanh_domain_never_clamps_outside_evidence(self) -> None:
+    def test_probability_domain_never_clamps_outside_evidence(self) -> None:
         for score in (
-            math.nextafter(-1.0, -math.inf),
-            -1.0 - 2.0**-23,
+            math.nextafter(0.0, -math.inf),
+            -2.0**-23,
             1.0 + 2.0**-23,
             math.nextafter(1.0, math.inf),
         ):
@@ -344,7 +345,7 @@ class QueritDeepinfraAdapterTests(unittest.TestCase):
                 adapter.parse_backend_response(_backend_response([score]), 1)
 
         self.assertEqual(
-            adapter.parse_backend_response(_backend_response([-1.0, 1.0]), 2).scores,
+            adapter.parse_backend_response(_backend_response([0.0, 1.0]), 2).scores,
             (0.0, 1.0),
         )
 

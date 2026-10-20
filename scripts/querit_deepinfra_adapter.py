@@ -33,7 +33,7 @@ PUBLIC_PATH = "/v1/inference/Qwen/Qwen3-Reranker-8B"
 PUBLIC_VERSION = "5fa94080caafeaa45a15d11f969d7978e087a3db"
 BACKEND_MODEL = "Querit/Querit-4B"
 DEFAULT_INSTRUCTION = (
-    "Given a web search query, retrieve relevant passages that answer the query"
+    "Judge whether the Content meets the requirements based on the Query."
 )
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
@@ -211,9 +211,9 @@ def parse_backend_response(body: bytes, expected_count: int) -> BackendResponse:
         ):
             raise AdapterError("vLLM raw scores must be finite numbers")
         score = float(value)
-        if not -1.0 <= score <= 1.0:
-            raise AdapterError("vLLM raw scores must be in the tanh [-1, 1] domain")
-        transformed.append((score + 1.0) / 2.0)
+        if not 0.0 <= score <= 1.0:
+            raise AdapterError("vLLM scores must be probabilities in [0, 1]")
+        transformed.append(score)
     usage = payload["usage"]
     if not isinstance(usage, dict) or set(usage) != {
         "completion_tokens",

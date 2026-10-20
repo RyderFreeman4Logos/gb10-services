@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import struct
 import sys
@@ -23,31 +24,11 @@ except ModuleNotFoundError:
 
 BFLOAT16 = object()
 TEMPLATE_PATH = ROOT / "config" / "querit" / "querit-rerank.jinja"
-EXPECTED_TEMPLATE = """{%- set q = (
-    messages
-    | selectattr("role", "eq", "query")
-    | first
-).content -%}
-{%- set d = (
-    messages
-    | selectattr("role", "eq", "document")
-    | first
-).content -%}
-{%- set instruction = instruction
-    if instruction is defined and instruction is not none
-    else "Given a web search query, retrieve relevant passages that answer the query"
--%}
-{{- "<|im_start|>system\\n"
-    ~ "Judge whether the Document meets the requirements based on the Query "
-    ~ "and the Instruct provided. Note that the answer can only be \\"yes\\" or \\"no\\"."
-    ~ "<|im_end|>\\n"
-    ~ "<|im_start|>user\\n"
-    ~ "<Instruct>: " ~ instruction ~ "\\n"
-    ~ "<Query>: " ~ q ~ "\\n"
-    ~ "<Document>: " ~ d
-    ~ "<|im_end|>\\n"
-    ~ "<|im_start|>assistant\\n"
--}}
+EXPECTED_TEMPLATE = """{%- set q = (messages | selectattr("role", "eq", "query") | first).content -%}
+{%- set d = (messages | selectattr("role", "eq", "document") | first).content -%}
+{{- (instruction if instruction is defined and instruction is not none
+     else "Judge whether the Content meets the requirements based on the Query.")
+    ~ " Query: " ~ q ~ "; Content: " ~ d ~ "[CLS]" -}}
 """
 
 
@@ -108,15 +89,11 @@ class PromotingFakeTensor(FakeTensor):
 
     def __sub__(self, other: "FakeTensor") -> "PromotingFakeTensor":
         result = super().__sub__(other)
-        return PromotingFakeTensor(result.data, dtype=self.dtype)
-
-    def __truediv__(self, divisor: int) -> "FakeTensor":
-        result = super().__truediv__(divisor)
-        return FakeTensor(result.data, dtype=object())
+        return PromotingFakeTensor(result.data, dtype=object())
 
 
 class HeadRewriteTests(unittest.TestCase):
-    def test_two_class_bfloat16_head_becomes_scalar_tanh_head(self) -> None:
+    def test_two_class_bfloat16_head_becomes_scalar_sigmoid_head(self) -> None:
         self.assertIsNotNone(converter, "conversion module is missing")
         self.assertTrue(hasattr(converter, "rewrite_head_state"))
         state = {
@@ -132,9 +109,9 @@ class HeadRewriteTests(unittest.TestCase):
         self.assertEqual(set(converted), {"model.weight", "score.weight", "score.bias"})
         self.assertIs(converted["model.weight"], state["model.weight"])
         self.assertEqual(converted["score.weight"].shape, (1, 2560))
-        self.assertEqual(converted["score.weight"].data, [[4.0] * 2560])
+        self.assertEqual(set(converted["score.weight"].data[0]), {8.0})
         self.assertEqual(converted["score.bias"].shape, (1,))
-        self.assertEqual(converted["score.bias"].data, [4.0])
+        self.assertEqual(converted["score.bias"].data, [8.0])
         self.assertIs(converted["score.weight"].dtype, BFLOAT16)
         self.assertIs(converted["score.bias"].dtype, BFLOAT16)
         self.assertIn("head.weight", state, "source mapping must not be mutated")
@@ -189,7 +166,7 @@ class HeadRewriteTests(unittest.TestCase):
 
 
 class MetadataRewriteTests(unittest.TestCase):
-    def test_config_enables_scalar_bfloat16_tanh_sequence_classification(self) -> None:
+    def test_config_enables_scalar_bfloat16_sigmoid_sequence_classification(self) -> None:
         source = {
             "architectures": ["MLQwen3Model"],
             "hidden_size": 2560,
@@ -206,7 +183,7 @@ class MetadataRewriteTests(unittest.TestCase):
         self.assertEqual(converted["head_dtype"], "model")
         self.assertEqual(
             converted["sbert_ce_default_activation_function"],
-            "torch.nn.modules.activation.Tanh",
+            "torch.nn.modules.activation.Sigmoid",
         )
         self.assertEqual(converted["hidden_size"], 2560)
         self.assertEqual(converted["model_type"], "qwen3")
@@ -300,9 +277,17 @@ class TemplateContractTests(unittest.TestCase):
 
 class SnapshotConversionTests(unittest.TestCase):
     def test_snapshot_conversion_updates_all_artifacts_in_place(self) -> None:
+        assert converter is not None
         self.assertTrue(hasattr(converter, "convert_snapshot"))
         with tempfile.TemporaryDirectory() as raw_tmp:
             snapshot = Path(raw_tmp)
+            tokenizer = {"post_processor": {"type": "TemplateProcessing"}, "model": {}}
+            (snapshot / "tokenizer.json").write_text(json.dumps(tokenizer))
+            self.enterContext(mock.patch.object(
+                converter.querit_vllm_artifact,
+                "EXPECTED_TOKENIZER_SHA256",
+                hashlib.sha256(converter._json_bytes({**tokenizer, "post_processor": None})).hexdigest(),
+            ))
             shard = snapshot / "model-00002-of-00002.safetensors"
             (snapshot / "model-00001-of-00002.safetensors").write_bytes(
                 _safetensors_stub("model.weight")
@@ -387,6 +372,10 @@ class SnapshotConversionTests(unittest.TestCase):
             self.assertEqual(config["num_labels"], 1)
             self.assertEqual(config["head_dtype"], "model")
             self.assertNotIn("problem_type", config)
+            self.assertEqual(
+                json.loads((snapshot / "tokenizer.json").read_text()),
+                {**tokenizer, "post_processor": None},
+            )
             self.assertEqual(
                 (snapshot / "querit-rerank.jinja").read_text(), EXPECTED_TEMPLATE
             )
