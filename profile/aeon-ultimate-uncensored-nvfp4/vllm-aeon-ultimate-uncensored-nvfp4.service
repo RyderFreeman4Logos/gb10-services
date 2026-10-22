@@ -60,6 +60,8 @@ ExecStart=/usr/bin/env -i HOME=/home/obj PATH=/usr/bin:/bin LC_ALL=C DOCKER_HOST
     --compilation-config "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}" \
     --enable-chunked-prefill \
     --enable-prefix-caching \
+    --enable-prompt-tokens-details \
+    --enable-per-request-metrics \
     --attention-backend TRITON_ATTN \
     --max-model-len 262144 \
     --max-num-batched-tokens 16384 \
