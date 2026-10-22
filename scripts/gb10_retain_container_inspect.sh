@@ -9,18 +9,163 @@ RETAIN_KILL_AFTER_SEC=2
 MAX_INSPECT_BYTES=262144
 
 if [[ "${GB10_RETAIN_UNDER_TIMEOUT:-}" != "1" ]]; then
-  export GB10_RETAIN_UNDER_TIMEOUT=1
-  if /usr/bin/timeout --signal=TERM --kill-after="$RETAIN_KILL_AFTER_SEC" \
-    "$RETAIN_DEADLINE_SEC" /usr/bin/bash --noprofile --norc "$0" "$@"; then
-    exit 0
-  else
-    rc=$?
-    if [[ $rc -eq 124 || $rc -eq 137 ]]; then
-      echo "gb10_retain_container_inspect: skip: retain timed out; keeping last inspect" >&2
-      exit 0
-    fi
-    exit "$rc"
-  fi
+  exec /usr/bin/python3 -IS - "$0" "$RETAIN_DEADLINE_SEC" "$RETAIN_KILL_AFTER_SEC" "$@" <<'PY_SUPERVISOR'
+import ctypes
+import os
+import select
+import secrets
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import time
+
+script, seconds, kill_after, *arguments = sys.argv[1:]
+channel, worker_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+env = dict(os.environ, GB10_RETAIN_UNDER_TIMEOUT="1",
+           GB10_RETAIN_SOCKET_FD=str(worker_channel.fileno()))
+process = None
+directory = temporary = pidfd = None
+leaf = None
+timed_out = False
+interrupted = False
+failed = False
+
+def interrupt(_signum, _frame):
+    global interrupted
+    interrupted = True
+
+def wait_ready(fd):
+    # Signals only record state, including across waitpid's status handoff.
+    while not interrupted:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("retainer supervisor timed out")
+        if select.select([fd], [], [], min(0.05, remaining))[0]:
+            return
+    raise InterruptedError("retainer supervisor interrupted")
+
+def kill_owned_children():
+    # This standalone subreaper owns only this invocation's worker lineage.
+    # A held pidfd plus a non-consuming child wait prevents stale PID signals.
+    with open(f"/proc/self/task/{os.getpid()}/children", "rb") as stream:
+        children = stream.read(65537)
+    if len(children) > 65536:
+        raise ValueError("retainer child list exceeded bound")
+    for candidate in children.split():
+        if time.monotonic() >= reap_deadline:
+            raise TimeoutError("retainer descendants did not reap; retaining owned tempfile")
+        try:
+            child_fd = os.pidfd_open(int(candidate))
+        except ProcessLookupError:
+            continue
+        try:
+            status = os.waitid(os.P_PIDFD, child_fd, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            if status is None:
+                signal.pidfd_send_signal(child_fd, signal.SIGKILL)
+        except (ChildProcessError, ProcessLookupError):
+            pass  # No longer our child, or already gone; never signal by PID.
+        finally:
+            os.close(child_fd)
+
+for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(signum, interrupt)
+
+deadline = time.monotonic() + float(seconds)
+try:
+    # Reap killed grandchildren here, rather than leaving them to host PID1.
+    if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
+        raise OSError("cannot own retainer descendants")
+    process = subprocess.Popen(
+        ["/usr/bin/bash", "--noprofile", "--norc", script, *arguments],
+        env=env, pass_fds=(worker_channel.fileno(),), start_new_session=True,
+    )
+    worker_channel.close()
+    pidfd = os.pidfd_open(process.pid)
+    channel.settimeout(max(0.001, deadline - time.monotonic()))
+    wait_ready(channel)
+    request, _, flags, _ = channel.recvmsg(65536)
+    if request:
+        if flags & socket.MSG_TRUNC:
+            raise ValueError("oversized publication path")
+        output = os.fsdecode(request)
+        if not os.path.isabs(output) or ".." in output:
+            raise ValueError("unsafe publication path")
+        parent, basename = os.path.split(output)
+        directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        leaf = basename + ".tmp." + secrets.token_urlsafe(5)[:6]
+        temporary = os.open(leaf, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                            0o600, dir_fd=directory)
+        channel.sendall(os.fsencode(os.path.join(parent, leaf)))
+    channel.close()
+    wait_ready(pidfd)
+    process.wait(timeout=0)
+except (subprocess.TimeoutExpired, TimeoutError):
+    timed_out = True
+except InterruptedError:
+    interrupted = True
+except (OSError, ValueError):
+    failed = True
+finally:
+    channel.close()
+    worker_channel.close()
+    if process is not None:
+        if process.returncode is None:
+            # The unreaped worker still owns this PGID; never reuse it after reap.
+            if timed_out:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                grace_deadline = time.monotonic() + float(kill_after)
+                while not interrupted:
+                    remaining = grace_deadline - time.monotonic()
+                    if remaining <= 0 or select.select([pidfd], [], [], min(0.05, remaining))[0]:
+                        break
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        reap_deadline = time.monotonic() + float(kill_after)
+        while True:
+            if time.monotonic() >= reap_deadline:
+                raise TimeoutError("retainer descendants did not reap; retaining owned tempfile")
+            try:
+                child, status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                if process.returncode is None:
+                    raise RuntimeError("retainer worker was not reaped")
+                break
+            if process.returncode is None and child == process.pid:
+                process.returncode = os.waitstatus_to_exitcode(status)
+            if child == 0:
+                if time.monotonic() >= reap_deadline:
+                    raise TimeoutError("retainer descendants did not reap; retaining owned tempfile")
+                kill_owned_children()
+                time.sleep(0.01)
+    if temporary is not None:
+        try:
+            owned = os.fstat(temporary)
+            current = os.stat(leaf, dir_fd=directory, follow_symlinks=False)
+            if (stat.S_ISREG(current.st_mode) and current.st_uid == os.getuid()
+                    and (current.st_dev, current.st_ino) == (owned.st_dev, owned.st_ino)):
+                os.unlink(leaf, dir_fd=directory)
+        except FileNotFoundError:
+            pass  # Successful publication moved our file to the output leaf.
+        finally:
+            os.close(temporary)
+    if directory is not None:
+        os.close(directory)
+    if pidfd is not None:
+        os.close(pidfd)
+if timed_out or interrupted or failed:
+    print("gb10_retain_container_inspect: skip: retain failed, timed out or interrupted; keeping last inspect",
+          file=sys.stderr)
+    raise SystemExit(0)
+code = process.returncode
+raise SystemExit(code if code >= 0 else 128 - code)
+PY_SUPERVISOR
 fi
 
 usage() {
@@ -102,7 +247,21 @@ PY
   skip "cidfile is missing or malformed; keeping last inspect"
 fi
 
-tmp="$(mktemp "${output}.tmp.XXXXXX")" || skip "mktemp failed; keeping last inspect"
+# Validation and allocation remain inside the supervisor's original deadline.
+tmp="$(/usr/bin/python3 -IS - "$output" <<'PY_TEMPFILE'
+import os
+import socket
+import sys
+
+with socket.socket(fileno=int(os.environ["GB10_RETAIN_SOCKET_FD"])) as channel:
+    channel.sendall(os.fsencode(sys.argv[1]))
+    path = channel.recv(65536)
+    if not path:
+        raise SystemExit(1)
+    sys.stdout.buffer.write(path)
+PY_TEMPFILE
+)" || skip "tempfile allocation failed; keeping last inspect"
+exec {GB10_RETAIN_SOCKET_FD}>&-
 cleanup() { rm -f -- "$tmp"; }
 trap cleanup EXIT
 chmod 0600 "$tmp" || skip "chmod failed; keeping last inspect"
