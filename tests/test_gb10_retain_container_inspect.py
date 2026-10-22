@@ -654,9 +654,222 @@ class RetainContainerInspectTests(unittest.TestCase):
         self.assertNotIn("retained", result.stdout.lower())
         self.assertIn("timed out", result.stderr.lower())
         leftover = list(self.identity.glob(f"{self.output.name}.tmp.*"))
-        self.assertEqual(len(leftover), 1)
+        self.assertEqual(leftover, [])
         self.assertGreaterEqual(elapsed, RETAIN_DEADLINE_SEC + RETAIN_KILL_AFTER_SEC - 1)
         self.assertLess(elapsed, RETAIN_DEADLINE_SEC + RETAIN_KILL_AFTER_SEC + 3)
+
+    def test_term_after_worker_reap_preserves_exit_status_and_cleanup(self) -> None:
+        source = HELPER.read_text().split("<<'PY_SUPERVISOR'\n", 1)[1].split("\nPY_SUPERVISOR", 1)[0]
+        root = Path(self.temporary.name)
+        script = root / "supervisor.source"
+        script.write_text(source)
+        worker = root / "abnormal-worker.sh"
+        worker.write_text("""exec /usr/bin/python3 -IS - "$1" <<'PY'
+import os, signal, socket, sys
+with socket.socket(fileno=int(os.environ["GB10_RETAIN_SOCKET_FD"])) as channel:
+    channel.settimeout(2)
+    channel.sendall(os.fsencode(sys.argv[1]))
+    assert channel.recv(65536)
+os.kill(os.getpid(), signal.SIGKILL)
+PY
+""")
+        # Keep real Popen/waitpid; inject TERM only after the kernel has reaped
+        # the abnormal worker, before Popen stores its returncode.
+        probe = r'''import json, os, signal, subprocess, sys
+from pathlib import Path
+from unittest.mock import patch
+source, worker, output = sys.argv[1:]
+original = subprocess.Popen._handle_exitstatus
+events = []
+def record_status(child, status):
+    assert child.returncode is None
+    assert os.waitstatus_to_exitcode(status) == -signal.SIGKILL
+    try:
+        os.waitpid(child.pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+    else:
+        raise AssertionError("worker was not already reaped")
+    assert len(list(Path(output).parent.glob(Path(output).name + ".tmp.*"))) == 1
+    print("TERM-after-real-waitpid", flush=True)
+    os.kill(os.getpid(), signal.SIGTERM)
+    original(child, status)
+    events.append({"pid": child.pid, "returncode": child.returncode})
+sys.argv = ["supervisor", worker, "10", "2", output]
+try:
+    with patch.object(subprocess.Popen, "_handle_exitstatus", record_status):
+        exec(compile(Path(source).read_text(), "supervisor", "exec"), {"__name__": "__main__"})
+except SystemExit as exit:
+    assert exit.code == 0, exit.code
+assert len(events) == 1 and events[0]["returncode"] == -signal.SIGKILL, events
+assert list(Path(output).parent.glob(Path(output).name + ".tmp.*")) == []
+print(json.dumps(events))
+'''
+        result = subprocess.run(
+            ["/usr/bin/python3", "-IS", "-c", probe, str(script), str(worker), str(self.output)],
+            env=self.env, text=True, capture_output=True, timeout=5, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("TERM-after-real-waitpid", result.stdout)
+        self.assertEqual(self.output.read_text(), LAST_GOOD + "\n")
+        self.assertEqual(list(self.identity.glob(f"{self.output.name}.tmp.*")), [])
+
+    def test_term_during_supervisor_settlement_does_not_abort_cleanup(self) -> None:
+        # Isolate real signal delivery from unittest's own process. Replace only
+        # process syscalls so the TERM lands deterministically inside settlement.
+        source = HELPER.read_text().split("<<'PY_SUPERVISOR'\n", 1)[1].split("\nPY_SUPERVISOR", 1)[0]
+        probe = r'''import json, os, select, signal, socket, subprocess, sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+source, output = sys.argv[1:]
+child = SimpleNamespace(pid=99999999, returncode=None)
+child.wait = lambda **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("owned worker", 10))
+channel, worker_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+worker_channel.sendall(os.fsencode(output))
+held_peer = worker_channel.dup()  # Model the live worker retaining its endpoint.
+events = []
+statuses = iter([(child.pid, signal.SIGKILL), ChildProcessError()])
+original_select = select.select
+def reap(*_args):
+    status = next(statuses)
+    if isinstance(status, BaseException):
+        raise status
+    events.append("reap")
+    return status
+def settle(readers, writers, errors, timeout):
+    if timeout != 2:
+        return original_select(readers, writers, errors, timeout)
+    events.append("TERM-during-settlement")
+    os.kill(os.getpid(), signal.SIGTERM)
+    return ([], [], [])
+def kill(_pid, sig):
+    events.append(signal.Signals(sig).name)
+sys.argv = ["supervisor", "fixture", "10", "2"]
+try:
+    with patch("socket.socketpair", return_value=(channel, worker_channel)), \
+         patch("subprocess.Popen", return_value=child), \
+         patch("os.pidfd_open", side_effect=lambda _pid: os.open(os.devnull, os.O_RDONLY)), \
+         patch("os.killpg", side_effect=kill), patch("os.waitpid", side_effect=reap), \
+         patch("select.select", side_effect=settle):
+        exec(compile(Path(source).read_text(), "supervisor", "exec"), {"__name__": "__main__"})
+except SystemExit as exit:
+    assert exit.code == 0, exit.code
+assert events == ["SIGTERM", "TERM-during-settlement", "SIGKILL", "reap"], events
+assert list(Path(output).parent.glob(Path(output).name + ".tmp.*")) == []
+print(json.dumps(events))
+'''
+        script = Path(self.temporary.name) / "supervisor.source"
+        script.write_text(source)
+        result = subprocess.run(
+            ["/usr/bin/python3", "-IS", "-c", probe, str(script), str(self.output)],
+            text=True, capture_output=True, timeout=5, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("TERM-during-settlement", result.stdout)
+        self.assertEqual(self.output.read_text(), LAST_GOOD + "\n")
+        self.assertEqual(list(self.identity.glob(f"{self.output.name}.tmp.*")), [])
+
+    def test_supervisor_cleanup_preserves_replacement_symlink(self) -> None:
+        _fake_docker(self.bin_dir, _exited_payload() + "\n", 0)
+        foreign = self.identity / "foreign"
+        foreign.write_text("not owned by the retainer\n")
+        mv = self.bin_dir / "mv"
+        mv.write_text(
+            "#!/bin/sh\n"
+            '/bin/rm -- "$3"\n'
+            f'/bin/ln -s {json.dumps(str(foreign))} "$3"\n'
+            "exec /bin/sleep 30\n"
+        )
+        mv.chmod(mv.stat().st_mode | stat.S_IXUSR)
+        bash_env = Path(self.temporary.name) / "replacement-ignore-term.bash"
+        bash_env.write_text("trap '' TERM\n")
+        env = dict(self.env, BASH_ENV=str(bash_env))
+        result = _run(env, self.cidfile, self.output, timeout=18)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.output.read_text(), LAST_GOOD + "\n")
+        leftover = list(self.identity.glob(f"{self.output.name}.tmp.*"))
+        self.assertEqual(len(leftover), 1)
+        self.assertTrue(leftover[0].is_symlink())
+        self.assertEqual(leftover[0].readlink(), foreign)
+        self.assertEqual(foreign.read_text(), "not owned by the retainer\n")
+
+    def test_timed_out_writer_does_not_clean_concurrent_publication(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _fake_docker(self.bin_dir, _exited_payload() + "\n", 0)
+        marker = self.identity / "paused"
+        mv = self.bin_dir / "mv"
+        mv.write_text(
+            "#!/bin/sh\n"
+            'if [ "${RETAIN_TEST_PAUSE:-}" = 1 ]; then\n'
+            f'  : > {json.dumps(str(marker))}\n'
+            "  trap '' TERM\n"
+            "  exec /bin/sleep 30\n"
+            "fi\n"
+            'exec /bin/mv "$@"\n'
+        )
+        mv.chmod(mv.stat().st_mode | stat.S_IXUSR)
+        foreign = self.identity / f"{self.output.name}.tmp.foreign"
+        foreign.write_text("another invocation owns this\n")
+        paused_env = dict(self.env, RETAIN_TEST_PAUSE="1")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(_run, paused_env, self.cidfile, self.output, timeout=16)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not marker.exists():
+                time.sleep(0.02)
+            self.assertTrue(marker.exists(), "writer did not reach publication")
+            published = _run(self.env, self.cidfile, self.output)
+            self.assertEqual(published.returncode, 0, published.stdout + published.stderr)
+            self.assertIn("retained", published.stdout)
+            expected = self.output.read_bytes()
+            result = pending.result(timeout=16)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("retained", result.stdout)
+        self.assertEqual(self.output.read_bytes(), expected)
+        self.assertEqual(list(self.identity.glob(f"{self.output.name}.tmp.*")), [foreign])
+        self.assertEqual(foreign.read_text(), "another invocation owns this\n")
+
+    def test_callers_outer_term_reaps_worker_before_cleanup(self) -> None:
+        _fake_docker(self.bin_dir, _exited_payload() + "\n", 0)
+        marker = self.identity / "worker-identity"
+        mv = self.bin_dir / "mv"
+        mv.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s ' \"$$\" > {json.dumps(str(marker))}\n"
+            f"/usr/bin/awk '{{print $22}}' /proc/$$/stat >> {json.dumps(str(marker))}\n"
+            "trap '' TERM\nexec /bin/sleep 30\n"
+        )
+        mv.chmod(mv.stat().st_mode | stat.S_IXUSR)
+        result = subprocess.run(
+            ["/usr/bin/timeout", "--signal=TERM", "--kill-after=2", "10",
+             "bash", str(HELPER), "--container", CONTAINER,
+             "--cidfile", str(self.cidfile), "--output", str(self.output)],
+            env=self.env, text=True, capture_output=True, timeout=16, check=False,
+        )
+        self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
+        self.assertTrue(marker.exists(), "worker never reached publication")
+        pid, start_ticks = marker.read_text().split()
+        try:
+            current = Path(f"/proc/{pid}/stat").read_text()
+        except FileNotFoundError:
+            pass
+        else:
+            fields = current[current.rfind(")") + 2:].split()
+            self.assertNotEqual(fields[19], start_ticks, "owned writer survived outer TERM")
+        self.assertEqual(self.output.read_text(), LAST_GOOD + "\n")
+        self.assertNotIn("retained", result.stdout)
+        self.assertEqual(list(self.identity.glob(f"{self.output.name}.tmp.*")), [])
+
+    def test_existing_maximum_temp_prefix_still_publishes(self) -> None:
+        _fake_docker(self.bin_dir, _exited_payload() + "\n", 0)
+        output = self.identity / ("x" * 244)
+        output.write_text(LAST_GOOD + "\n")
+        result = _run(self.env, self.cidfile, output)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("retained", result.stdout, result.stderr)
+        self.assertEqual(json.loads(output.read_text()), json.loads(_exited_payload()))
+        self.assertEqual(list(self.identity.glob(f"{output.name}.tmp.*")), [])
 
     def test_chmod_failure_keeps_last_good_and_exits_zero(self) -> None:
         chmod = self.bin_dir / "chmod"
