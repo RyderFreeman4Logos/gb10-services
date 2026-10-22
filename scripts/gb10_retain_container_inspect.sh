@@ -46,6 +46,29 @@ def wait_ready(fd):
             return
     raise InterruptedError("retainer supervisor interrupted")
 
+def kill_owned_children():
+    # This standalone subreaper owns only this invocation's worker lineage.
+    # A held pidfd plus a non-consuming child wait prevents stale PID signals.
+    with open(f"/proc/self/task/{os.getpid()}/children", "rb") as stream:
+        children = stream.read(65537)
+    if len(children) > 65536:
+        raise ValueError("retainer child list exceeded bound")
+    for candidate in children.split():
+        if time.monotonic() >= reap_deadline:
+            raise TimeoutError("retainer descendants did not reap; retaining owned tempfile")
+        try:
+            child_fd = os.pidfd_open(int(candidate))
+        except ProcessLookupError:
+            continue
+        try:
+            status = os.waitid(os.P_PIDFD, child_fd, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            if status is None:
+                signal.pidfd_send_signal(child_fd, signal.SIGKILL)
+        except (ChildProcessError, ProcessLookupError):
+            pass  # No longer our child, or already gone; never signal by PID.
+        finally:
+            os.close(child_fd)
+
 for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
     signal.signal(signum, interrupt)
 
@@ -87,31 +110,39 @@ except (OSError, ValueError):
 finally:
     channel.close()
     worker_channel.close()
-    if process is not None and process.returncode is None:
-        # Keep the direct child unreaped until its process group is killed.
-        if timed_out:
+    if process is not None:
+        if process.returncode is None:
+            # The unreaped worker still owns this PGID; never reuse it after reap.
+            if timed_out:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                grace_deadline = time.monotonic() + float(kill_after)
+                while not interrupted:
+                    remaining = grace_deadline - time.monotonic()
+                    if remaining <= 0 or select.select([pidfd], [], [], min(0.05, remaining))[0]:
+                        break
             try:
-                os.killpg(process.pid, signal.SIGTERM)
+                os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            select.select([pidfd], [], [], float(kill_after))
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
         reap_deadline = time.monotonic() + float(kill_after)
         while True:
+            if time.monotonic() >= reap_deadline:
+                raise TimeoutError("retainer descendants did not reap; retaining owned tempfile")
             try:
-                child, status = os.waitpid(-process.pid, os.WNOHANG)
+                child, status = os.waitpid(-1, os.WNOHANG)
             except ChildProcessError:
                 if process.returncode is None:
                     raise RuntimeError("retainer worker was not reaped")
                 break
-            if child == process.pid:
+            if process.returncode is None and child == process.pid:
                 process.returncode = os.waitstatus_to_exitcode(status)
             if child == 0:
                 if time.monotonic() >= reap_deadline:
                     raise TimeoutError("retainer descendants did not reap; retaining owned tempfile")
+                kill_owned_children()
                 time.sleep(0.01)
     if temporary is not None:
         try:

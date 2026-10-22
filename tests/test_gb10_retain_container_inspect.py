@@ -658,6 +658,235 @@ class RetainContainerInspectTests(unittest.TestCase):
         self.assertGreaterEqual(elapsed, RETAIN_DEADLINE_SEC + RETAIN_KILL_AFTER_SEC - 1)
         self.assertLess(elapsed, RETAIN_DEADLINE_SEC + RETAIN_KILL_AFTER_SEC + 3)
 
+    def test_nested_children_settle_after_timeout_and_normal_exit(self) -> None:
+        # Run each real process topology in an isolated subreaper so even RED
+        # owns and reaps its exact fixture children before deleting their files.
+        probe = r'''import ctypes, json, os, signal, subprocess, sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import test_gb10_retain_container_inspect as m
+mode = sys.argv[2]
+assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
+case = m.RetainContainerInspectTests(); case.setUp()
+known = []; caller = None
+try:
+    marker = case.identity / "nested-child.json"
+    docker = case.bin_dir / "docker"
+    identity = (
+        'raw=Path("/proc/self/stat").read_text(); f=raw[raw.rfind(")")+2:].split()\n'
+        'record={"pid":os.getpid(),"start_ticks":f[19],"pgid":os.getpgrp(),"sid":os.getsid(0)}\n'
+        f'part=Path({str(marker)!r}+".partial"); part.write_text(json.dumps(record)); os.replace(part,{str(marker)!r})\n'
+    )
+    prefix = "#!/usr/bin/python3 -IBS\nimport json,os,signal,time\nfrom pathlib import Path\n"
+    if mode == "delayed-inspect":
+        delay = case.identity / "chmod-start"
+        chmod = case.bin_dir / "chmod"
+        chmod.write_text(f'#!/bin/sh\nif [ ! -f "{delay}" ]; then : > "{delay}"; /bin/sleep 4; fi\nexec /bin/chmod "$@"\n')
+        chmod.chmod(0o700)
+        docker.write_text(prefix + 'signal.signal(signal.SIGTERM,signal.SIG_IGN)\n' + identity + 'time.sleep(30)\n')
+        command = ["/usr/bin/timeout", "--signal=TERM", "--kill-after=2", "10"]
+        limit = 16
+    else:
+        docker.write_text(prefix + 'child=os.fork()\nif child:\n'
+                          f'    deadline=time.monotonic()+3\n    while not Path({str(marker)!r}).exists() and time.monotonic()<deadline: time.sleep(.01)\n'
+                          f'    assert Path({str(marker)!r}).exists()\n    print({m._exited_payload()!r},flush=True)\n    os._exit(0)\n'
+                          'os.setsid()\nnull=os.open(os.devnull,os.O_RDWR)\n'
+                          'for fd in (0,1,2): os.dup2(null,fd)\nos.close(null)\n'
+                          'signal.signal(signal.SIGTERM,signal.SIG_IGN)\n' + identity + 'time.sleep(30)\n')
+        command = []
+        limit = 5
+    docker.chmod(0o700)
+    started = time.monotonic()
+    caller = subprocess.Popen(command + ["bash", str(m.HELPER), "--container", m.CONTAINER,
+                              "--cidfile", str(case.cidfile), "--output", str(case.output)],
+                              env=case.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    until = time.monotonic() + (6 if command else 3)
+    while time.monotonic() < until and not marker.exists(): time.sleep(.01)
+    assert marker.exists(), "owned nested process did not start"
+    recorded = json.loads(marker.read_text())
+    for pid in sorted({recorded["pid"], recorded["pgid"]}):
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            continue  # A repaired helper may already have settled this child.
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(); f = raw[raw.rfind(")")+2:].split()
+        except FileNotFoundError:
+            os.close(fd); continue
+        if pid == recorded["pid"] and f[19] != recorded["start_ticks"]:
+            os.close(fd); continue
+        known.append((pid, f[19], fd))
+    rc = caller.wait(timeout=limit)
+    alive = []
+    for pid, ticks, fd in known:
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(); f = raw[raw.rfind(")")+2:].split()
+        except FileNotFoundError:
+            continue
+        if f[19] == ticks: alive.append({"pid":pid,"start_ticks":ticks,"state":f[0]})
+    print(json.dumps({"mode":mode,"recorded":recorded,"returncode":rc,
+                      "elapsed":time.monotonic()-started,"surviving":alive}),flush=True)
+    assert rc == (124 if command else 0), rc
+    assert list(case.identity.glob(case.output.name + ".tmp.*")) == []
+    if command:
+        assert case.output.read_text() == m.LAST_GOOD + "\n"
+    else:
+        assert json.loads(case.output.read_text()) == json.loads(m._exited_payload())
+    assert not alive, "owned nested child survived helper return"
+finally:
+    if caller is not None and caller.poll() is None:
+        caller.kill(); caller.wait(timeout=2)
+    settled=False
+    try:
+        deadline=time.monotonic()+2
+        while True:
+            try: child,status=os.waitpid(-1,os.WNOHANG)
+            except ChildProcessError: break
+            if child:
+                print(json.dumps({"fixture_reaped":child,"status":status}),flush=True)
+                continue
+            if time.monotonic()>=deadline:
+                raise RuntimeError("fixture cleanup deadline")
+            with open(f"/proc/self/task/{os.getpid()}/children","rb") as stream:
+                raw=stream.read(65537)
+            if len(raw)>65536: raise RuntimeError("fixture child list exceeded bound")
+            for pid in raw.split():
+                if time.monotonic()>=deadline: raise RuntimeError("fixture cleanup deadline")
+                try: fd=os.pidfd_open(int(pid))
+                except ProcessLookupError: continue
+                try:
+                    if os.waitid(os.P_PIDFD,fd,os.WEXITED|os.WNOHANG|os.WNOWAIT) is None:
+                        signal.pidfd_send_signal(fd,signal.SIGKILL)
+                except (ChildProcessError,ProcessLookupError): pass
+                finally: os.close(fd)
+            time.sleep(.01)
+        settled=True
+    finally:
+        for _,_,fd in known: os.close(fd)
+        if caller is not None: caller.stdout.close(); caller.stderr.close()
+        if settled: case.doCleanups()
+        else:
+            case.temporary._finalizer.detach()
+            print("fixture cleanup uncertain; preserving " + case.temporary.name,flush=True)
+
+'''
+        for mode in ("delayed-inspect", "normal-exit"):
+            with self.subTest(mode=mode):
+                result = subprocess.run(
+                    ["/usr/bin/python3", "-IBS", "-c", probe, str(ROOT / "tests"), mode],
+                    text=True, capture_output=True, timeout=18, check=False,
+                )
+                print(result.stdout, end="", flush=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('"surviving": []', result.stdout)
+
+    def test_adopted_child_authority_bounds_and_descriptor_cleanup(self) -> None:
+        import ast
+        import io
+        import signal
+        from unittest.mock import patch
+
+        source = HELPER.read_text().split("<<'PY_SUPERVISOR'\n", 1)[1].split("\nPY_SUPERVISOR", 1)[0]
+        function = next(node for node in ast.parse(source).body
+                        if isinstance(node, ast.FunctionDef) and node.name == "kill_owned_children")
+        namespace = {"os": os, "time": time, "signal": signal, "reap_deadline": time.monotonic() + 2}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(HELPER), "exec"), namespace)
+        settle = namespace["kill_owned_children"]
+        opened = []
+        original = os.pidfd_open
+
+        def capture(pid: int) -> int:
+            fd = original(pid)
+            opened.append(fd)
+            return fd
+
+        # Our own PID is live but is not our child. Real P_PIDFD waitid must
+        # reject it, and the held descriptor must close without any signal.
+        with patch("builtins.open", return_value=io.BytesIO(str(os.getpid()).encode())), \
+             patch("os.pidfd_open", side_effect=capture), \
+             patch("signal.pidfd_send_signal") as send:
+            settle()
+            send.assert_not_called()
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError):
+            os.fstat(opened[0])
+        with patch("builtins.open", return_value=io.BytesIO(str(os.getpid()).encode())), \
+             patch("os.pidfd_open", side_effect=capture), \
+             patch("os.waitid", side_effect=OSError("child authority unavailable")), \
+             patch("signal.pidfd_send_signal") as send:
+            with self.assertRaises(OSError):
+                settle()
+            send.assert_not_called()
+        with self.assertRaises(OSError):
+            os.fstat(opened[-1])
+        with patch("builtins.open", return_value=io.BytesIO(b"99999999")), \
+             patch("os.pidfd_open", side_effect=ProcessLookupError), \
+             patch("signal.pidfd_send_signal") as send:
+            settle()
+            send.assert_not_called()
+        with patch("builtins.open", return_value=io.BytesIO(b"1" * 65537)), \
+             patch("os.pidfd_open") as acquire:
+            with self.assertRaises(ValueError):
+                settle()
+            acquire.assert_not_called()
+        namespace["reap_deadline"] = time.monotonic() - 1
+        with patch("builtins.open", return_value=io.BytesIO(b"1")), \
+             patch("os.pidfd_open") as acquire:
+            with self.assertRaises(TimeoutError):
+                settle()
+            acquire.assert_not_called()
+
+    def test_reused_worker_pid_preserves_recorded_status_and_cleanup(self) -> None:
+        # Model a distinct adopted child reusing the already-reaped worker PID.
+        source = HELPER.read_text().split("<<'PY_SUPERVISOR'\n", 1)[1].split("\nPY_SUPERVISOR", 1)[0]
+        probe = r'''import os, socket, subprocess, sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+source, output = sys.argv[1:]
+child = SimpleNamespace(pid=99999999, returncode=7)
+child.wait = lambda **kwargs: child.returncode
+channel, worker_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+worker_channel.sendall(os.fsencode(output))
+held_peer = worker_channel.dup()
+statuses = iter([(child.pid, 0), (child.pid + 1, 0), ChildProcessError()])
+def reap(pid, flags):
+    assert (pid, flags) == (-1, os.WNOHANG)
+    status = next(statuses)
+    if isinstance(status, BaseException):
+        raise status
+    return status
+sys.argv = ["supervisor", "fixture", "10", "2"]
+try:
+    with patch("socket.socketpair", return_value=(channel, worker_channel)), \
+         patch("subprocess.Popen", return_value=child), \
+         patch("os.pidfd_open", side_effect=lambda _pid: os.open(os.devnull, os.O_RDONLY)), \
+         patch("os.killpg") as kill, patch("os.waitpid", side_effect=reap) as wait:
+        try:
+            exec(compile(Path(source).read_text(), "supervisor", "exec"), {"__name__": "__main__"})
+        except SystemExit as exit:
+            assert exit.code == 7, exit.code
+        else:
+            raise AssertionError("supervisor did not preserve the worker exit")
+        assert child.returncode == 7
+        assert wait.call_count == 3, wait.call_count
+        kill.assert_not_called()
+finally:
+    held_peer.close()
+assert list(Path(output).parent.glob(Path(output).name + ".tmp.*")) == []
+print("reused-PID-reaped-to-ECHILD; worker-status-preserved; tempfile-cleaned")
+'''
+        script = Path(self.temporary.name) / "supervisor.source"
+        script.write_text(source)
+        result = subprocess.run(
+            ["/usr/bin/python3", "-IS", "-c", probe, str(script), str(self.output)],
+            text=True, capture_output=True, timeout=5, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("reused-PID-reaped-to-ECHILD", result.stdout)
+        self.assertEqual(self.output.read_text(), LAST_GOOD + "\n")
+        self.assertEqual(list(self.identity.glob(f"{self.output.name}.tmp.*")), [])
+
     def test_term_after_worker_reap_preserves_exit_status_and_cleanup(self) -> None:
         source = HELPER.read_text().split("<<'PY_SUPERVISOR'\n", 1)[1].split("\nPY_SUPERVISOR", 1)[0]
         root = Path(self.temporary.name)
@@ -738,7 +967,7 @@ def reap(*_args):
     events.append("reap")
     return status
 def settle(readers, writers, errors, timeout):
-    if timeout != 2:
+    if events != ["SIGTERM"]:
         return original_select(readers, writers, errors, timeout)
     events.append("TERM-during-settlement")
     os.kill(os.getpid(), signal.SIGTERM)
