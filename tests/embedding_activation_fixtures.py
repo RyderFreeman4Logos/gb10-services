@@ -39,6 +39,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -50,7 +51,16 @@ with log_path.open("a") as sink:
     sink.write("tool " + " ".join(args) + "\n")
 
 def save():
-    state_path.write_text(json.dumps(state, sort_keys=True))
+    fd, name = tempfile.mkstemp(
+        prefix=state_path.name + ".", suffix=".tmp", dir=state_path.parent
+    )
+    os.close(fd)
+    temporary = Path(name)
+    try:
+        temporary.write_text(json.dumps(state, sort_keys=True))
+        temporary.replace(state_path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 if args == ["info", "--format", "{{.CgroupVersion}}"]:
     if state.get("docker_info_fail"):
@@ -224,10 +234,24 @@ def _no_swap_core_source() -> str:
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 state_path = Path(os.environ["ACTIVATION_FIXTURE_STATE"])
 log_path = Path(os.environ["ACTIVATION_COMMAND_LOG"])
 state = json.loads(state_path.read_text())
+
+def save():
+    fd, name = tempfile.mkstemp(
+        prefix=state_path.name + ".", suffix=".tmp", dir=state_path.parent
+    )
+    os.close(fd)
+    temporary = Path(name)
+    try:
+        temporary.write_text(json.dumps(state, sort_keys=True))
+        temporary.replace(state_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
 args = sys.argv[1:]
 with log_path.open("a") as sink:
     sink.write("no-swap " + " ".join(args) + " core=" + str(Path(__file__).resolve()) + "\n")
@@ -259,13 +283,13 @@ if container == "vllm-embedding" and unit_path.read_bytes().count(b"ExecStart=")
 count = int(state.get("no_swap_count", 0)) + 1
 state["no_swap_count"] = count
 if container not in set(state.get("swap_zero", [])):
-    state_path.write_text(json.dumps(state, sort_keys=True))
+    save()
     raise SystemExit(85)
 if bind:
     state["runtime_bound"] = sorted(
         set(state.get("runtime_bound", [])) | {container}
     )
-state_path.write_text(json.dumps(state, sort_keys=True))
+save()
 if int(state.get("fail_no_swap_at", 0)) == count:
     raise SystemExit(84)
 '''
@@ -445,7 +469,16 @@ class ActivationFixture:
         self.save()
 
     def save(self) -> None:
-        self.state_path.write_text(json.dumps(self.state, sort_keys=True))
+        fd, name = tempfile.mkstemp(
+            prefix=self.state_path.name + ".", suffix=".tmp", dir=self.state_path.parent
+        )
+        os.close(fd)
+        temporary = Path(name)
+        try:
+            temporary.write_text(json.dumps(self.state, sort_keys=True))
+            temporary.replace(self.state_path)
+        finally:
+            temporary.unlink(missing_ok=True)
         payload = {
             "command_seconds": 2,
             "curl": str(self.tool),
@@ -893,7 +926,11 @@ class ActivationFixture:
         self._remember_group(process)
         return process
 
-    def wait_for_marker(self, timeout: float = 5) -> None:
+    def wait_for_marker(self, timeout: float | None = None) -> None:
+        if timeout is None:
+            config = json.loads(self.config.read_text())
+            # Rendezvous must not expire before the operation it is observing.
+            timeout = config["deadline_seconds"] + config["rollback_seconds"]
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and not self.marker.exists():
             time.sleep(0.02)
