@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -456,6 +457,7 @@ class RetainContainerInspectTests(unittest.TestCase):
         _assert_kept_last_good(self, refused, self.output)
         self.assertEqual(len(list(store.glob("*.exited.json"))), 64)
 
+    @patch.dict(os.environ, {"GB10_RETAIN_SNAPSHOT_LIVE": "1"})
     def test_concurrent_archive_admission_preserves_capacity(self) -> None:
         # Execute the unchanged archive block in owned processes, pausing only
         # the first count snapshot while the second writer attempts admission.
@@ -472,6 +474,7 @@ class RetainContainerInspectTests(unittest.TestCase):
         def worker(cid: str, pause: bool) -> None:
             import sys
             os.environ["HOME"] = self.env["HOME"]
+            os.environ["GB10_RETAIN_SNAPSHOT_LIVE"] = "0"
             payload = Path(self.temporary.name) / f"{cid}.inspect"
             body = json.loads(_exited_payload())
             body[0]["Id"] = cid
