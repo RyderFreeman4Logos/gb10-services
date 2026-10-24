@@ -241,6 +241,13 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
         process = fixture.spawn()
         try:
             fixture.wait_for_marker()
+            if fixture.state.get("slow_preparation_commands"):
+                state = json.loads(fixture.state_path.read_text())
+                intervals = state["preparation_command_intervals"]
+                self.assertEqual(state["slow_preparation_commands"], 0)
+                self.assertEqual(len(intervals), 12)
+                self.assertGreater(sum(end - start for start, end in intervals), 5)
+                self.assertTrue(all(end - start < 1 for start, end in intervals))
             os.killpg(process.pid, signum)
             stdout, stderr = process.communicate(timeout=12)
             return subprocess.CompletedProcess(
@@ -406,6 +413,10 @@ class EmbeddingActivationTransactionTests(unittest.TestCase):
         for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
             with self.subTest(signum=signum), ActivationFixture() as fixture:
                 fixture.hooks["pause_at"] = "after_install"
+                if signum == signal.SIGTERM:
+                    # Preparation crosses the old five-second observer limit.
+                    # Each 2s command reserves 1s for work and 1s for cleanup.
+                    fixture.state["slow_preparation_commands"] = 12
                 fixture.save()
                 result = self.terminate_at_pause(fixture, signum)
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
