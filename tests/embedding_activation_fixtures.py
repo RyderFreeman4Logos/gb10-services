@@ -62,6 +62,16 @@ def save():
     finally:
         temporary.unlink(missing_ok=True)
 
+if state.get("slow_preparation_commands", 0) > 0:
+    state["slow_preparation_commands"] -= 1
+    started = time.monotonic()
+    save()
+    time.sleep(0.45)
+    state.setdefault("preparation_command_intervals", []).append(
+        [started, time.monotonic()]
+    )
+    save()
+
 if args == ["info", "--format", "{{.CgroupVersion}}"]:
     if state.get("docker_info_fail"):
         raise SystemExit(73)
