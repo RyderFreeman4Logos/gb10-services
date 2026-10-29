@@ -1,0 +1,17 @@
+[Unit]
+# Observer only. Must not wait on default.target: that target waits for
+# model startup (up to TimeoutStartSec), which left this unit dead through
+# the 2026-10-28 freezes until models finished activating.
+Description=User-level freeze black box (MemAvailable/PSI/boot_id, 1s fsync)
+After=basic.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/freeze-blackbox.py
+Restart=always
+RestartSec=2
+OOMScoreAdjust=-800
+
+[Install]
+WantedBy=default.target

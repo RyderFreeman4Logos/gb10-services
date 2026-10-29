@@ -78,6 +78,16 @@ graph TD
    enqueue is not proof of persistence; a forced reboot may lose the unsynced
    tail. This is observer hardening, not proof of a historical freeze cause,
    Mode-1 recovery, or a guarantee against stalled kernel I/O.
+6. **freeze-blackbox.service**
+   Observer-only 1-second `fsync` of `MemAvailable`, PSI, `boot_id`, and
+   monotonic time to `~/log/freeze-blackbox/`. It is `WantedBy=default.target`
+   but `After=basic.target` only, so model startup cannot delay it.
+   A separate child writes `slow_*.csv` about every 10 seconds (GPU, thermal
+   zone 0, no-auth model gauges, D-state names). A hung child is killed and
+   is not allowed to stall the heartbeat. Slow files older than 21 days are
+   removed; daily `blackbox_*.csv` history is not. Kernel panic and GPU Xid
+   remain unreadable without root. `vllm_perf_*.csv` staying up with blank
+   workload columns is a separate gap, not evidence this log is complete.
 
 ### Integrated Guardian
 `llm-guard-proxy` owns the only automatic low-memory recovery path. The GB10
@@ -162,7 +172,8 @@ gb10-services/
 │   ├── gb10_check_mem_available.sh # Model startup headroom gate
 │   ├── llm_guard_proxy_publish_cgroup_registration.sh # Publish exact AEON cgroup identity
 │   ├── querit_openai_rerank_server.py # Historical reproducibility adapter
-│   └── sysmon.sh           # Observer-only metrics with measured sample cadence
+│   ├── sysmon.sh           # Observer-only metrics with measured sample cadence
+│   └── freeze-blackbox.py  # 1s fsync heartbeat plus a bounded slow sampler
 └── systemd/
     ├── llm-guard-proxy.service
     ├── sysmon.service
@@ -460,6 +471,7 @@ install -m 0755 scripts/gb10_lifecycle.sh ~/.local/bin/gb10_lifecycle.sh
 install -m 0755 scripts/gb10_restart_text_safe.sh ~/.local/bin/gb10_restart_text_safe.sh
 install -m 0644 scripts/sysmon_csv_writer.py ~/.local/bin/
 cp scripts/sysmon.sh ~/.local/bin/
+install -m 0755 scripts/freeze-blackbox.py ~/.local/bin/freeze-blackbox.py
 
 
 # Make scripts executable
@@ -481,6 +493,7 @@ mkdir -p ~/.config/systemd/user/
 install -m 0644 profile/llm-guard-proxy/llm-guard-proxy.service \
   profile/querit-4b-reranker/vllm-querit-4b-reranker.service \
   profile/sysmon/sysmon.service \
+  profile/freeze-blackbox/freeze-blackbox.service \
   profile/qwen3.6-27b-decensor-by-aeon/vllm-aeon-27b-dflash.service \
   profile/qwen3-embedding-8b/vllm-embedding.service \
   profile/qwen3-reranker-8b/vllm-qwen3-reranker-8b.service \
@@ -509,6 +522,7 @@ Reload systemd configurations and enable the services to persist across boot cyc
 systemctl --user daemon-reload
 
 systemctl --user enable --now sysmon.service
+systemctl --user enable --now freeze-blackbox.service
 
 # Model services remain independent from the proxy lifecycle.
 systemctl --user enable --now vllm-embedding.service

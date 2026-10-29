@@ -119,6 +119,7 @@ install -m 0755 scripts/gb10_verify_vllm_no_swap.sh /home/obj/.local/bin/gb10_ve
 install -m 0755 scripts/gb10_service_ready.sh /home/obj/.local/bin/gb10_service_ready.sh
 install -m 0755 scripts/gb10_lifecycle.sh /home/obj/.local/bin/gb10_lifecycle.sh
 cp scripts/sysmon.sh /home/obj/.local/bin/
+install -m 0755 scripts/freeze-blackbox.py /home/obj/.local/bin/freeze-blackbox.py
 
 # Make executable
 chmod +x /home/obj/scripts/*.sh
@@ -187,6 +188,7 @@ mkdir -p /home/obj/.config/systemd/user/
 install -m 0644 profile/llm-guard-proxy/llm-guard-proxy.service \
   profile/querit-4b-reranker/vllm-querit-4b-reranker.service \
   profile/sysmon/sysmon.service \
+  profile/freeze-blackbox/freeze-blackbox.service \
   profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service \
   profile/qwen3-embedding-8b/vllm-embedding.service \
   profile/qwen3-reranker-8b/vllm-qwen3-reranker-8b.service \
@@ -205,6 +207,9 @@ systemctl --user daemon-reload
 ### 6. Enable and Start Services
 ```bash
 systemctl --user enable --now sysmon.service
+# freeze-blackbox is WantedBy=default.target and After=basic.target.
+# Do not add After=default.target: that waits for model TimeoutStartSec.
+systemctl --user enable --now freeze-blackbox.service
 
 # Start model services and the proxy independently. Authorized restart
 # order is embedding → reranker → text.
