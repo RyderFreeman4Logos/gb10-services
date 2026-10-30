@@ -1,0 +1,32 @@
+[Unit]
+Description=vLLM Prometheus performance monitor (low-write CSV)
+Documentation=https://docs.vllm.ai/
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vllm_perf_monitor.py
+Restart=always
+RestartSec=10
+WorkingDirectory=%h
+Environment=VLLM_PERF_INTERVAL_SECONDS=30
+Environment=VLLM_PERF_TIMEOUT_SECONDS=2.5
+Environment=VLLM_PERF_RETENTION_DAYS=14
+Environment=VLLM_PERF_MAX_TOTAL_BYTES=5368709120
+Environment=VLLM_PERF_MAX_CURRENT_BYTES=33554432
+Environment=VLLM_PERF_MIN_FREE_BYTES=5368709120
+Environment=VLLM_PERF_LOG_DIR=%h/log
+# Raw engine publishes. Guard :18002/:18009/:18003 do not expose vLLM gauges.
+Environment=VLLM_PERF_ENDPOINTS=emb=http://100.105.4.92:18012/metrics,aeon=http://100.105.4.92:18010/metrics,rerank=http://100.105.4.92:18013/metrics
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=10
+IOWeight=10
+MemoryMax=128M
+TasksMax=16
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

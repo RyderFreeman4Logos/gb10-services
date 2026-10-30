@@ -1,0 +1,7 @@
+vllm:num_requests_running{engine="0",model_name="qwen3-embedding-8b"} 0.0
+vllm:num_requests_waiting{engine="0",model_name="qwen3-embedding-8b"} 0.0
+vllm:kv_cache_usage_perc{engine="0",model_name="qwen3-embedding-8b"} 0.0
+vllm:prompt_tokens_total{engine="0",model_name="qwen3-embedding-8b"} 327279.0
+vllm:generation_tokens_total{engine="0",model_name="qwen3-embedding-8b"} 0.0
+vllm:request_success_total{engine="0",finished_reason="stop",model_name="qwen3-embedding-8b"} 444.0
+vllm:request_success_total{engine="0",finished_reason="error",model_name="qwen3-embedding-8b"} 0.0
