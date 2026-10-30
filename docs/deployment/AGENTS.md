@@ -120,6 +120,7 @@ install -m 0755 scripts/gb10_service_ready.sh /home/obj/.local/bin/gb10_service_
 install -m 0755 scripts/gb10_lifecycle.sh /home/obj/.local/bin/gb10_lifecycle.sh
 cp scripts/sysmon.sh /home/obj/.local/bin/
 install -m 0755 scripts/freeze-blackbox.py /home/obj/.local/bin/freeze-blackbox.py
+install -m 0755 scripts/vllm_perf_monitor.py /home/obj/.local/bin/vllm_perf_monitor.py
 
 # Make executable
 chmod +x /home/obj/scripts/*.sh
@@ -189,6 +190,7 @@ install -m 0644 profile/llm-guard-proxy/llm-guard-proxy.service \
   profile/querit-4b-reranker/vllm-querit-4b-reranker.service \
   profile/sysmon/sysmon.service \
   profile/freeze-blackbox/freeze-blackbox.service \
+  profile/vllm-perf-monitor/vllm-perf-monitor.service \
   profile/aeon-ultimate-uncensored-nvfp4/vllm-aeon-ultimate-uncensored-nvfp4.service \
   profile/qwen3-embedding-8b/vllm-embedding.service \
   profile/qwen3-reranker-8b/vllm-qwen3-reranker-8b.service \
@@ -210,6 +212,7 @@ systemctl --user enable --now sysmon.service
 # freeze-blackbox is WantedBy=default.target and After=basic.target.
 # Do not add After=default.target: that waits for model TimeoutStartSec.
 systemctl --user enable --now freeze-blackbox.service
+systemctl --user enable --now vllm-perf-monitor.service
 
 # Start model services and the proxy independently. Authorized restart
 # order is embedding → reranker → text.
@@ -435,6 +438,13 @@ selector and invokes the script without arguments, which hard-binds real `/proc`
 the real clock, and `~/log`. `--test-only` is solely for hermetic source tests;
 bounded boot-ID/PSI readers degrade non-regular, symlinked, oversized,
 nonterminated, duplicate, missing, or malformed input to `N/A`.
+
+`vllm-perf-monitor.service` appends one row every 30 seconds to
+`~/log/vllm_perf_YYYY-MM-DD.csv`. It polls the raw engine publishes
+(`:18012` embedding, `:18010` AEON, `:18013` Querit), not the Guard
+listeners. An unreachable endpoint records `up=0` and an error class
+(`closed`, `refused`, `timeout`, `http_<code>`) with blank workload fields.
+Age and total-byte retention never delete the current day's file.
 
 ### View Live Service logs
 ```bash
